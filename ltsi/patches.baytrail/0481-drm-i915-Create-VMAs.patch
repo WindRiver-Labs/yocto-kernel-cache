@@ -1,0 +1,428 @@
+From ccf33cf038a407ddfe8b2037e1640479865847f4 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Wed, 17 Jul 2013 12:19:03 -0700
+Subject: drm/i915: Create VMAs
+
+Formerly: "drm/i915: Create VMAs (part 1)"
+
+In a previous patch, the notion of a VM was introduced. A VMA describes
+an area of part of the VM address space. A VMA is similar to the concept
+in the linux mm. However, instead of representing regular memory, a VMA
+is backed by a GEM BO. There may be many VMAs for a given object, one
+for each VM the object is to be used in. This may occur through flink,
+dma-buf, or a number of other transient states.
+
+Currently the code depends on only 1 VMA per object, for the global GTT
+(and aliasing PPGTT). The following patches will address this and make
+the rest of the infrastructure more suited
+
+v2: s/i915_obj/i915_gem_obj (Chris)
+
+v3: Only move an object to the now global unbound list if there are no
+more VMAs for the object which are bound into a VM (ie. the list is
+empty).
+
+v4: killed obj->gtt_space
+some reworks due to rebase
+
+v5: Free vma on error path (Imre)
+
+v6: Another missed vma free in i915_gem_object_bind_to_gtt error path
+(Imre)
+Fixed vma freeing in stolen preallocation (Imre)
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+[danvet: Squash in fixup from Ben to not deref a non-existing vma in
+set_cache_level, reported by Chris.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit 2f63315692b1d3c055972ad33fc7168ae908b97b)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h        | 48 +++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_gem.c        | 74 +++++++++++++++++++++++++++-------
+ drivers/gpu/drm/i915/i915_gem_evict.c  | 12 ++++--
+ drivers/gpu/drm/i915/i915_gem_gtt.c    |  5 ++-
+ drivers/gpu/drm/i915/i915_gem_stolen.c | 15 +++++--
+ 5 files changed, 120 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0bd41e4b9f08..d972025bff14 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -533,6 +533,17 @@ struct i915_hw_ppgtt {
+ 	int (*enable)(struct drm_device *dev);
+ };
+ 
++/* To make things as simple as possible (ie. no refcounting), a VMA's lifetime
++ * will always be <= an objects lifetime. So object refcounting should cover us.
++ */
++struct i915_vma {
++	struct drm_mm_node node;
++	struct drm_i915_gem_object *obj;
++	struct i915_address_space *vm;
++
++	struct list_head vma_link; /* Link in the object's VMA list */
++};
++
+ struct i915_ctx_hang_stats {
+ 	/* This context had batch pending when hang was declared */
+ 	unsigned batch_pending;
+@@ -1230,8 +1241,9 @@ struct drm_i915_gem_object {
+ 
+ 	const struct drm_i915_gem_object_ops *ops;
+ 
+-	/** Current space allocated to this object in the GTT, if any. */
+-	struct drm_mm_node gtt_space;
++	/** List of VMAs backed by this object */
++	struct list_head vma_list;
++
+ 	/** Stolen memory for this object, instead of being backed by shmem. */
+ 	struct drm_mm_node *stolen;
+ 	struct list_head global_list;
+@@ -1357,18 +1369,32 @@ struct drm_i915_gem_object {
+ 
+ #define to_intel_bo(x) container_of(x, struct drm_i915_gem_object, base)
+ 
+-/* Offset of the first PTE pointing to this object */
+-static inline unsigned long
+-i915_gem_obj_ggtt_offset(struct drm_i915_gem_object *o)
++/* This is a temporary define to help transition us to real VMAs. If you see
++ * this, you're either reviewing code, or bisecting it. */
++static inline struct i915_vma *
++__i915_gem_obj_to_vma(struct drm_i915_gem_object *obj)
+ {
+-	return o->gtt_space.start;
++	if (list_empty(&obj->vma_list))
++		return NULL;
++	return list_first_entry(&obj->vma_list, struct i915_vma, vma_link);
+ }
+ 
+ /* Whether or not this object is currently mapped by the translation tables */
+ static inline bool
+ i915_gem_obj_ggtt_bound(struct drm_i915_gem_object *o)
+ {
+-	return drm_mm_node_allocated(&o->gtt_space);
++	struct i915_vma *vma = __i915_gem_obj_to_vma(o);
++	if (vma == NULL)
++		return false;
++	return drm_mm_node_allocated(&vma->node);
++}
++
++/* Offset of the first PTE pointing to this object */
++static inline unsigned long
++i915_gem_obj_ggtt_offset(struct drm_i915_gem_object *o)
++{
++	BUG_ON(list_empty(&o->vma_list));
++	return __i915_gem_obj_to_vma(o)->node.start;
+ }
+ 
+ /* The size used in the translation tables may be larger than the actual size of
+@@ -1378,14 +1404,15 @@ i915_gem_obj_ggtt_bound(struct drm_i915_gem_object *o)
+ static inline unsigned long
+ i915_gem_obj_ggtt_size(struct drm_i915_gem_object *o)
+ {
+-	return o->gtt_space.size;
++	BUG_ON(list_empty(&o->vma_list));
++	return __i915_gem_obj_to_vma(o)->node.size;
+ }
+ 
+ static inline void
+ i915_gem_obj_ggtt_set_color(struct drm_i915_gem_object *o,
+ 			    enum i915_cache_level color)
+ {
+-	o->gtt_space.color = color;
++	__i915_gem_obj_to_vma(o)->node.color = color;
+ }
+ 
+ /**
+@@ -1693,6 +1720,9 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ struct drm_i915_gem_object *i915_gem_alloc_object(struct drm_device *dev,
+ 						  size_t size);
+ void i915_gem_free_object(struct drm_gem_object *obj);
++struct i915_vma *i915_gem_vma_create(struct drm_i915_gem_object *obj,
++				     struct i915_address_space *vm);
++void i915_gem_vma_destroy(struct i915_vma *vma);
+ 
+ int __must_check i915_gem_object_pin(struct drm_i915_gem_object *obj,
+ 				     uint32_t alignment,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 0d749cb9d01a..3200a201bcba 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2590,6 +2590,7 @@ int
+ i915_gem_object_unbind(struct drm_i915_gem_object *obj)
+ {
+ 	drm_i915_private_t *dev_priv = obj->base.dev->dev_private;
++	struct i915_vma *vma;
+ 	int ret;
+ 
+ 	if (!i915_gem_obj_ggtt_bound(obj))
+@@ -2627,11 +2628,20 @@ i915_gem_object_unbind(struct drm_i915_gem_object *obj)
+ 	i915_gem_object_unpin_pages(obj);
+ 
+ 	list_del(&obj->mm_list);
+-	list_move_tail(&obj->global_list, &dev_priv->mm.unbound_list);
+ 	/* Avoid an unnecessary call to unbind on rebind. */
+ 	obj->map_and_fenceable = true;
+ 
+-	drm_mm_remove_node(&obj->gtt_space);
++	vma = __i915_gem_obj_to_vma(obj);
++	list_del(&vma->vma_link);
++	drm_mm_remove_node(&vma->node);
++	i915_gem_vma_destroy(vma);
++
++	/* Since the unbound list is global, only move to that list if
++	 * no more VMAs exist.
++	 * NB: Until we have real VMAs there will only ever be one */
++	WARN_ON(!list_empty(&obj->vma_list));
++	if (list_empty(&obj->vma_list))
++		list_move_tail(&obj->global_list, &dev_priv->mm.unbound_list);
+ 
+ 	return 0;
+ }
+@@ -3065,8 +3075,12 @@ i915_gem_object_bind_to_gtt(struct drm_i915_gem_object *obj,
+ 	bool mappable, fenceable;
+ 	size_t gtt_max = map_and_fenceable ?
+ 		dev_priv->gtt.mappable_end : dev_priv->gtt.base.total;
++	struct i915_vma *vma;
+ 	int ret;
+ 
++	if (WARN_ON(!list_empty(&obj->vma_list)))
++		return -EBUSY;
++
+ 	fence_size = i915_gem_get_gtt_size(dev,
+ 					   obj->base.size,
+ 					   obj->tiling_mode);
+@@ -3105,9 +3119,15 @@ i915_gem_object_bind_to_gtt(struct drm_i915_gem_object *obj,
+ 
+ 	i915_gem_object_pin_pages(obj);
+ 
++	vma = i915_gem_vma_create(obj, &dev_priv->gtt.base);
++	if (vma == NULL) {
++		i915_gem_object_unpin_pages(obj);
++		return -ENOMEM;
++	}
++
+ search_free:
+ 	ret = drm_mm_insert_node_in_range_generic(&dev_priv->gtt.base.mm,
+-						  &obj->gtt_space,
++						  &vma->node,
+ 						  size, alignment,
+ 						  obj->cache_level, 0, gtt_max);
+ 	if (ret) {
+@@ -3118,25 +3138,21 @@ search_free:
+ 		if (ret == 0)
+ 			goto search_free;
+ 
+-		i915_gem_object_unpin_pages(obj);
+-		return ret;
++		goto err_out;
+ 	}
+-	if (WARN_ON(!i915_gem_valid_gtt_space(dev, &obj->gtt_space,
++	if (WARN_ON(!i915_gem_valid_gtt_space(dev, &vma->node,
+ 					      obj->cache_level))) {
+-		i915_gem_object_unpin_pages(obj);
+-		drm_mm_remove_node(&obj->gtt_space);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto err_out;
+ 	}
+ 
+ 	ret = i915_gem_gtt_prepare_object(obj);
+-	if (ret) {
+-		i915_gem_object_unpin_pages(obj);
+-		drm_mm_remove_node(&obj->gtt_space);
+-		return ret;
+-	}
++	if (ret)
++		goto err_out;
+ 
+ 	list_move_tail(&obj->global_list, &dev_priv->mm.bound_list);
+ 	list_add_tail(&obj->mm_list, &vm->inactive_list);
++	list_add(&vma->vma_link, &obj->vma_list);
+ 
+ 	fenceable =
+ 		i915_gem_obj_ggtt_size(obj) == fence_size &&
+@@ -3150,6 +3166,12 @@ search_free:
+ 	trace_i915_gem_object_bind(obj, map_and_fenceable);
+ 	i915_gem_verify_gtt(dev);
+ 	return 0;
++
++err_out:
++	i915_gem_vma_destroy(vma);
++	i915_gem_object_unpin_pages(obj);
++	drm_mm_remove_node(&vma->node);
++	return ret;
+ }
+ 
+ void
+@@ -3295,6 +3317,7 @@ int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
+ {
+ 	struct drm_device *dev = obj->base.dev;
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
++	struct i915_vma *vma = __i915_gem_obj_to_vma(obj);
+ 	int ret;
+ 
+ 	if (obj->cache_level == cache_level)
+@@ -3305,7 +3328,7 @@ int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
+ 		return -EBUSY;
+ 	}
+ 
+-	if (!i915_gem_valid_gtt_space(dev, &obj->gtt_space, cache_level)) {
++	if (vma && !i915_gem_valid_gtt_space(dev, &vma->node, cache_level)) {
+ 		ret = i915_gem_object_unbind(obj);
+ 		if (ret)
+ 			return ret;
+@@ -3850,6 +3873,7 @@ void i915_gem_object_init(struct drm_i915_gem_object *obj,
+ 	INIT_LIST_HEAD(&obj->global_list);
+ 	INIT_LIST_HEAD(&obj->ring_list);
+ 	INIT_LIST_HEAD(&obj->exec_list);
++	INIT_LIST_HEAD(&obj->vma_list);
+ 
+ 	obj->ops = ops;
+ 
+@@ -3970,6 +3994,26 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 	i915_gem_object_free(obj);
+ }
+ 
++struct i915_vma *i915_gem_vma_create(struct drm_i915_gem_object *obj,
++				     struct i915_address_space *vm)
++{
++	struct i915_vma *vma = kzalloc(sizeof(*vma), GFP_KERNEL);
++	if (vma == NULL)
++		return ERR_PTR(-ENOMEM);
++
++	INIT_LIST_HEAD(&vma->vma_link);
++	vma->vm = vm;
++	vma->obj = obj;
++
++	return vma;
++}
++
++void i915_gem_vma_destroy(struct i915_vma *vma)
++{
++	WARN_ON(vma->node.allocated);
++	kfree(vma);
++}
++
+ int
+ i915_gem_idle(struct drm_device *dev)
+ {
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.c b/drivers/gpu/drm/i915/i915_gem_evict.c
+index 43b82350d8dc..df61f338dea1 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -34,11 +34,13 @@
+ static bool
+ mark_free(struct drm_i915_gem_object *obj, struct list_head *unwind)
+ {
++	struct i915_vma *vma = __i915_gem_obj_to_vma(obj);
++
+ 	if (obj->pin_count)
+ 		return false;
+ 
+ 	list_add(&obj->exec_list, unwind);
+-	return drm_mm_scan_add_block(&obj->gtt_space);
++	return drm_mm_scan_add_block(&vma->node);
+ }
+ 
+ int
+@@ -49,6 +51,7 @@ i915_gem_evict_something(struct drm_device *dev, int min_size,
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct i915_address_space *vm = &dev_priv->gtt.base;
+ 	struct list_head eviction_list, unwind_list;
++	struct i915_vma *vma;
+ 	struct drm_i915_gem_object *obj;
+ 	int ret = 0;
+ 
+@@ -106,8 +109,8 @@ none:
+ 		obj = list_first_entry(&unwind_list,
+ 				       struct drm_i915_gem_object,
+ 				       exec_list);
+-
+-		ret = drm_mm_scan_remove_block(&obj->gtt_space);
++		vma = __i915_gem_obj_to_vma(obj);
++		ret = drm_mm_scan_remove_block(&vma->node);
+ 		BUG_ON(ret);
+ 
+ 		list_del_init(&obj->exec_list);
+@@ -127,7 +130,8 @@ found:
+ 		obj = list_first_entry(&unwind_list,
+ 				       struct drm_i915_gem_object,
+ 				       exec_list);
+-		if (drm_mm_scan_remove_block(&obj->gtt_space)) {
++		vma = __i915_gem_obj_to_vma(obj);
++		if (drm_mm_scan_remove_block(&vma->node)) {
+ 			list_move(&obj->exec_list, &eviction_list);
+ 			drm_gem_object_reference(&obj->base);
+ 			continue;
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 999ecfecb32e..3b639a94dddf 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -662,16 +662,17 @@ void i915_gem_setup_global_gtt(struct drm_device *dev,
+ 
+ 	/* Mark any preallocated objects as occupied */
+ 	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list) {
++		struct i915_vma *vma = __i915_gem_obj_to_vma(obj);
+ 		int ret;
+ 		DRM_DEBUG_KMS("reserving preallocated space: %lx + %zx\n",
+ 			      i915_gem_obj_ggtt_offset(obj), obj->base.size);
+ 
+ 		WARN_ON(i915_gem_obj_ggtt_bound(obj));
+-		ret = drm_mm_reserve_node(&dev_priv->gtt.base.mm,
+-					  &obj->gtt_space);
++		ret = drm_mm_reserve_node(&dev_priv->gtt.base.mm, &vma->node);
+ 		if (ret)
+ 			DRM_DEBUG_KMS("Reservation failed\n");
+ 		obj->has_global_gtt_mapping = 1;
++		list_add(&vma->vma_link, &obj->vma_list);
+ 	}
+ 
+ 	dev_priv->gtt.base.start = start;
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index a893834ab010..f52613605fe1 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -354,6 +354,7 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 	struct i915_address_space *vm = &dev_priv->gtt.base;
+ 	struct drm_i915_gem_object *obj;
+ 	struct drm_mm_node *stolen;
++	struct i915_vma *vma;
+ 	int ret;
+ 
+ 	if (!drm_mm_initialized(&dev_priv->mm.stolen))
+@@ -393,18 +394,24 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 	if (gtt_offset == I915_GTT_OFFSET_NONE)
+ 		return obj;
+ 
++	vma = i915_gem_vma_create(obj, &dev_priv->gtt.base);
++	if (!vma) {
++		ret = -ENOMEM;
++		goto err_out;
++	}
++
+ 	/* To simplify the initialisation sequence between KMS and GTT,
+ 	 * we allow construction of the stolen object prior to
+ 	 * setting up the GTT space. The actual reservation will occur
+ 	 * later.
+ 	 */
+-	obj->gtt_space.start = gtt_offset;
+-	obj->gtt_space.size = size;
++	vma->node.start = gtt_offset;
++	vma->node.size = size;
+ 	if (drm_mm_initialized(&dev_priv->gtt.base.mm)) {
+-		ret = drm_mm_reserve_node(&dev_priv->gtt.base.mm,
+-					  &obj->gtt_space);
++		ret = drm_mm_reserve_node(&dev_priv->gtt.base.mm, &vma->node);
+ 		if (ret) {
+ 			DRM_DEBUG_KMS("failed to allocate stolen GTT space\n");
++			i915_gem_vma_destroy(vma);
+ 			goto err_out;
+ 		}
+ 	}
+-- 
+1.8.5.rc3
+

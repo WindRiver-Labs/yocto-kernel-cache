@@ -1,0 +1,224 @@
+From a9d94064cfb097e910bbcde028972c8ba1c0eaea Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 15 Aug 2013 00:02:37 +0200
+Subject: drm/gem: fix up flink name create race
+
+This is the 2nd attempt, I've always been a bit dissatisified with the
+tricky nature of the first one:
+
+http://lists.freedesktop.org/archives/dri-devel/2012-July/025451.html
+
+The issue is that the flink ioctl can race with calling gem_close on
+the last gem handle. In that case we'll end up with a zero handle
+count, but an flink name (and it's corresponding reference). Which
+results in a neat space leak.
+
+In my first attempt I've solved this by rechecking the handle count.
+But fundamentally the issue is that ->handle_count isn't your usual
+refcount - it can be resurrected from 0 among other things.
+
+For those special beasts atomic_t often suggest way more ordering that
+it actually guarantees. To prevent being tricked by those hairy
+semantics take the easy way out and simply protect the handle with the
+existing dev->object_name_lock.
+
+With that change implemented it's dead easy to fix the flink vs. gem
+close reace: When we try to create the name we simply have to check
+whether there's still officially a gem handle around and if not refuse
+to create the flink name. Since the handle count decrement and flink
+name destruction is now also protected by that lock the reace is gone
+and we can't ever leak the flink reference again.
+
+Outside of the drm core only the exynos driver looks at the handle
+count, and tbh I have no idea why (it's just for debug dmesg output
+luckily).
+
+I've considered inlining the drm_gem_object_handle_free, but I plan to
+add more name-like things (like the exported dma_buf) to this scheme,
+so it's clearer to leave the handle freeing in its own function.
+
+This is exercised by the new gem_flink_race i-g-t testcase, which on
+my snb leaks gem objects at a rate of roughly 1k objects/s.
+
+v2: Fix up the error path handling in handle_create and make it more
+robust by simply calling object_handle_unreference.
+
+v3: Fix up the handle_unreference logic bug - atomic_dec_and_test
+retursn 1 for 0. Oops.
+
+v4: Squash in inlining of drm_gem_object_handle_reference as suggested
+by Dave Airlie and add a note that we now have a testcase.
+
+Cc: Dave Airlie <airlied@gmail.com>
+Cc: Inki Dae <inki.dae@samsung.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit a8e11d1c435f9d185c9f3b1981b9613a579b9999)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/drm_gem.c               | 31 ++++++++++++++++++++-----------
+ drivers/gpu/drm/drm_info.c              |  2 +-
+ drivers/gpu/drm/exynos/exynos_drm_gem.c |  2 +-
+ include/drm/drmP.h                      | 19 ++++++++++---------
+ 4 files changed, 32 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index 799c7fb73f15..ca08ed73528f 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -154,7 +154,7 @@ void drm_gem_private_object_init(struct drm_device *dev,
+ 	obj->filp = NULL;
+ 
+ 	kref_init(&obj->refcount);
+-	atomic_set(&obj->handle_count, 0);
++	obj->handle_count = 0;
+ 	obj->size = size;
+ }
+ EXPORT_SYMBOL(drm_gem_private_object_init);
+@@ -218,11 +218,9 @@ static void drm_gem_object_handle_free(struct drm_gem_object *obj)
+ 	struct drm_device *dev = obj->dev;
+ 
+ 	/* Remove any name for this object */
+-	spin_lock(&dev->object_name_lock);
+ 	if (obj->name) {
+ 		idr_remove(&dev->object_name_idr, obj->name);
+ 		obj->name = 0;
+-		spin_unlock(&dev->object_name_lock);
+ 		/*
+ 		 * The object name held a reference to this object, drop
+ 		 * that now.
+@@ -230,15 +228,13 @@ static void drm_gem_object_handle_free(struct drm_gem_object *obj)
+ 		* This cannot be the last reference, since the handle holds one too.
+ 		 */
+ 		kref_put(&obj->refcount, drm_gem_object_ref_bug);
+-	} else
+-		spin_unlock(&dev->object_name_lock);
+-
++	}
+ }
+ 
+ void
+ drm_gem_object_handle_unreference_unlocked(struct drm_gem_object *obj)
+ {
+-	if (WARN_ON(atomic_read(&obj->handle_count) == 0))
++	if (WARN_ON(obj->handle_count == 0))
+ 		return;
+ 
+ 	/*
+@@ -247,8 +243,11 @@ drm_gem_object_handle_unreference_unlocked(struct drm_gem_object *obj)
+ 	* checked for a name
+ 	*/
+ 
+-	if (atomic_dec_and_test(&obj->handle_count))
++	spin_lock(&obj->dev->object_name_lock);
++	if (--obj->handle_count == 0)
+ 		drm_gem_object_handle_free(obj);
++	spin_unlock(&obj->dev->object_name_lock);
++
+ 	drm_gem_object_unreference_unlocked(obj);
+ }
+ 
+@@ -326,17 +325,21 @@ drm_gem_handle_create(struct drm_file *file_priv,
+ 	 * allocation under our spinlock.
+ 	 */
+ 	idr_preload(GFP_KERNEL);
++	spin_lock(&dev->object_name_lock);
+ 	spin_lock(&file_priv->table_lock);
+ 
+ 	ret = idr_alloc(&file_priv->object_idr, obj, 1, 0, GFP_NOWAIT);
+-
++	drm_gem_object_reference(obj);
++	obj->handle_count++;
+ 	spin_unlock(&file_priv->table_lock);
++	spin_unlock(&dev->object_name_lock);
+ 	idr_preload_end();
+-	if (ret < 0)
++	if (ret < 0) {
++		drm_gem_object_handle_unreference_unlocked(obj);
+ 		return ret;
++	}
+ 	*handlep = ret;
+ 
+-	drm_gem_object_handle_reference(obj);
+ 
+ 	if (dev->driver->gem_open_object) {
+ 		ret = dev->driver->gem_open_object(obj, file_priv);
+@@ -454,6 +457,12 @@ drm_gem_flink_ioctl(struct drm_device *dev, void *data,
+ 
+ 	idr_preload(GFP_KERNEL);
+ 	spin_lock(&dev->object_name_lock);
++	/* prevent races with concurrent gem_close. */
++	if (obj->handle_count == 0) {
++		ret = -ENOENT;
++		goto err;
++	}
++
+ 	if (!obj->name) {
+ 		ret = idr_alloc(&dev->object_name_idr, obj, 1, 0, GFP_NOWAIT);
+ 		if (ret < 0)
+diff --git a/drivers/gpu/drm/drm_info.c b/drivers/gpu/drm/drm_info.c
+index d4b20ceda3fb..f4b348c8f333 100644
+--- a/drivers/gpu/drm/drm_info.c
++++ b/drivers/gpu/drm/drm_info.c
+@@ -207,7 +207,7 @@ static int drm_gem_one_name_info(int id, void *ptr, void *data)
+ 
+ 	seq_printf(m, "%6d %8zd %7d %8d\n",
+ 		   obj->name, obj->size,
+-		   atomic_read(&obj->handle_count),
++		   obj->handle_count,
+ 		   atomic_read(&obj->refcount.refcount));
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/exynos/exynos_drm_gem.c b/drivers/gpu/drm/exynos/exynos_drm_gem.c
+index e83930fdf6c7..aeb017ac046b 100644
+--- a/drivers/gpu/drm/exynos/exynos_drm_gem.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_gem.c
+@@ -138,7 +138,7 @@ void exynos_drm_gem_destroy(struct exynos_drm_gem_obj *exynos_gem_obj)
+ 	obj = &exynos_gem_obj->base;
+ 	buf = exynos_gem_obj->buffer;
+ 
+-	DRM_DEBUG_KMS("handle count = %d\n", atomic_read(&obj->handle_count));
++	DRM_DEBUG_KMS("handle count = %d\n", obj->handle_count);
+ 
+ 	/*
+ 	 * do not release memory region from exporter.
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index ee035f8eb161..6d9a991fbde7 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -631,8 +631,16 @@ struct drm_gem_object {
+ 	/** Reference count of this object */
+ 	struct kref refcount;
+ 
+-	/** Handle count of this object. Each handle also holds a reference */
+-	atomic_t handle_count; /* number of handles on this object */
++	/**
++	 * handle_count - gem file_priv handle count of this object
++	 *
++	 * Each handle also holds a reference. Note that when the handle_count
++	 * drops to 0 any global names (e.g. the id in the flink namespace) will
++	 * be cleared.
++	 *
++	 * Protected by dev->object_name_lock.
++	 * */
++	unsigned handle_count;
+ 
+ 	/** Related drm device */
+ 	struct drm_device *dev;
+@@ -1596,13 +1604,6 @@ int drm_gem_handle_create(struct drm_file *file_priv,
+ 			  u32 *handlep);
+ int drm_gem_handle_delete(struct drm_file *filp, u32 handle);
+ 
+-static inline void
+-drm_gem_object_handle_reference(struct drm_gem_object *obj)
+-{
+-	drm_gem_object_reference(obj);
+-	atomic_inc(&obj->handle_count);
+-}
+-
+ void drm_gem_object_handle_unreference_unlocked(struct drm_gem_object *obj);
+ 
+ void drm_gem_free_mmap_offset(struct drm_gem_object *obj);
+-- 
+1.8.5.rc3
+

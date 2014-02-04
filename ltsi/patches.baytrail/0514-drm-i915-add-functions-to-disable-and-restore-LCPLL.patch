@@ -1,0 +1,246 @@
+From 0f1a41c7df58bb279ba6421d5c7e6f6ab8c5562b Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Tue, 23 Jul 2013 11:19:26 -0300
+Subject: drm/i915: add functions to disable and restore LCPLL
+
+For now there are no callers, but these functions are going to be
+needed for the code that allows Package C8+. Other future features may
+also require this code.
+
+Also merge the commit which introduced assert_can_disable_lcpll and
+had the following commit message:
+
+Most of the hardware needs to be disabled before LCPLL is disabled, so
+let's add a function to assert some of items listed in the "Display
+Sequences for LCPLL disabling" documentation.
+
+The idea is that hsw_disable_lcpll should not disable the hardware,
+the callers need to take care of calling hsw_disable_lcpll only once
+everything is already disabled.
+
+v2: - Rebase.
+    - Fix D_COMP wait timeout.
+v3: - Use wait_for_atomic_use (Ben)
+    - Remove/add a useless/needed POSTING_READ (Ben)
+    - Early return in case LCPLL is already restored (Ben)
+    - Add ndelay(100) (Ben)
+v4: - Merge the commit that added assert_can_disable_lcpll (Ben)
+    - Add interrupt assertions (Ben)
+
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+[danvet: Fix compile fail since there's no HAS_LP_PCH yet.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit be256dc70284c028d0dd828b18b8f804e310507b)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_reg.h      |  15 ++++
+ drivers/gpu/drm/i915/intel_display.c | 136 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_drv.h     |   3 +
+ 3 files changed, 154 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index cf42bd61b420..fbe585da44d9 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2269,6 +2269,8 @@
+ #define BLC_PWM_CPU_CTL2	0x48250
+ #define BLC_PWM_CPU_CTL		0x48254
+ 
++#define HSW_BLC_PWM2_CTL	0x48350
++
+ /* PCH CTL1 is totally different, all but the below bits are reserved. CTL2 is
+  * like the normal CTL from gen4 and earlier. Hooray for confusing naming. */
+ #define BLC_PWM_PCH_CTL1	0xc8250
+@@ -2277,6 +2279,12 @@
+ #define   BLM_PCH_POLARITY			(1 << 29)
+ #define BLC_PWM_PCH_CTL2	0xc8254
+ 
++#define UTIL_PIN_CTL		0x48400
++#define   UTIL_PIN_ENABLE	(1 << 31)
++
++#define PCH_GTC_CTL		0xe7000
++#define   PCH_GTC_ENABLE	(1 << 31)
++
+ /* TV port control */
+ #define TV_CTL			0x68000
+ /** Enables the TV encoder */
+@@ -5017,7 +5025,14 @@
+ #define  LCPLL_CLK_FREQ_450		(0<<26)
+ #define  LCPLL_CD_CLOCK_DISABLE		(1<<25)
+ #define  LCPLL_CD2X_CLOCK_DISABLE	(1<<23)
++#define  LCPLL_POWER_DOWN_ALLOW		(1<<22)
+ #define  LCPLL_CD_SOURCE_FCLK		(1<<21)
++#define  LCPLL_CD_SOURCE_FCLK_DONE	(1<<19)
++
++#define D_COMP				(MCHBAR_MIRROR_BASE_SNB + 0x5F0C)
++#define  D_COMP_RCOMP_IN_PROGRESS	(1<<9)
++#define  D_COMP_COMP_FORCE		(1<<8)
++#define  D_COMP_COMP_DISABLE		(1<<0)
+ 
+ /* Pipe WM_LINETIME - watermark line time */
+ #define PIPE_WM_LINETIME_A		0x45270
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 4da60eebdf96..73965dfbf149 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5922,6 +5922,142 @@ static bool ironlake_get_pipe_config(struct intel_crtc *crtc,
+ 	return true;
+ }
+ 
++static void assert_can_disable_lcpll(struct drm_i915_private *dev_priv)
++{
++	struct drm_device *dev = dev_priv->dev;
++	struct intel_ddi_plls *plls = &dev_priv->ddi_plls;
++	struct intel_crtc *crtc;
++	unsigned long irqflags;
++	uint32_t val, pch_hpd_mask;
++
++	pch_hpd_mask = SDE_PORTB_HOTPLUG_CPT | SDE_PORTC_HOTPLUG_CPT;
++	if (!(dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE))
++		pch_hpd_mask |= SDE_PORTD_HOTPLUG_CPT | SDE_CRT_HOTPLUG_CPT;
++
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head)
++		WARN(crtc->base.enabled, "CRTC for pipe %c enabled\n",
++		     pipe_name(crtc->pipe));
++
++	WARN(I915_READ(HSW_PWR_WELL_DRIVER), "Power well on\n");
++	WARN(plls->spll_refcount, "SPLL enabled\n");
++	WARN(plls->wrpll1_refcount, "WRPLL1 enabled\n");
++	WARN(plls->wrpll2_refcount, "WRPLL2 enabled\n");
++	WARN(I915_READ(PCH_PP_STATUS) & PP_ON, "Panel power on\n");
++	WARN(I915_READ(BLC_PWM_CPU_CTL2) & BLM_PWM_ENABLE,
++	     "CPU PWM1 enabled\n");
++	WARN(I915_READ(HSW_BLC_PWM2_CTL) & BLM_PWM_ENABLE,
++	     "CPU PWM2 enabled\n");
++	WARN(I915_READ(BLC_PWM_PCH_CTL1) & BLM_PCH_PWM_ENABLE,
++	     "PCH PWM1 enabled\n");
++	WARN(I915_READ(UTIL_PIN_CTL) & UTIL_PIN_ENABLE,
++	     "Utility pin enabled\n");
++	WARN(I915_READ(PCH_GTC_CTL) & PCH_GTC_ENABLE, "PCH GTC enabled\n");
++
++	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++	val = I915_READ(DEIMR);
++	WARN((val & ~DE_PCH_EVENT_IVB) != val,
++	     "Unexpected DEIMR bits enabled: 0x%x\n", val);
++	val = I915_READ(SDEIMR);
++	WARN((val & ~pch_hpd_mask) != val,
++	     "Unexpected SDEIMR bits enabled: 0x%x\n", val);
++	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++}
++
++/*
++ * This function implements pieces of two sequences from BSpec:
++ * - Sequence for display software to disable LCPLL
++ * - Sequence for display software to allow package C8+
++ * The steps implemented here are just the steps that actually touch the LCPLL
++ * register. Callers should take care of disabling all the display engine
++ * functions, doing the mode unset, fixing interrupts, etc.
++ */
++void hsw_disable_lcpll(struct drm_i915_private *dev_priv,
++		       bool switch_to_fclk, bool allow_power_down)
++{
++	uint32_t val;
++
++	assert_can_disable_lcpll(dev_priv);
++
++	val = I915_READ(LCPLL_CTL);
++
++	if (switch_to_fclk) {
++		val |= LCPLL_CD_SOURCE_FCLK;
++		I915_WRITE(LCPLL_CTL, val);
++
++		if (wait_for_atomic_us(I915_READ(LCPLL_CTL) &
++				       LCPLL_CD_SOURCE_FCLK_DONE, 1))
++			DRM_ERROR("Switching to FCLK failed\n");
++
++		val = I915_READ(LCPLL_CTL);
++	}
++
++	val |= LCPLL_PLL_DISABLE;
++	I915_WRITE(LCPLL_CTL, val);
++	POSTING_READ(LCPLL_CTL);
++
++	if (wait_for((I915_READ(LCPLL_CTL) & LCPLL_PLL_LOCK) == 0, 1))
++		DRM_ERROR("LCPLL still locked\n");
++
++	val = I915_READ(D_COMP);
++	val |= D_COMP_COMP_DISABLE;
++	I915_WRITE(D_COMP, val);
++	POSTING_READ(D_COMP);
++	ndelay(100);
++
++	if (wait_for((I915_READ(D_COMP) & D_COMP_RCOMP_IN_PROGRESS) == 0, 1))
++		DRM_ERROR("D_COMP RCOMP still in progress\n");
++
++	if (allow_power_down) {
++		val = I915_READ(LCPLL_CTL);
++		val |= LCPLL_POWER_DOWN_ALLOW;
++		I915_WRITE(LCPLL_CTL, val);
++		POSTING_READ(LCPLL_CTL);
++	}
++}
++
++/*
++ * Fully restores LCPLL, disallowing power down and switching back to LCPLL
++ * source.
++ */
++void hsw_restore_lcpll(struct drm_i915_private *dev_priv)
++{
++	uint32_t val;
++
++	val = I915_READ(LCPLL_CTL);
++
++	if ((val & (LCPLL_PLL_LOCK | LCPLL_PLL_DISABLE | LCPLL_CD_SOURCE_FCLK |
++		    LCPLL_POWER_DOWN_ALLOW)) == LCPLL_PLL_LOCK)
++		return;
++
++	if (val & LCPLL_POWER_DOWN_ALLOW) {
++		val &= ~LCPLL_POWER_DOWN_ALLOW;
++		I915_WRITE(LCPLL_CTL, val);
++	}
++
++	val = I915_READ(D_COMP);
++	val |= D_COMP_COMP_FORCE;
++	val &= ~D_COMP_COMP_DISABLE;
++	I915_WRITE(D_COMP, val);
++	I915_READ(D_COMP);
++
++	val = I915_READ(LCPLL_CTL);
++	val &= ~LCPLL_PLL_DISABLE;
++	I915_WRITE(LCPLL_CTL, val);
++
++	if (wait_for(I915_READ(LCPLL_CTL) & LCPLL_PLL_LOCK, 5))
++		DRM_ERROR("LCPLL not locked yet\n");
++
++	if (val & LCPLL_CD_SOURCE_FCLK) {
++		val = I915_READ(LCPLL_CTL);
++		val &= ~LCPLL_CD_SOURCE_FCLK;
++		I915_WRITE(LCPLL_CTL, val);
++
++		if (wait_for_atomic_us((I915_READ(LCPLL_CTL) &
++					LCPLL_CD_SOURCE_FCLK_DONE) == 0, 1))
++			DRM_ERROR("Switching back to LCPLL failed\n");
++	}
++}
++
+ static void haswell_modeset_global_resources(struct drm_device *dev)
+ {
+ 	bool enable = false;
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 31087ff6d871..3fbe80bc36bb 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -838,5 +838,8 @@ extern bool intel_set_pch_fifo_underrun_reporting(struct drm_device *dev,
+ extern void intel_edp_psr_enable(struct intel_dp *intel_dp);
+ extern void intel_edp_psr_disable(struct intel_dp *intel_dp);
+ extern void intel_edp_psr_update(struct drm_device *dev);
++extern void hsw_disable_lcpll(struct drm_i915_private *dev_priv,
++			      bool switch_to_fclk, bool allow_power_down);
++extern void hsw_restore_lcpll(struct drm_i915_private *dev_priv);
+ 
+ #endif /* __INTEL_DRV_H__ */
+-- 
+1.8.5.rc3
+

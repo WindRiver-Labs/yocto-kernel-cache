@@ -1,0 +1,198 @@
+From 751f65aeec205eb72c33c07e8b7e50449d811ba9 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Tue, 20 Aug 2013 08:12:12 -0700
+Subject: usb: Fix xHCI host issues on remote wakeup.
+
+When a device signals remote wakeup on a roothub, and the suspend change
+bit is set, the host controller driver must not give control back to the
+USB core until the port goes back into the active state.
+
+EHCI accomplishes this by waiting in the get port status function until
+the PORT_RESUME bit is cleared:
+
+                        /* stop resume signaling */
+                        temp &= ~(PORT_RWC_BITS | PORT_SUSPEND | PORT_RESUME);
+                        ehci_writel(ehci, temp, status_reg);
+                        clear_bit(wIndex, &ehci->resuming_ports);
+                        retval = ehci_handshake(ehci, status_reg,
+                                        PORT_RESUME, 0, 2000 /* 2msec */);
+
+Similarly, the xHCI host should wait until the port goes into U0, before
+passing control up to the USB core.  When the port transitions from the
+RExit state to U0, the xHCI driver will get a port status change event.
+We need to wait for that event before passing control up to the USB
+core.
+
+After the port transitions to the active state, the USB core should time
+a recovery interval before it talks to the device.  The length of that
+recovery interval is TRSMRCY, 10 ms, mentioned in the USB 2.0 spec,
+section 7.1.7.7.  The previous xHCI code (which did not wait for the
+port to go into U0) would cause the USB core to violate that recovery
+interval.
+
+This bug caused numerous USB device disconnects on remote wakeup under
+ChromeOS and a Lynx Point LP xHCI host that takes up to 20 ms to move
+from RExit to U0.  ChromeOS is very aggressive about power savings, and
+sets the autosuspend_delay to 100 ms, and disables USB persist.
+
+I attempted to replicate this bug with Ubuntu 12.04, but could not.  I
+used Ubuntu 12.04 on the same platform, with the same BIOS that the bug
+was triggered on ChromeOS with.  I also changed the USB sysfs settings
+as described above, but still could not reproduce the bug under Ubuntu.
+It may be that ChromeOS userspace triggers this bug through additional
+settings.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+(cherry picked from commit 8b3d45705e54075cfb9d4212dbca9ea82c85c4b8)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/usb/host/xhci-hub.c  | 45 ++++++++++++++++++++++++++++++++++----------
+ drivers/usb/host/xhci-mem.c  |  2 ++
+ drivers/usb/host/xhci-ring.c | 13 +++++++++++++
+ drivers/usb/host/xhci.h      | 10 ++++++++++
+ 4 files changed, 60 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 458a89119aab..1f94d42bcc56 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -542,11 +542,15 @@ void xhci_del_comp_mod_timer(struct xhci_hcd *xhci, u32 status, u16 wIndex)
+  *  - Mark a port as being done with device resume,
+  *    and ring the endpoint doorbells.
+  *  - Stop the Synopsys redriver Compliance Mode polling.
++ *  - Drop and reacquire the xHCI lock, in order to wait for port resume.
+  */
+ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 		struct xhci_bus_state *bus_state,
+ 		__le32 __iomem **port_array,
+-		u16 wIndex, u32 raw_port_status)
++		u16 wIndex, u32 raw_port_status,
++		unsigned long flags)
++	__releases(&xhci->lock)
++	__acquires(&xhci->lock)
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+ 	u32 status = 0;
+@@ -581,21 +585,42 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 			return 0xffffffff;
+ 		if (time_after_eq(jiffies,
+ 					bus_state->resume_done[wIndex])) {
++			int time_left;
++
+ 			xhci_dbg(xhci, "Resume USB2 port %d\n",
+ 					wIndex + 1);
+ 			bus_state->resume_done[wIndex] = 0;
+ 			clear_bit(wIndex, &bus_state->resuming_ports);
++
++			set_bit(wIndex, &bus_state->rexit_ports);
+ 			xhci_set_link_state(xhci, port_array, wIndex,
+ 					XDEV_U0);
+-			xhci_dbg(xhci, "set port %d resume\n",
+-					wIndex + 1);
+-			slot_id = xhci_find_slot_id_by_port(hcd, xhci,
+-					wIndex + 1);
+-			if (!slot_id) {
+-				xhci_dbg(xhci, "slot_id is zero\n");
+-				return 0xffffffff;
++
++			spin_unlock_irqrestore(&xhci->lock, flags);
++			time_left = wait_for_completion_timeout(
++					&bus_state->rexit_done[wIndex],
++					msecs_to_jiffies(
++						XHCI_MAX_REXIT_TIMEOUT));
++			spin_lock_irqsave(&xhci->lock, flags);
++
++			if (time_left) {
++				slot_id = xhci_find_slot_id_by_port(hcd,
++						xhci, wIndex + 1);
++				if (!slot_id) {
++					xhci_dbg(xhci, "slot_id is zero\n");
++					return 0xffffffff;
++				}
++				xhci_ring_device(xhci, slot_id);
++			} else {
++				int port_status = xhci_readl(xhci,
++						port_array[wIndex]);
++				xhci_warn(xhci, "Port resume took longer than %i msec, port status = 0x%x\n",
++						XHCI_MAX_REXIT_TIMEOUT,
++						port_status);
++				status |= USB_PORT_STAT_SUSPEND;
++				clear_bit(wIndex, &bus_state->rexit_ports);
+ 			}
+-			xhci_ring_device(xhci, slot_id);
++
+ 			bus_state->port_c_suspend |= 1 << wIndex;
+ 			bus_state->suspended_ports &= ~(1 << wIndex);
+ 		} else {
+@@ -716,7 +741,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 			break;
+ 		}
+ 		status = xhci_get_port_status(hcd, bus_state, port_array,
+-				wIndex, temp);
++				wIndex, temp, flags);
+ 		if (status == 0xffffffff)
+ 			goto error;
+ 
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index f2e57a1112c9..19a0cc38b6d9 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -2448,6 +2448,8 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+ 	for (i = 0; i < USB_MAXCHILDREN; ++i) {
+ 		xhci->bus_state[0].resume_done[i] = 0;
+ 		xhci->bus_state[1].resume_done[i] = 0;
++		/* Only the USB 2.0 completions will ever be used. */
++		init_completion(&xhci->bus_state[1].rexit_done[i]);
+ 	}
+ 
+ 	if (scratchpad_alloc(xhci, flags))
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index bcfb08e41eb6..bfa24cd06b79 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1732,6 +1732,19 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 		}
+ 	}
+ 
++	/*
++	 * Check to see if xhci-hub.c is waiting on RExit to U0 transition (or
++	 * RExit to a disconnect state).  If so, let the the driver know it's
++	 * out of the RExit state.
++	 */
++	if (!DEV_SUPERSPEED(temp) &&
++			test_and_clear_bit(faked_port_index,
++				&bus_state->rexit_ports)) {
++		complete(&bus_state->rexit_done[faked_port_index]);
++		bogus_port_status = true;
++		goto cleanup;
++	}
++
+ 	if (hcd->speed != HCD_USB3)
+ 		xhci_test_and_clear_bit(xhci, port_array, faked_port_index,
+ 					PORT_PLC);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 627fcd9388ca..cd35c1fc596f 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1386,8 +1386,18 @@ struct xhci_bus_state {
+ 	unsigned long		resume_done[USB_MAXCHILDREN];
+ 	/* which ports have started to resume */
+ 	unsigned long		resuming_ports;
++	/* Which ports are waiting on RExit to U0 transition. */
++	unsigned long		rexit_ports;
++	struct completion	rexit_done[USB_MAXCHILDREN];
+ };
+ 
++
++/*
++ * It can take up to 20 ms to transition from RExit to U0 on the
++ * Intel Lynx Point LP xHCI host.
++ */
++#define	XHCI_MAX_REXIT_TIMEOUT	(20 * 1000)
++
+ static inline unsigned int hcd_index(struct usb_hcd *hcd)
+ {
+ 	if (hcd->speed == HCD_USB3)
+-- 
+1.8.5.rc3
+

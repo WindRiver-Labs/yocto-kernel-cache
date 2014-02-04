@@ -1,0 +1,131 @@
+From 2181bd42613113ce8c43f1e1d3fe573f254ab008 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Fri, 5 Jul 2013 14:41:05 -0700
+Subject: drm/i915: Kill obj->gtt_offset
+
+With the getters in place from the previous patch this members serves no
+purpose other than saving one spare pointer chase, which will be killed
+in the next patch anyway.
+
+Moving to VMAs, this members adds unnecessary confusion since an object
+may exist at different offsets in different VMs.
+
+v2: Properly preserve the stolen offset. This code is a bit hacky but it
+all goes away when we embed the drm_mm_node and removes the need for the
+incorrect patch I submitted previously: "Use gtt_space->start for stolen
+reservation"
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit edd41a870f11157a1bf4c15080421f9770912e09)
+(cherry picked from drm-intel-next-queued)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h        |  9 +--------
+ drivers/gpu/drm/i915/i915_gem.c        |  2 --
+ drivers/gpu/drm/i915/i915_gem_gtt.c    | 14 ++++++++------
+ drivers/gpu/drm/i915/i915_gem_stolen.c |  9 ++++++---
+ 4 files changed, 15 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index ccf9bfa54c08..83946426f3d9 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1202,7 +1202,7 @@ enum hdmi_force_audio {
+ 	HDMI_AUDIO_ON,			/* force turn on HDMI audio */
+ };
+ 
+-#define I915_GTT_RESERVED ((struct drm_mm_node *)0x1)
++#define I915_GTT_RESERVED (1<<0)
+ #define I915_GTT_OFFSET_NONE ((u32)-1)
+ 
+ struct drm_i915_gem_object_ops {
+@@ -1330,13 +1330,6 @@ struct drm_i915_gem_object {
+ 	unsigned long exec_handle;
+ 	struct drm_i915_gem_exec_object2 *exec_entry;
+ 
+-	/**
+-	 * Current offset of the object in GTT space.
+-	 *
+-	 * This is the same as gtt_space->start
+-	 */
+-	uint32_t gtt_offset;
+-
+ 	struct intel_ring_buffer *ring;
+ 
+ 	/** Breadcrumb of last rendering to the buffer. */
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index e43a35dcff63..468a08060020 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2637,7 +2637,6 @@ i915_gem_object_unbind(struct drm_i915_gem_object *obj)
+ 
+ 	drm_mm_put_block(obj->gtt_space);
+ 	obj->gtt_space = NULL;
+-	obj->gtt_offset = 0;
+ 
+ 	return 0;
+ }
+@@ -3150,7 +3149,6 @@ search_free:
+ 	list_add_tail(&obj->mm_list, &dev_priv->mm.inactive_list);
+ 
+ 	obj->gtt_space = node;
+-	obj->gtt_offset = node->start;
+ 
+ 	fenceable =
+ 		node->size == fence_size &&
+diff --git a/drivers/gpu/drm/i915/i915_gem_gtt.c b/drivers/gpu/drm/i915/i915_gem_gtt.c
+index 6f0a4c09e26a..76a4095452c7 100644
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -629,18 +629,20 @@ void i915_gem_setup_global_gtt(struct drm_device *dev,
+ 
+ 	/* Mark any preallocated objects as occupied */
+ 	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list) {
++		uintptr_t offset = (uintptr_t) obj->gtt_space;
+ 		int ret;
+-		DRM_DEBUG_KMS("reserving preallocated space: %x + %zx\n",
+-			      obj->gtt_offset, obj->base.size);
++		DRM_DEBUG_KMS("reserving preallocated space: %lx + %zx\n",
++			      offset, obj->base.size);
+ 
+-		BUG_ON(obj->gtt_space != I915_GTT_RESERVED);
++		BUG_ON((offset & I915_GTT_RESERVED) != 0);
++		offset &= ~I915_GTT_RESERVED;
+ 		obj->gtt_space = kzalloc(sizeof(*obj->gtt_space), GFP_KERNEL);
+ 		if (!obj->gtt_space) {
+-			DRM_ERROR("Failed to preserve object at offset %x\n",
+-				  obj->gtt_offset);
++			DRM_ERROR("Failed to preserve object at offset %lx\n",
++				  offset);
+ 			continue;
+ 		}
+-		obj->gtt_space->start = obj->gtt_offset;
++		obj->gtt_space->start = (unsigned long)offset;
+ 		obj->gtt_space->size = obj->base.size;
+ 		ret = drm_mm_reserve_node(&dev_priv->mm.gtt_space,
+ 					  obj->gtt_space);
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index bc601c4fdc37..ee3d619ac2a3 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -392,10 +392,13 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
+ 			DRM_DEBUG_KMS("failed to allocate stolen GTT space\n");
+ 			goto free_out;
+ 		}
+-	} else
+-		obj->gtt_space = I915_GTT_RESERVED;
++	} else {
++		if (WARN_ON(gtt_offset & ~PAGE_MASK))
++			DRM_DEBUG_KMS("Cannot preserve non page aligned offset\n");
++		obj->gtt_space =
++			(struct drm_mm_node *)((uintptr_t)(I915_GTT_RESERVED | gtt_offset));
++	}
+ 
+-	obj->gtt_offset = gtt_offset;
+ 	obj->has_global_gtt_mapping = 1;
+ 
+ 	list_add_tail(&obj->global_list, &dev_priv->mm.bound_list);
+-- 
+1.8.5.rc3
+

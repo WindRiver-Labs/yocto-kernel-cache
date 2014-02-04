@@ -1,0 +1,144 @@
+From 697bc71d398efdaf9d95fc77fe60d865d1f374e9 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 26 Aug 2013 13:46:09 +0100
+Subject: drm/i915: Delay the release of the forcewake by a jiffie
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Obtaining the forcwake requires expensive and time consuming
+serialisation. And we often try to obtain the forcewake multiple times
+in very quick succession. We can reduce the overhead of these sequences
+by delaying the forcewake release, and so not hammer the hw quite so
+hard.
+
+I was hoping this would help with the spurious
+[drm:__gen6_gt_force_wake_mt_get] *ERROR* Timed out waiting for forcewake old ack to clear.
+found on Haswell. Alas not.
+
+v2: Fix teardown ordering - unmap the regs after turning off forcewake,
+and make sure we do turn off forcewake - both found by Ville.
+
+v3: As we introduce intel_uncore_fini(), use it to make sure everything
+is disabled before we hand back to the BIOS.
+
+Note: I have no claims for improved performance, stablity or power
+comsumption for this patch. We should not be hitting the registers often
+enough for this to improve benchmarks, but given the nature of our hw it
+is likely to improve long term stability.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit aec347ab197ec064d1e98b52717d968521a62929)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c     |    6 ++++--
+ drivers/gpu/drm/i915/i915_drv.h     |    3 +++
+ drivers/gpu/drm/i915/intel_uncore.c |   33 +++++++++++++++++++++++++++++++--
+ 3 files changed, 38 insertions(+), 4 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1800,8 +1800,6 @@ int i915_driver_unload(struct drm_device
+ 	list_del(&dev_priv->gtt.base.global_link);
+ 	WARN_ON(!list_empty(&dev_priv->vm_list));
+ 	drm_mm_takedown(&dev_priv->gtt.base.mm);
+-	if (dev_priv->regs != NULL)
+-		pci_iounmap(dev->pdev, dev_priv->regs);
+ 
+ 	intel_teardown_gmbus(dev);
+ 	intel_teardown_mchbar(dev);
+@@ -1811,6 +1809,10 @@ int i915_driver_unload(struct drm_device
+ 
+ 	dev_priv->gtt.base.cleanup(&dev_priv->gtt.base);
+ 
++	intel_uncore_fini(dev);
++	if (dev_priv->regs != NULL)
++		pci_iounmap(dev->pdev, dev_priv->regs);
++
+ 	if (dev_priv->slab)
+ 		kmem_cache_destroy(dev_priv->slab);
+ 
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -408,6 +408,8 @@ struct intel_uncore {
+ 
+ 	unsigned fifo_count;
+ 	unsigned forcewake_count;
++
++	struct delayed_work force_wake_work;
+ };
+ 
+ #define DEV_INFO_FOR_EACH_FLAG(func, sep) \
+@@ -1801,6 +1803,7 @@ extern void intel_uncore_early_sanitize(
+ extern void intel_uncore_init(struct drm_device *dev);
+ extern void intel_uncore_clear_errors(struct drm_device *dev);
+ extern void intel_uncore_check_errors(struct drm_device *dev);
++extern void intel_uncore_fini(struct drm_device *dev);
+ 
+ void
+ i915_enable_pipestat(drm_i915_private_t *dev_priv, int pipe, u32 mask);
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -204,6 +204,18 @@ static void vlv_force_wake_put(struct dr
+ 	gen6_gt_check_fifodbg(dev_priv);
+ }
+ 
++static void gen6_force_wake_work(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(work, typeof(*dev_priv), uncore.force_wake_work.work);
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++	if (--dev_priv->uncore.forcewake_count == 0)
++		dev_priv->uncore.funcs.force_wake_put(dev_priv);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++}
++
+ void intel_uncore_early_sanitize(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -216,6 +228,9 @@ void intel_uncore_init(struct drm_device
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	INIT_DELAYED_WORK(&dev_priv->uncore.force_wake_work,
++			  gen6_force_wake_work);
++
+ 	if (IS_VALLEYVIEW(dev)) {
+ 		dev_priv->uncore.funcs.force_wake_get = vlv_force_wake_get;
+ 		dev_priv->uncore.funcs.force_wake_put = vlv_force_wake_put;
+@@ -261,6 +276,16 @@ void intel_uncore_init(struct drm_device
+ 	}
+ }
+ 
++void intel_uncore_fini(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	flush_delayed_work(&dev_priv->uncore.force_wake_work);
++
++	/* Paranoia: make sure we have disabled everything before we exit. */
++	intel_uncore_sanitize(dev);
++}
++
+ static void intel_uncore_forcewake_reset(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -306,8 +331,12 @@ void gen6_gt_force_wake_put(struct drm_i
+ 	unsigned long irqflags;
+ 
+ 	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+-	if (--dev_priv->uncore.forcewake_count == 0)
+-		dev_priv->uncore.funcs.force_wake_put(dev_priv);
++	if (--dev_priv->uncore.forcewake_count == 0) {
++		dev_priv->uncore.forcewake_count++;
++		mod_delayed_work(dev_priv->wq,
++				 &dev_priv->uncore.force_wake_work,
++				 1);
++	}
+ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+ }
+ 

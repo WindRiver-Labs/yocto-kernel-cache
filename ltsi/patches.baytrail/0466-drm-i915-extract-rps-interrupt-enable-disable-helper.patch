@@ -1,0 +1,158 @@
+From 8d69e66e6e90841bf12223765e74531f45195407 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Fri, 12 Jul 2013 22:43:27 +0200
+Subject: drm/i915: extract rps interrupt enable/disable helpers
+
+The VECS enabling required some changes to how rps interrupts are
+enabled/disabled since VECS interrupts are handling with the PM
+interrupt registers.
+
+But now that the pre/postinstall sequences is identical for all
+platforms with rps support (snb, ivb, hsw, vlv) we can also use the
+exact same sequence to actually enable the rps interrupts. Strictly
+speaking using spinlocks is overkill on snb/ivb & vlv since they have
+no VECS ring, but imo that's more than made up by the common code.
+
+Hence this just unifies the vlv code with the snb-hsw code which
+matched exactly before the VECS enabling. See
+
+commit eda63ffb906c2fb3b609a0e87aeb63c0f25b9e6b
+Author: Ben Widawsky <ben@bwidawsk.net>
+Date:   Tue May 28 19:22:26 2013 -0700
+
+    drm/i915: Add PM regs to pre/post install
+
+and
+
+commit 4848405cced3b46f4ec7d404b8ed5873171ae10a
+Author: Ben Widawsky <ben@bwidawsk.net>
+Date:   Tue May 28 19:22:27 2013 -0700
+
+    drm/i915: make PM interrupt writes non-destructive
+
+for why the gen6 code (shared between snb, ivb and hsw) needed to be
+changed originally.
+
+v3: Improve the commit message to more clearly spell out why we want
+to unify the code and what exactly changes.
+
+Cc: Paulo Zanoni <przanoni@gmail.com>
+Cc: Ben Widawsky <ben@bwidawsk.net>
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 44fc7d5cf30723563558715f0794c8389a5c15ba)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/intel_pm.c | 59 ++++++++++++++++++++---------------------
+ 1 file changed, 29 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 20c7c77e2b5e..f3ae27291701 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3121,13 +3121,10 @@ void valleyview_set_rps(struct drm_device *dev, u8 val)
+ 	trace_intel_gpu_freq_change(vlv_gpu_freq(dev_priv->mem_freq, val));
+ }
+ 
+-
+-static void gen6_disable_rps(struct drm_device *dev)
++static void gen6_disable_rps_interrupts(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	I915_WRITE(GEN6_RC_CONTROL, 0);
+-	I915_WRITE(GEN6_RPNSWREQ, 1 << 31);
+ 	I915_WRITE(GEN6_PMINTRMSK, 0xffffffff);
+ 	I915_WRITE(GEN6_PMIER, I915_READ(GEN6_PMIER) & ~GEN6_PM_RPS_EVENTS);
+ 	/* Complete PM interrupt masking here doesn't race with the rps work
+@@ -3142,23 +3139,23 @@ static void gen6_disable_rps(struct drm_device *dev)
+ 	I915_WRITE(GEN6_PMIIR, GEN6_PM_RPS_EVENTS);
+ }
+ 
+-static void valleyview_disable_rps(struct drm_device *dev)
++static void gen6_disable_rps(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	I915_WRITE(GEN6_RC_CONTROL, 0);
+-	I915_WRITE(GEN6_PMINTRMSK, 0xffffffff);
+-	I915_WRITE(GEN6_PMIER, 0);
+-	/* Complete PM interrupt masking here doesn't race with the rps work
+-	 * item again unmasking PM interrupts because that is using a different
+-	 * register (PMIMR) to mask PM interrupts. The only risk is in leaving
+-	 * stale bits in PMIIR and PMIMR which gen6_enable_rps will clean up. */
++	I915_WRITE(GEN6_RPNSWREQ, 1 << 31);
+ 
+-	spin_lock_irq(&dev_priv->irq_lock);
+-	dev_priv->rps.pm_iir = 0;
+-	spin_unlock_irq(&dev_priv->irq_lock);
++	gen6_disable_rps_interrupts(dev);
++}
++
++static void valleyview_disable_rps(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	I915_WRITE(GEN6_RC_CONTROL, 0);
+ 
+-	I915_WRITE(GEN6_PMIIR, I915_READ(GEN6_PMIIR));
++	gen6_disable_rps_interrupts(dev);
+ 
+ 	if (dev_priv->vlv_pctx) {
+ 		drm_gem_object_unreference(&dev_priv->vlv_pctx->base);
+@@ -3191,6 +3188,21 @@ int intel_enable_rc6(const struct drm_device *dev)
+ 	return (INTEL_RC6_ENABLE | INTEL_RC6p_ENABLE);
+ }
+ 
++static void gen6_enable_rps_interrupts(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	spin_lock_irq(&dev_priv->irq_lock);
++	/* FIXME: Our interrupt enabling sequence is bonghits.
++	 * dev_priv->rps.pm_iir really should be 0 here. */
++	dev_priv->rps.pm_iir = 0;
++	I915_WRITE(GEN6_PMIMR, I915_READ(GEN6_PMIMR) & ~GEN6_PM_RPS_EVENTS);
++	I915_WRITE(GEN6_PMIIR, GEN6_PM_RPS_EVENTS);
++	spin_unlock_irq(&dev_priv->irq_lock);
++	/* unmask all PM interrupts */
++	I915_WRITE(GEN6_PMINTRMSK, 0);
++}
++
+ static void gen6_enable_rps(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -3319,15 +3331,7 @@ static void gen6_enable_rps(struct drm_device *dev)
+ 
+ 	gen6_set_rps(dev_priv->dev, (gt_perf_status & 0xff00) >> 8);
+ 
+-	spin_lock_irq(&dev_priv->irq_lock);
+-	/* FIXME: Our interrupt enabling sequence is bonghits.
+-	 * dev_priv->rps.pm_iir really should be 0 here. */
+-	dev_priv->rps.pm_iir = 0;
+-	I915_WRITE(GEN6_PMIMR, I915_READ(GEN6_PMIMR) & ~GEN6_PM_RPS_EVENTS);
+-	I915_WRITE(GEN6_PMIIR, GEN6_PM_RPS_EVENTS);
+-	spin_unlock_irq(&dev_priv->irq_lock);
+-	/* unmask all PM interrupts */
+-	I915_WRITE(GEN6_PMINTRMSK, 0);
++	gen6_enable_rps_interrupts(dev);
+ 
+ 	rc6vids = 0;
+ 	ret = sandybridge_pcode_read(dev_priv, GEN6_PCODE_READ_RC6VIDS, &rc6vids);
+@@ -3597,12 +3601,7 @@ static void valleyview_enable_rps(struct drm_device *dev)
+ 
+ 	valleyview_set_rps(dev_priv->dev, dev_priv->rps.rpe_delay);
+ 
+-	spin_lock_irq(&dev_priv->irq_lock);
+-	WARN_ON(dev_priv->rps.pm_iir != 0);
+-	I915_WRITE(GEN6_PMIMR, 0);
+-	spin_unlock_irq(&dev_priv->irq_lock);
+-	/* enable all PM interrupts */
+-	I915_WRITE(GEN6_PMINTRMSK, 0);
++	gen6_enable_rps_interrupts(dev);
+ 
+ 	gen6_gt_force_wake_put(dev_priv);
+ }
+-- 
+1.8.5.rc3
+

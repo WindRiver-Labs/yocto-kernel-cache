@@ -1,0 +1,139 @@
+From 074b37ef3c0c37561b819c15d7483f154f77efab Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 15 Aug 2013 00:02:44 +0200
+Subject: drm/gem: switch dev->object_name_lock to a mutex
+
+I want to wrap the creation of a dma-buf from a gem object in it,
+so that the obj->export_dma_buf cache can be atomically filled in.
+
+Instead of creating a new mutex just for that variable I've figured
+I can reuse the existing dev->object_name_lock, especially since
+the new semantics will exactly mirror the flink obj->name already
+protected by that lock.
+
+v2: idr_preload/idr_preload_end is now an atomic section, so need to
+move the mutex locking outside.
+
+[airlied: fix up conflict with patch to make debugfs use lock]
+
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit cd4f013f3a4b6a55d484cc2e206dc08e055e5291)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/drm_gem.c  | 18 +++++++++---------
+ drivers/gpu/drm/drm_info.c |  4 ++--
+ include/drm/drmP.h         |  2 +-
+ 3 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index f8d2e63581e2..16af10030b42 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -93,7 +93,7 @@ drm_gem_init(struct drm_device *dev)
+ {
+ 	struct drm_gem_mm *mm;
+ 
+-	spin_lock_init(&dev->object_name_lock);
++	mutex_init(&dev->object_name_lock);
+ 	idr_init(&dev->object_name_idr);
+ 
+ 	mm = kzalloc(sizeof(struct drm_gem_mm), GFP_KERNEL);
+@@ -243,10 +243,10 @@ drm_gem_object_handle_unreference_unlocked(struct drm_gem_object *obj)
+ 	* checked for a name
+ 	*/
+ 
+-	spin_lock(&obj->dev->object_name_lock);
++	mutex_lock(&obj->dev->object_name_lock);
+ 	if (--obj->handle_count == 0)
+ 		drm_gem_object_handle_free(obj);
+-	spin_unlock(&obj->dev->object_name_lock);
++	mutex_unlock(&obj->dev->object_name_lock);
+ 
+ 	drm_gem_object_unreference_unlocked(obj);
+ }
+@@ -324,16 +324,16 @@ drm_gem_handle_create(struct drm_file *file_priv,
+ 	 * Get the user-visible handle using idr.  Preload and perform
+ 	 * allocation under our spinlock.
+ 	 */
++	mutex_lock(&dev->object_name_lock);
+ 	idr_preload(GFP_KERNEL);
+-	spin_lock(&dev->object_name_lock);
+ 	spin_lock(&file_priv->table_lock);
+ 
+ 	ret = idr_alloc(&file_priv->object_idr, obj, 1, 0, GFP_NOWAIT);
+ 	drm_gem_object_reference(obj);
+ 	obj->handle_count++;
+ 	spin_unlock(&file_priv->table_lock);
+-	spin_unlock(&dev->object_name_lock);
+ 	idr_preload_end();
++	mutex_unlock(&dev->object_name_lock);
+ 	if (ret < 0) {
+ 		drm_gem_object_handle_unreference_unlocked(obj);
+ 		return ret;
+@@ -455,8 +455,8 @@ drm_gem_flink_ioctl(struct drm_device *dev, void *data,
+ 	if (obj == NULL)
+ 		return -ENOENT;
+ 
++	mutex_lock(&dev->object_name_lock);
+ 	idr_preload(GFP_KERNEL);
+-	spin_lock(&dev->object_name_lock);
+ 	/* prevent races with concurrent gem_close. */
+ 	if (obj->handle_count == 0) {
+ 		ret = -ENOENT;
+@@ -478,8 +478,8 @@ drm_gem_flink_ioctl(struct drm_device *dev, void *data,
+ 	ret = 0;
+ 
+ err:
+-	spin_unlock(&dev->object_name_lock);
+ 	idr_preload_end();
++	mutex_unlock(&dev->object_name_lock);
+ 	drm_gem_object_unreference_unlocked(obj);
+ 	return ret;
+ }
+@@ -502,11 +502,11 @@ drm_gem_open_ioctl(struct drm_device *dev, void *data,
+ 	if (!(dev->driver->driver_features & DRIVER_GEM))
+ 		return -ENODEV;
+ 
+-	spin_lock(&dev->object_name_lock);
++	mutex_lock(&dev->object_name_lock);
+ 	obj = idr_find(&dev->object_name_idr, (int) args->name);
+ 	if (obj)
+ 		drm_gem_object_reference(obj);
+-	spin_unlock(&dev->object_name_lock);
++	mutex_unlock(&dev->object_name_lock);
+ 	if (!obj)
+ 		return -ENOENT;
+ 
+diff --git a/drivers/gpu/drm/drm_info.c b/drivers/gpu/drm/drm_info.c
+index 5351e811c421..53298320080b 100644
+--- a/drivers/gpu/drm/drm_info.c
++++ b/drivers/gpu/drm/drm_info.c
+@@ -219,9 +219,9 @@ int drm_gem_name_info(struct seq_file *m, void *data)
+ 
+ 	seq_printf(m, "  name     size handles refcount\n");
+ 
+-	spin_lock(&dev->object_name_lock);
++	mutex_lock(&dev->object_name_lock);
+ 	idr_for_each(&dev->object_name_idr, drm_gem_one_name_info, m);
+-	spin_unlock(&dev->object_name_lock);
++	mutex_unlock(&dev->object_name_lock);
+ 
+ 	return 0;
+ }
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index a2bf60db69f9..52bf270b2d5a 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1205,7 +1205,7 @@ struct drm_device {
+ 
+ 	/** \name GEM information */
+ 	/*@{ */
+-	spinlock_t object_name_lock;
++	struct mutex object_name_lock;
+ 	struct idr object_name_idr;
+ 	/*@} */
+ 	int switch_power_state;
+-- 
+1.8.5.rc3
+

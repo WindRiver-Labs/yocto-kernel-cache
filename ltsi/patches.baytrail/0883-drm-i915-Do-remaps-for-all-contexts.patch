@@ -1,0 +1,214 @@
+From 8384cdd8b83af2a6b432a2fd4f56459a3c316329 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Wed, 18 Sep 2013 19:03:18 -0700
+Subject: drm/i915: Do remaps for all contexts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On both Ivybridge and Haswell, row remapping information is saved and
+restored with context. This means, we never actually properly supported
+the l3 remapping because our sysfs interface is asynchronous (and not
+tied to any context), and the known faulty HW would be reused by the
+next context to run.
+
+Not that due to the asynchronous nature of the sysfs entry, there is no
+point modifying the registers for the existing context. Instead we set a
+flag for all contexts to load the correct remapping information on the
+next run. Interested clients can use debugfs to determine whether or not
+the row has been remapped.
+
+One could propose at this point that we just do the remapping in the
+kernel. I guess since we have to maintain the sysfs interface anyway,
+I'm not sure how useful it is, and I do like keeping the policy in
+userspace; (it wasn't my original decision to make the
+interface the way it is, so I'm not attached).
+
+v2: Force a context switch when we have a remap on the next switch.
+(Ville)
+Don't let userspace use the interface with disabled contexts.
+
+v3: Don't force a context switch, just let it nop
+Improper context slice remap initialization, 1<<1 instead of 1<<i, but I
+rewrote it to avoid a second round of confusion.
+Error print moved to error path (All Ville)
+Added a comment on why the slice remap initialization happens.
+
+CC: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 3ccfd19dea7c5c85aa4b1f929a97a02b026ab356)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c     |    8 ++++++
+ drivers/gpu/drm/i915/i915_drv.h         |    1 
+ drivers/gpu/drm/i915/i915_gem_context.c |   22 +++++++++++++++----
+ drivers/gpu/drm/i915/i915_sysfs.c       |   37 ++++++++++++--------------------
+ 4 files changed, 41 insertions(+), 27 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -145,6 +145,13 @@ describe_obj(struct seq_file *m, struct
+ 		seq_printf(m, " (%s)", obj->ring->name);
+ }
+ 
++static void describe_ctx(struct seq_file *m, struct i915_hw_context *ctx)
++{
++	seq_putc(m, ctx->is_initialized ? 'I' : 'i');
++	seq_putc(m, ctx->remap_slice ? 'R' : 'r');
++	seq_putc(m, ' ');
++}
++
+ static int i915_gem_object_list_info(struct seq_file *m, void *data)
+ {
+ 	struct drm_info_node *node = (struct drm_info_node *) m->private;
+@@ -1463,6 +1470,7 @@ static int i915_context_status(struct se
+ 
+ 	list_for_each_entry(ctx, &dev_priv->context_list, link) {
+ 		seq_puts(m, "HW context ");
++		describe_ctx(m, ctx);
+ 		for_each_ring(ring, dev_priv, i)
+ 			if (ring->default_context == ctx)
+ 				seq_printf(m, "(default context %s) ", ring->name);
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -601,6 +601,7 @@ struct i915_hw_context {
+ 	struct kref ref;
+ 	int id;
+ 	bool is_initialized;
++	uint8_t remap_slice;
+ 	struct drm_i915_file_private *file_priv;
+ 	struct intel_ring_buffer *ring;
+ 	struct drm_i915_gem_object *obj;
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -181,6 +181,10 @@ create_hw_context(struct drm_device *dev
+ 
+ 	ctx->file_priv = file_priv;
+ 	ctx->id = ret;
++	/* NB: Mark all slices as needing a remap so that when the context first
++	 * loads it will restore whatever remap state already exists. If there
++	 * is no remap info, it will be a NOP. */
++	ctx->remap_slice = (1 << NUM_L3_SLICES(dev)) - 1;
+ 
+ 	return ctx;
+ 
+@@ -394,11 +398,11 @@ static int do_switch(struct i915_hw_cont
+ 	struct intel_ring_buffer *ring = to->ring;
+ 	struct i915_hw_context *from = ring->last_context;
+ 	u32 hw_flags = 0;
+-	int ret;
++	int ret, i;
+ 
+ 	BUG_ON(from != NULL && from->obj != NULL && from->obj->pin_count == 0);
+ 
+-	if (from == to)
++	if (from == to && !to->remap_slice)
+ 		return 0;
+ 
+ 	ret = i915_gem_obj_ggtt_pin(to->obj, CONTEXT_ALIGN, false, false);
+@@ -421,8 +425,6 @@ static int do_switch(struct i915_hw_cont
+ 
+ 	if (!to->is_initialized || is_default_context(to))
+ 		hw_flags |= MI_RESTORE_INHIBIT;
+-	else if (WARN_ON_ONCE(from == to)) /* not yet expected */
+-		hw_flags |= MI_FORCE_RESTORE;
+ 
+ 	ret = mi_set_context(ring, to, hw_flags);
+ 	if (ret) {
+@@ -430,6 +432,18 @@ static int do_switch(struct i915_hw_cont
+ 		return ret;
+ 	}
+ 
++	for (i = 0; i < MAX_L3_SLICES; i++) {
++		if (!(to->remap_slice & (1<<i)))
++			continue;
++
++		ret = i915_gem_l3_remap(ring, i);
++		/* If it failed, try again next round */
++		if (ret)
++			DRM_DEBUG_DRIVER("L3 remapping failed\n");
++		else
++			to->remap_slice &= ~(1<<i);
++	}
++
+ 	/* The backing object for the context is done after switching to the
+ 	 * *next* context. Therefore we cannot retire the previous context until
+ 	 * the next context has already started running. In fact, the below code
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -118,9 +118,8 @@ i915_l3_read(struct file *filp, struct k
+ 	struct drm_minor *dminor = container_of(dev, struct drm_minor, kdev);
+ 	struct drm_device *drm_dev = dminor->dev;
+ 	struct drm_i915_private *dev_priv = drm_dev->dev_private;
+-	uint32_t misccpctl;
+ 	int slice = (int)(uintptr_t)attr->private;
+-	int i, ret;
++	int ret;
+ 
+ 	count = round_down(count, 4);
+ 
+@@ -134,26 +133,13 @@ i915_l3_read(struct file *filp, struct k
+ 	if (ret)
+ 		return ret;
+ 
+-	if (IS_HASWELL(drm_dev)) {
+-		if (dev_priv->l3_parity.remap_info[slice])
+-			memcpy(buf,
+-			       dev_priv->l3_parity.remap_info[slice] + (offset/4),
+-			       count);
+-		else
+-			memset(buf, 0, count);
+-
+-		goto out;
+-	}
+-
+-	misccpctl = I915_READ(GEN7_MISCCPCTL);
+-	I915_WRITE(GEN7_MISCCPCTL, misccpctl & ~GEN7_DOP_CLOCK_GATE_ENABLE);
++	if (dev_priv->l3_parity.remap_info[slice])
++		memcpy(buf,
++		       dev_priv->l3_parity.remap_info[slice] + (offset/4),
++		       count);
++	else
++		memset(buf, 0, count);
+ 
+-	for (i = 0; i < count; i += 4)
+-		*((uint32_t *)(&buf[i])) = I915_READ(GEN7_L3LOG_BASE + offset + i);
+-
+-	I915_WRITE(GEN7_MISCCPCTL, misccpctl);
+-
+-out:
+ 	mutex_unlock(&drm_dev->struct_mutex);
+ 
+ 	return count;
+@@ -168,6 +154,7 @@ i915_l3_write(struct file *filp, struct
+ 	struct drm_minor *dminor = container_of(dev, struct drm_minor, kdev);
+ 	struct drm_device *drm_dev = dminor->dev;
+ 	struct drm_i915_private *dev_priv = drm_dev->dev_private;
++	struct i915_hw_context *ctx;
+ 	u32 *temp = NULL; /* Just here to make handling failures easy */
+ 	int slice = (int)(uintptr_t)attr->private;
+ 	int ret;
+@@ -176,6 +163,9 @@ i915_l3_write(struct file *filp, struct
+ 	if (ret)
+ 		return ret;
+ 
++	if (dev_priv->hw_contexts_disabled)
++		return -ENXIO;
++
+ 	ret = i915_mutex_lock_interruptible(drm_dev);
+ 	if (ret)
+ 		return ret;
+@@ -204,8 +194,9 @@ i915_l3_write(struct file *filp, struct
+ 
+ 	memcpy(dev_priv->l3_parity.remap_info[slice] + (offset/4), buf, count);
+ 
+-	if (i915_gem_l3_remap(&dev_priv->ring[RCS], slice))
+-		count = 0;
++	/* NB: We defer the remapping until we switch to the context */
++	list_for_each_entry(ctx, &dev_priv->context_list, link)
++		ctx->remap_slice |= (1<<slice);
+ 
+ 	mutex_unlock(&drm_dev->struct_mutex);
+ 

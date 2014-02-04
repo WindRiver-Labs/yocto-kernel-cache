@@ -1,0 +1,1399 @@
+From 130059e2fe52f76a0c8456856e75d84c9d478441 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 19 Jul 2013 20:36:52 +0100
+Subject: drm/i915: Colocate all GT access routines in the same file
+
+Currently, the register access code is split between i915_drv.c and
+intel_pm.c. It only bares a superficial resemblance to the reset of the
+powermanagement code, so move it all into its own file. This is to ease
+further patches to enforce serialised register access.
+
+v2: Scan for random abuse of I915_WRITE_NOTRACE
+v3: Take the opportunity to rename the GT functions as uncore. Uncore is
+the term used by the hardware design (and bspec) for all functions
+outside of the GPU (and CPU) cores in what is also known as the System
+Agent.
+v4: Rebase onto SNB rc6 fixes
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+[danvet: Wrestle patch into applying and inline
+intel_uncore_early_sanitize (plus move the old comment to the new
+function). Also keep the _santize postfix for intel_uncore_sanitize.]
+[danvet: Squash in fixup spotted by Chris on irc: We need to call
+intel_pm_init before intel_uncore_sanitize since the later will call
+cancel_work on the delayed rps setup work the former initializes.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit 907b28c56ea40629aa6595ddfa414ec2fc7da41c)
+Signed-off-by: James Ausmus <james.ausmus@intel.com>
+
+Conflicts:
+	drivers/gpu/drm/i915/i915_dma.c
+	drivers/gpu/drm/i915/intel_pm.c
+	(context changes)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/Makefile        |    1 
+ drivers/gpu/drm/i915/i915_debugfs.c  |   12 
+ drivers/gpu/drm/i915/i915_dma.c      |   24 -
+ drivers/gpu/drm/i915/i915_drv.c      |  271 ----------------
+ drivers/gpu/drm/i915/i915_drv.h      |   31 +
+ drivers/gpu/drm/i915/i915_irq.c      |    6 
+ drivers/gpu/drm/i915/intel_display.c |    3 
+ drivers/gpu/drm/i915/intel_drv.h     |    1 
+ drivers/gpu/drm/i915/intel_pm.c      |  264 ----------------
+ drivers/gpu/drm/i915/intel_uncore.c  |  571 +++++++++++++++++++++++++++++++++++
+ 10 files changed, 613 insertions(+), 571 deletions(-)
+ create mode 100644 drivers/gpu/drm/i915/intel_uncore.c
+
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -38,6 +38,7 @@ i915-y := i915_drv.o i915_dma.o i915_irq
+ 	  intel_sprite.o \
+ 	  intel_opregion.o \
+ 	  intel_sideband.o \
++	  intel_uncore.o \
+ 	  dvo_ch7xxx.o \
+ 	  dvo_ch7017.o \
+ 	  dvo_ivch.o \
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -989,9 +989,9 @@ static int gen6_drpc_info(struct seq_fil
+ 	if (ret)
+ 		return ret;
+ 
+-	spin_lock_irq(&dev_priv->gt_lock);
+-	forcewake_count = dev_priv->forcewake_count;
+-	spin_unlock_irq(&dev_priv->gt_lock);
++	spin_lock_irq(&dev_priv->uncore.lock);
++	forcewake_count = dev_priv->uncore.forcewake_count;
++	spin_unlock_irq(&dev_priv->uncore.lock);
+ 
+ 	if (forcewake_count) {
+ 		seq_puts(m, "RC information inaccurate because somebody "
+@@ -1375,9 +1375,9 @@ static int i915_gen6_forcewake_count_inf
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	unsigned forcewake_count;
+ 
+-	spin_lock_irq(&dev_priv->gt_lock);
+-	forcewake_count = dev_priv->forcewake_count;
+-	spin_unlock_irq(&dev_priv->gt_lock);
++	spin_lock_irq(&dev_priv->uncore.lock);
++	forcewake_count = dev_priv->uncore.forcewake_count;
++	spin_unlock_irq(&dev_priv->uncore.lock);
+ 
+ 	seq_printf(m, "forcewake count = %u\n", forcewake_count);
+ 
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1444,22 +1444,6 @@ static void i915_dump_device_info(struct
+ }
+ 
+ /**
+- * intel_early_sanitize_regs - clean up BIOS state
+- * @dev: DRM device
+- *
+- * This function must be called before we do any I915_READ or I915_WRITE. Its
+- * purpose is to clean up any state left by the BIOS that may affect us when
+- * reading and/or writing registers.
+- */
+-static void intel_early_sanitize_regs(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	if (HAS_FPGA_DBG_UNCLAIMED(dev))
+-		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
+-}
+-
+-/**
+  * i915_driver_load - setup chip and create an initial config
+  * @dev: DRM device
+  * @flags: startup flags
+@@ -1501,7 +1485,7 @@ int i915_driver_load(struct drm_device *
+ 	spin_lock_init(&dev_priv->irq_lock);
+ 	spin_lock_init(&dev_priv->gpu_error.lock);
+ 	spin_lock_init(&dev_priv->backlight.lock);
+-	spin_lock_init(&dev_priv->gt_lock);
++	spin_lock_init(&dev_priv->uncore.lock);
+ 	mutex_init(&dev_priv->dpio_lock);
+ 	mutex_init(&dev_priv->rps.hw_lock);
+ 	mutex_init(&dev_priv->modeset_restore_lock);
+@@ -1537,7 +1521,7 @@ int i915_driver_load(struct drm_device *
+ 		goto put_bridge;
+ 	}
+ 
+-	intel_early_sanitize_regs(dev);
++	intel_uncore_early_sanitize(dev);
+ 
+ 	if (IS_HASWELL(dev) && (I915_READ(HSW_EDRAM_PRESENT) == 1)) {
+ 		/* The docs do not explain exactly how the calculation can be
+@@ -1611,8 +1595,8 @@ int i915_driver_load(struct drm_device *
+ 
+ 	intel_irq_init(dev);
+ 	intel_pm_init(dev);
+-	intel_gt_sanitize(dev);
+-	intel_gt_init(dev);
++	intel_uncore_sanitize(dev);
++	intel_uncore_init(dev);
+ 
+ 	/* Try to make sure MCHBAR is enabled before poking at it */
+ 	intel_setup_mchbar(dev);
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -723,7 +723,7 @@ static int i915_drm_thaw(struct drm_devi
+ {
+ 	int error = 0;
+ 
+-	intel_gt_sanitize(dev);
++	intel_uncore_sanitize(dev);
+ 
+ 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+ 		mutex_lock(&dev->struct_mutex);
+@@ -749,7 +749,7 @@ int i915_resume(struct drm_device *dev)
+ 
+ 	pci_set_master(dev->pdev);
+ 
+-	intel_gt_sanitize(dev);
++	intel_uncore_sanitize(dev);
+ 
+ 	/*
+ 	 * Platforms with opregion should have sane BIOS, older ones (gen3 and
+@@ -770,140 +770,6 @@ int i915_resume(struct drm_device *dev)
+ 	return 0;
+ }
+ 
+-static int i8xx_do_reset(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	if (IS_I85X(dev))
+-		return -ENODEV;
+-
+-	I915_WRITE(D_STATE, I915_READ(D_STATE) | DSTATE_GFX_RESET_I830);
+-	POSTING_READ(D_STATE);
+-
+-	if (IS_I830(dev) || IS_845G(dev)) {
+-		I915_WRITE(DEBUG_RESET_I830,
+-			   DEBUG_RESET_DISPLAY |
+-			   DEBUG_RESET_RENDER |
+-			   DEBUG_RESET_FULL);
+-		POSTING_READ(DEBUG_RESET_I830);
+-		msleep(1);
+-
+-		I915_WRITE(DEBUG_RESET_I830, 0);
+-		POSTING_READ(DEBUG_RESET_I830);
+-	}
+-
+-	msleep(1);
+-
+-	I915_WRITE(D_STATE, I915_READ(D_STATE) & ~DSTATE_GFX_RESET_I830);
+-	POSTING_READ(D_STATE);
+-
+-	return 0;
+-}
+-
+-static int i965_reset_complete(struct drm_device *dev)
+-{
+-	u8 gdrst;
+-	pci_read_config_byte(dev->pdev, I965_GDRST, &gdrst);
+-	return (gdrst & GRDOM_RESET_ENABLE) == 0;
+-}
+-
+-static int i965_do_reset(struct drm_device *dev)
+-{
+-	int ret;
+-
+-	/*
+-	 * Set the domains we want to reset (GRDOM/bits 2 and 3) as
+-	 * well as the reset bit (GR/bit 0).  Setting the GR bit
+-	 * triggers the reset; when done, the hardware will clear it.
+-	 */
+-	pci_write_config_byte(dev->pdev, I965_GDRST,
+-			      GRDOM_RENDER | GRDOM_RESET_ENABLE);
+-	ret =  wait_for(i965_reset_complete(dev), 500);
+-	if (ret)
+-		return ret;
+-
+-	/* We can't reset render&media without also resetting display ... */
+-	pci_write_config_byte(dev->pdev, I965_GDRST,
+-			      GRDOM_MEDIA | GRDOM_RESET_ENABLE);
+-
+-	ret =  wait_for(i965_reset_complete(dev), 500);
+-	if (ret)
+-		return ret;
+-
+-	pci_write_config_byte(dev->pdev, I965_GDRST, 0);
+-
+-	return 0;
+-}
+-
+-static int ironlake_do_reset(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	u32 gdrst;
+-	int ret;
+-
+-	gdrst = I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR);
+-	gdrst &= ~GRDOM_MASK;
+-	I915_WRITE(MCHBAR_MIRROR_BASE + ILK_GDSR,
+-		   gdrst | GRDOM_RENDER | GRDOM_RESET_ENABLE);
+-	ret = wait_for(I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR) & 0x1, 500);
+-	if (ret)
+-		return ret;
+-
+-	/* We can't reset render&media without also resetting display ... */
+-	gdrst = I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR);
+-	gdrst &= ~GRDOM_MASK;
+-	I915_WRITE(MCHBAR_MIRROR_BASE + ILK_GDSR,
+-		   gdrst | GRDOM_MEDIA | GRDOM_RESET_ENABLE);
+-	return wait_for(I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR) & 0x1, 500);
+-}
+-
+-static int gen6_do_reset(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	int	ret;
+-	unsigned long irqflags;
+-
+-	/* Hold gt_lock across reset to prevent any register access
+-	 * with forcewake not set correctly
+-	 */
+-	spin_lock_irqsave(&dev_priv->gt_lock, irqflags);
+-
+-	/* Reset the chip */
+-
+-	/* GEN6_GDRST is not in the gt power well, no need to check
+-	 * for fifo space for the write or forcewake the chip for
+-	 * the read
+-	 */
+-	I915_WRITE_NOTRACE(GEN6_GDRST, GEN6_GRDOM_FULL);
+-
+-	/* Spin waiting for the device to ack the reset request */
+-	ret = wait_for((I915_READ_NOTRACE(GEN6_GDRST) & GEN6_GRDOM_FULL) == 0, 500);
+-
+-	/* If reset with a user forcewake, try to restore, otherwise turn it off */
+-	if (dev_priv->forcewake_count)
+-		dev_priv->gt.force_wake_get(dev_priv);
+-	else
+-		dev_priv->gt.force_wake_put(dev_priv);
+-
+-	/* Restore fifo count */
+-	dev_priv->gt_fifo_count = I915_READ_NOTRACE(GT_FIFO_FREE_ENTRIES);
+-
+-	spin_unlock_irqrestore(&dev_priv->gt_lock, irqflags);
+-	return ret;
+-}
+-
+-int intel_gpu_reset(struct drm_device *dev)
+-{
+-	switch (INTEL_INFO(dev)->gen) {
+-	case 7:
+-	case 6: return gen6_do_reset(dev);
+-	case 5: return ironlake_do_reset(dev);
+-	case 4: return i965_do_reset(dev);
+-	case 2: return i8xx_do_reset(dev);
+-	default: return -ENODEV;
+-	}
+-}
+-
+ /**
+  * i915_reset - reset chip after a hang
+  * @dev: drm device to reset
+@@ -1233,136 +1099,3 @@ module_exit(i915_exit);
+ MODULE_AUTHOR(DRIVER_AUTHOR);
+ MODULE_DESCRIPTION(DRIVER_DESC);
+ MODULE_LICENSE("GPL and additional rights");
+-
+-/* We give fast paths for the really cool registers */
+-#define NEEDS_FORCE_WAKE(dev_priv, reg) \
+-	((HAS_FORCE_WAKE((dev_priv)->dev)) && \
+-	 ((reg) < 0x40000) &&            \
+-	 ((reg) != FORCEWAKE))
+-static void
+-ilk_dummy_write(struct drm_i915_private *dev_priv)
+-{
+-	/* WaIssueDummyWriteToWakeupFromRC6:ilk Issue a dummy write to wake up
+-	 * the chip from rc6 before touching it for real. MI_MODE is masked,
+-	 * hence harmless to write 0 into. */
+-	I915_WRITE_NOTRACE(MI_MODE, 0);
+-}
+-
+-static void
+-hsw_unclaimed_reg_clear(struct drm_i915_private *dev_priv, u32 reg)
+-{
+-	if (HAS_FPGA_DBG_UNCLAIMED(dev_priv->dev) &&
+-	    (I915_READ_NOTRACE(FPGA_DBG) & FPGA_DBG_RM_NOCLAIM)) {
+-		DRM_ERROR("Unknown unclaimed register before writing to %x\n",
+-			  reg);
+-		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
+-	}
+-}
+-
+-static void
+-hsw_unclaimed_reg_check(struct drm_i915_private *dev_priv, u32 reg)
+-{
+-	if (HAS_FPGA_DBG_UNCLAIMED(dev_priv->dev) &&
+-	    (I915_READ_NOTRACE(FPGA_DBG) & FPGA_DBG_RM_NOCLAIM)) {
+-		DRM_ERROR("Unclaimed write to %x\n", reg);
+-		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
+-	}
+-}
+-
+-#define __i915_read(x, y) \
+-u##x i915_read##x(struct drm_i915_private *dev_priv, u32 reg) { \
+-	unsigned long irqflags; \
+-	u##x val = 0; \
+-	spin_lock_irqsave(&dev_priv->gt_lock, irqflags); \
+-	if (IS_GEN5(dev_priv->dev)) \
+-		ilk_dummy_write(dev_priv); \
+-	if (NEEDS_FORCE_WAKE((dev_priv), (reg))) { \
+-		if (dev_priv->forcewake_count == 0) \
+-			dev_priv->gt.force_wake_get(dev_priv); \
+-		val = read##y(dev_priv->regs + reg); \
+-		if (dev_priv->forcewake_count == 0) \
+-			dev_priv->gt.force_wake_put(dev_priv); \
+-	} else { \
+-		val = read##y(dev_priv->regs + reg); \
+-	} \
+-	spin_unlock_irqrestore(&dev_priv->gt_lock, irqflags); \
+-	trace_i915_reg_rw(false, reg, val, sizeof(val)); \
+-	return val; \
+-}
+-
+-__i915_read(8, b)
+-__i915_read(16, w)
+-__i915_read(32, l)
+-__i915_read(64, q)
+-#undef __i915_read
+-
+-#define __i915_write(x, y) \
+-void i915_write##x(struct drm_i915_private *dev_priv, u32 reg, u##x val) { \
+-	unsigned long irqflags; \
+-	u32 __fifo_ret = 0; \
+-	trace_i915_reg_rw(true, reg, val, sizeof(val)); \
+-	spin_lock_irqsave(&dev_priv->gt_lock, irqflags); \
+-	if (NEEDS_FORCE_WAKE((dev_priv), (reg))) { \
+-		__fifo_ret = __gen6_gt_wait_for_fifo(dev_priv); \
+-	} \
+-	if (IS_GEN5(dev_priv->dev)) \
+-		ilk_dummy_write(dev_priv); \
+-	hsw_unclaimed_reg_clear(dev_priv, reg); \
+-	write##y(val, dev_priv->regs + reg); \
+-	if (unlikely(__fifo_ret)) { \
+-		gen6_gt_check_fifodbg(dev_priv); \
+-	} \
+-	hsw_unclaimed_reg_check(dev_priv, reg); \
+-	spin_unlock_irqrestore(&dev_priv->gt_lock, irqflags); \
+-}
+-__i915_write(8, b)
+-__i915_write(16, w)
+-__i915_write(32, l)
+-__i915_write(64, q)
+-#undef __i915_write
+-
+-static const struct register_whitelist {
+-	uint64_t offset;
+-	uint32_t size;
+-	uint32_t gen_bitmask; /* support gens, 0x10 for 4, 0x30 for 4 and 5, etc. */
+-} whitelist[] = {
+-	{ RING_TIMESTAMP(RENDER_RING_BASE), 8, 0xF0 },
+-};
+-
+-int i915_reg_read_ioctl(struct drm_device *dev,
+-			void *data, struct drm_file *file)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct drm_i915_reg_read *reg = data;
+-	struct register_whitelist const *entry = whitelist;
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(whitelist); i++, entry++) {
+-		if (entry->offset == reg->offset &&
+-		    (1 << INTEL_INFO(dev)->gen & entry->gen_bitmask))
+-			break;
+-	}
+-
+-	if (i == ARRAY_SIZE(whitelist))
+-		return -EINVAL;
+-
+-	switch (entry->size) {
+-	case 8:
+-		reg->val = I915_READ64(reg->offset);
+-		break;
+-	case 4:
+-		reg->val = I915_READ(reg->offset);
+-		break;
+-	case 2:
+-		reg->val = I915_READ16(reg->offset);
+-		break;
+-	case 1:
+-		reg->val = I915_READ8(reg->offset);
+-		break;
+-	default:
+-		WARN_ON(1);
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -391,11 +391,20 @@ struct drm_i915_display_funcs {
+ 	/* pll clock increase/decrease */
+ };
+ 
+-struct drm_i915_gt_funcs {
++struct intel_uncore_funcs {
+ 	void (*force_wake_get)(struct drm_i915_private *dev_priv);
+ 	void (*force_wake_put)(struct drm_i915_private *dev_priv);
+ };
+ 
++struct intel_uncore {
++	spinlock_t lock; /** lock is also taken in irq contexts. */
++
++	struct intel_uncore_funcs funcs;
++
++	unsigned fifo_count;
++	unsigned forcewake_count;
++};
++
+ #define DEV_INFO_FOR_EACH_FLAG(func, sep) \
+ 	func(is_mobile) sep \
+ 	func(is_i85x) sep \
+@@ -1045,14 +1054,7 @@ typedef struct drm_i915_private {
+ 
+ 	void __iomem *regs;
+ 
+-	struct drm_i915_gt_funcs gt;
+-	/** gt_fifo_count and the subsequent register write are synchronized
+-	 * with dev->struct_mutex. */
+-	unsigned gt_fifo_count;
+-	/** forcewake_count is protected by gt_lock */
+-	unsigned forcewake_count;
+-	/** gt_lock is also taken in irq contexts. */
+-	spinlock_t gt_lock;
++	struct intel_uncore uncore;
+ 
+ 	struct intel_gmbus gmbus[GMBUS_NUM_PORTS];
+ 
+@@ -1671,8 +1673,14 @@ void i915_handle_error(struct drm_device
+ extern void intel_irq_init(struct drm_device *dev);
+ extern void intel_pm_init(struct drm_device *dev);
+ extern void intel_hpd_init(struct drm_device *dev);
+-extern void intel_gt_init(struct drm_device *dev);
+-extern void intel_gt_sanitize(struct drm_device *dev);
++extern void intel_pm_init(struct drm_device *dev);
++
++extern void intel_uncore_sanitize(struct drm_device *dev);
++extern void intel_uncore_early_sanitize(struct drm_device *dev);
++extern void intel_uncore_init(struct drm_device *dev);
++extern void intel_uncore_reset(struct drm_device *dev);
++extern void intel_uncore_clear_errors(struct drm_device *dev);
++extern void intel_uncore_check_errors(struct drm_device *dev);
+ 
+ void
+ i915_enable_pipestat(drm_i915_private_t *dev_priv, int pipe, u32 mask);
+@@ -2108,7 +2116,6 @@ extern void intel_display_print_error_st
+  */
+ void gen6_gt_force_wake_get(struct drm_i915_private *dev_priv);
+ void gen6_gt_force_wake_put(struct drm_i915_private *dev_priv);
+-int __gen6_gt_wait_for_fifo(struct drm_i915_private *dev_priv);
+ 
+ int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u8 mbox, u32 *val);
+ int sandybridge_pcode_write(struct drm_i915_private *dev_priv, u8 mbox, u32 val);
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1307,11 +1307,7 @@ static irqreturn_t ironlake_irq_handler(
+ 
+ 	/* We get interrupts on unclaimed registers, so check for this before we
+ 	 * do any I915_{READ,WRITE}. */
+-	if (IS_HASWELL(dev) &&
+-	    (I915_READ_NOTRACE(FPGA_DBG) & FPGA_DBG_RM_NOCLAIM)) {
+-		DRM_ERROR("Unclaimed register before interrupt\n");
+-		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
+-	}
++	intel_uncore_check_errors(dev);
+ 
+ 	/* disable master interrupt before clearing iir  */
+ 	de_ier = I915_READ(DEIER);
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -10484,8 +10484,7 @@ intel_display_capture_error_state(struct
+ 	 * well was on, so here we have to clear the FPGA_DBG_RM_NOCLAIM bit to
+ 	 * prevent the next I915_WRITE from detecting it and printing an error
+ 	 * message. */
+-	if (HAS_POWER_WELL(dev))
+-		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
++	intel_uncore_clear_errors(dev);
+ 
+ 	return error;
+ }
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -806,7 +806,6 @@ extern void intel_init_power_well(struct
+ extern void intel_set_power_well(struct drm_device *dev, bool enable);
+ extern void intel_enable_gt_powersave(struct drm_device *dev);
+ extern void intel_disable_gt_powersave(struct drm_device *dev);
+-extern void gen6_gt_check_fifodbg(struct drm_i915_private *dev_priv);
+ extern void ironlake_teardown_rc6(struct drm_device *dev);
+ 
+ extern bool intel_ddi_get_hw_state(struct intel_encoder *encoder,
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -32,8 +32,6 @@
+ #include <linux/module.h>
+ #include <drm/i915_powerwell.h>
+ 
+-#define FORCEWAKE_ACK_TIMEOUT_MS 2
+-
+ /* FBC, or Frame Buffer Compression, is a technique employed to compress the
+  * framebuffer contents in-memory, aiming at reducing the required bandwidth
+  * during in-memory transfers and, therefore, reduce the power packet.
+@@ -5307,260 +5305,6 @@ void intel_init_pm(struct drm_device *de
+ 	}
+ }
+ 
+-static void __gen6_gt_wait_for_thread_c0(struct drm_i915_private *dev_priv)
+-{
+-	u32 gt_thread_status_mask;
+-
+-	if (IS_HASWELL(dev_priv->dev))
+-		gt_thread_status_mask = GEN6_GT_THREAD_STATUS_CORE_MASK_HSW;
+-	else
+-		gt_thread_status_mask = GEN6_GT_THREAD_STATUS_CORE_MASK;
+-
+-	/* w/a for a sporadic read returning 0 by waiting for the GT
+-	 * thread to wake up.
+-	 */
+-	if (wait_for_atomic_us((I915_READ_NOTRACE(GEN6_GT_THREAD_STATUS_REG) & gt_thread_status_mask) == 0, 500))
+-		DRM_ERROR("GT thread status wait timed out\n");
+-}
+-
+-static void __gen6_gt_force_wake_reset(struct drm_i915_private *dev_priv)
+-{
+-	I915_WRITE_NOTRACE(FORCEWAKE, 0);
+-	POSTING_READ(ECOBUS); /* something from same cacheline, but !FORCEWAKE */
+-}
+-
+-static void __gen6_gt_force_wake_get(struct drm_i915_private *dev_priv)
+-{
+-	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK) & 1) == 0,
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for forcewake old ack to clear.\n");
+-
+-	I915_WRITE_NOTRACE(FORCEWAKE, 1);
+-	POSTING_READ(ECOBUS); /* something from same cacheline, but !FORCEWAKE */
+-
+-	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK) & 1),
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for forcewake to ack request.\n");
+-
+-	/* WaRsForcewakeWaitTC0:snb */
+-	__gen6_gt_wait_for_thread_c0(dev_priv);
+-}
+-
+-static void __gen6_gt_force_wake_mt_reset(struct drm_i915_private *dev_priv)
+-{
+-	I915_WRITE_NOTRACE(FORCEWAKE_MT, _MASKED_BIT_DISABLE(0xffff));
+-	/* something from same cacheline, but !FORCEWAKE_MT */
+-	POSTING_READ(ECOBUS);
+-}
+-
+-static void __gen6_gt_force_wake_mt_get(struct drm_i915_private *dev_priv)
+-{
+-	u32 forcewake_ack;
+-
+-	if (IS_HASWELL(dev_priv->dev))
+-		forcewake_ack = FORCEWAKE_ACK_HSW;
+-	else
+-		forcewake_ack = FORCEWAKE_MT_ACK;
+-
+-	if (wait_for_atomic((I915_READ_NOTRACE(forcewake_ack) & FORCEWAKE_KERNEL) == 0,
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for forcewake old ack to clear.\n");
+-
+-	I915_WRITE_NOTRACE(FORCEWAKE_MT, _MASKED_BIT_ENABLE(FORCEWAKE_KERNEL));
+-	/* something from same cacheline, but !FORCEWAKE_MT */
+-	POSTING_READ(ECOBUS);
+-
+-	if (wait_for_atomic((I915_READ_NOTRACE(forcewake_ack) & FORCEWAKE_KERNEL),
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for forcewake to ack request.\n");
+-
+-	/* WaRsForcewakeWaitTC0:ivb,hsw */
+-	__gen6_gt_wait_for_thread_c0(dev_priv);
+-}
+-
+-/*
+- * Generally this is called implicitly by the register read function. However,
+- * if some sequence requires the GT to not power down then this function should
+- * be called at the beginning of the sequence followed by a call to
+- * gen6_gt_force_wake_put() at the end of the sequence.
+- */
+-void gen6_gt_force_wake_get(struct drm_i915_private *dev_priv)
+-{
+-	unsigned long irqflags;
+-
+-	spin_lock_irqsave(&dev_priv->gt_lock, irqflags);
+-	if (dev_priv->forcewake_count++ == 0)
+-		dev_priv->gt.force_wake_get(dev_priv);
+-	spin_unlock_irqrestore(&dev_priv->gt_lock, irqflags);
+-}
+-
+-void gen6_gt_check_fifodbg(struct drm_i915_private *dev_priv)
+-{
+-	u32 gtfifodbg;
+-	gtfifodbg = I915_READ_NOTRACE(GTFIFODBG);
+-	if (WARN(gtfifodbg & GT_FIFO_CPU_ERROR_MASK,
+-	     "MMIO read or write has been dropped %x\n", gtfifodbg))
+-		I915_WRITE_NOTRACE(GTFIFODBG, GT_FIFO_CPU_ERROR_MASK);
+-}
+-
+-static void __gen6_gt_force_wake_put(struct drm_i915_private *dev_priv)
+-{
+-	I915_WRITE_NOTRACE(FORCEWAKE, 0);
+-	/* something from same cacheline, but !FORCEWAKE */
+-	POSTING_READ(ECOBUS);
+-	gen6_gt_check_fifodbg(dev_priv);
+-}
+-
+-static void __gen6_gt_force_wake_mt_put(struct drm_i915_private *dev_priv)
+-{
+-	I915_WRITE_NOTRACE(FORCEWAKE_MT, _MASKED_BIT_DISABLE(FORCEWAKE_KERNEL));
+-	/* something from same cacheline, but !FORCEWAKE_MT */
+-	POSTING_READ(ECOBUS);
+-	gen6_gt_check_fifodbg(dev_priv);
+-}
+-
+-/*
+- * see gen6_gt_force_wake_get()
+- */
+-void gen6_gt_force_wake_put(struct drm_i915_private *dev_priv)
+-{
+-	unsigned long irqflags;
+-
+-	spin_lock_irqsave(&dev_priv->gt_lock, irqflags);
+-	if (--dev_priv->forcewake_count == 0)
+-		dev_priv->gt.force_wake_put(dev_priv);
+-	spin_unlock_irqrestore(&dev_priv->gt_lock, irqflags);
+-}
+-
+-int __gen6_gt_wait_for_fifo(struct drm_i915_private *dev_priv)
+-{
+-	int ret = 0;
+-
+-	if (dev_priv->gt_fifo_count < GT_FIFO_NUM_RESERVED_ENTRIES) {
+-		int loop = 500;
+-		u32 fifo = I915_READ_NOTRACE(GT_FIFO_FREE_ENTRIES);
+-		while (fifo <= GT_FIFO_NUM_RESERVED_ENTRIES && loop--) {
+-			udelay(10);
+-			fifo = I915_READ_NOTRACE(GT_FIFO_FREE_ENTRIES);
+-		}
+-		if (WARN_ON(loop < 0 && fifo <= GT_FIFO_NUM_RESERVED_ENTRIES))
+-			++ret;
+-		dev_priv->gt_fifo_count = fifo;
+-	}
+-	dev_priv->gt_fifo_count--;
+-
+-	return ret;
+-}
+-
+-static void vlv_force_wake_reset(struct drm_i915_private *dev_priv)
+-{
+-	I915_WRITE_NOTRACE(FORCEWAKE_VLV, _MASKED_BIT_DISABLE(0xffff));
+-	/* something from same cacheline, but !FORCEWAKE_VLV */
+-	POSTING_READ(FORCEWAKE_ACK_VLV);
+-}
+-
+-static void vlv_force_wake_get(struct drm_i915_private *dev_priv)
+-{
+-	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK_VLV) & FORCEWAKE_KERNEL) == 0,
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for forcewake old ack to clear.\n");
+-
+-	I915_WRITE_NOTRACE(FORCEWAKE_VLV, _MASKED_BIT_ENABLE(FORCEWAKE_KERNEL));
+-	I915_WRITE_NOTRACE(FORCEWAKE_MEDIA_VLV,
+-			   _MASKED_BIT_ENABLE(FORCEWAKE_KERNEL));
+-
+-	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK_VLV) & FORCEWAKE_KERNEL),
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for GT to ack forcewake request.\n");
+-
+-	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK_MEDIA_VLV) &
+-			     FORCEWAKE_KERNEL),
+-			    FORCEWAKE_ACK_TIMEOUT_MS))
+-		DRM_ERROR("Timed out waiting for media to ack forcewake request.\n");
+-
+-	/* WaRsForcewakeWaitTC0:vlv */
+-	__gen6_gt_wait_for_thread_c0(dev_priv);
+-}
+-
+-static void vlv_force_wake_put(struct drm_i915_private *dev_priv)
+-{
+-	I915_WRITE_NOTRACE(FORCEWAKE_VLV, _MASKED_BIT_DISABLE(FORCEWAKE_KERNEL));
+-	I915_WRITE_NOTRACE(FORCEWAKE_MEDIA_VLV,
+-			   _MASKED_BIT_DISABLE(FORCEWAKE_KERNEL));
+-	/* The below doubles as a POSTING_READ */
+-	gen6_gt_check_fifodbg(dev_priv);
+-}
+-
+-void intel_gt_sanitize(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	if (IS_VALLEYVIEW(dev)) {
+-		vlv_force_wake_reset(dev_priv);
+-	} else if (INTEL_INFO(dev)->gen >= 6) {
+-		__gen6_gt_force_wake_reset(dev_priv);
+-		if (IS_IVYBRIDGE(dev) || IS_HASWELL(dev))
+-			__gen6_gt_force_wake_mt_reset(dev_priv);
+-	}
+-
+-	/* BIOS often leaves RC6 enabled, but disable it for hw init */
+-	if (INTEL_INFO(dev)->gen >= 6)
+-		intel_disable_gt_powersave(dev);
+-}
+-
+-void intel_gt_init(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	if (IS_VALLEYVIEW(dev)) {
+-		dev_priv->gt.force_wake_get = vlv_force_wake_get;
+-		dev_priv->gt.force_wake_put = vlv_force_wake_put;
+-	} else if (IS_HASWELL(dev)) {
+-		dev_priv->gt.force_wake_get = __gen6_gt_force_wake_mt_get;
+-		dev_priv->gt.force_wake_put = __gen6_gt_force_wake_mt_put;
+-	} else if (IS_IVYBRIDGE(dev)) {
+-		u32 ecobus;
+-
+-		/* IVB configs may use multi-threaded forcewake */
+-
+-		/* A small trick here - if the bios hasn't configured
+-		 * MT forcewake, and if the device is in RC6, then
+-		 * force_wake_mt_get will not wake the device and the
+-		 * ECOBUS read will return zero. Which will be
+-		 * (correctly) interpreted by the test below as MT
+-		 * forcewake being disabled.
+-		 */
+-		mutex_lock(&dev->struct_mutex);
+-		__gen6_gt_force_wake_mt_get(dev_priv);
+-		ecobus = I915_READ_NOTRACE(ECOBUS);
+-		__gen6_gt_force_wake_mt_put(dev_priv);
+-		mutex_unlock(&dev->struct_mutex);
+-
+-		if (ecobus & FORCEWAKE_MT_ENABLE) {
+-			dev_priv->gt.force_wake_get =
+-						__gen6_gt_force_wake_mt_get;
+-			dev_priv->gt.force_wake_put =
+-						__gen6_gt_force_wake_mt_put;
+-		} else {
+-			DRM_INFO("No MT forcewake available on Ivybridge, this can result in issues\n");
+-			DRM_INFO("when using vblank-synced partial screen updates.\n");
+-			dev_priv->gt.force_wake_get = __gen6_gt_force_wake_get;
+-			dev_priv->gt.force_wake_put = __gen6_gt_force_wake_put;
+-		}
+-	} else if (IS_GEN6(dev)) {
+-		dev_priv->gt.force_wake_get = __gen6_gt_force_wake_get;
+-		dev_priv->gt.force_wake_put = __gen6_gt_force_wake_put;
+-	}
+-}
+-
+-void intel_pm_init(struct drm_device *dev)
+-{
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	INIT_DELAYED_WORK(&dev_priv->rps.delayed_resume_work,
+-			  intel_gen6_powersave_work);
+-}
+-
+ int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u8 mbox, u32 *val)
+ {
+ 	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
+@@ -5663,3 +5407,11 @@ int vlv_freq_opcode(int ddr_freq, int va
+ 	return val;
+ }
+ 
++void intel_pm_init(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	INIT_DELAYED_WORK(&dev_priv->rps.delayed_resume_work,
++			  intel_gen6_powersave_work);
++}
++
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@ -0,0 +1,571 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#include "i915_drv.h"
++#include "intel_drv.h"
++
++#define FORCEWAKE_ACK_TIMEOUT_MS 2
++
++static void __gen6_gt_wait_for_thread_c0(struct drm_i915_private *dev_priv)
++{
++	u32 gt_thread_status_mask;
++
++	if (IS_HASWELL(dev_priv->dev))
++		gt_thread_status_mask = GEN6_GT_THREAD_STATUS_CORE_MASK_HSW;
++	else
++		gt_thread_status_mask = GEN6_GT_THREAD_STATUS_CORE_MASK;
++
++	/* w/a for a sporadic read returning 0 by waiting for the GT
++	 * thread to wake up.
++	 */
++	if (wait_for_atomic_us((I915_READ_NOTRACE(GEN6_GT_THREAD_STATUS_REG) & gt_thread_status_mask) == 0, 500))
++		DRM_ERROR("GT thread status wait timed out\n");
++}
++
++static void __gen6_gt_force_wake_reset(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE_NOTRACE(FORCEWAKE, 0);
++	POSTING_READ(ECOBUS); /* something from same cacheline, but !FORCEWAKE */
++}
++
++static void __gen6_gt_force_wake_get(struct drm_i915_private *dev_priv)
++{
++	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK) & 1) == 0,
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for forcewake old ack to clear.\n");
++
++	I915_WRITE_NOTRACE(FORCEWAKE, 1);
++	POSTING_READ(ECOBUS); /* something from same cacheline, but !FORCEWAKE */
++
++	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK) & 1),
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for forcewake to ack request.\n");
++
++	/* WaRsForcewakeWaitTC0:snb */
++	__gen6_gt_wait_for_thread_c0(dev_priv);
++}
++
++static void __gen6_gt_force_wake_mt_reset(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE_NOTRACE(FORCEWAKE_MT, _MASKED_BIT_DISABLE(0xffff));
++	/* something from same cacheline, but !FORCEWAKE_MT */
++	POSTING_READ(ECOBUS);
++}
++
++static void __gen6_gt_force_wake_mt_get(struct drm_i915_private *dev_priv)
++{
++	u32 forcewake_ack;
++
++	if (IS_HASWELL(dev_priv->dev))
++		forcewake_ack = FORCEWAKE_ACK_HSW;
++	else
++		forcewake_ack = FORCEWAKE_MT_ACK;
++
++	if (wait_for_atomic((I915_READ_NOTRACE(forcewake_ack) & FORCEWAKE_KERNEL) == 0,
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for forcewake old ack to clear.\n");
++
++	I915_WRITE_NOTRACE(FORCEWAKE_MT, _MASKED_BIT_ENABLE(FORCEWAKE_KERNEL));
++	/* something from same cacheline, but !FORCEWAKE_MT */
++	POSTING_READ(ECOBUS);
++
++	if (wait_for_atomic((I915_READ_NOTRACE(forcewake_ack) & FORCEWAKE_KERNEL),
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for forcewake to ack request.\n");
++
++	/* WaRsForcewakeWaitTC0:ivb,hsw */
++	__gen6_gt_wait_for_thread_c0(dev_priv);
++}
++
++static void gen6_gt_check_fifodbg(struct drm_i915_private *dev_priv)
++{
++	u32 gtfifodbg;
++	gtfifodbg = I915_READ_NOTRACE(GTFIFODBG);
++	if (WARN(gtfifodbg & GT_FIFO_CPU_ERROR_MASK,
++	     "MMIO read or write has been dropped %x\n", gtfifodbg))
++		I915_WRITE_NOTRACE(GTFIFODBG, GT_FIFO_CPU_ERROR_MASK);
++}
++
++static void __gen6_gt_force_wake_put(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE_NOTRACE(FORCEWAKE, 0);
++	/* something from same cacheline, but !FORCEWAKE */
++	POSTING_READ(ECOBUS);
++	gen6_gt_check_fifodbg(dev_priv);
++}
++
++static void __gen6_gt_force_wake_mt_put(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE_NOTRACE(FORCEWAKE_MT, _MASKED_BIT_DISABLE(FORCEWAKE_KERNEL));
++	/* something from same cacheline, but !FORCEWAKE_MT */
++	POSTING_READ(ECOBUS);
++	gen6_gt_check_fifodbg(dev_priv);
++}
++
++static int __gen6_gt_wait_for_fifo(struct drm_i915_private *dev_priv)
++{
++	int ret = 0;
++
++	if (dev_priv->uncore.fifo_count < GT_FIFO_NUM_RESERVED_ENTRIES) {
++		int loop = 500;
++		u32 fifo = I915_READ_NOTRACE(GT_FIFO_FREE_ENTRIES);
++		while (fifo <= GT_FIFO_NUM_RESERVED_ENTRIES && loop--) {
++			udelay(10);
++			fifo = I915_READ_NOTRACE(GT_FIFO_FREE_ENTRIES);
++		}
++		if (WARN_ON(loop < 0 && fifo <= GT_FIFO_NUM_RESERVED_ENTRIES))
++			++ret;
++		dev_priv->uncore.fifo_count = fifo;
++	}
++	dev_priv->uncore.fifo_count--;
++
++	return ret;
++}
++
++static void vlv_force_wake_reset(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE_NOTRACE(FORCEWAKE_VLV, _MASKED_BIT_DISABLE(0xffff));
++	/* something from same cacheline, but !FORCEWAKE_VLV */
++	POSTING_READ(FORCEWAKE_ACK_VLV);
++}
++
++static void vlv_force_wake_get(struct drm_i915_private *dev_priv)
++{
++	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK_VLV) & FORCEWAKE_KERNEL) == 0,
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for forcewake old ack to clear.\n");
++
++	I915_WRITE_NOTRACE(FORCEWAKE_VLV, _MASKED_BIT_ENABLE(FORCEWAKE_KERNEL));
++	I915_WRITE_NOTRACE(FORCEWAKE_MEDIA_VLV,
++			   _MASKED_BIT_ENABLE(FORCEWAKE_KERNEL));
++
++	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK_VLV) & FORCEWAKE_KERNEL),
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for GT to ack forcewake request.\n");
++
++	if (wait_for_atomic((I915_READ_NOTRACE(FORCEWAKE_ACK_MEDIA_VLV) &
++			     FORCEWAKE_KERNEL),
++			    FORCEWAKE_ACK_TIMEOUT_MS))
++		DRM_ERROR("Timed out waiting for media to ack forcewake request.\n");
++
++	/* WaRsForcewakeWaitTC0:vlv */
++	__gen6_gt_wait_for_thread_c0(dev_priv);
++}
++
++static void vlv_force_wake_put(struct drm_i915_private *dev_priv)
++{
++	I915_WRITE_NOTRACE(FORCEWAKE_VLV, _MASKED_BIT_DISABLE(FORCEWAKE_KERNEL));
++	I915_WRITE_NOTRACE(FORCEWAKE_MEDIA_VLV,
++			   _MASKED_BIT_DISABLE(FORCEWAKE_KERNEL));
++	/* The below doubles as a POSTING_READ */
++	gen6_gt_check_fifodbg(dev_priv);
++}
++
++void intel_uncore_early_sanitize(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (HAS_FPGA_DBG_UNCLAIMED(dev))
++		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
++}
++
++void intel_uncore_init(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (IS_VALLEYVIEW(dev)) {
++		dev_priv->uncore.funcs.force_wake_get = vlv_force_wake_get;
++		dev_priv->uncore.funcs.force_wake_put = vlv_force_wake_put;
++	} else if (IS_HASWELL(dev)) {
++		dev_priv->uncore.funcs.force_wake_get = __gen6_gt_force_wake_mt_get;
++		dev_priv->uncore.funcs.force_wake_put = __gen6_gt_force_wake_mt_put;
++	} else if (IS_IVYBRIDGE(dev)) {
++		u32 ecobus;
++
++		/* IVB configs may use multi-threaded forcewake */
++
++		/* A small trick here - if the bios hasn't configured
++		 * MT forcewake, and if the device is in RC6, then
++		 * force_wake_mt_get will not wake the device and the
++		 * ECOBUS read will return zero. Which will be
++		 * (correctly) interpreted by the test below as MT
++		 * forcewake being disabled.
++		 */
++		mutex_lock(&dev->struct_mutex);
++		__gen6_gt_force_wake_mt_get(dev_priv);
++		ecobus = I915_READ_NOTRACE(ECOBUS);
++		__gen6_gt_force_wake_mt_put(dev_priv);
++		mutex_unlock(&dev->struct_mutex);
++
++		if (ecobus & FORCEWAKE_MT_ENABLE) {
++			dev_priv->uncore.funcs.force_wake_get =
++				__gen6_gt_force_wake_mt_get;
++			dev_priv->uncore.funcs.force_wake_put =
++				__gen6_gt_force_wake_mt_put;
++		} else {
++			DRM_INFO("No MT forcewake available on Ivybridge, this can result in issues\n");
++			DRM_INFO("when using vblank-synced partial screen updates.\n");
++			dev_priv->uncore.funcs.force_wake_get =
++				__gen6_gt_force_wake_get;
++			dev_priv->uncore.funcs.force_wake_put =
++				__gen6_gt_force_wake_put;
++		}
++	} else if (IS_GEN6(dev)) {
++		dev_priv->uncore.funcs.force_wake_get =
++			__gen6_gt_force_wake_get;
++		dev_priv->uncore.funcs.force_wake_put =
++			__gen6_gt_force_wake_put;
++	}
++}
++
++void intel_uncore_sanitize(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (IS_VALLEYVIEW(dev)) {
++		vlv_force_wake_reset(dev_priv);
++	} else if (INTEL_INFO(dev)->gen >= 6) {
++		__gen6_gt_force_wake_reset(dev_priv);
++		if (IS_IVYBRIDGE(dev) || IS_HASWELL(dev))
++			__gen6_gt_force_wake_mt_reset(dev_priv);
++	}
++
++	/* BIOS often leaves RC6 enabled, but disable it for hw init */
++	intel_disable_gt_powersave(dev);
++}
++
++/*
++ * Generally this is called implicitly by the register read function. However,
++ * if some sequence requires the GT to not power down then this function should
++ * be called at the beginning of the sequence followed by a call to
++ * gen6_gt_force_wake_put() at the end of the sequence.
++ */
++void gen6_gt_force_wake_get(struct drm_i915_private *dev_priv)
++{
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++	if (dev_priv->uncore.forcewake_count++ == 0)
++		dev_priv->uncore.funcs.force_wake_get(dev_priv);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++}
++
++/*
++ * see gen6_gt_force_wake_get()
++ */
++void gen6_gt_force_wake_put(struct drm_i915_private *dev_priv)
++{
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++	if (--dev_priv->uncore.forcewake_count == 0)
++		dev_priv->uncore.funcs.force_wake_put(dev_priv);
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++}
++
++/* We give fast paths for the really cool registers */
++#define NEEDS_FORCE_WAKE(dev_priv, reg) \
++	((HAS_FORCE_WAKE((dev_priv)->dev)) && \
++	 ((reg) < 0x40000) &&            \
++	 ((reg) != FORCEWAKE))
++
++static void
++ilk_dummy_write(struct drm_i915_private *dev_priv)
++{
++	/* WaIssueDummyWriteToWakeupFromRC6:ilk Issue a dummy write to wake up
++	 * the chip from rc6 before touching it for real. MI_MODE is masked,
++	 * hence harmless to write 0 into. */
++	I915_WRITE_NOTRACE(MI_MODE, 0);
++}
++
++static void
++hsw_unclaimed_reg_clear(struct drm_i915_private *dev_priv, u32 reg)
++{
++	if (HAS_FPGA_DBG_UNCLAIMED(dev_priv->dev) &&
++	    (I915_READ_NOTRACE(FPGA_DBG) & FPGA_DBG_RM_NOCLAIM)) {
++		DRM_ERROR("Unknown unclaimed register before writing to %x\n",
++			  reg);
++		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
++	}
++}
++
++static void
++hsw_unclaimed_reg_check(struct drm_i915_private *dev_priv, u32 reg)
++{
++	if (HAS_FPGA_DBG_UNCLAIMED(dev_priv->dev) &&
++	    (I915_READ_NOTRACE(FPGA_DBG) & FPGA_DBG_RM_NOCLAIM)) {
++		DRM_ERROR("Unclaimed write to %x\n", reg);
++		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
++	}
++}
++
++#define __i915_read(x, y) \
++u##x i915_read##x(struct drm_i915_private *dev_priv, u32 reg) { \
++	unsigned long irqflags; \
++	u##x val = 0; \
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags); \
++	if (IS_GEN5(dev_priv->dev)) \
++		ilk_dummy_write(dev_priv); \
++	if (NEEDS_FORCE_WAKE((dev_priv), (reg))) { \
++		if (dev_priv->uncore.forcewake_count == 0) \
++			dev_priv->uncore.funcs.force_wake_get(dev_priv); \
++		val = read##y(dev_priv->regs + reg); \
++		if (dev_priv->uncore.forcewake_count == 0) \
++			dev_priv->uncore.funcs.force_wake_put(dev_priv); \
++	} else { \
++		val = read##y(dev_priv->regs + reg); \
++	} \
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags); \
++	trace_i915_reg_rw(false, reg, val, sizeof(val)); \
++	return val; \
++}
++
++__i915_read(8, b)
++__i915_read(16, w)
++__i915_read(32, l)
++__i915_read(64, q)
++#undef __i915_read
++
++#define __i915_write(x, y) \
++void i915_write##x(struct drm_i915_private *dev_priv, u32 reg, u##x val) { \
++	unsigned long irqflags; \
++	u32 __fifo_ret = 0; \
++	trace_i915_reg_rw(true, reg, val, sizeof(val)); \
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags); \
++	if (NEEDS_FORCE_WAKE((dev_priv), (reg))) { \
++		__fifo_ret = __gen6_gt_wait_for_fifo(dev_priv); \
++	} \
++	if (IS_GEN5(dev_priv->dev)) \
++		ilk_dummy_write(dev_priv); \
++	hsw_unclaimed_reg_clear(dev_priv, reg); \
++	write##y(val, dev_priv->regs + reg); \
++	if (unlikely(__fifo_ret)) { \
++		gen6_gt_check_fifodbg(dev_priv); \
++	} \
++	hsw_unclaimed_reg_check(dev_priv, reg); \
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags); \
++}
++__i915_write(8, b)
++__i915_write(16, w)
++__i915_write(32, l)
++__i915_write(64, q)
++#undef __i915_write
++
++static const struct register_whitelist {
++	uint64_t offset;
++	uint32_t size;
++	uint32_t gen_bitmask; /* support gens, 0x10 for 4, 0x30 for 4 and 5, etc. */
++} whitelist[] = {
++	{ RING_TIMESTAMP(RENDER_RING_BASE), 8, 0xF0 },
++};
++
++int i915_reg_read_ioctl(struct drm_device *dev,
++			void *data, struct drm_file *file)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_reg_read *reg = data;
++	struct register_whitelist const *entry = whitelist;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(whitelist); i++, entry++) {
++		if (entry->offset == reg->offset &&
++		    (1 << INTEL_INFO(dev)->gen & entry->gen_bitmask))
++			break;
++	}
++
++	if (i == ARRAY_SIZE(whitelist))
++		return -EINVAL;
++
++	switch (entry->size) {
++	case 8:
++		reg->val = I915_READ64(reg->offset);
++		break;
++	case 4:
++		reg->val = I915_READ(reg->offset);
++		break;
++	case 2:
++		reg->val = I915_READ16(reg->offset);
++		break;
++	case 1:
++		reg->val = I915_READ8(reg->offset);
++		break;
++	default:
++		WARN_ON(1);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int i8xx_do_reset(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (IS_I85X(dev))
++		return -ENODEV;
++
++	I915_WRITE(D_STATE, I915_READ(D_STATE) | DSTATE_GFX_RESET_I830);
++	POSTING_READ(D_STATE);
++
++	if (IS_I830(dev) || IS_845G(dev)) {
++		I915_WRITE(DEBUG_RESET_I830,
++			   DEBUG_RESET_DISPLAY |
++			   DEBUG_RESET_RENDER |
++			   DEBUG_RESET_FULL);
++		POSTING_READ(DEBUG_RESET_I830);
++		msleep(1);
++
++		I915_WRITE(DEBUG_RESET_I830, 0);
++		POSTING_READ(DEBUG_RESET_I830);
++	}
++
++	msleep(1);
++
++	I915_WRITE(D_STATE, I915_READ(D_STATE) & ~DSTATE_GFX_RESET_I830);
++	POSTING_READ(D_STATE);
++
++	return 0;
++}
++
++static int i965_reset_complete(struct drm_device *dev)
++{
++	u8 gdrst;
++	pci_read_config_byte(dev->pdev, I965_GDRST, &gdrst);
++	return (gdrst & GRDOM_RESET_ENABLE) == 0;
++}
++
++static int i965_do_reset(struct drm_device *dev)
++{
++	int ret;
++
++	/*
++	 * Set the domains we want to reset (GRDOM/bits 2 and 3) as
++	 * well as the reset bit (GR/bit 0).  Setting the GR bit
++	 * triggers the reset; when done, the hardware will clear it.
++	 */
++	pci_write_config_byte(dev->pdev, I965_GDRST,
++			      GRDOM_RENDER | GRDOM_RESET_ENABLE);
++	ret =  wait_for(i965_reset_complete(dev), 500);
++	if (ret)
++		return ret;
++
++	/* We can't reset render&media without also resetting display ... */
++	pci_write_config_byte(dev->pdev, I965_GDRST,
++			      GRDOM_MEDIA | GRDOM_RESET_ENABLE);
++
++	ret =  wait_for(i965_reset_complete(dev), 500);
++	if (ret)
++		return ret;
++
++	pci_write_config_byte(dev->pdev, I965_GDRST, 0);
++
++	return 0;
++}
++
++static int ironlake_do_reset(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 gdrst;
++	int ret;
++
++	gdrst = I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR);
++	gdrst &= ~GRDOM_MASK;
++	I915_WRITE(MCHBAR_MIRROR_BASE + ILK_GDSR,
++		   gdrst | GRDOM_RENDER | GRDOM_RESET_ENABLE);
++	ret = wait_for(I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR) & 0x1, 500);
++	if (ret)
++		return ret;
++
++	/* We can't reset render&media without also resetting display ... */
++	gdrst = I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR);
++	gdrst &= ~GRDOM_MASK;
++	I915_WRITE(MCHBAR_MIRROR_BASE + ILK_GDSR,
++		   gdrst | GRDOM_MEDIA | GRDOM_RESET_ENABLE);
++	return wait_for(I915_READ(MCHBAR_MIRROR_BASE + ILK_GDSR) & 0x1, 500);
++}
++
++static int gen6_do_reset(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int	ret;
++	unsigned long irqflags;
++
++	/* Hold uncore.lock across reset to prevent any register access
++	 * with forcewake not set correctly
++	 */
++	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++
++	/* Reset the chip */
++
++	/* GEN6_GDRST is not in the gt power well, no need to check
++	 * for fifo space for the write or forcewake the chip for
++	 * the read
++	 */
++	I915_WRITE_NOTRACE(GEN6_GDRST, GEN6_GRDOM_FULL);
++
++	/* Spin waiting for the device to ack the reset request */
++	ret = wait_for((I915_READ_NOTRACE(GEN6_GDRST) & GEN6_GRDOM_FULL) == 0, 500);
++
++	/* If reset with a user forcewake, try to restore, otherwise turn it off */
++	if (dev_priv->uncore.forcewake_count)
++		dev_priv->uncore.funcs.force_wake_get(dev_priv);
++	else
++		dev_priv->uncore.funcs.force_wake_put(dev_priv);
++
++	/* Restore fifo count */
++	dev_priv->uncore.fifo_count = I915_READ_NOTRACE(GT_FIFO_FREE_ENTRIES);
++
++	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++	return ret;
++}
++
++int intel_gpu_reset(struct drm_device *dev)
++{
++	switch (INTEL_INFO(dev)->gen) {
++	case 7:
++	case 6: return gen6_do_reset(dev);
++	case 5: return ironlake_do_reset(dev);
++	case 4: return i965_do_reset(dev);
++	case 2: return i8xx_do_reset(dev);
++	default: return -ENODEV;
++	}
++}
++
++void intel_uncore_clear_errors(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (HAS_FPGA_DBG_UNCLAIMED(dev))
++		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
++}
++
++void intel_uncore_check_errors(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (HAS_FPGA_DBG_UNCLAIMED(dev) &&
++	    (I915_READ_NOTRACE(FPGA_DBG) & FPGA_DBG_RM_NOCLAIM)) {
++		DRM_ERROR("Unclaimed register before interrupt\n");
++		I915_WRITE_NOTRACE(FPGA_DBG, FPGA_DBG_RM_NOCLAIM);
++	}
++}

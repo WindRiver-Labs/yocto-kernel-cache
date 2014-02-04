@@ -1,0 +1,591 @@
+From 9f9bd2603f4383aa68ec4440cdd9997057e643f7 Mon Sep 17 00:00:00 2001
+From: David Herrmann <dh.herrmann@gmail.com>
+Date: Wed, 24 Jul 2013 21:07:52 +0200
+Subject: drm/gem: convert to new unified vma manager
+
+Use the new vma manager instead of the old hashtable. Also convert all
+drivers to use the new convenience helpers. This drops all the
+(map_list.hash.key << PAGE_SHIFT) non-sense.
+
+Locking and access-management is exactly the same as before with an
+additional lock inside of the vma-manager, which strictly wouldn't be
+needed for gem.
+
+v2:
+ - rebase on drm-next
+ - init nodes via drm_vma_node_reset() in drm_gem.c
+v3:
+ - fix tegra
+v4:
+ - remove duplicate if (drm_vma_node_has_offset()) checks
+ - inline now trivial drm_vma_node_offset_addr() calls
+v5:
+ - skip node-reset on gem-init due to kzalloc()
+ - do not allow mapping gem-objects with offsets (backwards compat)
+ - remove unneccessary casts
+
+Cc: Inki Dae <inki.dae@samsung.com>
+Cc: Rob Clark <robdclark@gmail.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Thierry Reding <thierry.reding@gmail.com>
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Acked-by: Patrik Jakobsson <patrik.r.jakobsson@gmail.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Dave Airlie <airlied@gmail.com>
+(cherry picked from commit 0de23977cfeb5b357ec884ba15417ae118ff9e9b)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/drm_gem.c                  |   89 ++++-------------------------
+ drivers/gpu/drm/drm_gem_cma_helper.c       |   16 +----
+ drivers/gpu/drm/exynos/exynos_drm_gem.c    |   14 +---
+ drivers/gpu/drm/gma500/gem.c               |   15 +---
+ drivers/gpu/drm/i915/i915_gem.c            |   10 +--
+ drivers/gpu/drm/omapdrm/omap_gem.c         |   28 ++++-----
+ drivers/gpu/drm/omapdrm/omap_gem_helpers.c |   49 ---------------
+ drivers/gpu/drm/udl/udl_gem.c              |   13 +---
+ drivers/gpu/host1x/drm/gem.c               |    5 -
+ include/drm/drmP.h                         |    7 --
+ include/uapi/drm/drm.h                     |    2 
+ 11 files changed, 62 insertions(+), 186 deletions(-)
+
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -37,6 +37,7 @@
+ #include <linux/shmem_fs.h>
+ #include <linux/dma-buf.h>
+ #include <drm/drmP.h>
++#include <drm/drm_vma_manager.h>
+ 
+ /** @file drm_gem.c
+  *
+@@ -102,14 +103,9 @@ drm_gem_init(struct drm_device *dev)
+ 	}
+ 
+ 	dev->mm_private = mm;
+-
+-	if (drm_ht_create(&mm->offset_hash, 12)) {
+-		kfree(mm);
+-		return -ENOMEM;
+-	}
+-
+-	drm_mm_init(&mm->offset_manager, DRM_FILE_PAGE_OFFSET_START,
+-		    DRM_FILE_PAGE_OFFSET_SIZE);
++	drm_vma_offset_manager_init(&mm->vma_manager,
++				    DRM_FILE_PAGE_OFFSET_START,
++				    DRM_FILE_PAGE_OFFSET_SIZE);
+ 
+ 	return 0;
+ }
+@@ -119,8 +115,7 @@ drm_gem_destroy(struct drm_device *dev)
+ {
+ 	struct drm_gem_mm *mm = dev->mm_private;
+ 
+-	drm_mm_takedown(&mm->offset_manager);
+-	drm_ht_remove(&mm->offset_hash);
++	drm_vma_offset_manager_destroy(&mm->vma_manager);
+ 	kfree(mm);
+ 	dev->mm_private = NULL;
+ }
+@@ -302,12 +297,8 @@ drm_gem_free_mmap_offset(struct drm_gem_
+ {
+ 	struct drm_device *dev = obj->dev;
+ 	struct drm_gem_mm *mm = dev->mm_private;
+-	struct drm_map_list *list = &obj->map_list;
+ 
+-	drm_ht_remove_item(&mm->offset_hash, &list->hash);
+-	drm_mm_put_block(list->file_offset_node);
+-	kfree(list->map);
+-	list->map = NULL;
++	drm_vma_offset_remove(&mm->vma_manager, &obj->vma_node);
+ }
+ EXPORT_SYMBOL(drm_gem_free_mmap_offset);
+ 
+@@ -327,54 +318,9 @@ drm_gem_create_mmap_offset(struct drm_ge
+ {
+ 	struct drm_device *dev = obj->dev;
+ 	struct drm_gem_mm *mm = dev->mm_private;
+-	struct drm_map_list *list;
+-	struct drm_local_map *map;
+-	int ret;
+-
+-	/* Set the object up for mmap'ing */
+-	list = &obj->map_list;
+-	list->map = kzalloc(sizeof(struct drm_map_list), GFP_KERNEL);
+-	if (!list->map)
+-		return -ENOMEM;
+-
+-	map = list->map;
+-	map->type = _DRM_GEM;
+-	map->size = obj->size;
+-	map->handle = obj;
+-
+-	/* Get a DRM GEM mmap offset allocated... */
+-	list->file_offset_node = drm_mm_search_free(&mm->offset_manager,
+-			obj->size / PAGE_SIZE, 0, false);
+-
+-	if (!list->file_offset_node) {
+-		DRM_ERROR("failed to allocate offset for bo %d\n", obj->name);
+-		ret = -ENOSPC;
+-		goto out_free_list;
+-	}
+-
+-	list->file_offset_node = drm_mm_get_block(list->file_offset_node,
+-			obj->size / PAGE_SIZE, 0);
+-	if (!list->file_offset_node) {
+-		ret = -ENOMEM;
+-		goto out_free_list;
+-	}
+-
+-	list->hash.key = list->file_offset_node->start;
+-	ret = drm_ht_insert_item(&mm->offset_hash, &list->hash);
+-	if (ret) {
+-		DRM_ERROR("failed to add to map hash\n");
+-		goto out_free_mm;
+-	}
+-
+-	return 0;
+ 
+-out_free_mm:
+-	drm_mm_put_block(list->file_offset_node);
+-out_free_list:
+-	kfree(list->map);
+-	list->map = NULL;
+-
+-	return ret;
++	return drm_vma_offset_add(&mm->vma_manager, &obj->vma_node,
++				  obj->size / PAGE_SIZE);
+ }
+ EXPORT_SYMBOL(drm_gem_create_mmap_offset);
+ 
+@@ -699,8 +645,8 @@ int drm_gem_mmap(struct file *filp, stru
+ 	struct drm_file *priv = filp->private_data;
+ 	struct drm_device *dev = priv->minor->dev;
+ 	struct drm_gem_mm *mm = dev->mm_private;
+-	struct drm_local_map *map = NULL;
+-	struct drm_hash_item *hash;
++	struct drm_gem_object *obj;
++	struct drm_vma_offset_node *node;
+ 	int ret = 0;
+ 
+ 	if (drm_device_is_unplugged(dev))
+@@ -708,21 +654,16 @@ int drm_gem_mmap(struct file *filp, stru
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 
+-	if (drm_ht_find_item(&mm->offset_hash, vma->vm_pgoff, &hash)) {
++	node = drm_vma_offset_exact_lookup(&mm->vma_manager, vma->vm_pgoff,
++					   vma_pages(vma));
++	if (!node) {
+ 		mutex_unlock(&dev->struct_mutex);
+ 		return drm_mmap(filp, vma);
+ 	}
+ 
+-	map = drm_hash_entry(hash, struct drm_map_list, hash)->map;
+-	if (!map ||
+-	    ((map->flags & _DRM_RESTRICTED) && !capable(CAP_SYS_ADMIN))) {
+-		ret =  -EPERM;
+-		goto out_unlock;
+-	}
+-
+-	ret = drm_gem_mmap_obj(map->handle, map->size, vma);
++	obj = container_of(node, struct drm_gem_object, vma_node);
++	ret = drm_gem_mmap_obj(obj, drm_vma_node_size(node), vma);
+ 
+-out_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	return ret;
+--- a/drivers/gpu/drm/drm_gem_cma_helper.c
++++ b/drivers/gpu/drm/drm_gem_cma_helper.c
+@@ -27,11 +27,7 @@
+ #include <drm/drmP.h>
+ #include <drm/drm.h>
+ #include <drm/drm_gem_cma_helper.h>
+-
+-static unsigned int get_gem_mmap_offset(struct drm_gem_object *obj)
+-{
+-	return (unsigned int)obj->map_list.hash.key << PAGE_SHIFT;
+-}
++#include <drm/drm_vma_manager.h>
+ 
+ /*
+  * __drm_gem_cma_create - Create a GEM CMA object without allocating memory
+@@ -172,8 +168,7 @@ void drm_gem_cma_free_object(struct drm_
+ {
+ 	struct drm_gem_cma_object *cma_obj;
+ 
+-	if (gem_obj->map_list.map)
+-		drm_gem_free_mmap_offset(gem_obj);
++	drm_gem_free_mmap_offset(gem_obj);
+ 
+ 	cma_obj = to_drm_gem_cma_obj(gem_obj);
+ 
+@@ -240,7 +235,7 @@ int drm_gem_cma_dumb_map_offset(struct d
+ 		return -EINVAL;
+ 	}
+ 
+-	*offset = get_gem_mmap_offset(gem_obj);
++	*offset = drm_vma_node_offset_addr(&gem_obj->vma_node);
+ 
+ 	drm_gem_object_unreference(gem_obj);
+ 
+@@ -304,12 +299,11 @@ void drm_gem_cma_describe(struct drm_gem
+ {
+ 	struct drm_gem_object *obj = &cma_obj->base;
+ 	struct drm_device *dev = obj->dev;
+-	uint64_t off = 0;
++	uint64_t off;
+ 
+ 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
+-	if (obj->map_list.map)
+-		off = (uint64_t)obj->map_list.hash.key;
++	off = drm_vma_node_start(&obj->vma_node);
+ 
+ 	seq_printf(m, "%2d (%2d) %08llx %08Zx %p %d",
+ 			obj->name, obj->refcount.refcount.counter,
+--- a/drivers/gpu/drm/exynos/exynos_drm_gem.c
++++ b/drivers/gpu/drm/exynos/exynos_drm_gem.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <drm/drmP.h>
++#include <drm/drm_vma_manager.h>
+ 
+ #include <linux/shmem_fs.h>
+ #include <drm/exynos_drm.h>
+@@ -154,8 +155,7 @@ out:
+ 	exynos_drm_fini_buf(obj->dev, buf);
+ 	exynos_gem_obj->buffer = NULL;
+ 
+-	if (obj->map_list.map)
+-		drm_gem_free_mmap_offset(obj);
++	drm_gem_free_mmap_offset(obj);
+ 
+ 	/* release file pointer to gem object. */
+ 	drm_gem_object_release(obj);
+@@ -721,13 +721,11 @@ int exynos_drm_gem_dumb_map_offset(struc
+ 		goto unlock;
+ 	}
+ 
+-	if (!obj->map_list.map) {
+-		ret = drm_gem_create_mmap_offset(obj);
+-		if (ret)
+-			goto out;
+-	}
++	ret = drm_gem_create_mmap_offset(obj);
++	if (ret)
++		goto out;
+ 
+-	*offset = (u64)obj->map_list.hash.key << PAGE_SHIFT;
++	*offset = drm_vma_node_offset_addr(&obj->vma_node);
+ 	DRM_DEBUG_KMS("offset = 0x%lx\n", (unsigned long)*offset);
+ 
+ out:
+--- a/drivers/gpu/drm/gma500/gem.c
++++ b/drivers/gpu/drm/gma500/gem.c
+@@ -26,6 +26,7 @@
+ #include <drm/drmP.h>
+ #include <drm/drm.h>
+ #include <drm/gma_drm.h>
++#include <drm/drm_vma_manager.h>
+ #include "psb_drv.h"
+ 
+ int psb_gem_init_object(struct drm_gem_object *obj)
+@@ -38,8 +39,7 @@ void psb_gem_free_object(struct drm_gem_
+ 	struct gtt_range *gtt = container_of(obj, struct gtt_range, gem);
+ 
+ 	/* Remove the list map if one is present */
+-	if (obj->map_list.map)
+-		drm_gem_free_mmap_offset(obj);
++	drm_gem_free_mmap_offset(obj);
+ 	drm_gem_object_release(obj);
+ 
+ 	/* This must occur last as it frees up the memory of the GEM object */
+@@ -81,13 +81,10 @@ int psb_gem_dumb_map_gtt(struct drm_file
+ 	/* What validation is needed here ? */
+ 
+ 	/* Make it mmapable */
+-	if (!obj->map_list.map) {
+-		ret = drm_gem_create_mmap_offset(obj);
+-		if (ret)
+-			goto out;
+-	}
+-	/* GEM should really work out the hash offsets for us */
+-	*offset = (u64)obj->map_list.hash.key << PAGE_SHIFT;
++	ret = drm_gem_create_mmap_offset(obj);
++	if (ret)
++		goto out;
++	*offset = drm_vma_node_offset_addr(&obj->vma_node);
+ out:
+ 	drm_gem_object_unreference(obj);
+ unlock:
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -26,6 +26,7 @@
+  */
+ 
+ #include <drm/drmP.h>
++#include <drm/drm_vma_manager.h>
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ #include "i915_trace.h"
+@@ -1424,7 +1425,7 @@ i915_gem_release_mmap(struct drm_i915_ge
+ 
+ 	if (obj->base.dev->dev_mapping)
+ 		unmap_mapping_range(obj->base.dev->dev_mapping,
+-				    (loff_t)obj->base.map_list.hash.key<<PAGE_SHIFT,
++				    (loff_t)drm_vma_node_offset_addr(&obj->base.vma_node),
+ 				    obj->base.size, 1);
+ 
+ 	obj->fault_mappable = false;
+@@ -1482,7 +1483,7 @@ static int i915_gem_object_create_mmap_o
+ 	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ 	int ret;
+ 
+-	if (obj->base.map_list.map)
++	if (drm_vma_node_has_offset(&obj->base.vma_node))
+ 		return 0;
+ 
+ 	dev_priv->mm.shrinker_no_lock_stealing = true;
+@@ -1513,9 +1514,6 @@ out:
+ 
+ static void i915_gem_object_free_mmap_offset(struct drm_i915_gem_object *obj)
+ {
+-	if (!obj->base.map_list.map)
+-		return;
+-
+ 	drm_gem_free_mmap_offset(&obj->base);
+ }
+ 
+@@ -1554,7 +1552,7 @@ i915_gem_mmap_gtt(struct drm_file *file,
+ 	if (ret)
+ 		goto out;
+ 
+-	*offset = (u64)obj->base.map_list.hash.key << PAGE_SHIFT;
++	*offset = drm_vma_node_offset_addr(&obj->base.vma_node);
+ 
+ out:
+ 	drm_gem_object_unreference(&obj->base);
+--- a/drivers/gpu/drm/omapdrm/omap_gem.c
++++ b/drivers/gpu/drm/omapdrm/omap_gem.c
+@@ -20,6 +20,7 @@
+ 
+ #include <linux/spinlock.h>
+ #include <linux/shmem_fs.h>
++#include <drm/drm_vma_manager.h>
+ 
+ #include "omap_drv.h"
+ #include "omap_dmm_tiler.h"
+@@ -308,21 +309,20 @@ uint32_t omap_gem_flags(struct drm_gem_o
+ static uint64_t mmap_offset(struct drm_gem_object *obj)
+ {
+ 	struct drm_device *dev = obj->dev;
++	int ret;
++	size_t size;
+ 
+ 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
+-	if (!obj->map_list.map) {
+-		/* Make it mmapable */
+-		size_t size = omap_gem_mmap_size(obj);
+-		int ret = _drm_gem_create_mmap_offset_size(obj, size);
+-
+-		if (ret) {
+-			dev_err(dev->dev, "could not allocate mmap offset\n");
+-			return 0;
+-		}
++	/* Make it mmapable */
++	size = omap_gem_mmap_size(obj);
++	ret = _drm_gem_create_mmap_offset_size(obj, size);
++	if (ret) {
++		dev_err(dev->dev, "could not allocate mmap offset\n");
++		return 0;
+ 	}
+ 
+-	return (uint64_t)obj->map_list.hash.key << PAGE_SHIFT;
++	return drm_vma_node_offset_addr(&obj->vma_node);
+ }
+ 
+ uint64_t omap_gem_mmap_offset(struct drm_gem_object *obj)
+@@ -997,12 +997,11 @@ void omap_gem_describe(struct drm_gem_ob
+ {
+ 	struct drm_device *dev = obj->dev;
+ 	struct omap_gem_object *omap_obj = to_omap_bo(obj);
+-	uint64_t off = 0;
++	uint64_t off;
+ 
+ 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+ 
+-	if (obj->map_list.map)
+-		off = (uint64_t)obj->map_list.hash.key;
++	off = drm_vma_node_start(&obj->vma_node);
+ 
+ 	seq_printf(m, "%08x: %2d (%2d) %08llx %08Zx (%2d) %p %4d",
+ 			omap_obj->flags, obj->name, obj->refcount.refcount.counter,
+@@ -1309,8 +1308,7 @@ void omap_gem_free_object(struct drm_gem
+ 
+ 	list_del(&omap_obj->mm_list);
+ 
+-	if (obj->map_list.map)
+-		drm_gem_free_mmap_offset(obj);
++	drm_gem_free_mmap_offset(obj);
+ 
+ 	/* this means the object is still pinned.. which really should
+ 	 * not happen.  I think..
+--- a/drivers/gpu/drm/omapdrm/omap_gem_helpers.c
++++ b/drivers/gpu/drm/omapdrm/omap_gem_helpers.c
+@@ -118,52 +118,7 @@ _drm_gem_create_mmap_offset_size(struct
+ {
+ 	struct drm_device *dev = obj->dev;
+ 	struct drm_gem_mm *mm = dev->mm_private;
+-	struct drm_map_list *list;
+-	struct drm_local_map *map;
+-	int ret = 0;
+ 
+-	/* Set the object up for mmap'ing */
+-	list = &obj->map_list;
+-	list->map = kzalloc(sizeof(struct drm_map_list), GFP_KERNEL);
+-	if (!list->map)
+-		return -ENOMEM;
+-
+-	map = list->map;
+-	map->type = _DRM_GEM;
+-	map->size = size;
+-	map->handle = obj;
+-
+-	/* Get a DRM GEM mmap offset allocated... */
+-	list->file_offset_node = drm_mm_search_free(&mm->offset_manager,
+-			size / PAGE_SIZE, 0, 0);
+-
+-	if (!list->file_offset_node) {
+-		DRM_ERROR("failed to allocate offset for bo %d\n", obj->name);
+-		ret = -ENOSPC;
+-		goto out_free_list;
+-	}
+-
+-	list->file_offset_node = drm_mm_get_block(list->file_offset_node,
+-			size / PAGE_SIZE, 0);
+-	if (!list->file_offset_node) {
+-		ret = -ENOMEM;
+-		goto out_free_list;
+-	}
+-
+-	list->hash.key = list->file_offset_node->start;
+-	ret = drm_ht_insert_item(&mm->offset_hash, &list->hash);
+-	if (ret) {
+-		DRM_ERROR("failed to add to map hash\n");
+-		goto out_free_mm;
+-	}
+-
+-	return 0;
+-
+-out_free_mm:
+-	drm_mm_put_block(list->file_offset_node);
+-out_free_list:
+-	kfree(list->map);
+-	list->map = NULL;
+-
+-	return ret;
++	return drm_vma_offset_add(&mm->vma_manager, &obj->vma_node,
++				  size / PAGE_SIZE);
+ }
+--- a/drivers/gpu/drm/udl/udl_gem.c
++++ b/drivers/gpu/drm/udl/udl_gem.c
+@@ -223,8 +223,7 @@ void udl_gem_free_object(struct drm_gem_
+ 	if (obj->pages)
+ 		udl_gem_put_pages(obj);
+ 
+-	if (gem_obj->map_list.map)
+-		drm_gem_free_mmap_offset(gem_obj);
++	drm_gem_free_mmap_offset(gem_obj);
+ }
+ 
+ /* the dumb interface doesn't work with the GEM straight MMAP
+@@ -247,13 +246,11 @@ int udl_gem_mmap(struct drm_file *file,
+ 	ret = udl_gem_get_pages(gobj, GFP_KERNEL);
+ 	if (ret)
+ 		goto out;
+-	if (!gobj->base.map_list.map) {
+-		ret = drm_gem_create_mmap_offset(obj);
+-		if (ret)
+-			goto out;
+-	}
++	ret = drm_gem_create_mmap_offset(obj);
++	if (ret)
++		goto out;
+ 
+-	*offset = (u64)gobj->base.map_list.hash.key << PAGE_SHIFT;
++	*offset = drm_vma_node_offset_addr(&gobj->base.vma_node);
+ 
+ out:
+ 	drm_gem_object_unreference(&gobj->base);
+--- a/drivers/gpu/host1x/drm/gem.c
++++ b/drivers/gpu/host1x/drm/gem.c
+@@ -108,7 +108,7 @@ static void tegra_bo_destroy(struct drm_
+ 
+ unsigned int tegra_bo_get_mmap_offset(struct tegra_bo *bo)
+ {
+-	return (unsigned int)bo->gem.map_list.hash.key << PAGE_SHIFT;
++	return (unsigned int)drm_vma_node_offset_addr(&bo->gem.vma_node);
+ }
+ 
+ struct tegra_bo *tegra_bo_create(struct drm_device *drm, unsigned int size)
+@@ -182,8 +182,7 @@ void tegra_bo_free_object(struct drm_gem
+ {
+ 	struct tegra_bo *bo = to_tegra_bo(gem);
+ 
+-	if (gem->map_list.map)
+-		drm_gem_free_mmap_offset(gem);
++	drm_gem_free_mmap_offset(gem);
+ 
+ 	drm_gem_object_release(gem);
+ 	tegra_bo_destroy(gem->dev, bo);
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -74,6 +74,7 @@
+ #include <asm/pgalloc.h>
+ #include <drm/drm.h>
+ #include <drm/drm_sarea.h>
++#include <drm/drm_vma_manager.h>
+ 
+ #include <linux/idr.h>
+ 
+@@ -590,7 +591,6 @@ struct drm_map_list {
+ 	struct drm_local_map *map;	/**< mapping */
+ 	uint64_t user_token;
+ 	struct drm_master *master;
+-	struct drm_mm_node *file_offset_node;	/**< fake offset */
+ };
+ 
+ /**
+@@ -625,8 +625,7 @@ struct drm_ati_pcigart_info {
+  * GEM specific mm private for tracking GEM objects
+  */
+ struct drm_gem_mm {
+-	struct drm_mm offset_manager;	/**< Offset mgmt for buffer objects */
+-	struct drm_open_hash offset_hash; /**< User token hash table for maps */
++	struct drm_vma_offset_manager vma_manager;
+ };
+ 
+ /**
+@@ -647,7 +646,7 @@ struct drm_gem_object {
+ 	struct file *filp;
+ 
+ 	/* Mapping info for this object */
+-	struct drm_map_list map_list;
++	struct drm_vma_offset_node vma_node;
+ 
+ 	/**
+ 	 * Size of the object, in bytes.  Immutable over the object's
+--- a/include/uapi/drm/drm.h
++++ b/include/uapi/drm/drm.h
+@@ -181,7 +181,7 @@ enum drm_map_type {
+ 	_DRM_AGP = 3,		  /**< AGP/GART */
+ 	_DRM_SCATTER_GATHER = 4,  /**< Scatter/gather memory for PCI DMA */
+ 	_DRM_CONSISTENT = 5,	  /**< Consistent memory for PCI DMA */
+-	_DRM_GEM = 6,		  /**< GEM object */
++	_DRM_GEM = 6,		  /**< GEM object (obsolete) */
+ };
+ 
+ /**

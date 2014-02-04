@@ -1,0 +1,158 @@
+From 7d90aef0324df9789299ba23043207c71f867bef Mon Sep 17 00:00:00 2001
+From: Chon Ming Lee <chon.ming.lee@intel.com>
+Date: Fri, 27 Sep 2013 15:31:00 +0800
+Subject: drm/i915: Program GMBUS Frequency based on the CDCLK for VLV.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CDCLK is used to generate the gmbus clock.  This is normally done by
+BIOS. Program the value if the BIOS-less system doesn't do it.
+
+v2: Move this to intel_i2c_reset to allow reprogram the gmbus frequency
+during resume. (Daniel)
+
+v3: Change GMBUS_FREQ to GMBUSFREQ_VLV, and use VLV_DISPLAY_BASE.
+(Ville).
+	Remove cdclk_ratio[] table, and calculate the cdclk ratio instead.
+(Ville).
+ 	Change the shift then mask for reg read, to mask first, then shift.
+(Ville).
+	Remove the gmbus frequency calculation = cdclk/1.01.  Based on BIOS
+programming, gmbus frequency = cdclk frequency. (Ville)
+	Add get_disp_clk_div, which can use to get cdclk/czclk divide.
+
+v4: Fix the mmio_offset base for CZCLK_CDCLK_FREQ_RATIO, gmbus_freq
+calculation, and duplicate check for gmbus_freq. (Ville)
+
+In VLV, the spec is wrong about 4Mhz reference frequency for GMBUS. It
+should be 1Mhz.
+
+Signed-off-by: Chon Ming Lee <chon.ming.lee@intel.com>
+[danvet: Add the comment Ville suggested. Also appease checkpatch a
+bit.]
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit 24eb2d599b6a2bf7761c00e1959898d1d9240cb5)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_reg.h  |  8 +++++
+ drivers/gpu/drm/i915/intel_i2c.c | 64 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 72 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 00fda45728d7..33bb4750516a 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -382,6 +382,8 @@
+ #define   FB_FMAX_VMIN_FREQ_LO_MASK		0xf8000000
+ 
+ /* vlv2 north clock has */
++#define CCK_FUSE_REG				0x8
++#define  CCK_FUSE_HPLL_FREQ_MASK		0x3
+ #define CCK_REG_DSI_PLL_FUSE			0x44
+ #define CCK_REG_DSI_PLL_CONTROL			0x48
+ #define  DSI_PLL_VCO_EN				(1 << 31)
+@@ -1429,6 +1431,12 @@
+ 
+ #define MI_ARB_VLV		(VLV_DISPLAY_BASE + 0x6504)
+ 
++#define CZCLK_CDCLK_FREQ_RATIO	(VLV_DISPLAY_BASE + 0x6508)
++#define   CDCLK_FREQ_SHIFT	4
++#define   CDCLK_FREQ_MASK	(0x1f << CDCLK_FREQ_SHIFT)
++#define   CZCLK_FREQ_MASK	0xf
++#define GMBUSFREQ_VLV		(VLV_DISPLAY_BASE + 0x6510)
++
+ /*
+  * Palette regs
+  */
+diff --git a/drivers/gpu/drm/i915/intel_i2c.c b/drivers/gpu/drm/i915/intel_i2c.c
+index d1c1e0f7f262..2ca17b14b6c1 100644
+--- a/drivers/gpu/drm/i915/intel_i2c.c
++++ b/drivers/gpu/drm/i915/intel_i2c.c
+@@ -34,6 +34,11 @@
+ #include <drm/i915_drm.h>
+ #include "i915_drv.h"
+ 
++enum disp_clk {
++	CDCLK,
++	CZCLK
++};
++
+ struct gmbus_port {
+ 	const char *name;
+ 	int reg;
+@@ -58,10 +63,69 @@ to_intel_gmbus(struct i2c_adapter *i2c)
+ 	return container_of(i2c, struct intel_gmbus, adapter);
+ }
+ 
++static int get_disp_clk_div(struct drm_i915_private *dev_priv,
++			    enum disp_clk clk)
++{
++	u32 reg_val;
++	int clk_ratio;
++
++	reg_val = I915_READ(CZCLK_CDCLK_FREQ_RATIO);
++
++	if (clk == CDCLK)
++		clk_ratio =
++			((reg_val & CDCLK_FREQ_MASK) >> CDCLK_FREQ_SHIFT) + 1;
++	else
++		clk_ratio = (reg_val & CZCLK_FREQ_MASK) + 1;
++
++	return clk_ratio;
++}
++
++static void gmbus_set_freq(struct drm_i915_private *dev_priv)
++{
++	int vco_freq[] = { 800, 1600, 2000, 2400 };
++	int gmbus_freq = 0, cdclk_div, hpll_freq;
++
++	BUG_ON(!IS_VALLEYVIEW(dev_priv->dev));
++
++	/* Skip setting the gmbus freq if BIOS has already programmed it */
++	if (I915_READ(GMBUSFREQ_VLV) != 0xA0)
++		return;
++
++	/* Obtain SKU information */
++	mutex_lock(&dev_priv->dpio_lock);
++	hpll_freq =
++		vlv_cck_read(dev_priv, CCK_FUSE_REG) & CCK_FUSE_HPLL_FREQ_MASK;
++	mutex_unlock(&dev_priv->dpio_lock);
++
++	/* Get the CDCLK divide ratio */
++	cdclk_div = get_disp_clk_div(dev_priv, CDCLK);
++
++	/*
++	 * Program the gmbus_freq based on the cdclk frequency.
++	 * BSpec erroneously claims we should aim for 4MHz, but
++	 * in fact 1MHz is the correct frequency.
++	 */
++	if (cdclk_div)
++		gmbus_freq = (vco_freq[hpll_freq] << 1) / cdclk_div;
++
++	if (WARN_ON(gmbus_freq == 0))
++		return;
++
++	I915_WRITE(GMBUSFREQ_VLV, gmbus_freq);
++}
++
+ void
+ intel_i2c_reset(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/*
++	 * In BIOS-less system, program the correct gmbus frequency
++	 * before reading edid.
++	 */
++	if (IS_VALLEYVIEW(dev))
++		gmbus_set_freq(dev_priv);
++
+ 	I915_WRITE(dev_priv->gpio_mmio_base + GMBUS0, 0);
+ 	I915_WRITE(dev_priv->gpio_mmio_base + GMBUS4, 0);
+ }
+-- 
+1.8.5.rc3
+

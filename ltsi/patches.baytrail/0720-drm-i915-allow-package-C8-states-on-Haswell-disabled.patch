@@ -1,0 +1,654 @@
+From 8a15d0a7767762e5901533b37c17bd2fa126617b Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Mon, 19 Aug 2013 13:18:09 -0300
+Subject: drm/i915: allow package C8+ states on Haswell (disabled)
+
+This patch allows PC8+ states on Haswell. These states can only be
+reached when all the display outputs are disabled, and they allow some
+more power savings.
+
+The fact that the graphics device is allowing PC8+ doesn't mean that
+the machine will actually enter PC8+: all the other devices also need
+to allow PC8+.
+
+For now this option is disabled by default. You need i915.allow_pc8=1
+if you want it.
+
+This patch adds a big comment inside i915_drv.h explaining how it
+works and how it tracks things. Read it.
+
+v2: (this is not really v2, many previous versions were already sent,
+     but they had different names)
+    - Use the new functions to enable/disable GTIMR and GEN6_PMIMR
+    - Rename almost all variables and functions to names suggested by
+      Chris
+    - More WARNs on the IRQ handling code
+    - Also disable PC8 when there's GPU work to do (thanks to Ben for
+      the help on this), so apps can run caster
+    - Enable PC8 on a delayed work function that is delayed for 5
+      seconds. This makes sure we only enable PC8+ if we're really
+      idle
+    - Make sure we're not in PC8+ when suspending
+v3: - WARN if IRQs are disabled on __wait_seqno
+    - Replace some DRM_ERRORs with WARNs
+    - Fix calls to restore GT and PM interrupts
+    - Use intel_mark_busy instead of intel_ring_advance to disable PC8
+v4: - Use the force_wake, Luke!
+v5: - Remove the "IIR is not zero" WARNs
+    - Move the force_wake chunk to its own patch
+    - Only restore what's missing from RC6, not everything
+
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit c67a470b1db781c54be07a87217cff35a91f564e)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |   10 ++
+ drivers/gpu/drm/i915/i915_drv.c      |   11 ++
+ drivers/gpu/drm/i915/i915_drv.h      |   72 ++++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c      |    2 
+ drivers/gpu/drm/i915/i915_irq.c      |  101 ++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_display.c |  170 ++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_dp.c      |    3 
+ drivers/gpu/drm/i915/intel_drv.h     |    8 +
+ drivers/gpu/drm/i915/intel_i2c.c     |    2 
+ drivers/gpu/drm/i915/intel_pm.c      |   13 ++
+ 10 files changed, 390 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1494,6 +1494,14 @@ int i915_driver_load(struct drm_device *
+ 	mutex_init(&dev_priv->rps.hw_lock);
+ 	mutex_init(&dev_priv->modeset_restore_lock);
+ 
++	mutex_init(&dev_priv->pc8.lock);
++	dev_priv->pc8.requirements_met = false;
++	dev_priv->pc8.gpu_idle = false;
++	dev_priv->pc8.irqs_disabled = false;
++	dev_priv->pc8.enabled = false;
++	dev_priv->pc8.disable_count = 2; /* requirements_met + gpu_idle */
++	INIT_DELAYED_WORK(&dev_priv->pc8.enable_work, hsw_enable_pc8_work);
++
+ 	i915_dump_device_info(dev_priv);
+ 
+ 	/* Not all pre-production machines fall into this category, only the
+@@ -1748,6 +1756,8 @@ int i915_driver_unload(struct drm_device
+ 	cancel_work_sync(&dev_priv->gpu_error.work);
+ 	i915_destroy_error_state(dev);
+ 
++	cancel_delayed_work_sync(&dev_priv->pc8.enable_work);
++
+ 	if (dev->pdev->msi_enabled)
+ 		pci_disable_msi(dev->pdev);
+ 
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -141,6 +141,10 @@ module_param_named(fastboot, i915_fastbo
+ MODULE_PARM_DESC(fastboot, "Try to skip unnecessary mode sets at boot time "
+ 		 "(default: false)");
+ 
++int i915_enable_pc8 __read_mostly = 0;
++module_param_named(enable_pc8, i915_enable_pc8, int, 0600);
++MODULE_PARM_DESC(enable_pc8, "Enable support for low power package C states (PC8+) (default: false)");
++
+ bool i915_prefault_disable __read_mostly;
+ module_param_named(prefault_disable, i915_prefault_disable, bool, 0600);
+ MODULE_PARM_DESC(prefault_disable,
+@@ -557,6 +561,9 @@ static int i915_drm_freeze(struct drm_de
+ 	dev_priv->modeset_restore = MODESET_SUSPENDED;
+ 	mutex_unlock(&dev_priv->modeset_restore_lock);
+ 
++	/* We do a lot of poking in a lot of registers, make sure they work
++	 * properly. */
++	hsw_disable_package_c8(dev_priv);
+ 	intel_set_power_well(dev, true);
+ 
+ 	drm_kms_helper_poll_disable(dev);
+@@ -713,6 +720,10 @@ static int __i915_drm_thaw(struct drm_de
+ 		schedule_work(&dev_priv->console_resume_work);
+ 	}
+ 
++	/* Undo what we did at i915_drm_freeze so the refcount goes back to the
++	 * expected level. */
++	hsw_enable_package_c8(dev_priv);
++
+ 	mutex_lock(&dev_priv->modeset_restore_lock);
+ 	dev_priv->modeset_restore = MODESET_DONE;
+ 	mutex_unlock(&dev_priv->modeset_restore_lock);
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1076,6 +1076,75 @@ struct intel_wm_level {
+ 	uint32_t fbc_val;
+ };
+ 
++/*
++ * This struct tracks the state needed for the Package C8+ feature.
++ *
++ * Package states C8 and deeper are really deep PC states that can only be
++ * reached when all the devices on the system allow it, so even if the graphics
++ * device allows PC8+, it doesn't mean the system will actually get to these
++ * states.
++ *
++ * Our driver only allows PC8+ when all the outputs are disabled, the power well
++ * is disabled and the GPU is idle. When these conditions are met, we manually
++ * do the other conditions: disable the interrupts, clocks and switch LCPLL
++ * refclk to Fclk.
++ *
++ * When we really reach PC8 or deeper states (not just when we allow it) we lose
++ * the state of some registers, so when we come back from PC8+ we need to
++ * restore this state. We don't get into PC8+ if we're not in RC6, so we don't
++ * need to take care of the registers kept by RC6.
++ *
++ * The interrupt disabling is part of the requirements. We can only leave the
++ * PCH HPD interrupts enabled. If we're in PC8+ and we get another interrupt we
++ * can lock the machine.
++ *
++ * Ideally every piece of our code that needs PC8+ disabled would call
++ * hsw_disable_package_c8, which would increment disable_count and prevent the
++ * system from reaching PC8+. But we don't have a symmetric way to do this for
++ * everything, so we have the requirements_met and gpu_idle variables. When we
++ * switch requirements_met or gpu_idle to true we decrease disable_count, and
++ * increase it in the opposite case. The requirements_met variable is true when
++ * all the CRTCs, encoders and the power well are disabled. The gpu_idle
++ * variable is true when the GPU is idle.
++ *
++ * In addition to everything, we only actually enable PC8+ if disable_count
++ * stays at zero for at least some seconds. This is implemented with the
++ * enable_work variable. We do this so we don't enable/disable PC8 dozens of
++ * consecutive times when all screens are disabled and some background app
++ * queries the state of our connectors, or we have some application constantly
++ * waking up to use the GPU. Only after the enable_work function actually
++ * enables PC8+ the "enable" variable will become true, which means that it can
++ * be false even if disable_count is 0.
++ *
++ * The irqs_disabled variable becomes true exactly after we disable the IRQs and
++ * goes back to false exactly before we reenable the IRQs. We use this variable
++ * to check if someone is trying to enable/disable IRQs while they're supposed
++ * to be disabled. This shouldn't happen and we'll print some error messages in
++ * case it happens, but if it actually happens we'll also update the variables
++ * inside struct regsave so when we restore the IRQs they will contain the
++ * latest expected values.
++ *
++ * For more, read "Display Sequences for Package C8" on our documentation.
++ */
++struct i915_package_c8 {
++	bool requirements_met;
++	bool gpu_idle;
++	bool irqs_disabled;
++	/* Only true after the delayed work task actually enables it. */
++	bool enabled;
++	int disable_count;
++	struct mutex lock;
++	struct delayed_work enable_work;
++
++	struct {
++		uint32_t deimr;
++		uint32_t sdeimr;
++		uint32_t gtimr;
++		uint32_t gtier;
++		uint32_t gen6_pmimr;
++	} regsave;
++};
++
+ typedef struct drm_i915_private {
+ 	struct drm_device *dev;
+ 	struct kmem_cache *slab;
+@@ -1260,6 +1329,8 @@ typedef struct drm_i915_private {
+ 		uint16_t cur_latency[5];
+ 	} wm;
+ 
++	struct i915_package_c8 pc8;
++
+ 	/* Old dri1 support infrastructure, beware the dragons ya fools entering
+ 	 * here! */
+ 	struct i915_dri1_state dri1;
+@@ -1635,6 +1706,7 @@ extern unsigned int i915_preliminary_hw_
+ extern int i915_disable_power_well __read_mostly;
+ extern int i915_enable_ips __read_mostly;
+ extern bool i915_fastboot __read_mostly;
++extern int i915_enable_pc8 __read_mostly;
+ extern bool i915_prefault_disable __read_mostly;
+ 
+ extern int i915_suspend(struct drm_device *dev, pm_message_t state);
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -999,6 +999,8 @@ static int __wait_seqno(struct intel_rin
+ 	bool wait_forever = true;
+ 	int ret;
+ 
++	WARN(dev_priv->pc8.irqs_disabled, "IRQs disabled\n");
++
+ 	if (i915_seqno_passed(ring->get_seqno(ring, true), seqno))
+ 		return 0;
+ 
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -85,6 +85,12 @@ ironlake_enable_display_irq(drm_i915_pri
+ {
+ 	assert_spin_locked(&dev_priv->irq_lock);
+ 
++	if (dev_priv->pc8.irqs_disabled) {
++		WARN(1, "IRQs disabled\n");
++		dev_priv->pc8.regsave.deimr &= ~mask;
++		return;
++	}
++
+ 	if ((dev_priv->irq_mask & mask) != 0) {
+ 		dev_priv->irq_mask &= ~mask;
+ 		I915_WRITE(DEIMR, dev_priv->irq_mask);
+@@ -97,6 +103,12 @@ ironlake_disable_display_irq(drm_i915_pr
+ {
+ 	assert_spin_locked(&dev_priv->irq_lock);
+ 
++	if (dev_priv->pc8.irqs_disabled) {
++		WARN(1, "IRQs disabled\n");
++		dev_priv->pc8.regsave.deimr |= mask;
++		return;
++	}
++
+ 	if ((dev_priv->irq_mask & mask) != mask) {
+ 		dev_priv->irq_mask |= mask;
+ 		I915_WRITE(DEIMR, dev_priv->irq_mask);
+@@ -116,6 +128,14 @@ static void ilk_update_gt_irq(struct drm
+ {
+ 	assert_spin_locked(&dev_priv->irq_lock);
+ 
++	if (dev_priv->pc8.irqs_disabled) {
++		WARN(1, "IRQs disabled\n");
++		dev_priv->pc8.regsave.gtimr &= ~interrupt_mask;
++		dev_priv->pc8.regsave.gtimr |= (~enabled_irq_mask &
++						interrupt_mask);
++		return;
++	}
++
+ 	dev_priv->gt_irq_mask &= ~interrupt_mask;
+ 	dev_priv->gt_irq_mask |= (~enabled_irq_mask & interrupt_mask);
+ 	I915_WRITE(GTIMR, dev_priv->gt_irq_mask);
+@@ -146,6 +166,14 @@ static void snb_update_pm_irq(struct drm
+ 
+ 	assert_spin_locked(&dev_priv->irq_lock);
+ 
++	if (dev_priv->pc8.irqs_disabled) {
++		WARN(1, "IRQs disabled\n");
++		dev_priv->pc8.regsave.gen6_pmimr &= ~interrupt_mask;
++		dev_priv->pc8.regsave.gen6_pmimr |= (~enabled_irq_mask &
++						     interrupt_mask);
++		return;
++	}
++
+ 	new_val = dev_priv->pm_irq_mask;
+ 	new_val &= ~interrupt_mask;
+ 	new_val |= (~enabled_irq_mask & interrupt_mask);
+@@ -257,6 +285,15 @@ static void ibx_display_interrupt_update
+ 
+ 	assert_spin_locked(&dev_priv->irq_lock);
+ 
++	if (dev_priv->pc8.irqs_disabled &&
++	    (interrupt_mask & SDE_HOTPLUG_MASK_CPT)) {
++		WARN(1, "IRQs disabled\n");
++		dev_priv->pc8.regsave.sdeimr &= ~interrupt_mask;
++		dev_priv->pc8.regsave.sdeimr |= (~enabled_irq_mask &
++						 interrupt_mask);
++		return;
++	}
++
+ 	I915_WRITE(SDEIMR, sdeimr);
+ 	POSTING_READ(SDEIMR);
+ }
+@@ -3159,3 +3196,67 @@ void intel_hpd_init(struct drm_device *d
+ 		dev_priv->display.hpd_irq_setup(dev);
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+ }
++
++/* Disable interrupts so we can allow Package C8+. */
++void hsw_pc8_disable_interrupts(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	unsigned long irqflags;
++
++	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++
++	dev_priv->pc8.regsave.deimr = I915_READ(DEIMR);
++	dev_priv->pc8.regsave.sdeimr = I915_READ(SDEIMR);
++	dev_priv->pc8.regsave.gtimr = I915_READ(GTIMR);
++	dev_priv->pc8.regsave.gtier = I915_READ(GTIER);
++	dev_priv->pc8.regsave.gen6_pmimr = I915_READ(GEN6_PMIMR);
++
++	ironlake_disable_display_irq(dev_priv, ~DE_PCH_EVENT_IVB);
++	ibx_disable_display_interrupt(dev_priv, ~SDE_HOTPLUG_MASK_CPT);
++	ilk_disable_gt_irq(dev_priv, 0xffffffff);
++	snb_disable_pm_irq(dev_priv, 0xffffffff);
++
++	dev_priv->pc8.irqs_disabled = true;
++
++	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++}
++
++/* Restore interrupts so we can recover from Package C8+. */
++void hsw_pc8_restore_interrupts(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	unsigned long irqflags;
++	uint32_t val, expected;
++
++	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
++
++	val = I915_READ(DEIMR);
++	expected = ~DE_PCH_EVENT_IVB;
++	WARN(val != expected, "DEIMR is 0x%08x, not 0x%08x\n", val, expected);
++
++	val = I915_READ(SDEIMR) & ~SDE_HOTPLUG_MASK_CPT;
++	expected = ~SDE_HOTPLUG_MASK_CPT;
++	WARN(val != expected, "SDEIMR non-HPD bits are 0x%08x, not 0x%08x\n",
++	     val, expected);
++
++	val = I915_READ(GTIMR);
++	expected = 0xffffffff;
++	WARN(val != expected, "GTIMR is 0x%08x, not 0x%08x\n", val, expected);
++
++	val = I915_READ(GEN6_PMIMR);
++	expected = 0xffffffff;
++	WARN(val != expected, "GEN6_PMIMR is 0x%08x, not 0x%08x\n", val,
++	     expected);
++
++	dev_priv->pc8.irqs_disabled = false;
++
++	ironlake_enable_display_irq(dev_priv, ~dev_priv->pc8.regsave.deimr);
++	ibx_enable_display_interrupt(dev_priv,
++				     ~dev_priv->pc8.regsave.sdeimr &
++				     ~SDE_HOTPLUG_MASK_CPT);
++	ilk_enable_gt_irq(dev_priv, ~dev_priv->pc8.regsave.gtimr);
++	snb_enable_pm_irq(dev_priv, ~dev_priv->pc8.regsave.gen6_pmimr);
++	I915_WRITE(GTIER, dev_priv->pc8.regsave.gtier);
++
++	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
++}
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -6064,6 +6064,166 @@ void hsw_restore_lcpll(struct drm_i915_p
+ 	dev_priv->uncore.funcs.force_wake_put(dev_priv);
+ }
+ 
++void hsw_enable_pc8_work(struct work_struct *__work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(to_delayed_work(__work), struct drm_i915_private,
++			     pc8.enable_work);
++	struct drm_device *dev = dev_priv->dev;
++	uint32_t val;
++
++	if (dev_priv->pc8.enabled)
++		return;
++
++	DRM_DEBUG_KMS("Enabling package C8+\n");
++
++	dev_priv->pc8.enabled = true;
++
++	if (dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE) {
++		val = I915_READ(SOUTH_DSPCLK_GATE_D);
++		val &= ~PCH_LP_PARTITION_LEVEL_DISABLE;
++		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
++	}
++
++	lpt_disable_clkout_dp(dev);
++	hsw_pc8_disable_interrupts(dev);
++	hsw_disable_lcpll(dev_priv, true, true);
++}
++
++static void __hsw_enable_package_c8(struct drm_i915_private *dev_priv)
++{
++	WARN_ON(!mutex_is_locked(&dev_priv->pc8.lock));
++	WARN(dev_priv->pc8.disable_count < 1,
++	     "pc8.disable_count: %d\n", dev_priv->pc8.disable_count);
++
++	dev_priv->pc8.disable_count--;
++	if (dev_priv->pc8.disable_count != 0)
++		return;
++
++	schedule_delayed_work(&dev_priv->pc8.enable_work,
++			      msecs_to_jiffies(5 * 1000));
++}
++
++static void __hsw_disable_package_c8(struct drm_i915_private *dev_priv)
++{
++	struct drm_device *dev = dev_priv->dev;
++	uint32_t val;
++
++	WARN_ON(!mutex_is_locked(&dev_priv->pc8.lock));
++	WARN(dev_priv->pc8.disable_count < 0,
++	     "pc8.disable_count: %d\n", dev_priv->pc8.disable_count);
++
++	dev_priv->pc8.disable_count++;
++	if (dev_priv->pc8.disable_count != 1)
++		return;
++
++	cancel_delayed_work_sync(&dev_priv->pc8.enable_work);
++	if (!dev_priv->pc8.enabled)
++		return;
++
++	DRM_DEBUG_KMS("Disabling package C8+\n");
++
++	hsw_restore_lcpll(dev_priv);
++	hsw_pc8_restore_interrupts(dev);
++	lpt_init_pch_refclk(dev);
++
++	if (dev_priv->pch_id == INTEL_PCH_LPT_LP_DEVICE_ID_TYPE) {
++		val = I915_READ(SOUTH_DSPCLK_GATE_D);
++		val |= PCH_LP_PARTITION_LEVEL_DISABLE;
++		I915_WRITE(SOUTH_DSPCLK_GATE_D, val);
++	}
++
++	intel_prepare_ddi(dev);
++	i915_gem_init_swizzling(dev);
++	mutex_lock(&dev_priv->rps.hw_lock);
++	gen6_update_ring_freq(dev);
++	mutex_unlock(&dev_priv->rps.hw_lock);
++	dev_priv->pc8.enabled = false;
++}
++
++void hsw_enable_package_c8(struct drm_i915_private *dev_priv)
++{
++	mutex_lock(&dev_priv->pc8.lock);
++	__hsw_enable_package_c8(dev_priv);
++	mutex_unlock(&dev_priv->pc8.lock);
++}
++
++void hsw_disable_package_c8(struct drm_i915_private *dev_priv)
++{
++	mutex_lock(&dev_priv->pc8.lock);
++	__hsw_disable_package_c8(dev_priv);
++	mutex_unlock(&dev_priv->pc8.lock);
++}
++
++static bool hsw_can_enable_package_c8(struct drm_i915_private *dev_priv)
++{
++	struct drm_device *dev = dev_priv->dev;
++	struct intel_crtc *crtc;
++	uint32_t val;
++
++	list_for_each_entry(crtc, &dev->mode_config.crtc_list, base.head)
++		if (crtc->base.enabled)
++			return false;
++
++	/* This case is still possible since we have the i915.disable_power_well
++	 * parameter and also the KVMr or something else might be requesting the
++	 * power well. */
++	val = I915_READ(HSW_PWR_WELL_DRIVER);
++	if (val != 0) {
++		DRM_DEBUG_KMS("Not enabling PC8: power well on\n");
++		return false;
++	}
++
++	return true;
++}
++
++/* Since we're called from modeset_global_resources there's no way to
++ * symmetrically increase and decrease the refcount, so we use
++ * dev_priv->pc8.requirements_met to track whether we already have the refcount
++ * or not.
++ */
++static void hsw_update_package_c8(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	bool allow;
++
++	if (!i915_enable_pc8)
++		return;
++
++	mutex_lock(&dev_priv->pc8.lock);
++
++	allow = hsw_can_enable_package_c8(dev_priv);
++
++	if (allow == dev_priv->pc8.requirements_met)
++		goto done;
++
++	dev_priv->pc8.requirements_met = allow;
++
++	if (allow)
++		__hsw_enable_package_c8(dev_priv);
++	else
++		__hsw_disable_package_c8(dev_priv);
++
++done:
++	mutex_unlock(&dev_priv->pc8.lock);
++}
++
++static void hsw_package_c8_gpu_idle(struct drm_i915_private *dev_priv)
++{
++	if (!dev_priv->pc8.gpu_idle) {
++		dev_priv->pc8.gpu_idle = true;
++		hsw_enable_package_c8(dev_priv);
++	}
++}
++
++static void hsw_package_c8_gpu_busy(struct drm_i915_private *dev_priv)
++{
++	if (dev_priv->pc8.gpu_idle) {
++		dev_priv->pc8.gpu_idle = false;
++		hsw_disable_package_c8(dev_priv);
++	}
++}
++
+ static void haswell_modeset_global_resources(struct drm_device *dev)
+ {
+ 	bool enable = false;
+@@ -6079,6 +6239,8 @@ static void haswell_modeset_global_resou
+ 	}
+ 
+ 	intel_set_power_well(dev, enable);
++
++	hsw_update_package_c8(dev);
+ }
+ 
+ static int haswell_crtc_mode_set(struct drm_crtc *crtc,
+@@ -7314,13 +7476,19 @@ static void intel_decrease_pllclock(stru
+ 
+ void intel_mark_busy(struct drm_device *dev)
+ {
+-	i915_update_gfx_val(dev->dev_private);
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	hsw_package_c8_gpu_busy(dev_priv);
++	i915_update_gfx_val(dev_priv);
+ }
+ 
+ void intel_mark_idle(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_crtc *crtc;
+ 
++	hsw_package_c8_gpu_idle(dev_priv);
++
+ 	if (!i915_powersave)
+ 		return;
+ 
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -344,6 +344,8 @@ intel_dp_aux_ch(struct intel_dp *intel_d
+ 	else
+ 		precharge = 5;
+ 
++	intel_aux_display_runtime_get(dev_priv);
++
+ 	/* Try to wait for any previous AUX channel activity */
+ 	for (try = 0; try < 3; try++) {
+ 		status = I915_READ_NOTRACE(ch_ctl);
+@@ -434,6 +436,7 @@ intel_dp_aux_ch(struct intel_dp *intel_d
+ 	ret = recv_bytes;
+ out:
+ 	pm_qos_update_request(&dev_priv->pm_qos, PM_QOS_DEFAULT_VALUE);
++	intel_aux_display_runtime_put(dev_priv);
+ 
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -745,6 +745,7 @@ extern void intel_set_power_well(struct
+ extern void intel_enable_gt_powersave(struct drm_device *dev);
+ extern void intel_disable_gt_powersave(struct drm_device *dev);
+ extern void ironlake_teardown_rc6(struct drm_device *dev);
++void gen6_update_ring_freq(struct drm_device *dev);
+ 
+ extern bool intel_ddi_get_hw_state(struct intel_encoder *encoder,
+ 				   enum pipe *pipe);
+@@ -784,5 +785,12 @@ extern void ilk_disable_gt_irq(struct dr
+ extern void snb_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ extern void snb_disable_pm_irq(struct drm_i915_private *dev_priv,
+ 			       uint32_t mask);
++extern void hsw_enable_pc8_work(struct work_struct *__work);
++extern void hsw_enable_package_c8(struct drm_i915_private *dev_priv);
++extern void hsw_disable_package_c8(struct drm_i915_private *dev_priv);
++extern void hsw_pc8_disable_interrupts(struct drm_device *dev);
++extern void hsw_pc8_restore_interrupts(struct drm_device *dev);
++extern void intel_aux_display_runtime_get(struct drm_i915_private *dev_priv);
++extern void intel_aux_display_runtime_put(struct drm_i915_private *dev_priv);
+ 
+ #endif /* __INTEL_DRV_H__ */
+--- a/drivers/gpu/drm/i915/intel_i2c.c
++++ b/drivers/gpu/drm/i915/intel_i2c.c
+@@ -398,6 +398,7 @@ gmbus_xfer(struct i2c_adapter *adapter,
+ 	int i, reg_offset;
+ 	int ret = 0;
+ 
++	intel_aux_display_runtime_get(dev_priv);
+ 	mutex_lock(&dev_priv->gmbus_mutex);
+ 
+ 	if (bus->force_bit) {
+@@ -497,6 +498,7 @@ timeout:
+ 
+ out:
+ 	mutex_unlock(&dev_priv->gmbus_mutex);
++	intel_aux_display_runtime_put(dev_priv);
+ 	return ret;
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3607,7 +3607,7 @@ static void gen6_enable_rps(struct drm_d
+ 	gen6_gt_force_wake_put(dev_priv);
+ }
+ 
+-static void gen6_update_ring_freq(struct drm_device *dev)
++void gen6_update_ring_freq(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int min_freq = 15;
+@@ -5416,6 +5416,17 @@ void intel_init_power_well(struct drm_de
+ 		I915_WRITE(HSW_PWR_WELL_BIOS, 0);
+ }
+ 
++/* Disables PC8 so we can use the GMBUS and DP AUX interrupts. */
++void intel_aux_display_runtime_get(struct drm_i915_private *dev_priv)
++{
++	hsw_disable_package_c8(dev_priv);
++}
++
++void intel_aux_display_runtime_put(struct drm_i915_private *dev_priv)
++{
++	hsw_enable_package_c8(dev_priv);
++}
++
+ /* Set up chip specific power management-related functions */
+ void intel_init_pm(struct drm_device *dev)
+ {

@@ -1,0 +1,196 @@
+From d5661cd841b425e2030ac5ab6dfc7669f5cf8082 Mon Sep 17 00:00:00 2001
+From: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date: Fri, 30 Aug 2013 16:19:28 +0300
+Subject: drm/i915: ban badly behaving contexts
+
+Now when we have mechanism in place to track which context
+was guilty of hanging the gpu, it is possible to punish
+for bad behaviour.
+
+If context has recently submitted a faulty batchbuffers guilty of
+gpu hang and submits another batch which hangs gpu in quick
+succession, ban it permanently. If ctx is banned, no more
+batchbuffers will be queued for execution.
+
+There is no need for global wedge machinery anymore and
+it would be unwise to wedge the whole gpu if we have multiple
+hanging batches queued for execution. Instead just ban
+the guilty ones and carry on.
+
+v2: Store guilty ban status bool in gpu_error instead of pointers
+    that might become danling before hang is declared.
+
+v3: Use return value for banned status instead of stashing state
+    into gpu_error (Chris Wilson)
+
+v4: - rebase on top of fixed hang stats api
+    - add define for ban period
+    - rename commit and improve commit msg
+
+v5: - rely context banning instead of wedging the gpu
+    - beautification and fix for ban calculation (Chris)
+
+Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit be62acb4cce1389a28296852737e3917d9cc5b25)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c            | 29 ++++++++++++-----------------
+ drivers/gpu/drm/i915/i915_drv.h            | 11 +++++++++--
+ drivers/gpu/drm/i915/i915_gem.c            | 22 ++++++++++++++++++++--
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c | 12 ++++++++++++
+ 4 files changed, 53 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index 72e2be7a6c80..ec690ca40af7 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -719,24 +719,19 @@ int i915_reset(struct drm_device *dev)
+ 
+ 	simulated = dev_priv->gpu_error.stop_rings != 0;
+ 
+-	if (!simulated && get_seconds() - dev_priv->gpu_error.last_reset < 5) {
+-		DRM_ERROR("GPU hanging too fast, declaring wedged!\n");
+-		ret = -ENODEV;
+-	} else {
+-		ret = intel_gpu_reset(dev);
+-
+-		/* Also reset the gpu hangman. */
+-		if (simulated) {
+-			DRM_INFO("Simulated gpu hang, resetting stop_rings\n");
+-			dev_priv->gpu_error.stop_rings = 0;
+-			if (ret == -ENODEV) {
+-				DRM_ERROR("Reset not implemented, but ignoring "
+-					  "error for simulated gpu hangs\n");
+-				ret = 0;
+-			}
+-		} else
+-			dev_priv->gpu_error.last_reset = get_seconds();
++	ret = intel_gpu_reset(dev);
++
++	/* Also reset the gpu hangman. */
++	if (simulated) {
++		DRM_INFO("Simulated gpu hang, resetting stop_rings\n");
++		dev_priv->gpu_error.stop_rings = 0;
++		if (ret == -ENODEV) {
++			DRM_ERROR("Reset not implemented, but ignoring "
++				  "error for simulated gpu hangs\n");
++			ret = 0;
++		}
+ 	}
++
+ 	if (ret) {
+ 		DRM_ERROR("Failed to reset chip.\n");
+ 		mutex_unlock(&dev->struct_mutex);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index e357995a6aad..c5f0abaa9a22 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -586,6 +586,12 @@ struct i915_ctx_hang_stats {
+ 
+ 	/* This context had batch active when hang was declared */
+ 	unsigned batch_active;
++
++	/* Time when this context was last blamed for a GPU reset */
++	unsigned long guilty_ts;
++
++	/* This context is banned to submit more work */
++	bool banned;
+ };
+ 
+ /* This must match up with the value previously used for execbuf2.rsvd1. */
+@@ -987,6 +993,9 @@ struct i915_gpu_error {
+ 	/* For hangcheck timer */
+ #define DRM_I915_HANGCHECK_PERIOD 1500 /* in ms */
+ #define DRM_I915_HANGCHECK_JIFFIES msecs_to_jiffies(DRM_I915_HANGCHECK_PERIOD)
++	/* Hang gpu twice in this window and your context gets banned */
++#define DRM_I915_CTX_BAN_PERIOD DIV_ROUND_UP(8*DRM_I915_HANGCHECK_PERIOD, 1000)
++
+ 	struct timer_list hangcheck_timer;
+ 
+ 	/* For reset and error_state handling. */
+@@ -995,8 +1004,6 @@ struct i915_gpu_error {
+ 	struct drm_i915_error_state *first_error;
+ 	struct work_struct work;
+ 
+-	unsigned long last_reset;
+-
+ 	/**
+ 	 * State variable and reset counter controlling the reset flow
+ 	 *
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index f0884a949a1f..ff8817f3eaa6 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2221,6 +2221,21 @@ static bool i915_request_guilty(struct drm_i915_gem_request *request,
+ 	return false;
+ }
+ 
++static bool i915_context_is_banned(const struct i915_ctx_hang_stats *hs)
++{
++	const unsigned long elapsed = get_seconds() - hs->guilty_ts;
++
++	if (hs->banned)
++		return true;
++
++	if (elapsed <= DRM_I915_CTX_BAN_PERIOD) {
++		DRM_ERROR("context hanging too fast, declaring banned!\n");
++		return true;
++	}
++
++	return false;
++}
++
+ static void i915_set_reset_status(struct intel_ring_buffer *ring,
+ 				  struct drm_i915_gem_request *request,
+ 				  u32 acthd)
+@@ -2257,10 +2272,13 @@ static void i915_set_reset_status(struct intel_ring_buffer *ring,
+ 		hs = &request->file_priv->hang_stats;
+ 
+ 	if (hs) {
+-		if (guilty)
++		if (guilty) {
++			hs->banned = i915_context_is_banned(hs);
+ 			hs->batch_active++;
+-		else
++			hs->guilty_ts = get_seconds();
++		} else {
+ 			hs->batch_pending++;
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index e519f9f6e5cd..c8a01c141644 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -929,6 +929,7 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	struct drm_i915_gem_object *batch_obj;
+ 	struct drm_clip_rect *cliprects = NULL;
+ 	struct intel_ring_buffer *ring;
++	struct i915_ctx_hang_stats *hs;
+ 	u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u32 exec_start, exec_len;
+ 	u32 mask, flags;
+@@ -1118,6 +1119,17 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto err;
+ 
++	hs = i915_gem_context_get_hang_stats(dev, file, ctx_id);
++	if (IS_ERR(hs)) {
++		ret = PTR_ERR(hs);
++		goto err;
++	}
++
++	if (hs->banned) {
++		ret = -EIO;
++		goto err;
++	}
++
+ 	ret = i915_switch_context(ring, file, ctx_id);
+ 	if (ret)
+ 		goto err;
+-- 
+1.8.5.rc3
+

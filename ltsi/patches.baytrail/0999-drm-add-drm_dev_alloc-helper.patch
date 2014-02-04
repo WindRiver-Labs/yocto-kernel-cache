@@ -1,0 +1,249 @@
+From 895a18baf96f3cc05a5a36ca4a70a2a14586e0aa Mon Sep 17 00:00:00 2001
+From: David Herrmann <dh.herrmann@gmail.com>
+Date: Wed, 2 Oct 2013 11:23:34 +0200
+Subject: drm: add drm_dev_alloc() helper
+
+Instead of managing device allocation+initialization in each bus-driver,
+we should do that in a central place. drm_fill_in_dev() already does most
+of it, but also requires the global drm lock for partial AGP device
+registration.
+
+Split both apart so we have a clean device initialization/allocation
+phase, and a registration phase.
+
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 1bb72532ac260a2d3982b40bdd4c936d779d0d16)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/drm_pci.c      |   4 +-
+ drivers/gpu/drm/drm_platform.c |   3 +-
+ drivers/gpu/drm/drm_stub.c     | 121 +++++++++++++++++++++++++----------------
+ drivers/gpu/drm/drm_usb.c      |   7 +--
+ include/drm/drmP.h             |   2 +
+ 5 files changed, 80 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_pci.c b/drivers/gpu/drm/drm_pci.c
+index 564075586a60..efcbc3dbf21a 100644
+--- a/drivers/gpu/drm/drm_pci.c
++++ b/drivers/gpu/drm/drm_pci.c
+@@ -326,7 +326,7 @@ int drm_get_pci_dev(struct pci_dev *pdev, const struct pci_device_id *ent,
+ 
+ 	DRM_DEBUG("\n");
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	dev = drm_dev_alloc(driver, &pdev->dev);
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
+@@ -335,8 +335,6 @@ int drm_get_pci_dev(struct pci_dev *pdev, const struct pci_device_id *ent,
+ 		goto err_g1;
+ 
+ 	dev->pdev = pdev;
+-	dev->dev = &pdev->dev;
+-
+ 	dev->pci_device = pdev->device;
+ 	dev->pci_vendor = pdev->vendor;
+ 
+diff --git a/drivers/gpu/drm/drm_platform.c b/drivers/gpu/drm/drm_platform.c
+index 53ae674dee85..bcf980c9677d 100644
+--- a/drivers/gpu/drm/drm_platform.c
++++ b/drivers/gpu/drm/drm_platform.c
+@@ -47,12 +47,11 @@ int drm_get_platform_dev(struct platform_device *platdev,
+ 
+ 	DRM_DEBUG("\n");
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	dev = drm_dev_alloc(driver, &platdev->dev);
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
+ 	dev->platformdev = platdev;
+-	dev->dev = &platdev->dev;
+ 
+ 	mutex_lock(&drm_global_mutex);
+ 
+diff --git a/drivers/gpu/drm/drm_stub.c b/drivers/gpu/drm/drm_stub.c
+index d9c90b11e443..a2becaff63bc 100644
+--- a/drivers/gpu/drm/drm_stub.c
++++ b/drivers/gpu/drm/drm_stub.c
+@@ -261,60 +261,15 @@ int drm_fill_in_dev(struct drm_device *dev,
+ {
+ 	int retcode;
+ 
+-	INIT_LIST_HEAD(&dev->filelist);
+-	INIT_LIST_HEAD(&dev->ctxlist);
+-	INIT_LIST_HEAD(&dev->vmalist);
+-	INIT_LIST_HEAD(&dev->maplist);
+-	INIT_LIST_HEAD(&dev->vblank_event_list);
+-
+-	spin_lock_init(&dev->count_lock);
+-	spin_lock_init(&dev->event_lock);
+-	mutex_init(&dev->struct_mutex);
+-	mutex_init(&dev->ctxlist_mutex);
+-
+-	if (drm_ht_create(&dev->map_hash, 12)) {
+-		return -ENOMEM;
+-	}
+-
+-	/* the DRM has 6 basic counters */
+-	dev->counters = 6;
+-	dev->types[0] = _DRM_STAT_LOCK;
+-	dev->types[1] = _DRM_STAT_OPENS;
+-	dev->types[2] = _DRM_STAT_CLOSES;
+-	dev->types[3] = _DRM_STAT_IOCTLS;
+-	dev->types[4] = _DRM_STAT_LOCKS;
+-	dev->types[5] = _DRM_STAT_UNLOCKS;
+-
+-	dev->driver = driver;
+-
+ 	if (dev->driver->bus->agp_init) {
+ 		retcode = dev->driver->bus->agp_init(dev);
+-		if (retcode)
+-			goto error_out_unreg;
+-	}
+-
+-
+-
+-	retcode = drm_ctxbitmap_init(dev);
+-	if (retcode) {
+-		DRM_ERROR("Cannot allocate memory for context bitmap.\n");
+-		goto error_out_unreg;
+-	}
+-
+-	if (driver->driver_features & DRIVER_GEM) {
+-		retcode = drm_gem_init(dev);
+ 		if (retcode) {
+-			DRM_ERROR("Cannot initialize graphics execution "
+-				  "manager (GEM)\n");
+-			goto error_out_unreg;
++			drm_lastclose(dev);
++			return retcode;
+ 		}
+ 	}
+ 
+ 	return 0;
+-
+-      error_out_unreg:
+-	drm_lastclose(dev);
+-	return retcode;
+ }
+ EXPORT_SYMBOL(drm_fill_in_dev);
+ 
+@@ -506,3 +461,75 @@ void drm_unplug_dev(struct drm_device *dev)
+ 	mutex_unlock(&drm_global_mutex);
+ }
+ EXPORT_SYMBOL(drm_unplug_dev);
++
++/**
++ * drm_dev_alloc - Allocate new drm device
++ * @driver: DRM driver to allocate device for
++ * @parent: Parent device object
++ *
++ * Allocate and initialize a new DRM device. No device registration is done.
++ *
++ * RETURNS:
++ * Pointer to new DRM device, or NULL if out of memory.
++ */
++struct drm_device *drm_dev_alloc(struct drm_driver *driver,
++				 struct device *parent)
++{
++	struct drm_device *dev;
++	int ret;
++
++	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	if (!dev)
++		return NULL;
++
++	dev->dev = parent;
++	dev->driver = driver;
++
++	INIT_LIST_HEAD(&dev->filelist);
++	INIT_LIST_HEAD(&dev->ctxlist);
++	INIT_LIST_HEAD(&dev->vmalist);
++	INIT_LIST_HEAD(&dev->maplist);
++	INIT_LIST_HEAD(&dev->vblank_event_list);
++
++	spin_lock_init(&dev->count_lock);
++	spin_lock_init(&dev->event_lock);
++	mutex_init(&dev->struct_mutex);
++	mutex_init(&dev->ctxlist_mutex);
++
++	/* the DRM has 6 basic counters */
++	dev->counters = 6;
++	dev->types[0] = _DRM_STAT_LOCK;
++	dev->types[1] = _DRM_STAT_OPENS;
++	dev->types[2] = _DRM_STAT_CLOSES;
++	dev->types[3] = _DRM_STAT_IOCTLS;
++	dev->types[4] = _DRM_STAT_LOCKS;
++	dev->types[5] = _DRM_STAT_UNLOCKS;
++
++	if (drm_ht_create(&dev->map_hash, 12))
++		goto err_free;
++
++	ret = drm_ctxbitmap_init(dev);
++	if (ret) {
++		DRM_ERROR("Cannot allocate memory for context bitmap.\n");
++		goto err_ht;
++	}
++
++	if (driver->driver_features & DRIVER_GEM) {
++		ret = drm_gem_init(dev);
++		if (ret) {
++			DRM_ERROR("Cannot initialize graphics execution manager (GEM)\n");
++			goto err_ctxbitmap;
++		}
++	}
++
++	return dev;
++
++err_ctxbitmap:
++	drm_ctxbitmap_cleanup(dev);
++err_ht:
++	drm_ht_remove(&dev->map_hash);
++err_free:
++	kfree(dev);
++	return NULL;
++}
++EXPORT_SYMBOL(drm_dev_alloc);
+diff --git a/drivers/gpu/drm/drm_usb.c b/drivers/gpu/drm/drm_usb.c
+index 87664723b9ce..34ad8edfe806 100644
+--- a/drivers/gpu/drm/drm_usb.c
++++ b/drivers/gpu/drm/drm_usb.c
+@@ -7,18 +7,15 @@ int drm_get_usb_dev(struct usb_interface *interface,
+ 		    struct drm_driver *driver)
+ {
+ 	struct drm_device *dev;
+-	struct usb_device *usbdev;
+ 	int ret;
+ 
+ 	DRM_DEBUG("\n");
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	dev = drm_dev_alloc(driver, &interface->dev);
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
+-	usbdev = interface_to_usbdev(interface);
+-	dev->usbdev = usbdev;
+-	dev->dev = &interface->dev;
++	dev->usbdev = interface_to_usbdev(interface);
+ 
+ 	mutex_lock(&drm_global_mutex);
+ 
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index 4f2b3f343c2e..32019d82882e 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1660,6 +1660,8 @@ static __inline__ void drm_core_dropmap(struct drm_local_map *map)
+ extern int drm_fill_in_dev(struct drm_device *dev,
+ 			   const struct pci_device_id *ent,
+ 			   struct drm_driver *driver);
++struct drm_device *drm_dev_alloc(struct drm_driver *driver,
++				 struct device *parent);
+ int drm_get_minor(struct drm_device *dev, struct drm_minor **minor, int type);
+ /*@}*/
+ 
+-- 
+1.8.5.rc3
+

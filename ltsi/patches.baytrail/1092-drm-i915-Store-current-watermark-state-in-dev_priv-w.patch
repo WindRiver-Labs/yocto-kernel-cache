@@ -1,0 +1,185 @@
+From 5216f57bc87126c102d8817c53f74559412dd72d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 9 Oct 2013 19:18:03 +0300
+Subject: drm/i915: Store current watermark state in dev_priv->wm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+To make it easier to check what watermark updates are actually
+necessary, keep copies of the relevant bits that match the current
+hardware state.
+
+Also add DDB partitioning into hsw_wm_values as that's another piece
+of state we want to track.
+
+We don't read out the hardware state on init yet, so we can't really
+start using this yet, but it will be used later.
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+[danvet: Paulo asked for a comment around the memcmp to say that we
+depend upon zero-initializing the entire structures due to padding.
+But a later patch in this series removes the memcmp again. So this is
+ok as-is.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 609cedef6a9d5d90574903c71e81bd1c1f311f06)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h | 12 +++++++++++
+ drivers/gpu/drm/i915/intel_pm.c | 46 ++++++++++++++---------------------------
+ 2 files changed, 27 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 6ef70e23de9c..fc7e4db7c037 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1141,6 +1141,15 @@ struct intel_wm_level {
+ 	uint32_t fbc_val;
+ };
+ 
++struct hsw_wm_values {
++	uint32_t wm_pipe[3];
++	uint32_t wm_lp[3];
++	uint32_t wm_lp_spr[3];
++	uint32_t wm_linetime[3];
++	bool enable_fbc_wm;
++	enum intel_ddb_partitioning partitioning;
++};
++
+ /*
+  * This struct tracks the state needed for the Package C8+ feature.
+  *
+@@ -1402,6 +1411,9 @@ typedef struct drm_i915_private {
+ 		uint16_t spr_latency[5];
+ 		/* cursor */
+ 		uint16_t cur_latency[5];
++
++		/* current hardware state */
++		struct hsw_wm_values hw;
+ 	} wm;
+ 
+ 	struct i915_package_c8 pc8;
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index abea03c1e480..6d3d5f62dd6b 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -2200,14 +2200,6 @@ struct hsw_wm_maximums {
+ 	uint16_t fbc;
+ };
+ 
+-struct hsw_wm_values {
+-	uint32_t wm_pipe[3];
+-	uint32_t wm_lp[3];
+-	uint32_t wm_lp_spr[3];
+-	uint32_t wm_linetime[3];
+-	bool enable_fbc_wm;
+-};
+-
+ /* used in computing the new watermarks state */
+ struct intel_wm_config {
+ 	unsigned int num_pipes_active;
+@@ -2712,12 +2704,14 @@ static int ilk_wm_lp_to_level(int wm_lp, const struct intel_pipe_wm *pipe_wm)
+ 
+ static void hsw_compute_wm_results(struct drm_device *dev,
+ 				   const struct intel_pipe_wm *merged,
++				   enum intel_ddb_partitioning partitioning,
+ 				   struct hsw_wm_values *results)
+ {
+ 	struct intel_crtc *intel_crtc;
+ 	int level, wm_lp;
+ 
+ 	results->enable_fbc_wm = merged->fbc_wm_enabled;
++	results->partitioning = partitioning;
+ 
+ 	/* LP1+ register values */
+ 	for (wm_lp = 1; wm_lp <= 3; wm_lp++) {
+@@ -2787,13 +2781,10 @@ static struct intel_pipe_wm *hsw_find_best_result(struct drm_device *dev,
+  * causes WMs to be re-evaluated, expending some power.
+  */
+ static void hsw_write_wm_values(struct drm_i915_private *dev_priv,
+-				struct hsw_wm_values *results,
+-				enum intel_ddb_partitioning partitioning)
++				struct hsw_wm_values *results)
+ {
+ 	struct hsw_wm_values previous;
+ 	uint32_t val;
+-	enum intel_ddb_partitioning prev_partitioning;
+-	bool prev_enable_fbc_wm;
+ 
+ 	previous.wm_pipe[0] = I915_READ(WM0_PIPEA_ILK);
+ 	previous.wm_pipe[1] = I915_READ(WM0_PIPEB_ILK);
+@@ -2808,21 +2799,12 @@ static void hsw_write_wm_values(struct drm_i915_private *dev_priv,
+ 	previous.wm_linetime[1] = I915_READ(PIPE_WM_LINETIME(PIPE_B));
+ 	previous.wm_linetime[2] = I915_READ(PIPE_WM_LINETIME(PIPE_C));
+ 
+-	prev_partitioning = (I915_READ(WM_MISC) & WM_MISC_DATA_PARTITION_5_6) ?
++	previous.partitioning = (I915_READ(WM_MISC) & WM_MISC_DATA_PARTITION_5_6) ?
+ 				INTEL_DDB_PART_5_6 : INTEL_DDB_PART_1_2;
+ 
+-	prev_enable_fbc_wm = !(I915_READ(DISP_ARB_CTL) & DISP_FBC_WM_DIS);
+-
+-	if (memcmp(results->wm_pipe, previous.wm_pipe,
+-		   sizeof(results->wm_pipe)) == 0 &&
+-	    memcmp(results->wm_lp, previous.wm_lp,
+-		   sizeof(results->wm_lp)) == 0 &&
+-	    memcmp(results->wm_lp_spr, previous.wm_lp_spr,
+-		   sizeof(results->wm_lp_spr)) == 0 &&
+-	    memcmp(results->wm_linetime, previous.wm_linetime,
+-		   sizeof(results->wm_linetime)) == 0 &&
+-	    partitioning == prev_partitioning &&
+-	    results->enable_fbc_wm == prev_enable_fbc_wm)
++	previous.enable_fbc_wm = !(I915_READ(DISP_ARB_CTL) & DISP_FBC_WM_DIS);
++
++	if (memcmp(results, &previous, sizeof(*results)) == 0)
+ 		return;
+ 
+ 	if (previous.wm_lp[2] != 0)
+@@ -2846,16 +2828,16 @@ static void hsw_write_wm_values(struct drm_i915_private *dev_priv,
+ 	if (previous.wm_linetime[2] != results->wm_linetime[2])
+ 		I915_WRITE(PIPE_WM_LINETIME(PIPE_C), results->wm_linetime[2]);
+ 
+-	if (prev_partitioning != partitioning) {
++	if (previous.partitioning != results->partitioning) {
+ 		val = I915_READ(WM_MISC);
+-		if (partitioning == INTEL_DDB_PART_1_2)
++		if (results->partitioning == INTEL_DDB_PART_1_2)
+ 			val &= ~WM_MISC_DATA_PARTITION_5_6;
+ 		else
+ 			val |= WM_MISC_DATA_PARTITION_5_6;
+ 		I915_WRITE(WM_MISC, val);
+ 	}
+ 
+-	if (prev_enable_fbc_wm != results->enable_fbc_wm) {
++	if (previous.enable_fbc_wm != results->enable_fbc_wm) {
+ 		val = I915_READ(DISP_ARB_CTL);
+ 		if (results->enable_fbc_wm)
+ 			val &= ~DISP_FBC_WM_DIS;
+@@ -2877,6 +2859,8 @@ static void hsw_write_wm_values(struct drm_i915_private *dev_priv,
+ 		I915_WRITE(WM2_LP_ILK, results->wm_lp[1]);
+ 	if (results->wm_lp[2] != 0)
+ 		I915_WRITE(WM3_LP_ILK, results->wm_lp[2]);
++
++	dev_priv->wm.hw = *results;
+ }
+ 
+ static void haswell_update_wm(struct drm_crtc *crtc)
+@@ -2914,12 +2898,12 @@ static void haswell_update_wm(struct drm_crtc *crtc)
+ 		best_lp_wm = &lp_wm_1_2;
+ 	}
+ 
+-	hsw_compute_wm_results(dev, best_lp_wm, &results);
+-
+ 	partitioning = (best_lp_wm == &lp_wm_1_2) ?
+ 		       INTEL_DDB_PART_1_2 : INTEL_DDB_PART_5_6;
+ 
+-	hsw_write_wm_values(dev_priv, &results, partitioning);
++	hsw_compute_wm_results(dev, best_lp_wm, partitioning, &results);
++
++	hsw_write_wm_values(dev_priv, &results);
+ }
+ 
+ static void haswell_update_sprite_wm(struct drm_plane *plane,
+-- 
+1.8.5.rc3
+

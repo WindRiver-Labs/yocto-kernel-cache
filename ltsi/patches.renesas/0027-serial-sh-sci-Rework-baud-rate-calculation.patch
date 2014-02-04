@@ -1,0 +1,151 @@
+From e4a9d61407a3f578ab35a3f67f745d99c5ee06c3 Mon Sep 17 00:00:00 2001
+From: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Date: Fri, 6 Dec 2013 10:59:20 +0100
+Subject: serial: sh-sci: Rework baud rate calculation
+
+Computing the baud rate register value requires knowledge of the
+hardware sampling rate. This information is currently encoded in a baud
+rate calculation algorithm ID passed through platform data. However, it
+can be derived from the port type directly in most cases.
+
+Compute the sampling rate internally in the driver if the baud rate
+calculation algorithm ID isn't specified, and allow platforms to
+override the sampling rate through platform data in special cases (this
+is only required for SCIFA ports on sh7723 and sh7724, the reason needs
+to be investigated).
+
+Signed-off-by: Laurent Pinchart <laurent.pinchart+renesas@ideasonboard.com>
+Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Simon Horman <horms+renesas@verge.net.au>
+(cherry picked from commit ec09c5eb491834d4011c72538e58d8b7096076bd)
+(Queued by Simon Horman for v3.14 but not yet in Linus's tree)
+Signed-off-by: Simon Horman <horms+renesas@verge.net.au>
+---
+ drivers/tty/serial/sh-sci.c | 37 ++++++++++++++++++++++++++++++-------
+ include/linux/serial_sci.h  |  2 ++
+ 2 files changed, 32 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/tty/serial/sh-sci.c b/drivers/tty/serial/sh-sci.c
+index e643df18f48b..35e3225714bc 100644
+--- a/drivers/tty/serial/sh-sci.c
++++ b/drivers/tty/serial/sh-sci.c
+@@ -65,6 +65,7 @@ struct sci_port {
+ 	struct plat_sci_port	*cfg;
+ 	int			overrun_bit;
+ 	unsigned int		error_mask;
++	unsigned int		sampling_rate;
+ 
+ 
+ 	/* Break timer */
+@@ -1750,10 +1751,13 @@ static void sci_shutdown(struct uart_port *port)
+ 	sci_free_irq(s);
+ }
+ 
+-static unsigned int sci_scbrr_calc(unsigned int algo_id, unsigned int bps,
++static unsigned int sci_scbrr_calc(struct sci_port *s, unsigned int bps,
+ 				   unsigned long freq)
+ {
+-	switch (algo_id) {
++	if (s->sampling_rate)
++		return DIV_ROUND_CLOSEST(freq, s->sampling_rate * bps) - 1;
++
++	switch (s->cfg->scbrr_algo_id) {
+ 	case SCBRR_ALGO_1:
+ 		return freq / (16 * bps);
+ 	case SCBRR_ALGO_2:
+@@ -1843,12 +1847,11 @@ static void sci_set_termios(struct uart_port *port, struct ktermios *termios,
+ 
+ 	baud = uart_get_baud_rate(port, termios, old, 0, max_baud);
+ 	if (likely(baud && port->uartclk)) {
+-		if (s->cfg->scbrr_algo_id == SCBRR_ALGO_6) {
++		if (s->cfg->type == PORT_HSCIF) {
+ 			sci_baud_calc_hscif(baud, port->uartclk, &t, &srr,
+ 					    &cks);
+ 		} else {
+-			t = sci_scbrr_calc(s->cfg->scbrr_algo_id, baud,
+-					   port->uartclk);
++			t = sci_scbrr_calc(s, baud, port->uartclk);
+ 			for (cks = 0; t >= 256 && cks <= 3; cks++)
+ 				t >>= 2;
+ 		}
+@@ -2092,6 +2095,7 @@ static int sci_init_single(struct platform_device *dev,
+ {
+ 	struct uart_port *port = &sci_port->port;
+ 	const struct resource *res;
++	unsigned int sampling_rate;
+ 	unsigned int i;
+ 	int ret;
+ 
+@@ -2143,28 +2147,47 @@ static int sci_init_single(struct platform_device *dev,
+ 	case PORT_SCIFB:
+ 		port->fifosize = 256;
+ 		sci_port->overrun_bit = 9;
++		sampling_rate = 16;
+ 		break;
+ 	case PORT_HSCIF:
+ 		port->fifosize = 128;
++		sampling_rate = 0;
+ 		sci_port->overrun_bit = 0;
+ 		break;
+ 	case PORT_SCIFA:
+ 		port->fifosize = 64;
+ 		sci_port->overrun_bit = 9;
++		sampling_rate = 16;
+ 		break;
+ 	case PORT_SCIF:
+ 		port->fifosize = 16;
+-		if (p->regtype == SCIx_SH7705_SCIF_REGTYPE)
++		if (p->regtype == SCIx_SH7705_SCIF_REGTYPE) {
+ 			sci_port->overrun_bit = 9;
+-		else
++			sampling_rate = 16;
++		} else {
+ 			sci_port->overrun_bit = 0;
++			sampling_rate = 32;
++		}
+ 		break;
+ 	default:
+ 		port->fifosize = 1;
+ 		sci_port->overrun_bit = 5;
++		sampling_rate = 32;
+ 		break;
+ 	}
+ 
++	/* Set the sampling rate if the baud rate calculation algorithm isn't
++	 * specified.
++	 */
++	if (p->scbrr_algo_id == SCBRR_ALGO_NONE) {
++		/* SCIFA on sh7723 and sh7724 need a custom sampling rate that
++		 * doesn't match the SoC datasheet, this should be investigated.
++		 * Let platform data override the sampling rate for now.
++		 */
++		sci_port->sampling_rate = p->sampling_rate ? p->sampling_rate
++					: sampling_rate;
++	}
++
+ 	if (!early) {
+ 		sci_port->iclk = clk_get(&dev->dev, "sci_ick");
+ 		if (IS_ERR(sci_port->iclk)) {
+diff --git a/include/linux/serial_sci.h b/include/linux/serial_sci.h
+index efd4727ccd67..0bac5628e650 100644
+--- a/include/linux/serial_sci.h
++++ b/include/linux/serial_sci.h
+@@ -11,6 +11,7 @@
+ #define SCIx_NOT_SUPPORTED	(-1)
+ 
+ enum {
++	SCBRR_ALGO_NONE,	/* Compute sampling rate in the driver */
+ 	SCBRR_ALGO_1,		/* clk / (16 * bps) */
+ 	SCBRR_ALGO_2,		/* DIV_ROUND_CLOSEST(clk, 32 * bps) - 1 */
+ 	SCBRR_ALGO_3,		/* clk / (8 * bps) */
+@@ -134,6 +135,7 @@ struct plat_sci_port {
+ 	upf_t		flags;			/* UPF_* flags */
+ 	unsigned long	capabilities;		/* Port features/capabilities */
+ 
++	unsigned int	sampling_rate;
+ 	unsigned int	scbrr_algo_id;		/* SCBRR calculation algo */
+ 	unsigned int	scscr;			/* SCSCR initialization */
+ 
+-- 
+1.8.5.rc3
+

@@ -1,0 +1,132 @@
+From ccbcec20855d9d033d5c306306fae1fcde840e39 Mon Sep 17 00:00:00 2001
+From: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+Date: Fri, 6 Sep 2013 16:03:28 +0300
+Subject: drm/i915: include hangcheck action and score in error_state
+
+Score and action reveals what all the rings were doing
+and why hang was declared. Add idle state so that
+we can distinguish between waiting and idle ring.
+
+v2: - add idle as a hangcheck action
+    - consensed hangcheck status to single line (Chris)
+    - mark active explicitly when we are making progress (Chris)
+
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit da66146425c3136943452988afd3d64cd551da58)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |  2 ++
+ drivers/gpu/drm/i915/i915_gpu_error.c   | 24 ++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_irq.c         |  5 +++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |  1 +
+ 4 files changed, 32 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c5f0abaa9a22..1fb01b5b819d 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -328,6 +328,8 @@ struct drm_i915_error_state {
+ 	u32 *active_bo_count, *pinned_bo_count;
+ 	struct intel_overlay_error_state *overlay;
+ 	struct intel_display_error_state *display;
++	int hangcheck_score[I915_NUM_RINGS];
++	enum intel_ring_hangcheck_action hangcheck_action[I915_NUM_RINGS];
+ };
+ 
+ struct intel_crtc_config;
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index aba9d7498996..c38d575dc5a6 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -213,6 +213,24 @@ static void print_error_buffers(struct drm_i915_error_state_buf *m,
+ 	}
+ }
+ 
++static const char *hangcheck_action_to_str(enum intel_ring_hangcheck_action a)
++{
++	switch (a) {
++	case HANGCHECK_IDLE:
++		return "idle";
++	case HANGCHECK_WAIT:
++		return "wait";
++	case HANGCHECK_ACTIVE:
++		return "active";
++	case HANGCHECK_KICK:
++		return "kick";
++	case HANGCHECK_HUNG:
++		return "hung";
++	}
++
++	return "unknown";
++}
++
+ static void i915_ring_error_state(struct drm_i915_error_state_buf *m,
+ 				  struct drm_device *dev,
+ 				  struct drm_i915_error_state *error,
+@@ -253,6 +271,9 @@ static void i915_ring_error_state(struct drm_i915_error_state_buf *m,
+ 	err_printf(m, "  waiting: %s\n", yesno(error->waiting[ring]));
+ 	err_printf(m, "  ring->head: 0x%08x\n", error->cpu_ring_head[ring]);
+ 	err_printf(m, "  ring->tail: 0x%08x\n", error->cpu_ring_tail[ring]);
++	err_printf(m, "  hangcheck: %s [%d]\n",
++		   hangcheck_action_to_str(error->hangcheck_action[ring]),
++		   error->hangcheck_score[ring]);
+ }
+ 
+ void i915_error_printf(struct drm_i915_error_state_buf *e, const char *f, ...)
+@@ -718,6 +739,9 @@ static void i915_record_ring_state(struct drm_device *dev,
+ 
+ 	error->cpu_ring_head[ring->id] = ring->head;
+ 	error->cpu_ring_tail[ring->id] = ring->tail;
++
++	error->hangcheck_score[ring->id] = ring->hangcheck.score;
++	error->hangcheck_action[ring->id] = ring->hangcheck.action;
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 4b91228fd9bd..13d26cf49f03 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2021,6 +2021,8 @@ static void i915_hangcheck_elapsed(unsigned long data)
+ 
+ 		if (ring->hangcheck.seqno == seqno) {
+ 			if (ring_idle(ring, seqno)) {
++				ring->hangcheck.action = HANGCHECK_IDLE;
++
+ 				if (waitqueue_active(&ring->irq_queue)) {
+ 					/* Issue a wake-up to catch stuck h/w. */
+ 					DRM_ERROR("Hangcheck timer elapsed... %s idle\n",
+@@ -2049,6 +2051,7 @@ static void i915_hangcheck_elapsed(unsigned long data)
+ 								    acthd);
+ 
+ 				switch (ring->hangcheck.action) {
++				case HANGCHECK_IDLE:
+ 				case HANGCHECK_WAIT:
+ 					break;
+ 				case HANGCHECK_ACTIVE:
+@@ -2064,6 +2067,8 @@ static void i915_hangcheck_elapsed(unsigned long data)
+ 				}
+ 			}
+ 		} else {
++			ring->hangcheck.action = HANGCHECK_ACTIVE;
++
+ 			/* Gradually reduce the count so that we catch DoS
+ 			 * attempts across multiple batches.
+ 			 */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index ad2dd65c63f8..b5aac5702085 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -34,6 +34,7 @@ struct  intel_hw_status_page {
+ #define I915_WRITE_IMR(ring, val) I915_WRITE(RING_IMR((ring)->mmio_base), val)
+ 
+ enum intel_ring_hangcheck_action {
++	HANGCHECK_IDLE = 0,
+ 	HANGCHECK_WAIT,
+ 	HANGCHECK_ACTIVE,
+ 	HANGCHECK_KICK,
+-- 
+1.8.5.rc3
+

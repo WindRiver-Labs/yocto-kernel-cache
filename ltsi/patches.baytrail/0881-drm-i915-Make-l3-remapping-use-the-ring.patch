@@ -1,0 +1,138 @@
+From 3233af408e804840627ed140da63863b0b0f8e38 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Tue, 17 Sep 2013 21:12:44 -0700
+Subject: drm/i915: Make l3 remapping use the ring
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Using LRI for setting the remapping registers allows us to stream l3
+remapping information. This is necessary to handle per context remaps as
+we'll see implemented in an upcoming patch.
+
+Using the ring also means we don't need to frob the DOP clock gating
+bits.
+
+v2: Add comment about lack of worry for concurrent register access
+(Daniel)
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+[danvet: Bikeshed the comment a bit by doing a s/XXX/Note - there's
+nothing to fix.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit c3787e2eac816a597a7f92daa5d0629a85e77d56)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h   |  2 +-
+ drivers/gpu/drm/i915/i915_gem.c   | 40 +++++++++++++++++++--------------------
+ drivers/gpu/drm/i915/i915_sysfs.c |  3 ++-
+ 3 files changed, 23 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c6e8df737566..0c39805b881e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1949,7 +1949,7 @@ bool i915_gem_clflush_object(struct drm_i915_gem_object *obj, bool force);
+ int __must_check i915_gem_object_finish_gpu(struct drm_i915_gem_object *obj);
+ int __must_check i915_gem_init(struct drm_device *dev);
+ int __must_check i915_gem_init_hw(struct drm_device *dev);
+-void i915_gem_l3_remap(struct drm_device *dev, int slice);
++int i915_gem_l3_remap(struct intel_ring_buffer *ring, int slice);
+ void i915_gem_init_swizzling(struct drm_device *dev);
+ void i915_gem_cleanup_ringbuffer(struct drm_device *dev);
+ int __must_check i915_gpu_idle(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 66bf75dce783..778b33a5df6c 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4252,35 +4252,35 @@ i915_gem_idle(struct drm_device *dev)
+ 	return 0;
+ }
+ 
+-void i915_gem_l3_remap(struct drm_device *dev, int slice)
++int i915_gem_l3_remap(struct intel_ring_buffer *ring, int slice)
+ {
++	struct drm_device *dev = ring->dev;
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	u32 reg_base = GEN7_L3LOG_BASE + (slice * 0x200);
+ 	u32 *remap_info = dev_priv->l3_parity.remap_info[slice];
+-	u32 misccpctl;
+-	int i;
++	int i, ret;
+ 
+ 	if (!HAS_L3_GPU_CACHE(dev) || !remap_info)
+-		return;
++		return 0;
+ 
+-	misccpctl = I915_READ(GEN7_MISCCPCTL);
+-	I915_WRITE(GEN7_MISCCPCTL, misccpctl & ~GEN7_DOP_CLOCK_GATE_ENABLE);
+-	POSTING_READ(GEN7_MISCCPCTL);
++	ret = intel_ring_begin(ring, GEN7_L3LOG_SIZE / 4 * 3);
++	if (ret)
++		return ret;
+ 
++	/*
++	 * Note: We do not worry about the concurrent register cacheline hang
++	 * here because no other code should access these registers other than
++	 * at initialization time.
++	 */
+ 	for (i = 0; i < GEN7_L3LOG_SIZE; i += 4) {
+-		u32 remap = I915_READ(reg_base + i);
+-		if (remap && remap != remap_info[i/4])
+-			DRM_DEBUG("0x%x was already programmed to %x\n",
+-				  reg_base + i, remap);
+-		if (remap && !remap_info[i/4])
+-			DRM_DEBUG_DRIVER("Clearing remapped register\n");
+-		I915_WRITE(reg_base + i, remap_info[i/4]);
++		intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
++		intel_ring_emit(ring, reg_base + i);
++		intel_ring_emit(ring, remap_info[i/4]);
+ 	}
+ 
+-	/* Make sure all the writes land before disabling dop clock gating */
+-	POSTING_READ(reg_base);
++	intel_ring_advance(ring);
+ 
+-	I915_WRITE(GEN7_MISCCPCTL, misccpctl);
++	return ret;
+ }
+ 
+ void i915_gem_init_swizzling(struct drm_device *dev)
+@@ -4391,15 +4391,15 @@ i915_gem_init_hw(struct drm_device *dev)
+ 		I915_WRITE(GEN7_MSG_CTL, temp);
+ 	}
+ 
+-	for (i = 0; i < NUM_L3_SLICES(dev); i++)
+-		i915_gem_l3_remap(dev, i);
+-
+ 	i915_gem_init_swizzling(dev);
+ 
+ 	ret = i915_gem_init_rings(dev);
+ 	if (ret)
+ 		return ret;
+ 
++	for (i = 0; i < NUM_L3_SLICES(dev); i++)
++		i915_gem_l3_remap(&dev_priv->ring[RCS], i);
++
+ 	/*
+ 	 * XXX: There was some w/a described somewhere suggesting loading
+ 	 * contexts before PPGTT.
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index 3a8bf0c9b5ce..b07bdfb8892d 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -204,7 +204,8 @@ i915_l3_write(struct file *filp, struct kobject *kobj,
+ 
+ 	memcpy(dev_priv->l3_parity.remap_info[slice] + (offset/4), buf, count);
+ 
+-	i915_gem_l3_remap(drm_dev, slice);
++	if (i915_gem_l3_remap(&dev_priv->ring[RCS], slice))
++		count = 0;
+ 
+ 	mutex_unlock(&drm_dev->struct_mutex);
+ 
+-- 
+1.8.5.rc3
+

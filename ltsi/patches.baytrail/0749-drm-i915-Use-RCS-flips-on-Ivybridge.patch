@@ -1,0 +1,139 @@
+From d23382f3305731e890eb4b2f8a6f8297b7b3d2f9 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 26 Aug 2013 20:58:12 +0100
+Subject: drm/i915: Use RCS flips on Ivybridge+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RCS flips do work on Iybridge+ so long as we can unmask the messages
+through DERRMR. However, there are quite a few workarounds mentioned
+regarding unmasking more than one event or triggering more than one
+message through DERRMR. Those workarounds in principle prevent us from
+performing pipelined flips (and asynchronous flips across multiple
+planes) and equally apply to the "known good" BCS ring. Given that it
+already appears to work, and also appears to work with unmasking all 3
+planes at once (and queuing flips across multiple planes), be brave.
+
+Bugzlla: https://bugs.freedesktop.org/show_bug.cgi?id=67600
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Lightly-tested-by: Stephane Marchesin <marchesin@icps.u-strasbg.fr>
+Cc: Stephane Marchesin <marchesin@icps.u-strasbg.fr>
+Cc: Ben Widawsky <ben@bwidawsk.net>
+Tested-by: Stéphane Marchesin <marcheu@chromium.org>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit ffe74d75502e3a9b0791240b5562bcbecc6ab8dc)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_reg.h      | 18 ++++++++++++++++
+ drivers/gpu/drm/i915/intel_display.c | 40 ++++++++++++++++++++++++++++--------
+ 2 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index b6a58f720f9a..b2fa2a4c4454 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -245,6 +245,7 @@
+  *   address/value pairs. Don't overdue it, though, x <= 2^4 must hold!
+  */
+ #define MI_LOAD_REGISTER_IMM(x)	MI_INSTR(0x22, 2*x-1)
++#define MI_STORE_REGISTER_MEM(x) MI_INSTR(0x24, 2*x-1)
+ #define MI_FLUSH_DW		MI_INSTR(0x26, 1) /* for GEN6 */
+ #define   MI_FLUSH_DW_STORE_INDEX	(1<<21)
+ #define   MI_INVALIDATE_TLB		(1<<18)
+@@ -693,6 +694,23 @@
+ #define   FPGA_DBG_RM_NOCLAIM	(1<<31)
+ 
+ #define DERRMR		0x44050
++#define   DERRMR_PIPEA_SCANLINE		(1<<0)
++#define   DERRMR_PIPEA_PRI_FLIP_DONE	(1<<1)
++#define   DERRMR_PIPEA_SPR_FLIP_DONE	(1<<2)
++#define   DERRMR_PIPEA_VBLANK		(1<<3)
++#define   DERRMR_PIPEA_HBLANK		(1<<5)
++#define   DERRMR_PIPEB_SCANLINE 	(1<<8)
++#define   DERRMR_PIPEB_PRI_FLIP_DONE	(1<<9)
++#define   DERRMR_PIPEB_SPR_FLIP_DONE	(1<<10)
++#define   DERRMR_PIPEB_VBLANK		(1<<11)
++#define   DERRMR_PIPEB_HBLANK		(1<<13)
++/* Note that PIPEC is not a simple translation of PIPEA/PIPEB */
++#define   DERRMR_PIPEC_SCANLINE		(1<<14)
++#define   DERRMR_PIPEC_PRI_FLIP_DONE	(1<<15)
++#define   DERRMR_PIPEC_SPR_FLIP_DONE	(1<<20)
++#define   DERRMR_PIPEC_VBLANK		(1<<21)
++#define   DERRMR_PIPEC_HBLANK		(1<<22)
++
+ 
+ /* GM45+ chicken bits -- debug workaround bits that may be required
+  * for various sorts of correct behavior.  The top 16 bits of each are
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 2ed6214010c6..b27738d0b49d 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -7832,12 +7832,6 @@ err:
+ 	return ret;
+ }
+ 
+-/*
+- * On gen7 we currently use the blit ring because (in early silicon at least)
+- * the render ring doesn't give us interrpts for page flip completion, which
+- * means clients will hang after the first flip is queued.  Fortunately the
+- * blit ring generates interrupts properly, so use it instead.
+- */
+ static int intel_gen7_queue_flip(struct drm_device *dev,
+ 				 struct drm_crtc *crtc,
+ 				 struct drm_framebuffer *fb,
+@@ -7846,9 +7840,13 @@ static int intel_gen7_queue_flip(struct drm_device *dev,
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+-	struct intel_ring_buffer *ring = &dev_priv->ring[BCS];
++	struct intel_ring_buffer *ring;
+ 	uint32_t plane_bit = 0;
+-	int ret;
++	int len, ret;
++
++	ring = obj->ring;
++	if (ring == NULL || ring->id != RCS)
++		ring = &dev_priv->ring[BCS];
+ 
+ 	ret = intel_pin_and_fence_fb_obj(dev, obj, ring);
+ 	if (ret)
+@@ -7870,10 +7868,34 @@ static int intel_gen7_queue_flip(struct drm_device *dev,
+ 		goto err_unpin;
+ 	}
+ 
+-	ret = intel_ring_begin(ring, 4);
++	len = 4;
++	if (ring->id == RCS)
++		len += 6;
++
++	ret = intel_ring_begin(ring, len);
+ 	if (ret)
+ 		goto err_unpin;
+ 
++	/* Unmask the flip-done completion message. Note that the bspec says that
++	 * we should do this for both the BCS and RCS, and that we must not unmask
++	 * more than one flip event at any time (or ensure that one flip message
++	 * can be sent by waiting for flip-done prior to queueing new flips).
++	 * Experimentation says that BCS works despite DERRMR masking all
++	 * flip-done completion events and that unmasking all planes at once
++	 * for the RCS also doesn't appear to drop events. Setting the DERRMR
++	 * to zero does lead to lockups within MI_DISPLAY_FLIP.
++	 */
++	if (ring->id == RCS) {
++		intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
++		intel_ring_emit(ring, DERRMR);
++		intel_ring_emit(ring, ~(DERRMR_PIPEA_PRI_FLIP_DONE |
++					DERRMR_PIPEB_PRI_FLIP_DONE |
++					DERRMR_PIPEC_PRI_FLIP_DONE));
++		intel_ring_emit(ring, MI_STORE_REGISTER_MEM(1));
++		intel_ring_emit(ring, DERRMR);
++		intel_ring_emit(ring, ring->scratch.gtt_offset + 256);
++	}
++
+ 	intel_ring_emit(ring, MI_DISPLAY_FLIP_I915 | plane_bit);
+ 	intel_ring_emit(ring, (fb->pitches[0] | obj->tiling_mode));
+ 	intel_ring_emit(ring, i915_gem_obj_ggtt_offset(obj) + intel_crtc->dspaddr_offset);
+-- 
+1.8.5.rc3
+

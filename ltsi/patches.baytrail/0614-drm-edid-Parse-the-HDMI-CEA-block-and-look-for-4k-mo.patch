@@ -1,0 +1,194 @@
+From af2a7255606a2ff9e909bf24d5c28379b37f313f Mon Sep 17 00:00:00 2001
+From: "Lespiau, Damien" <damien.lespiau@intel.com>
+Date: Mon, 19 Aug 2013 16:58:54 +0100
+Subject: drm/edid: Parse the HDMI CEA block and look for 4k modes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+HDMI 1.4 adds 4 "4k x 2k" modes in the the CEA vendor specific block.
+
+With this commit, we now parse this block and expose the 4k modes that
+we find there.
+
+v2: Fix the "4096x2160" string (nice catch!), add comments about
+    do_hdmi_vsdb_modes() arguments and make it clearer that offset is
+    relative to the end of the required fields of the HDMI VSDB
+    (Ville Syrjälä)
+
+v3: Fix 'Unknow' typo (Simon Farnsworth)
+
+Signed-off-by: Damien Lespiau <damien.lespiau@intel.com>
+Tested-by: Cancan Feng <cancan.feng@intel.com>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=67030
+Reviewed-by: Simon Farnsworth <simon.farnsworth@onelan.co.uk>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Thierry Reding <treding@nvidia.com>
+Signed-off-by: Dave Airlie <airlied@gmail.com>
+(cherry picked from commit 7ebe1963a063daf30f95752c35244c5d49550aa9)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/drm_edid.c |  124 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 109 insertions(+), 15 deletions(-)
+
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -939,6 +939,36 @@ static const struct drm_display_mode edi
+ 	 .vrefresh = 100, },
+ };
+ 
++/*
++ * HDMI 1.4 4k modes.
++ */
++static const struct drm_display_mode edid_4k_modes[] = {
++	/* 1 - 3840x2160@30Hz */
++	{ DRM_MODE("3840x2160", DRM_MODE_TYPE_DRIVER, 297000,
++		   3840, 4016, 4104, 4400, 0,
++		   2160, 2168, 2178, 2250, 0,
++		   DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
++	  .vrefresh = 30, },
++	/* 2 - 3840x2160@25Hz */
++	{ DRM_MODE("3840x2160", DRM_MODE_TYPE_DRIVER, 297000,
++		   3840, 4896, 4984, 5280, 0,
++		   2160, 2168, 2178, 2250, 0,
++		   DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
++	  .vrefresh = 25, },
++	/* 3 - 3840x2160@24Hz */
++	{ DRM_MODE("3840x2160", DRM_MODE_TYPE_DRIVER, 297000,
++		   3840, 5116, 5204, 5500, 0,
++		   2160, 2168, 2178, 2250, 0,
++		   DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
++	  .vrefresh = 24, },
++	/* 4 - 4096x2160@24Hz (SMPTE) */
++	{ DRM_MODE("4096x2160", DRM_MODE_TYPE_DRIVER, 297000,
++		   4096, 5116, 5204, 5500, 0,
++		   2160, 2168, 2178, 2250, 0,
++		   DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
++	  .vrefresh = 24, },
++};
++
+ /*** DDC fetch and block validation ***/
+ 
+ static const u8 edid_header[] = {
+@@ -2397,6 +2427,68 @@ do_cea_modes(struct drm_connector *conne
+ 	return modes;
+ }
+ 
++/*
++ * do_hdmi_vsdb_modes - Parse the HDMI Vendor Specific data block
++ * @connector: connector corresponding to the HDMI sink
++ * @db: start of the CEA vendor specific block
++ * @len: length of the CEA block payload, ie. one can access up to db[len]
++ *
++ * Parses the HDMI VSDB looking for modes to add to @connector.
++ */
++static int
++do_hdmi_vsdb_modes(struct drm_connector *connector, const u8 *db, u8 len)
++{
++	struct drm_device *dev = connector->dev;
++	int modes = 0, offset = 0, i;
++	u8 vic_len;
++
++	if (len < 8)
++		goto out;
++
++	/* no HDMI_Video_Present */
++	if (!(db[8] & (1 << 5)))
++		goto out;
++
++	/* Latency_Fields_Present */
++	if (db[8] & (1 << 7))
++		offset += 2;
++
++	/* I_Latency_Fields_Present */
++	if (db[8] & (1 << 6))
++		offset += 2;
++
++	/* the declared length is not long enough for the 2 first bytes
++	 * of additional video format capabilities */
++	offset += 2;
++	if (len < (8 + offset))
++		goto out;
++
++	vic_len = db[8 + offset] >> 5;
++
++	for (i = 0; i < vic_len && len >= (9 + offset + i); i++) {
++		struct drm_display_mode *newmode;
++		u8 vic;
++
++		vic = db[9 + offset + i];
++
++		vic--; /* VICs start at 1 */
++		if (vic >= ARRAY_SIZE(edid_4k_modes)) {
++			DRM_ERROR("Unknown HDMI VIC: %d\n", vic);
++			continue;
++		}
++
++		newmode = drm_mode_duplicate(dev, &edid_4k_modes[vic]);
++		if (!newmode)
++			continue;
++
++		drm_mode_probed_add(connector, newmode);
++		modes++;
++	}
++
++out:
++	return modes;
++}
++
+ static int
+ cea_db_payload_len(const u8 *db)
+ {
+@@ -2428,6 +2520,21 @@ cea_db_offsets(const u8 *cea, int *start
+ 	return 0;
+ }
+ 
++static bool cea_db_is_hdmi_vsdb(const u8 *db)
++{
++	int hdmi_id;
++
++	if (cea_db_tag(db) != VENDOR_BLOCK)
++		return false;
++
++	if (cea_db_payload_len(db) < 5)
++		return false;
++
++	hdmi_id = db[1] | (db[2] << 8) | (db[3] << 16);
++
++	return hdmi_id == HDMI_IDENTIFIER;
++}
++
+ #define for_each_cea_db(cea, i, start, end) \
+ 	for ((i) = (start); (i) < (end) && (i) + cea_db_payload_len(&(cea)[(i)]) < (end); (i) += cea_db_payload_len(&(cea)[(i)]) + 1)
+ 
+@@ -2451,6 +2558,8 @@ add_cea_modes(struct drm_connector *conn
+ 
+ 			if (cea_db_tag(db) == VIDEO_BLOCK)
+ 				modes += do_cea_modes(connector, db + 1, dbl);
++			else if (cea_db_is_hdmi_vsdb(db))
++				modes += do_hdmi_vsdb_modes(connector, db, dbl);
+ 		}
+ 	}
+ 
+@@ -2503,21 +2612,6 @@ monitor_name(struct detailed_timing *t,
+ 		*(u8 **)data = t->data.other_data.data.str.str;
+ }
+ 
+-static bool cea_db_is_hdmi_vsdb(const u8 *db)
+-{
+-	int hdmi_id;
+-
+-	if (cea_db_tag(db) != VENDOR_BLOCK)
+-		return false;
+-
+-	if (cea_db_payload_len(db) < 5)
+-		return false;
+-
+-	hdmi_id = db[1] | (db[2] << 8) | (db[3] << 16);
+-
+-	return hdmi_id == HDMI_IDENTIFIER;
+-}
+-
+ /**
+  * drm_edid_to_eld - build ELD from EDID
+  * @connector: connector corresponding to the HDMI/DP sink

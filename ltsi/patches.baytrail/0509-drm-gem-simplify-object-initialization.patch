@@ -1,0 +1,184 @@
+From 831337c7d33d6d219086feba2b6687334f65db8e Mon Sep 17 00:00:00 2001
+From: David Herrmann <dh.herrmann@gmail.com>
+Date: Thu, 11 Jul 2013 11:56:32 +0200
+Subject: drm/gem: simplify object initialization
+
+drm_gem_object_init() and drm_gem_private_object_init() do exactly the
+same (except for shmem alloc) so make the first use the latter to reduce
+code duplication.
+
+Also drop the return code from drm_gem_private_object_init(). It seems
+unlikely that we will extend it any time soon so no reason to keep it
+around. This simplifies code paths in drivers, too.
+
+Last but not least, fix gma500 to call drm_gem_object_release() before
+freeing objects that were allocated via drm_gem_private_object_init().
+That isn't actually necessary for now, but might be in the future.
+
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Patrik Jakobsson <patrik.r.jakobsson@gmail.com>
+Acked-by: Rob Clark <robdclark@gmail.com>
+Signed-off-by: Dave Airlie <airlied@gmail.com>
+(cherry picked from commit 89c8233f82d9c8af5b20e72e4a185a38a7d3c50b)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/drm_gem.c              | 20 ++++++++------------
+ drivers/gpu/drm/gma500/framebuffer.c   |  6 ++----
+ drivers/gpu/drm/gma500/gem.c           |  7 ++++---
+ drivers/gpu/drm/i915/i915_gem_dmabuf.c |  7 +------
+ drivers/gpu/drm/i915/i915_gem_stolen.c |  4 +---
+ drivers/gpu/drm/omapdrm/omap_gem.c     |  3 ++-
+ include/drm/drmP.h                     |  4 ++--
+ 7 files changed, 20 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_gem.c b/drivers/gpu/drm/drm_gem.c
+index 4e7407cb0ebc..fdd8248925b8 100644
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -132,16 +132,14 @@ drm_gem_destroy(struct drm_device *dev)
+ int drm_gem_object_init(struct drm_device *dev,
+ 			struct drm_gem_object *obj, size_t size)
+ {
+-	BUG_ON((size & (PAGE_SIZE - 1)) != 0);
++	struct file *filp;
+ 
+-	obj->dev = dev;
+-	obj->filp = shmem_file_setup("drm mm object", size, VM_NORESERVE);
+-	if (IS_ERR(obj->filp))
+-		return PTR_ERR(obj->filp);
++	filp = shmem_file_setup("drm mm object", size, VM_NORESERVE);
++	if (IS_ERR(filp))
++		return PTR_ERR(filp);
+ 
+-	kref_init(&obj->refcount);
+-	atomic_set(&obj->handle_count, 0);
+-	obj->size = size;
++	drm_gem_private_object_init(dev, obj, size);
++	obj->filp = filp;
+ 
+ 	return 0;
+ }
+@@ -152,8 +150,8 @@ EXPORT_SYMBOL(drm_gem_object_init);
+  * no GEM provided backing store. Instead the caller is responsible for
+  * backing the object and handling it.
+  */
+-int drm_gem_private_object_init(struct drm_device *dev,
+-			struct drm_gem_object *obj, size_t size)
++void drm_gem_private_object_init(struct drm_device *dev,
++				 struct drm_gem_object *obj, size_t size)
+ {
+ 	BUG_ON((size & (PAGE_SIZE - 1)) != 0);
+ 
+@@ -163,8 +161,6 @@ int drm_gem_private_object_init(struct drm_device *dev,
+ 	kref_init(&obj->refcount);
+ 	atomic_set(&obj->handle_count, 0);
+ 	obj->size = size;
+-
+-	return 0;
+ }
+ EXPORT_SYMBOL(drm_gem_private_object_init);
+ 
+diff --git a/drivers/gpu/drm/gma500/framebuffer.c b/drivers/gpu/drm/gma500/framebuffer.c
+index 8b1b6d923abe..362dd2ad286f 100644
+--- a/drivers/gpu/drm/gma500/framebuffer.c
++++ b/drivers/gpu/drm/gma500/framebuffer.c
+@@ -321,10 +321,8 @@ static struct gtt_range *psbfb_alloc(struct drm_device *dev, int aligned_size)
+ 	/* Begin by trying to use stolen memory backing */
+ 	backing = psb_gtt_alloc_range(dev, aligned_size, "fb", 1);
+ 	if (backing) {
+-		if (drm_gem_private_object_init(dev,
+-					&backing->gem, aligned_size) == 0)
+-			return backing;
+-		psb_gtt_free_range(dev, backing);
++		drm_gem_private_object_init(dev, &backing->gem, aligned_size);
++		return backing;
+ 	}
+ 	return NULL;
+ }
+diff --git a/drivers/gpu/drm/gma500/gem.c b/drivers/gpu/drm/gma500/gem.c
+index eefd6cc5b80d..fe1d3320ce6a 100644
+--- a/drivers/gpu/drm/gma500/gem.c
++++ b/drivers/gpu/drm/gma500/gem.c
+@@ -261,11 +261,12 @@ static int psb_gem_create_stolen(struct drm_file *file, struct drm_device *dev,
+ 	struct gtt_range *gtt = psb_gtt_alloc_range(dev, size, "gem", 1);
+ 	if (gtt == NULL)
+ 		return -ENOMEM;
+-	if (drm_gem_private_object_init(dev, &gtt->gem, size) != 0)
+-		goto free_gtt;
++
++	drm_gem_private_object_init(dev, &gtt->gem, size);
+ 	if (drm_gem_handle_create(file, &gtt->gem, handle) == 0)
+ 		return 0;
+-free_gtt:
++
++	drm_gem_object_release(&gtt->gem);
+ 	psb_gtt_free_range(dev, gtt);
+ 	return -ENOMEM;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_dmabuf.c b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+index 9e6578330801..6ed7275d0900 100644
+--- a/drivers/gpu/drm/i915/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+@@ -297,12 +297,7 @@ struct drm_gem_object *i915_gem_prime_import(struct drm_device *dev,
+ 		goto fail_detach;
+ 	}
+ 
+-	ret = drm_gem_private_object_init(dev, &obj->base, dma_buf->size);
+-	if (ret) {
+-		i915_gem_object_free(obj);
+-		goto fail_detach;
+-	}
+-
++	drm_gem_private_object_init(dev, &obj->base, dma_buf->size);
+ 	i915_gem_object_init(obj, &i915_gem_object_dmabuf_ops);
+ 	obj->base.import_attach = attach;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_stolen.c b/drivers/gpu/drm/i915/i915_gem_stolen.c
+index 27ffb4c865fa..977b3d91f4e0 100644
+--- a/drivers/gpu/drm/i915/i915_gem_stolen.c
++++ b/drivers/gpu/drm/i915/i915_gem_stolen.c
+@@ -291,9 +291,7 @@ _i915_gem_object_create_stolen(struct drm_device *dev,
+ 	if (obj == NULL)
+ 		return NULL;
+ 
+-	if (drm_gem_private_object_init(dev, &obj->base, stolen->size))
+-		goto cleanup;
+-
++	drm_gem_private_object_init(dev, &obj->base, stolen->size);
+ 	i915_gem_object_init(obj, &i915_gem_object_stolen_ops);
+ 
+ 	obj->pages = i915_pages_create_for_stolen(dev,
+diff --git a/drivers/gpu/drm/omapdrm/omap_gem.c b/drivers/gpu/drm/omapdrm/omap_gem.c
+index ebbdf4132e9c..cbcd71e6ed83 100644
+--- a/drivers/gpu/drm/omapdrm/omap_gem.c
++++ b/drivers/gpu/drm/omapdrm/omap_gem.c
+@@ -1427,8 +1427,9 @@ struct drm_gem_object *omap_gem_new(struct drm_device *dev,
+ 		omap_obj->height = gsize.tiled.height;
+ 	}
+ 
++	ret = 0;
+ 	if (flags & (OMAP_BO_DMA|OMAP_BO_EXT_MEM))
+-		ret = drm_gem_private_object_init(dev, obj, size);
++		drm_gem_private_object_init(dev, obj, size);
+ 	else
+ 		ret = drm_gem_object_init(dev, obj, size);
+ 
+diff --git a/include/drm/drmP.h b/include/drm/drmP.h
+index 63d17ee9eb48..8043e53374d9 100644
+--- a/include/drm/drmP.h
++++ b/include/drm/drmP.h
+@@ -1643,8 +1643,8 @@ struct drm_gem_object *drm_gem_object_alloc(struct drm_device *dev,
+ 					    size_t size);
+ int drm_gem_object_init(struct drm_device *dev,
+ 			struct drm_gem_object *obj, size_t size);
+-int drm_gem_private_object_init(struct drm_device *dev,
+-			struct drm_gem_object *obj, size_t size);
++void drm_gem_private_object_init(struct drm_device *dev,
++				 struct drm_gem_object *obj, size_t size);
+ void drm_gem_object_handle_free(struct drm_gem_object *obj);
+ void drm_gem_vm_open(struct vm_area_struct *vma);
+ void drm_gem_vm_close(struct vm_area_struct *vma);
+-- 
+1.8.5.rc3
+

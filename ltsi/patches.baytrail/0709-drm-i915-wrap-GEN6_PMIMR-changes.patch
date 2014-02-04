@@ -1,0 +1,164 @@
+From 13d18277dc1bf6a7f3eabc886596c860d96ae21f Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Tue, 6 Aug 2013 18:57:13 -0300
+Subject: drm/i915: wrap GEN6_PMIMR changes
+
+Just like we're doing with the other IMR changes.
+
+One of the functional changes is that not every caller was doing the
+POSTING_READ.
+
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Reviewed-by: Rodrigo Vivi <rodrigo.vivi@gmail.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit edbfdb456053d0738e6b06a3827ead4158bfc918)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c         | 47 ++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/intel_drv.h        |  3 +++
+ drivers/gpu/drm/i915/intel_pm.c         |  2 +-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  8 ++----
+ 4 files changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 5315161d6e71..bb4bd21399a1 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -132,6 +132,41 @@ void ilk_disable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask)
+ 	ilk_update_gt_irq(dev_priv, mask, 0);
+ }
+ 
++/**
++  * snb_update_pm_irq - update GEN6_PMIMR
++  * @dev_priv: driver private
++  * @interrupt_mask: mask of interrupt bits to update
++  * @enabled_irq_mask: mask of interrupt bits to enable
++  */
++static void snb_update_pm_irq(struct drm_i915_private *dev_priv,
++			      uint32_t interrupt_mask,
++			      uint32_t enabled_irq_mask)
++{
++	uint32_t pmimr = I915_READ(GEN6_PMIMR);
++	pmimr &= ~interrupt_mask;
++	pmimr |= (~enabled_irq_mask & interrupt_mask);
++
++	assert_spin_locked(&dev_priv->irq_lock);
++
++	I915_WRITE(GEN6_PMIMR, pmimr);
++	POSTING_READ(GEN6_PMIMR);
++}
++
++void snb_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask)
++{
++	snb_update_pm_irq(dev_priv, mask, mask);
++}
++
++void snb_disable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask)
++{
++	snb_update_pm_irq(dev_priv, mask, 0);
++}
++
++static void snb_set_pm_irq(struct drm_i915_private *dev_priv, uint32_t val)
++{
++	snb_update_pm_irq(dev_priv, 0xffffffff, ~val);
++}
++
+ static bool ivb_can_enable_err_int(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -739,15 +774,14 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ {
+ 	drm_i915_private_t *dev_priv = container_of(work, drm_i915_private_t,
+ 						    rps.work);
+-	u32 pm_iir, pm_imr;
++	u32 pm_iir;
+ 	u8 new_delay;
+ 
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 	pm_iir = dev_priv->rps.pm_iir;
+ 	dev_priv->rps.pm_iir = 0;
+-	pm_imr = I915_READ(GEN6_PMIMR);
+ 	/* Make sure not to corrupt PMIMR state used by ringbuffer code */
+-	I915_WRITE(GEN6_PMIMR, pm_imr & ~GEN6_PM_RPS_EVENTS);
++	snb_enable_pm_irq(dev_priv, GEN6_PM_RPS_EVENTS);
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ 
+ 	if ((pm_iir & GEN6_PM_RPS_EVENTS) == 0)
+@@ -921,8 +955,7 @@ static void gen6_rps_irq_handler(struct drm_i915_private *dev_priv,
+ 
+ 	spin_lock(&dev_priv->irq_lock);
+ 	dev_priv->rps.pm_iir |= pm_iir;
+-	I915_WRITE(GEN6_PMIMR, dev_priv->rps.pm_iir);
+-	POSTING_READ(GEN6_PMIMR);
++	snb_set_pm_irq(dev_priv, dev_priv->rps.pm_iir);
+ 	spin_unlock(&dev_priv->irq_lock);
+ 
+ 	queue_work(dev_priv->wq, &dev_priv->rps.work);
+@@ -1005,8 +1038,8 @@ static void hsw_pm_irq_handler(struct drm_i915_private *dev_priv,
+ 	if (pm_iir & GEN6_PM_RPS_EVENTS) {
+ 		spin_lock(&dev_priv->irq_lock);
+ 		dev_priv->rps.pm_iir |= pm_iir & GEN6_PM_RPS_EVENTS;
+-		I915_WRITE(GEN6_PMIMR, dev_priv->rps.pm_iir);
+-		/* never want to mask useful interrupts. (also posting read) */
++		snb_set_pm_irq(dev_priv, dev_priv->rps.pm_iir);
++		/* never want to mask useful interrupts. */
+ 		WARN_ON(I915_READ_NOTRACE(GEN6_PMIMR) & ~GEN6_PM_RPS_EVENTS);
+ 		spin_unlock(&dev_priv->irq_lock);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index a8462064714c..8222f2426b47 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -781,5 +781,8 @@ extern void hsw_restore_lcpll(struct drm_i915_private *dev_priv);
+ extern void ilk_enable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask);
+ extern void ilk_disable_gt_irq(struct drm_i915_private *dev_priv,
+ 			       uint32_t mask);
++extern void snb_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask);
++extern void snb_disable_pm_irq(struct drm_i915_private *dev_priv,
++			       uint32_t mask);
+ 
+ #endif /* __INTEL_DRV_H__ */
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 21f4c958bbfe..8dca2530a8f4 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3450,7 +3450,7 @@ static void gen6_enable_rps_interrupts(struct drm_device *dev)
+ 
+ 	spin_lock_irq(&dev_priv->irq_lock);
+ 	WARN_ON(dev_priv->rps.pm_iir);
+-	I915_WRITE(GEN6_PMIMR, I915_READ(GEN6_PMIMR) & ~GEN6_PM_RPS_EVENTS);
++	snb_enable_pm_irq(dev_priv, GEN6_PM_RPS_EVENTS);
+ 	I915_WRITE(GEN6_PMIIR, GEN6_PM_RPS_EVENTS);
+ 	spin_unlock_irq(&dev_priv->irq_lock);
+ 	/* only unmask PM interrupts we need. Mask all others. */
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index c26c90607355..f05cceac5a52 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1074,10 +1074,8 @@ hsw_vebox_get_irq(struct intel_ring_buffer *ring)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (ring->irq_refcount++ == 0) {
+-		u32 pm_imr = I915_READ(GEN6_PMIMR);
+ 		I915_WRITE_IMR(ring, ~ring->irq_enable_mask);
+-		I915_WRITE(GEN6_PMIMR, pm_imr & ~ring->irq_enable_mask);
+-		POSTING_READ(GEN6_PMIMR);
++		snb_enable_pm_irq(dev_priv, ring->irq_enable_mask);
+ 	}
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
+ 
+@@ -1096,10 +1094,8 @@ hsw_vebox_put_irq(struct intel_ring_buffer *ring)
+ 
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (--ring->irq_refcount == 0) {
+-		u32 pm_imr = I915_READ(GEN6_PMIMR);
+ 		I915_WRITE_IMR(ring, ~0);
+-		I915_WRITE(GEN6_PMIMR, pm_imr | ring->irq_enable_mask);
+-		POSTING_READ(GEN6_PMIMR);
++		snb_disable_pm_irq(dev_priv, ring->irq_enable_mask);
+ 	}
+ 	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
+ }
+-- 
+1.8.5.rc3
+

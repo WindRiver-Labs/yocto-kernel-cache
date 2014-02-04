@@ -1,0 +1,349 @@
+From 587a17640f431c364afc4d24a2aab6a834f4b276 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 25 Sep 2013 17:34:55 +0100
+Subject: drm/i915: Fix __wait_seqno to use true infinite timeouts
+
+When we switched to always using a timeout in conjunction with
+wait_seqno, we lost the ability to detect missed interrupts. Since, we
+have had issues with interrupts on a number of generations, and they are
+required to be delivered in a timely fashion for a smooth UX, it is
+important that we do log errors found in the wild and prevent the
+display stalling for upwards of 1s every time the seqno interrupt is
+missed.
+
+Rather than continue to fix up the timeouts to work around the interface
+impedence in wait_event_*(), open code the combination of
+wait_event[_interruptible][_timeout], and use the exposed timer to
+poll for seqno should we detect a lost interrupt.
+
+v2: In order to satisfy the debug requirement of logging missed
+interrupts with the real world requirments of making machines work even
+if interrupts are hosed, we revert to polling after detecting a missed
+interrupt.
+
+v3: Throw in a debugfs interface to simulate broken hw not reporting
+interrupts.
+
+v4: s/EGAIN/EAGAIN/ (Imre)
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+[danvet: Don't use the struct typedef in new code.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit 094f9a54e35500739da185cdb78f2e92fc379458)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c   |  68 ++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_drv.h       |   6 ++
+ drivers/gpu/drm/i915/i915_gem.c       | 114 ++++++++++++++++++++--------------
+ drivers/gpu/drm/i915/i915_gpu_error.c |   1 +
+ drivers/gpu/drm/i915/i915_irq.c       |  11 ++--
+ 5 files changed, 149 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index fcfa98844ccc..bc5c04d5890f 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1897,6 +1897,72 @@ DEFINE_SIMPLE_ATTRIBUTE(i915_ring_stop_fops,
+ 			i915_ring_stop_get, i915_ring_stop_set,
+ 			"0x%08llx\n");
+ 
++static int
++i915_ring_missed_irq_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	*val = dev_priv->gpu_error.missed_irq_rings;
++	return 0;
++}
++
++static int
++i915_ring_missed_irq_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret;
++
++	/* Lock against concurrent debugfs callers */
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++	dev_priv->gpu_error.missed_irq_rings = val;
++	mutex_unlock(&dev->struct_mutex);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_ring_missed_irq_fops,
++			i915_ring_missed_irq_get, i915_ring_missed_irq_set,
++			"0x%08llx\n");
++
++static int
++i915_ring_test_irq_get(void *data, u64 *val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	*val = dev_priv->gpu_error.test_irq_rings;
++
++	return 0;
++}
++
++static int
++i915_ring_test_irq_set(void *data, u64 val)
++{
++	struct drm_device *dev = data;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	int ret;
++
++	DRM_DEBUG_DRIVER("Masking interrupts on rings 0x%08llx\n", val);
++
++	/* Lock against concurrent debugfs callers */
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++
++	dev_priv->gpu_error.test_irq_rings = val;
++	mutex_unlock(&dev->struct_mutex);
++
++	return 0;
++}
++
++DEFINE_SIMPLE_ATTRIBUTE(i915_ring_test_irq_fops,
++			i915_ring_test_irq_get, i915_ring_test_irq_set,
++			"0x%08llx\n");
++
+ #define DROP_UNBOUND 0x1
+ #define DROP_BOUND 0x2
+ #define DROP_RETIRE 0x4
+@@ -2290,6 +2356,8 @@ static struct i915_debugfs_files {
+ 	{"i915_min_freq", &i915_min_freq_fops},
+ 	{"i915_cache_sharing", &i915_cache_sharing_fops},
+ 	{"i915_ring_stop", &i915_ring_stop_fops},
++	{"i915_ring_missed_irq", &i915_ring_missed_irq_fops},
++	{"i915_ring_test_irq", &i915_ring_test_irq_fops},
+ 	{"i915_gem_drop_caches", &i915_drop_caches_fops},
+ 	{"i915_error_state", &i915_error_state_fops},
+ 	{"i915_next_seqno", &i915_next_seqno_fops},
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 08e96a8c01aa..79bbcf925e4a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1013,6 +1013,9 @@ struct i915_gpu_error {
+ 	struct drm_i915_error_state *first_error;
+ 	struct work_struct work;
+ 
++
++	unsigned long missed_irq_rings;
++
+ 	/**
+ 	 * State variable and reset counter controlling the reset flow
+ 	 *
+@@ -1051,6 +1054,9 @@ struct i915_gpu_error {
+ 
+ 	/* For gpu hang simulation. */
+ 	unsigned int stop_rings;
++
++	/* For missed irq/seqno simulation. */
++	unsigned int test_irq_rings;
+ };
+ 
+ enum modeset_restore {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 5ff2338b811b..6ee80f4e80ce 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -969,6 +969,17 @@ i915_gem_check_olr(struct intel_ring_buffer *ring, u32 seqno)
+ 	return ret;
+ }
+ 
++static void fake_irq(unsigned long data)
++{
++	wake_up_process((struct task_struct *)data);
++}
++
++static bool missed_irq(struct drm_i915_private *dev_priv,
++		       struct intel_ring_buffer *ring)
++{
++	return test_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings);
++}
++
+ /**
+  * __wait_seqno - wait until execution of seqno has finished
+  * @ring: the ring expected to report seqno
+@@ -992,10 +1003,9 @@ static int __wait_seqno(struct intel_ring_buffer *ring, u32 seqno,
+ 			bool interruptible, struct timespec *timeout)
+ {
+ 	drm_i915_private_t *dev_priv = ring->dev->dev_private;
+-	struct timespec before, now, wait_time={1,0};
+-	unsigned long timeout_jiffies;
+-	long end;
+-	bool wait_forever = true;
++	struct timespec before, now;
++	DEFINE_WAIT(wait);
++	long timeout_jiffies;
+ 	int ret;
+ 
+ 	WARN(dev_priv->pc8.irqs_disabled, "IRQs disabled\n");
+@@ -1003,51 +1013,71 @@ static int __wait_seqno(struct intel_ring_buffer *ring, u32 seqno,
+ 	if (i915_seqno_passed(ring->get_seqno(ring, true), seqno))
+ 		return 0;
+ 
+-	trace_i915_gem_request_wait_begin(ring, seqno);
+-
+-	if (timeout != NULL) {
+-		wait_time = *timeout;
+-		wait_forever = false;
+-	}
+-
+-	timeout_jiffies = timespec_to_jiffies_timeout(&wait_time);
++	timeout_jiffies = timeout ? timespec_to_jiffies_timeout(timeout) : 1;
+ 
+-	if (WARN_ON(!ring->irq_get(ring)))
++	if (!(dev_priv->gpu_error.test_irq_rings & intel_ring_flag(ring)) &&
++	    WARN_ON(!ring->irq_get(ring)))
+ 		return -ENODEV;
+ 
+-	/* Record current time in case interrupted by signal, or wedged * */
++	/* Record current time in case interrupted by signal, or wedged */
++	trace_i915_gem_request_wait_begin(ring, seqno);
+ 	getrawmonotonic(&before);
++	for (;;) {
++		struct timer_list timer;
++		unsigned long expire;
+ 
+-#define EXIT_COND \
+-	(i915_seqno_passed(ring->get_seqno(ring, false), seqno) || \
+-	 i915_reset_in_progress(&dev_priv->gpu_error) || \
+-	 reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter))
+-	do {
+-		if (interruptible)
+-			end = wait_event_interruptible_timeout(ring->irq_queue,
+-							       EXIT_COND,
+-							       timeout_jiffies);
+-		else
+-			end = wait_event_timeout(ring->irq_queue, EXIT_COND,
+-						 timeout_jiffies);
++		prepare_to_wait(&ring->irq_queue, &wait,
++				interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
+ 
+ 		/* We need to check whether any gpu reset happened in between
+ 		 * the caller grabbing the seqno and now ... */
+-		if (reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter))
+-			end = -EAGAIN;
++		if (reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter)) {
++			/* ... but upgrade the -EAGAIN to an -EIO if the gpu
++			 * is truely gone. */
++			ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
++			if (ret == 0)
++				ret = -EAGAIN;
++			break;
++		}
+ 
+-		/* ... but upgrade the -EGAIN to an -EIO if the gpu is truely
+-		 * gone. */
+-		ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
+-		if (ret)
+-			end = ret;
+-	} while (end == 0 && wait_forever);
++		if (i915_seqno_passed(ring->get_seqno(ring, false), seqno)) {
++			ret = 0;
++			break;
++		}
++
++		if (interruptible && signal_pending(current)) {
++			ret = -ERESTARTSYS;
++			break;
++		}
++
++		if (timeout_jiffies <= 0) {
++			ret = -ETIME;
++			break;
++		}
+ 
++		timer.function = NULL;
++		if (timeout || missed_irq(dev_priv, ring)) {
++			setup_timer_on_stack(&timer, fake_irq, (unsigned long)current);
++			expire = jiffies + (missed_irq(dev_priv, ring) ? 1: timeout_jiffies);
++			mod_timer(&timer, expire);
++		}
++
++		schedule();
++
++		if (timeout)
++			timeout_jiffies = expire - jiffies;
++
++		if (timer.function) {
++			del_singleshot_timer_sync(&timer);
++			destroy_timer_on_stack(&timer);
++		}
++	}
+ 	getrawmonotonic(&now);
++	trace_i915_gem_request_wait_end(ring, seqno);
+ 
+ 	ring->irq_put(ring);
+-	trace_i915_gem_request_wait_end(ring, seqno);
+-#undef EXIT_COND
++
++	finish_wait(&ring->irq_queue, &wait);
+ 
+ 	if (timeout) {
+ 		struct timespec sleep_time = timespec_sub(now, before);
+@@ -1056,17 +1086,7 @@ static int __wait_seqno(struct intel_ring_buffer *ring, u32 seqno,
+ 			set_normalized_timespec(timeout, 0, 0);
+ 	}
+ 
+-	switch (end) {
+-	case -EIO:
+-	case -EAGAIN: /* Wedged */
+-	case -ERESTARTSYS: /* Signal */
+-		return (int)end;
+-	case 0: /* Timeout */
+-		return -ETIME;
+-	default: /* Completed */
+-		WARN_ON(end < 0); /* We're not aware of other errors */
+-		return 0;
+-	}
++	return ret;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/i915_gpu_error.c b/drivers/gpu/drm/i915/i915_gpu_error.c
+index 0a49b651e510..da1022a328e3 100644
+--- a/drivers/gpu/drm/i915/i915_gpu_error.c
++++ b/drivers/gpu/drm/i915/i915_gpu_error.c
+@@ -311,6 +311,7 @@ int i915_error_state_to_str(struct drm_i915_error_state_buf *m,
+ 	err_printf(m, "FORCEWAKE: 0x%08x\n", error->forcewake);
+ 	err_printf(m, "DERRMR: 0x%08x\n", error->derrmr);
+ 	err_printf(m, "CCID: 0x%08x\n", error->ccid);
++	err_printf(m, "Missed interrupts: 0x%08lx\n", dev_priv->gpu_error.missed_irq_rings);
+ 
+ 	for (i = 0; i < dev_priv->num_fence_regs; i++)
+ 		err_printf(m, "  fence[%d] = %08llx\n", i, error->fence[i]);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 84b7efc6ee91..05c05a6a4360 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2039,10 +2039,13 @@ static void i915_hangcheck_elapsed(unsigned long data)
+ 
+ 				if (waitqueue_active(&ring->irq_queue)) {
+ 					/* Issue a wake-up to catch stuck h/w. */
+-					DRM_ERROR("Hangcheck timer elapsed... %s idle\n",
+-						  ring->name);
+-					wake_up_all(&ring->irq_queue);
+-					ring->hangcheck.score += HUNG;
++					if (!test_and_set_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings)) {
++						DRM_ERROR("Hangcheck timer elapsed... %s idle\n",
++							  ring->name);
++						wake_up_all(&ring->irq_queue);
++					}
++					/* Safeguard against driver failure */
++					ring->hangcheck.score += BUSY;
+ 				} else
+ 					busy = false;
+ 			} else {
+-- 
+1.8.5.rc3
+

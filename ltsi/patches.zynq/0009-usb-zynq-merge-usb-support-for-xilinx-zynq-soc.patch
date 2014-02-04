@@ -1,0 +1,3821 @@
+From 485381435a50c8de2cee2720cee12434437a9354 Mon Sep 17 00:00:00 2001
+From: Michal Simek <michal.simek@xilinx.com>
+Date: Tue, 24 Dec 2013 09:27:30 +0900
+Subject: usb: zynq: merge usb support for xilinx zynq soc
+
+This merges support for the Zynq's USB from the Xilinx repository
+(commit efc27505715e64526653f35274717c0fc56491e3 in master branch).
+It has been tested by connecting a USB storage device into a
+Zynq 702 board.
+
+Signed-off-by: Daniel Sangorrin <daniel.sangorrin@toshiba.co.jp>
+Signed-off-by: Yoshitake Kobayashi <yoshitake.kobayashi@toshiba.co.jp>
+---
+ drivers/usb/Kconfig                  |    1 
+ drivers/usb/core/hub.c               |    4 
+ drivers/usb/host/Kconfig             |   15 
+ drivers/usb/host/Makefile            |    1 
+ drivers/usb/host/ehci-hcd.c          |   52 
+ drivers/usb/host/ehci-hub.c          |   22 
+ drivers/usb/host/ehci-xilinx-of.c    |   17 
+ drivers/usb/host/ehci-xilinx-usbps.c |  531 ++++++++
+ drivers/usb/host/ehci-xilinx-usbps.h |   33 
+ drivers/usb/host/ehci.h              |    8 
+ drivers/usb/host/xusbps-dr-of.c      |  331 +++++
+ drivers/usb/phy/Kconfig              |   12 
+ drivers/usb/phy/Makefile             |    1 
+ drivers/usb/phy/phy-zynq-usb.c       | 2305 +++++++++++++++++++++++++++++++++++
+ include/linux/usb/xilinx_usbps_otg.h |  216 +++
+ include/linux/xilinx_devices.h       |   70 +
+ 16 files changed, 3617 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/usb/host/ehci-xilinx-usbps.c
+ create mode 100644 drivers/usb/host/ehci-xilinx-usbps.h
+ create mode 100644 drivers/usb/host/xusbps-dr-of.c
+ create mode 100644 drivers/usb/phy/phy-zynq-usb.c
+ create mode 100644 include/linux/usb/xilinx_usbps_otg.h
+ create mode 100644 include/linux/xilinx_devices.h
+
+--- a/drivers/usb/Kconfig
++++ b/drivers/usb/Kconfig
+@@ -45,6 +45,7 @@ config USB_ARCH_HAS_EHCI
+ 	default y if PLAT_S5P
+ 	default y if ARCH_MSM
+ 	default y if MICROBLAZE
++	default y if ARCH_ZYNQ
+ 	default y if SPARC_LEON
+ 	default y if ARCH_MMP
+ 	default y if MACH_LOONGSON1
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1685,7 +1685,11 @@ static int hub_probe(struct usb_interfac
+ 	pm_runtime_set_autosuspend_delay(&hdev->dev, 0);
+ 
+ 	/* Hubs have proper suspend/resume support. */
++#ifdef CONFIG_USB_ZYNQ_PHY
++	usb_disable_autosuspend(hdev);
++#else
+ 	usb_enable_autosuspend(hdev);
++#endif
+ 
+ 	if (hdev->level == MAX_TOPO_LEVEL) {
+ 		dev_err(&intf->dev,
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -132,6 +132,21 @@ config XPS_USB_HCD_XILINX
+ 		support both high speed and full speed devices, or high speed
+ 		devices only.
+ 
++config USB_XUSBPS_DR_OF
++	tristate
++	select USB_PHY
++	select USB_ULPI
++	select USB_ULPI_VIEWPORT
++
++config USB_EHCI_XUSBPS
++	bool "Support for Xilinx PS EHCI USB controller"
++	depends on USB_EHCI_HCD && ARCH_ZYNQ
++	select USB_EHCI_ROOT_HUB_TT
++	select USB_XUSBPS_DR_OF
++	---help---
++		Xilinx PS USB host controller core is EHCI compilant and has
++		transaction translator built-in.
++
+ config USB_EHCI_FSL
+ 	bool "Support for Freescale PPC on-chip EHCI USB controller"
+ 	depends on FSL_SOC
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -49,6 +49,7 @@ obj-$(CONFIG_USB_ISP1760_HCD)	+= isp1760
+ obj-$(CONFIG_USB_HWA_HCD)	+= hwa-hc.o
+ obj-$(CONFIG_USB_IMX21_HCD)	+= imx21-hcd.o
+ obj-$(CONFIG_USB_FSL_MPH_DR_OF)	+= fsl-mph-dr-of.o
++obj-$(CONFIG_USB_XUSBPS_DR_OF)	+= xusbps-dr-of.o
+ obj-$(CONFIG_USB_OCTEON2_COMMON) += octeon2-common.o
+ obj-$(CONFIG_USB_HCD_BCMA)	+= bcma-hcd.o
+ obj-$(CONFIG_USB_HCD_SSB)	+= ssb-hcd.o
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -335,11 +335,21 @@ static void ehci_turn_off_all_ports(stru
+  */
+ static void ehci_silence_controller(struct ehci_hcd *ehci)
+ {
++#ifdef CONFIG_USB_ZYNQ_PHY
++	struct usb_hcd *hcd = ehci_to_hcd(ehci);
++#endif
++
+ 	ehci_halt(ehci);
+ 
+ 	spin_lock_irq(&ehci->lock);
+ 	ehci->rh_state = EHCI_RH_HALTED;
++#ifdef CONFIG_USB_ZYNQ_PHY
++	/* turn off for non-otg port */
++	if (!hcd->phy)
++		ehci_turn_off_all_ports(ehci);
++#else
+ 	ehci_turn_off_all_ports(ehci);
++#endif
+ 
+ 	/* make BIOS/etc use companion controller during reboot */
+ 	ehci_writel(ehci, 0, &ehci->regs->configured_flag);
+@@ -422,7 +432,12 @@ static void ehci_stop (struct usb_hcd *h
+ 
+ 	ehci_quiesce(ehci);
+ 	ehci_silence_controller(ehci);
++#ifdef CONFIG_USB_ZYNQ_PHY
++	if (!hcd->phy)
++		ehci_reset(ehci);
++#else
+ 	ehci_reset (ehci);
++#endif
+ 
+ 	hrtimer_cancel(&ehci->hrtimer);
+ 	remove_sysfs_files(ehci);
+@@ -569,6 +584,9 @@ static int ehci_run (struct usb_hcd *hcd
+ 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+ 	u32			temp;
+ 	u32			hcc_params;
++#if defined(CONFIG_ARCH_ZYNQ)
++	void __iomem *non_ehci = hcd->regs;
++#endif
+ 
+ 	hcd->uses_new_polling = 1;
+ 
+@@ -638,7 +656,11 @@ static int ehci_run (struct usb_hcd *hcd
+ 
+ 	ehci_writel(ehci, INTR_MASK,
+ 		    &ehci->regs->intr_enable); /* Turn On Interrupts */
+-
++#if defined(CONFIG_ARCH_ZYNQ)
++	/* Modifying FIFO Burst Threshold value from 2 to 8 */
++	temp = readl(non_ehci + 0x164);
++	ehci_writel(ehci, 0x00080000, non_ehci + 0x164);
++#endif
+ 	/* GRR this is run-once init(), being done every time the HC starts.
+ 	 * So long as they're part of class devices, we can't do it init()
+ 	 * since the class device isn't created that early.
+@@ -691,6 +713,29 @@ static irqreturn_t ehci_irq (struct usb_
+ 
+ 	status = ehci_readl(ehci, &ehci->regs->status);
+ 
++#ifdef CONFIG_USB_ZYNQ_PHY
++	if (hcd->phy) {
++		/* A device */
++		if (hcd->phy->otg->default_a &&
++			(hcd->phy->state == OTG_STATE_A_PERIPHERAL)) {
++			spin_unlock(&ehci->lock);
++			return IRQ_NONE;
++		}
++		/* B device */
++		if (!hcd->phy->otg->default_a &&
++			((hcd->phy->state != OTG_STATE_B_WAIT_ACON) &&
++			(hcd->phy->state != OTG_STATE_B_HOST))) {
++			spin_unlock(&ehci->lock);
++			return IRQ_NONE;
++		}
++		/* If HABA is set and B-disconnect occurs, don't process
++		 * that interrupt */
++		if (ehci_is_TDI(ehci) && tdi_in_host_mode(ehci) == 0) {
++			spin_unlock(&ehci->lock);
++			return IRQ_NONE;
++		}
++	}
++#endif
+ 	/* e.g. cardbus physical eject */
+ 	if (status == ~(u32) 0) {
+ 		ehci_dbg (ehci, "device removed\n");
+@@ -1246,6 +1291,11 @@ MODULE_LICENSE ("GPL");
+ #define XILINX_OF_PLATFORM_DRIVER	ehci_hcd_xilinx_of_driver
+ #endif
+ 
++#ifdef CONFIG_USB_EHCI_XUSBPS
++#include "ehci-xilinx-usbps.c"
++#define PLATFORM_DRIVER		ehci_xusbps_driver
++#endif
++
+ #ifdef CONFIG_USB_W90X900_EHCI
+ #include "ehci-w90x900.c"
+ #define	PLATFORM_DRIVER		ehci_hcd_w90x900_driver
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -1018,9 +1018,22 @@ static int ehci_hub_control (
+ 			 * Set appropriate bit thus could put phy into low power
+ 			 * mode if we have hostpc feature
+ 			 */
++#ifdef CONFIG_USB_ZYNQ_PHY
++			if (hcd->phy && (hcd->self.otg_port == (wIndex + 1))
++				&& (hcd->self.b_hnp_enable ||
++				hcd->self.is_b_host))
++				ehci->start_hnp(ehci);
++			else {
++				temp &= ~PORT_WKCONN_E;
++				temp |= PORT_WKDISC_E | PORT_WKOC_E;
++				ehci_writel(ehci, temp | PORT_SUSPEND,
++					    status_reg);
++			}
++#else
+ 			temp &= ~PORT_WKCONN_E;
+ 			temp |= PORT_WKDISC_E | PORT_WKOC_E;
+ 			ehci_writel(ehci, temp | PORT_SUSPEND, status_reg);
++#endif
+ 			if (ehci->has_hostpc) {
+ 				spin_unlock_irqrestore(&ehci->lock, flags);
+ 				msleep(5);/* 5ms for HCD enter low pwr mode */
+@@ -1036,9 +1049,18 @@ static int ehci_hub_control (
+ 			set_bit(wIndex, &ehci->suspended_ports);
+ 			break;
+ 		case USB_PORT_FEAT_POWER:
++#ifdef CONFIG_USB_ZYNQ_PHY
++			/* Check if otg is enabled */
++			if (!hcd->phy) {
++				if (HCS_PPC(ehci->hcs_params))
++					ehci_writel(ehci, temp | PORT_POWER,
++							status_reg);
++			}
++#else
+ 			if (HCS_PPC (ehci->hcs_params))
+ 				ehci_writel(ehci, temp | PORT_POWER,
+ 						status_reg);
++#endif
+ 			break;
+ 		case USB_PORT_FEAT_RESET:
+ 			if (temp & PORT_RESUME)
+--- a/drivers/usb/host/ehci-xilinx-of.c
++++ b/drivers/usb/host/ehci-xilinx-of.c
+@@ -220,6 +220,21 @@ static int ehci_hcd_xilinx_of_remove(str
+ 	return 0;
+ }
+ 
++/**
++ * ehci_hcd_xilinx_of_shutdown - shutdown the hcd
++ * @op:		pointer to platform_device structure that is to be removed
++ *
++ * Properly shutdown the hcd, call driver's shutdown routine.
++ */
++static void ehci_hcd_xilinx_of_shutdown(struct platform_device *op)
++{
++	struct usb_hcd *hcd = platform_get_drvdata(op);
++
++	if (hcd->driver->shutdown)
++		hcd->driver->shutdown(hcd);
++}
++
++
+ static const struct of_device_id ehci_hcd_xilinx_of_match[] = {
+ 		{.compatible = "xlnx,xps-usb-host-1.00.a",},
+ 	{},
+@@ -229,7 +244,7 @@ MODULE_DEVICE_TABLE(of, ehci_hcd_xilinx_
+ static struct platform_driver ehci_hcd_xilinx_of_driver = {
+ 	.probe		= ehci_hcd_xilinx_of_probe,
+ 	.remove		= ehci_hcd_xilinx_of_remove,
+-	.shutdown	= usb_hcd_platform_shutdown,
++	.shutdown	= ehci_hcd_xilinx_of_shutdown,
+ 	.driver = {
+ 		.name = "xilinx-of-ehci",
+ 		.owner = THIS_MODULE,
+--- /dev/null
++++ b/drivers/usb/host/ehci-xilinx-usbps.c
+@@ -0,0 +1,531 @@
++/*
++ * Xilinx PS USB Host Controller Driver.
++ *
++ * Copyright (C) 2011 Xilinx, Inc.
++ *
++ * This file is based on ehci-fsl.c file with few minor modifications
++ * to support Xilinx PS USB controller.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#include <linux/clk.h>
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/delay.h>
++#include <linux/pm.h>
++#include <linux/platform_device.h>
++#include <linux/xilinx_devices.h>
++#include <linux/usb/otg.h>
++#include <linux/usb/xilinx_usbps_otg.h>
++
++#include "ehci-xilinx-usbps.h"
++
++#ifdef CONFIG_USB_ZYNQ_PHY
++/********************************************************************
++ * OTG related functions
++ ********************************************************************/
++static int ehci_xusbps_reinit(struct ehci_hcd *ehci);
++
++/* This connection event is useful when a OTG test device is connected.
++   In that case, the device connect notify event will not be generated
++   since the device will be suspended before complete enumeration.
++*/
++static int ehci_xusbps_update_device(struct usb_hcd *hcd, struct usb_device
++		*udev)
++{
++	struct xusbps_otg *xotg = xceiv_to_xotg(hcd->phy);
++
++	if (udev->portnum == hcd->self.otg_port) {
++		/* HNP test device */
++		if ((le16_to_cpu(udev->descriptor.idVendor) == 0x1a0a &&
++			le16_to_cpu(udev->descriptor.idProduct) == 0xbadd)) {
++			if (xotg->otg.otg->default_a == 1)
++				xotg->hsm.b_conn = 1;
++			else
++				xotg->hsm.a_conn = 1;
++			xusbps_update_transceiver();
++		}
++	}
++	return 0;
++}
++
++static void ehci_xusbps_start_hnp(struct ehci_hcd *ehci)
++{
++	const unsigned	port = ehci_to_hcd(ehci)->self.otg_port - 1;
++	struct usb_hcd *hcd = ehci_to_hcd(ehci);
++	unsigned long	flags;
++	u32 portsc;
++
++	local_irq_save(flags);
++	portsc = ehci_readl(ehci, &ehci->regs->port_status[port]);
++	portsc |= PORT_SUSPEND;
++	ehci_writel(ehci, portsc, &ehci->regs->port_status[port]);
++	local_irq_restore(flags);
++
++	otg_start_hnp(hcd->phy->otg);
++}
++
++static int ehci_xusbps_otg_start_host(struct usb_phy *otg)
++{
++	struct usb_hcd		*hcd = bus_to_hcd(otg->otg->host);
++	struct xusbps_otg *xotg =
++			xceiv_to_xotg(hcd->phy);
++
++	usb_add_hcd(hcd, xotg->irq, IRQF_SHARED);
++	return 0;
++}
++
++static int ehci_xusbps_otg_stop_host(struct usb_phy *otg)
++{
++	struct usb_hcd		*hcd = bus_to_hcd(otg->otg->host);
++
++	usb_remove_hcd(hcd);
++	return 0;
++}
++#endif
++
++static int xusbps_ehci_clk_notifier_cb(struct notifier_block *nb,
++		unsigned long event, void *data)
++{
++
++	switch (event) {
++	case PRE_RATE_CHANGE:
++		/* if a rate change is announced we need to check whether we can
++		 * maintain the current frequency by changing the clock
++		 * dividers.
++		 */
++		/* fall through */
++	case POST_RATE_CHANGE:
++		return NOTIFY_OK;
++	case ABORT_RATE_CHANGE:
++	default:
++		return NOTIFY_DONE;
++	}
++}
++
++/* configure so an HC device and id are always provided */
++/* always called with process context; sleeping is OK */
++
++/**
++ * usb_hcd_xusbps_probe - initialize XUSBPS-based HCDs
++ * @driver: Driver to be used for this HCD
++ * @pdev: USB Host Controller being probed
++ * Context: !in_interrupt()
++ *
++ * Allocates basic resources for this USB host controller.
++ *
++ */
++static int usb_hcd_xusbps_probe(const struct hc_driver *driver,
++			     struct platform_device *pdev)
++{
++	struct xusbps_usb2_platform_data *pdata;
++	struct usb_hcd *hcd;
++	int irq;
++	int retval;
++
++	pr_debug("initializing XUSBPS-SOC USB Controller\n");
++
++	/* Need platform data for setup */
++	pdata = (struct xusbps_usb2_platform_data *)pdev->dev.platform_data;
++	if (!pdata) {
++		dev_err(&pdev->dev,
++			"No platform data for %s.\n", dev_name(&pdev->dev));
++		return -ENODEV;
++	}
++
++	/*
++	 * This is a host mode driver, verify that we're supposed to be
++	 * in host mode.
++	 */
++	if (!((pdata->operating_mode == XUSBPS_USB2_DR_HOST) ||
++	      (pdata->operating_mode == XUSBPS_USB2_MPH_HOST) ||
++	      (pdata->operating_mode == XUSBPS_USB2_DR_OTG))) {
++		dev_err(&pdev->dev, "Non Host Mode configured for %s. Wrong \
++				driver linked.\n", dev_name(&pdev->dev));
++		return -ENODEV;
++	}
++
++	hcd = usb_create_hcd(driver, &pdev->dev, dev_name(&pdev->dev));
++	if (!hcd) {
++		retval = -ENOMEM;
++		goto err1;
++	}
++
++	irq = pdata->irq;
++	hcd->regs = pdata->regs;
++
++	if (hcd->regs == NULL) {
++		dev_dbg(&pdev->dev, "error mapping memory\n");
++		retval = -EFAULT;
++		goto err2;
++	}
++
++	retval = clk_prepare_enable(pdata->clk);
++	if (retval) {
++		dev_err(&pdev->dev, "Unable to enable APER clock.\n");
++		goto err2;
++	}
++
++	pdata->clk_rate_change_nb.notifier_call = xusbps_ehci_clk_notifier_cb;
++	pdata->clk_rate_change_nb.next = NULL;
++	if (clk_notifier_register(pdata->clk, &pdata->clk_rate_change_nb))
++		dev_warn(&pdev->dev, "Unable to register clock notifier.\n");
++
++
++	/*
++	 * do platform specific init: check the clock, grab/config pins, etc.
++	 */
++	if (pdata->init && pdata->init(pdev)) {
++		retval = -ENODEV;
++		goto err_out_clk_unreg_notif;
++	}
++
++#ifdef CONFIG_USB_ZYNQ_PHY
++	if (pdata->otg) {
++		struct xusbps_otg *xotg;
++		struct ehci_hcd *ehci = hcd_to_ehci(hcd);
++
++		hcd->self.otg_port = 1;
++		hcd->phy = pdata->otg;
++		retval = otg_set_host(hcd->phy->otg,
++				&ehci_to_hcd(ehci)->self);
++		if (retval)
++			goto err_out_clk_unreg_notif;
++		xotg = xceiv_to_xotg(hcd->phy);
++		ehci->start_hnp = ehci_xusbps_start_hnp;
++		xotg->start_host = ehci_xusbps_otg_start_host;
++		xotg->stop_host = ehci_xusbps_otg_stop_host;
++		/* inform otg driver about host driver */
++		xusbps_update_transceiver();
++	} else {
++		retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
++		if (retval)
++			goto err_out_clk_unreg_notif;
++
++		/*
++		 * Enable vbus on ULPI - zedboard requirement
++		 * to get host mode to work
++		 */
++		if (pdata->ulpi)
++			otg_set_vbus(pdata->ulpi->otg, 1);
++	}
++#else
++	/* Don't need to set host mode here. It will be done by tdi_reset() */
++	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
++	if (retval)
++		goto err_out_clk_unreg_notif;
++#endif
++	return retval;
++
++err_out_clk_unreg_notif:
++	clk_notifier_unregister(pdata->clk, &pdata->clk_rate_change_nb);
++	clk_disable_unprepare(pdata->clk);
++err2:
++	usb_put_hcd(hcd);
++err1:
++	dev_err(&pdev->dev, "init %s fail, %d\n", dev_name(&pdev->dev), retval);
++	if (pdata->exit)
++		pdata->exit(pdev);
++
++	return retval;
++}
++
++/* may be called without controller electrically present */
++/* may be called with controller, bus, and devices active */
++
++/**
++ * usb_hcd_xusbps_remove - shutdown processing for XUSBPS-based HCDs
++ * @dev: USB Host Controller being removed
++ * Context: !in_interrupt()
++ *
++ * Reverses the effect of usb_hcd_xusbps_probe().
++ *
++ */
++static void usb_hcd_xusbps_remove(struct usb_hcd *hcd,
++			       struct platform_device *pdev)
++{
++	struct xusbps_usb2_platform_data *pdata = pdev->dev.platform_data;
++
++	usb_remove_hcd(hcd);
++
++	/*
++	 * do platform specific un-initialization:
++	 * release iomux pins, disable clock, etc.
++	 */
++	if (pdata->exit)
++		pdata->exit(pdev);
++	usb_put_hcd(hcd);
++	clk_notifier_unregister(pdata->clk, &pdata->clk_rate_change_nb);
++	clk_disable_unprepare(pdata->clk);
++}
++
++static void ehci_xusbps_setup_phy(struct ehci_hcd *ehci,
++			       enum xusbps_usb2_phy_modes phy_mode,
++			       unsigned int port_offset)
++{
++	u32 portsc;
++
++	portsc = ehci_readl(ehci, &ehci->regs->port_status[port_offset]);
++	portsc &= ~(PORT_PTS_MSK | PORT_PTS_PTW);
++
++	switch (phy_mode) {
++	case XUSBPS_USB2_PHY_ULPI:
++		portsc |= PORT_PTS_ULPI;
++		break;
++	case XUSBPS_USB2_PHY_SERIAL:
++		portsc |= PORT_PTS_SERIAL;
++		break;
++	case XUSBPS_USB2_PHY_UTMI_WIDE:
++		portsc |= PORT_PTS_PTW;
++		/* fall through */
++	case XUSBPS_USB2_PHY_UTMI:
++		portsc |= PORT_PTS_UTMI;
++		break;
++	case XUSBPS_USB2_PHY_NONE:
++		break;
++	}
++	ehci_writel(ehci, portsc, &ehci->regs->port_status[port_offset]);
++}
++
++static void ehci_xusbps_usb_setup(struct ehci_hcd *ehci)
++{
++	struct usb_hcd *hcd = ehci_to_hcd(ehci);
++	struct xusbps_usb2_platform_data *pdata;
++
++	pdata = hcd->self.controller->platform_data;
++
++	if ((pdata->operating_mode == XUSBPS_USB2_DR_HOST) ||
++			(pdata->operating_mode == XUSBPS_USB2_DR_OTG))
++		ehci_xusbps_setup_phy(ehci, pdata->phy_mode, 0);
++
++	if (pdata->operating_mode == XUSBPS_USB2_MPH_HOST) {
++		if (pdata->port_enables & XUSBPS_USB2_PORT0_ENABLED)
++			ehci_xusbps_setup_phy(ehci, pdata->phy_mode, 0);
++		if (pdata->port_enables & XUSBPS_USB2_PORT1_ENABLED)
++			ehci_xusbps_setup_phy(ehci, pdata->phy_mode, 1);
++	}
++}
++
++/*
++ * FIXME USB: EHCI: remove ehci_port_power() routine
++ *(sha1: c73cee717e7d5da0698acb720ad1219646fe4f46)
++ */
++static void ehci_port_power(struct ehci_hcd *ehci, int is_on)
++{
++	unsigned port;
++
++	if (!HCS_PPC(ehci->hcs_params))
++		return;
++
++	ehci_dbg(ehci, "...power%s ports...\n", is_on ? "up" : "down");
++	for (port = HCS_N_PORTS(ehci->hcs_params); port > 0; )
++		(void) ehci_hub_control(ehci_to_hcd(ehci),
++				is_on ? SetPortFeature : ClearPortFeature,
++				USB_PORT_FEAT_POWER,
++				port--, NULL, 0);
++	/* Flush those writes */
++	ehci_readl(ehci, &ehci->regs->command);
++	msleep(20);
++}
++
++/* called after powerup, by probe or system-pm "wakeup" */
++static int ehci_xusbps_reinit(struct ehci_hcd *ehci)
++{
++#ifdef CONFIG_USB_ZYNQ_PHY
++	struct usb_hcd *hcd = ehci_to_hcd(ehci);
++#endif
++
++	ehci_xusbps_usb_setup(ehci);
++#ifdef CONFIG_USB_ZYNQ_PHY
++	/* Don't turn off port power in OTG mode */
++	if (!hcd->phy)
++#endif
++		ehci_port_power(ehci, 0);
++
++	return 0;
++}
++
++struct ehci_xusbps {
++	struct ehci_hcd	ehci;
++
++#ifdef CONFIG_PM
++	/* Saved USB PHY settings, need to restore after deep sleep. */
++	u32 usb_ctrl;
++#endif
++};
++
++/* called during probe() after chip reset completes */
++static int ehci_xusbps_setup(struct usb_hcd *hcd)
++{
++	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
++	int retval;
++
++	/* EHCI registers start at offset 0x100 */
++	ehci->caps = hcd->regs + 0x100;
++	ehci->regs = hcd->regs + 0x100 +
++	    HC_LENGTH(ehci, ehci_readl(ehci, &ehci->caps->hc_capbase));
++	dbg_hcs_params(ehci, "reset");
++	dbg_hcc_params(ehci, "reset");
++
++	/* cache this readonly data; minimize chip reads */
++	ehci->hcs_params = ehci_readl(ehci, &ehci->caps->hcs_params);
++
++	hcd->has_tt = 1;
++
++	/* data structure init */
++	retval = ehci_init(hcd);
++	if (retval)
++		return retval;
++
++	retval = ehci_halt(ehci);
++	if (retval)
++		return retval;
++
++	ehci->sbrn = 0x20;
++
++	ehci_reset(ehci);
++
++	retval = ehci_xusbps_reinit(ehci);
++	return retval;
++}
++
++static void ehci_xusbps_shutdown(struct usb_hcd *hcd)
++{
++	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
++
++	if (ehci->regs)
++		ehci_shutdown(hcd);
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int ehci_xusbps_drv_suspend(struct device *dev)
++{
++	struct usb_hcd *hcd = dev_get_drvdata(dev);
++	struct xusbps_usb2_platform_data *pdata = dev->platform_data;
++
++	ehci_prepare_ports_for_controller_suspend(hcd_to_ehci(hcd),
++			device_may_wakeup(dev));
++
++	clk_disable(pdata->clk);
++
++	return 0;
++}
++
++static int ehci_xusbps_drv_resume(struct device *dev)
++{
++	struct usb_hcd *hcd = dev_get_drvdata(dev);
++	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
++	struct xusbps_usb2_platform_data *pdata = dev->platform_data;
++	int ret;
++
++	ret = clk_enable(pdata->clk);
++	if (ret) {
++		dev_err(dev, "cannot enable clock. resume failed\n");
++		return ret;
++	}
++
++	ehci_prepare_ports_for_controller_resume(ehci);
++
++	usb_root_hub_lost_power(hcd->self.root_hub);
++
++	ehci_reset(ehci);
++	ehci_xusbps_reinit(ehci);
++
++	return 0;
++}
++
++static const struct dev_pm_ops ehci_xusbps_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(ehci_xusbps_drv_suspend, ehci_xusbps_drv_resume)
++};
++#define EHCI_XUSBPS_PM_OPS	(&ehci_xusbps_pm_ops)
++
++#else /* ! CONFIG_PM_SLEEP */
++#define EHCI_XUSBPS_PM_OPS	NULL
++#endif /* ! CONFIG_PM_SLEEP */
++
++
++static const struct hc_driver ehci_xusbps_hc_driver = {
++	.description = hcd_name,
++	.product_desc = "Xilinx PS USB EHCI Host Controller",
++	.hcd_priv_size = sizeof(struct ehci_xusbps),
++
++	/*
++	 * generic hardware linkage
++	 */
++	.irq = ehci_irq,
++	.flags = HCD_USB2 | HCD_MEMORY,
++
++	/*
++	 * basic lifecycle operations
++	 */
++	.reset = ehci_xusbps_setup,
++	.start = ehci_run,
++	.stop = ehci_stop,
++	.shutdown = ehci_xusbps_shutdown,
++
++	/*
++	 * managing i/o requests and associated device resources
++	 */
++	.urb_enqueue = ehci_urb_enqueue,
++	.urb_dequeue = ehci_urb_dequeue,
++	.endpoint_disable = ehci_endpoint_disable,
++	.endpoint_reset = ehci_endpoint_reset,
++
++	/*
++	 * scheduling support
++	 */
++	.get_frame_number = ehci_get_frame,
++
++	/*
++	 * root hub support
++	 */
++	.hub_status_data = ehci_hub_status_data,
++	.hub_control = ehci_hub_control,
++	.bus_suspend = ehci_bus_suspend,
++	.bus_resume = ehci_bus_resume,
++	.relinquish_port = ehci_relinquish_port,
++	.port_handed_over = ehci_port_handed_over,
++
++	.clear_tt_buffer_complete = ehci_clear_tt_buffer_complete,
++#ifdef CONFIG_USB_ZYNQ_PHY
++	.update_device = ehci_xusbps_update_device,
++#endif
++};
++
++static int ehci_xusbps_drv_probe(struct platform_device *pdev)
++{
++	if (usb_disabled())
++		return -ENODEV;
++
++	/* FIXME we only want one one probe() not two */
++	return usb_hcd_xusbps_probe(&ehci_xusbps_hc_driver, pdev);
++}
++
++static int ehci_xusbps_drv_remove(struct platform_device *pdev)
++{
++	struct usb_hcd *hcd = platform_get_drvdata(pdev);
++
++	/* FIXME we only want one one remove() not two */
++	usb_hcd_xusbps_remove(hcd, pdev);
++	return 0;
++}
++
++MODULE_ALIAS("platform:xusbps-ehci");
++
++static struct platform_driver ehci_xusbps_driver = {
++	.probe = ehci_xusbps_drv_probe,
++	.remove = ehci_xusbps_drv_remove,
++	.shutdown = usb_hcd_platform_shutdown,
++	.driver = {
++		.name = "xusbps-ehci",
++		.pm = EHCI_XUSBPS_PM_OPS,
++	},
++};
+--- /dev/null
++++ b/drivers/usb/host/ehci-xilinx-usbps.h
+@@ -0,0 +1,33 @@
++/*
++ * Xilinx PS USB Host Controller Driver Header file.
++ *
++ * Copyright (C) 2011 Xilinx, Inc.
++ *
++ * This file is based on ehci-fsl.h file with few minor modifications
++ * to support Xilinx PS USB controller.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++#ifndef _EHCI_XILINX_XUSBPS_H
++#define _EHCI_XILINX_XUSBPS_H
++
++#include <linux/usb/xilinx_usbps_otg.h>
++
++/* offsets for the non-ehci registers in the XUSBPS SOC USB controller */
++#define XUSBPS_SOC_USB_ULPIVP	0x170
++#define XUSBPS_SOC_USB_PORTSC1	0x184
++#define PORT_PTS_MSK		(3<<30)
++#define PORT_PTS_UTMI		(0<<30)
++#define PORT_PTS_ULPI		(2<<30)
++#define	PORT_PTS_SERIAL		(3<<30)
++#define PORT_PTS_PTW		(1<<28)
++#define XUSBPS_SOC_USB_PORTSC2	0x188
++
++#endif				/* _EHCI_XILINX_XUSBPS_H */
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -176,6 +176,14 @@ struct ehci_hcd {			/* one per controlle
+ 	unsigned long		resuming_ports;		/* which ports have
+ 			started to resume */
+ 
++#ifdef CONFIG_USB_ZYNQ_PHY
++	/*
++	 * OTG controllers and transceivers need software interaction;
++	 * other external transceivers should be software-transparent
++	 */
++	void (*start_hnp)(struct ehci_hcd *ehci);
++#endif
++
+ 	/* per-HC memory pools (could be per-bus, but ...) */
+ 	struct dma_pool		*qh_pool;	/* qh per active urb */
+ 	struct dma_pool		*qtd_pool;	/* one or more per qh */
+--- /dev/null
++++ b/drivers/usb/host/xusbps-dr-of.c
+@@ -0,0 +1,331 @@
++/*
++ * Xilinx PS USB Driver for device tree support.
++ *
++ * Copyright (C) 2011 Xilinx, Inc.
++ *
++ * This file is based on fsl-mph-dr-of.c file with few minor modifications
++ * to support Xilinx PS USB controller.
++ *
++ * Setup platform devices needed by the dual-role USB controller modules
++ * based on the description in flat device tree.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/xilinx_devices.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/of_platform.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/clk.h>
++#include <linux/usb/ulpi.h>
++
++#include "ehci-xilinx-usbps.h"
++
++static u64 dma_mask = 0xFFFFFFF0;
++
++struct xusbps_dev_data {
++	char *dr_mode;		/* controller mode */
++	char *drivers[3];	/* drivers to instantiate for this mode */
++	enum xusbps_usb2_operating_modes op_mode;	/* operating mode */
++};
++
++struct xusbps_host_data {
++	struct clk *clk;
++};
++
++static struct xusbps_dev_data dr_mode_data[] = {
++	{
++		.dr_mode = "host",
++		.drivers = { "xusbps-ehci", NULL, NULL, },
++		.op_mode = XUSBPS_USB2_DR_HOST,
++	},
++	{
++		.dr_mode = "otg",
++		.drivers = { "xusbps-otg", "xusbps-ehci", "xusbps-udc", },
++		.op_mode = XUSBPS_USB2_DR_OTG,
++	},
++	{
++		.dr_mode = "peripheral",
++		.drivers = { "xusbps-udc", NULL, NULL, },
++		.op_mode = XUSBPS_USB2_DR_DEVICE,
++	},
++};
++
++static struct xusbps_dev_data *get_dr_mode_data(
++		struct device_node *np)
++{
++	const unsigned char *prop;
++	int i;
++
++	prop = of_get_property(np, "dr_mode", NULL);
++	if (prop) {
++		for (i = 0; i < ARRAY_SIZE(dr_mode_data); i++) {
++			if (!strcmp(prop, dr_mode_data[i].dr_mode))
++				return &dr_mode_data[i];
++		}
++	}
++	pr_warn("%s: Invalid 'dr_mode' property, fallback to host mode\n",
++		np->full_name);
++	return &dr_mode_data[0]; /* mode not specified, use host */
++}
++
++static enum xusbps_usb2_phy_modes determine_usb_phy(const char *phy_type)
++{
++	if (!phy_type)
++		return XUSBPS_USB2_PHY_NONE;
++	if (!strcasecmp(phy_type, "ulpi"))
++		return XUSBPS_USB2_PHY_ULPI;
++	if (!strcasecmp(phy_type, "utmi"))
++		return XUSBPS_USB2_PHY_UTMI;
++	if (!strcasecmp(phy_type, "utmi_wide"))
++		return XUSBPS_USB2_PHY_UTMI_WIDE;
++	if (!strcasecmp(phy_type, "serial"))
++		return XUSBPS_USB2_PHY_SERIAL;
++
++	return XUSBPS_USB2_PHY_NONE;
++}
++
++static struct platform_device *xusbps_device_register(
++					struct platform_device *ofdev,
++					struct xusbps_usb2_platform_data *pdata,
++					const char *name, int id)
++{
++	struct platform_device *pdev;
++	const struct resource *res = ofdev->resource;
++	unsigned int num = ofdev->num_resources;
++	struct xusbps_usb2_platform_data *pdata1;
++	int retval;
++
++	pdev = platform_device_alloc(name, id);
++	if (!pdev) {
++		retval = -ENOMEM;
++		goto error;
++	}
++
++	pdev->dev.parent = &ofdev->dev;
++
++	pdev->dev.coherent_dma_mask = ofdev->dev.coherent_dma_mask;
++	pdev->dev.dma_mask = &dma_mask;
++
++	retval = platform_device_add_data(pdev, pdata, sizeof(*pdata));
++	if (retval)
++		goto error;
++
++	if (num) {
++		retval = platform_device_add_resources(pdev, res, num);
++		if (retval)
++			goto error;
++	}
++
++	retval = platform_device_add(pdev);
++	if (retval)
++		goto error;
++
++	pdata1 = pdev->dev.platform_data;
++	/* Copy the otg transceiver pointer into host/device platform data */
++	if (pdata1->otg)
++		pdata->otg = pdata1->otg;
++
++	return pdev;
++
++error:
++	platform_device_put(pdev);
++	return ERR_PTR(retval);
++}
++
++static int xusbps_dr_of_probe(struct platform_device *ofdev)
++{
++	struct device_node *np = ofdev->dev.of_node;
++	struct platform_device *usb_dev;
++	struct xusbps_usb2_platform_data data, *pdata;
++	struct xusbps_dev_data *dev_data;
++	struct xusbps_host_data *hdata;
++	const unsigned char *prop;
++	static unsigned int idx;
++	struct resource *res;
++	int i, phy_init;
++	int ret;
++
++	pdata = &data;
++	memset(pdata, 0, sizeof(data));
++
++	res = platform_get_resource(ofdev, IORESOURCE_IRQ, 0);
++	if (IS_ERR(res)) {
++		dev_err(&ofdev->dev,
++			"IRQ not found\n");
++		return PTR_ERR(res);
++	}
++	pdata->irq = res->start;
++
++	res = platform_get_resource(ofdev, IORESOURCE_MEM, 0);
++	pdata->regs = devm_ioremap_resource(&ofdev->dev, res);
++	if (IS_ERR(pdata->regs)) {
++		dev_err(&ofdev->dev, "unable to iomap registers\n");
++		return PTR_ERR(pdata->regs);
++	}
++
++	dev_data = get_dr_mode_data(np);
++	pdata->operating_mode = dev_data->op_mode;
++
++	prop = of_get_property(np, "phy_type", NULL);
++	pdata->phy_mode = determine_usb_phy(prop);
++
++	hdata = devm_kzalloc(&ofdev->dev, sizeof(*hdata), GFP_KERNEL);
++	if (!hdata)
++		return -ENOMEM;
++	platform_set_drvdata(ofdev, hdata);
++
++	hdata->clk = devm_clk_get(&ofdev->dev, NULL);
++	if (IS_ERR(hdata->clk)) {
++		dev_err(&ofdev->dev, "input clock not found.\n");
++		return PTR_ERR(hdata->clk);
++	}
++
++	ret = clk_prepare_enable(hdata->clk);
++	if (ret) {
++		dev_err(&ofdev->dev, "Unable to enable APER clock.\n");
++		return ret;
++	}
++
++	pdata->clk = hdata->clk;
++
++	/* If ULPI phy type, set it up */
++	if (pdata->phy_mode == XUSBPS_USB2_PHY_ULPI) {
++		pdata->ulpi = otg_ulpi_create(&ulpi_viewport_access_ops,
++			ULPI_OTG_DRVVBUS | ULPI_OTG_DRVVBUS_EXT);
++		if (pdata->ulpi) {
++			pdata->ulpi->io_priv = pdata->regs +
++							XUSBPS_SOC_USB_ULPIVP;
++
++			phy_init = usb_phy_init(pdata->ulpi);
++			if (phy_init) {
++				dev_err(&ofdev->dev,
++					"Unable to init USB phy, missing?\n");
++				ret = -ENODEV;
++				goto err_out_clk_disable;
++			}
++		} else {
++			dev_err(&ofdev->dev,
++				"Unable to create ULPI transceiver\n");
++		}
++	}
++
++	for (i = 0; i < ARRAY_SIZE(dev_data->drivers); i++) {
++		if (!dev_data->drivers[i])
++			continue;
++		usb_dev = xusbps_device_register(ofdev, pdata,
++					dev_data->drivers[i], idx);
++		if (IS_ERR(usb_dev)) {
++			dev_err(&ofdev->dev, "Can't register usb device\n");
++			ret = PTR_ERR(usb_dev);
++			goto err_out_clk_disable;
++		}
++	}
++	idx++;
++	return 0;
++
++err_out_clk_disable:
++	clk_disable_unprepare(hdata->clk);
++
++	return ret;
++}
++
++static int __unregister_subdev(struct device *dev, void *d)
++{
++	platform_device_unregister(to_platform_device(dev));
++	return 0;
++}
++
++static int xusbps_dr_of_remove(struct platform_device *ofdev)
++{
++	struct xusbps_host_data *hdata = platform_get_drvdata(ofdev);
++
++	device_for_each_child(&ofdev->dev, NULL, __unregister_subdev);
++	clk_disable_unprepare(hdata->clk);
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int xusbps_dr_of_suspend(struct device *dev)
++{
++	struct xusbps_host_data *hdata = dev_get_drvdata(dev);
++
++	clk_disable(hdata->clk);
++
++	return 0;
++}
++
++static int xusbps_dr_of_resume(struct device *dev)
++{
++	struct xusbps_host_data *hdata = dev_get_drvdata(dev);
++	int ret;
++
++	ret = clk_enable(hdata->clk);
++	if (ret) {
++		dev_err(dev, "cannot enable clock. resume failed\n");
++		return ret;
++	}
++
++	return 0;
++}
++#endif /* CONFIG_PM_SLEEP */
++
++static SIMPLE_DEV_PM_OPS(xusbps_pm_ops, xusbps_dr_of_suspend,
++		xusbps_dr_of_resume);
++
++static const struct of_device_id xusbps_dr_of_match[] = {
++	{ .compatible = "xlnx,ps7-usb-1.00.a" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, xusbps_dr_of_match);
++
++static struct platform_driver xusbps_dr_driver = {
++	.driver = {
++		.name = "xusbps-dr",
++		.owner = THIS_MODULE,
++		.of_match_table = xusbps_dr_of_match,
++		.pm = &xusbps_pm_ops,
++	},
++	.probe	= xusbps_dr_of_probe,
++	.remove	= xusbps_dr_of_remove,
++};
++
++#ifdef CONFIG_USB_ZYNQ_PHY
++extern struct platform_driver xusbps_otg_driver;
++
++static int __init xusbps_dr_init(void)
++{
++	int retval;
++
++	/* Register otg driver first */
++	retval = platform_driver_register(&xusbps_otg_driver);
++	if (retval != 0)
++		return retval;
++
++	return platform_driver_register(&xusbps_dr_driver);
++}
++module_init(xusbps_dr_init);
++
++static void __exit xusbps_dr_exit(void)
++{
++	platform_driver_unregister(&xusbps_dr_driver);
++}
++module_exit(xusbps_dr_exit);
++#else
++module_platform_driver(xusbps_dr_driver);
++#endif
++
++MODULE_DESCRIPTION("XUSBPS DR OF devices driver");
++MODULE_AUTHOR("Xilinx");
++MODULE_LICENSE("GPL");
+--- a/drivers/usb/phy/Kconfig
++++ b/drivers/usb/phy/Kconfig
+@@ -210,4 +210,16 @@ config USB_ULPI_VIEWPORT
+ 	  Provides read/write operations to the ULPI phy register set for
+ 	  controllers with a viewport register (e.g. Chipidea/ARC controllers).
+ 
++config USB_ZYNQ_PHY
++	tristate "Xilinx Zynq USB OTG dual-role support"
++	depends on USB && ARCH_ZYNQ && USB_EHCI_XUSBPS && USB_GADGET_XUSBPS && USB_OTG
++	select USB_OTG_UTILS
++	help
++	  Say Y here if you want to build Xilinx USB PS OTG
++	  driver in kernel. This driver implements role
++	  switch between EHCI host driver and USB gadget driver.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called xilinx_usbps_otg.
++
+ endif # USB_PHY
+--- a/drivers/usb/phy/Makefile
++++ b/drivers/usb/phy/Makefile
+@@ -31,3 +31,4 @@ obj-$(CONFIG_USB_MXS_PHY)		+= phy-mxs-us
+ obj-$(CONFIG_USB_RCAR_PHY)		+= phy-rcar-usb.o
+ obj-$(CONFIG_USB_ULPI)			+= phy-ulpi.o
+ obj-$(CONFIG_USB_ULPI_VIEWPORT)		+= phy-ulpi-viewport.o
++obj-$(CONFIG_USB_ZYNQ_PHY)		+= phy-zynq-usb.o
+--- /dev/null
++++ b/drivers/usb/phy/phy-zynq-usb.c
+@@ -0,0 +1,2305 @@
++/*
++ * Xilinx PS USB otg driver.
++ *
++ * Copyright 2011 Xilinx, Inc.
++ *
++ * This file is based on langwell_otg.c file with few minor modifications
++ * to support Xilinx PS USB controller.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++/* This driver helps to switch Xilinx OTG controller function between host
++ * and peripheral. It works with EHCI driver and Xilinx client controller
++ * driver together.
++ */
++#include <linux/clk.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/moduleparam.h>
++#include <linux/usb/ch9.h>
++#include <linux/usb/gadget.h>
++#include <linux/usb.h>
++#include <linux/usb/otg.h>
++#include <linux/usb/hcd.h>
++#include <linux/notifier.h>
++#include <linux/delay.h>
++#include <linux/pm.h>
++#include <linux/io.h>
++
++#include "../core/usb.h"
++
++#include <linux/xilinx_devices.h>
++#include <linux/usb/xilinx_usbps_otg.h>
++
++#define	DRIVER_NAME	"xusbps-otg"
++
++static const char driver_name[] = DRIVER_NAME;
++
++/* HSM timers */
++static inline struct xusbps_otg_timer *otg_timer_initializer
++(void (*function)(unsigned long), unsigned long expires, unsigned long data)
++{
++	struct xusbps_otg_timer *timer;
++	timer = kmalloc(sizeof(struct xusbps_otg_timer), GFP_KERNEL);
++	if (timer == NULL)
++		return timer;
++
++	timer->function = function;
++	timer->expires = expires;
++	timer->data = data;
++	return timer;
++}
++
++static struct xusbps_otg_timer *a_wait_vrise_tmr, *a_aidl_bdis_tmr,
++	*b_se0_srp_tmr, *b_srp_init_tmr;
++
++static struct list_head active_timers;
++
++static struct xusbps_otg *the_transceiver;
++
++/* host/client notify transceiver when event affects HNP state */
++void xusbps_update_transceiver(void)
++{
++	struct xusbps_otg *xotg = the_transceiver;
++
++	dev_dbg(xotg->dev, "transceiver is updated\n");
++
++	if (!xotg->qwork)
++		return;
++
++	queue_work(xotg->qwork, &xotg->work);
++}
++EXPORT_SYMBOL(xusbps_update_transceiver);
++
++static int xusbps_otg_set_host(struct usb_otg *otg,
++					struct usb_bus *host)
++{
++	otg->host = host;
++
++	if (host) {
++		if (otg->default_a)
++			host->is_b_host = 0;
++		else
++			host->is_b_host = 1;
++	}
++
++	return 0;
++}
++
++static int xusbps_otg_set_peripheral(struct usb_otg *otg,
++					struct usb_gadget *gadget)
++{
++	otg->gadget = gadget;
++
++	if (gadget) {
++		if (otg->default_a)
++			gadget->is_a_peripheral = 1;
++		else
++			gadget->is_a_peripheral = 0;
++	}
++
++	return 0;
++}
++
++static int xusbps_otg_set_power(struct usb_phy *otg,
++				unsigned mA)
++{
++	return 0;
++}
++
++/* A-device drives vbus, controlled through PMIC CHRGCNTL register*/
++static int xusbps_otg_set_vbus(struct usb_otg *otg, bool enabled)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	u32 val;
++
++	dev_dbg(xotg->dev, "%s <--- %s\n", __func__, enabled ? "on" : "off");
++
++	/* Enable ulpi VBUS if required */
++	if (xotg->ulpi)
++		otg_set_vbus(xotg->ulpi->otg, enabled);
++
++	val = readl(xotg->base + CI_PORTSC1);
++
++	if (enabled)
++		writel((val | PORTSC_PP), xotg->base + CI_PORTSC1);
++	else
++		writel((val & ~PORTSC_PP), xotg->base + CI_PORTSC1);
++
++	dev_dbg(xotg->dev, "%s --->\n", __func__);
++
++	return 0;
++}
++
++/* Charge vbus for VBUS pulsing in SRP */
++static void xusbps_otg_chrg_vbus(int on)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	u32	val;
++
++	val = readl(xotg->base + CI_OTGSC) & ~OTGSC_INTSTS_MASK;
++
++	if (on)
++		/* stop discharging, start charging */
++		val = (val & ~OTGSC_VD) | OTGSC_VC;
++	else
++		/* stop charging */
++		val &= ~OTGSC_VC;
++
++	writel(val, xotg->base + CI_OTGSC);
++}
++
++#if 0
++
++/* Discharge vbus through a resistor to ground */
++static void xusbps_otg_dischrg_vbus(int on)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	u32	val;
++
++	val = readl(xotg->base + CI_OTGSC) & ~OTGSC_INTSTS_MASK;
++
++	if (on)
++		/* stop charging, start discharging */
++		val = (val & ~OTGSC_VC) | OTGSC_VD;
++	else
++		val &= ~OTGSC_VD;
++
++	writel(val, xotg->base + CI_OTGSC);
++}
++
++#endif
++
++/* Start SRP */
++static int xusbps_otg_start_srp(struct usb_otg *otg)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	u32				val;
++
++	dev_warn(xotg->dev, "Starting SRP...\n");
++	dev_dbg(xotg->dev, "%s --->\n", __func__);
++
++	val = readl(xotg->base + CI_OTGSC);
++
++	writel((val & ~OTGSC_INTSTS_MASK) | OTGSC_HADP,
++				xotg->base + CI_OTGSC);
++
++	/* Check if the data plus is finished or not */
++	msleep(8);
++	val = readl(xotg->base + CI_OTGSC);
++	if (val & (OTGSC_HADP | OTGSC_DP))
++		dev_dbg(xotg->dev, "DataLine SRP Error\n");
++
++	/* If Vbus is valid, then update the hsm */
++	if (val & OTGSC_BSV) {
++		dev_dbg(xotg->dev, "no b_sess_vld interrupt\n");
++
++		xotg->hsm.b_sess_vld = 1;
++		xusbps_update_transceiver();
++		return 0;
++	}
++
++	dev_warn(xotg->dev, "Starting VBUS Pulsing...\n");
++
++	/* Disable interrupt - b_sess_vld */
++	val = readl(xotg->base + CI_OTGSC);
++	val &= (~(OTGSC_BSVIE | OTGSC_BSEIE));
++	writel(val, xotg->base + CI_OTGSC);
++
++	/* Start VBus SRP, drive vbus to generate VBus pulse */
++	xusbps_otg_chrg_vbus(1);
++	msleep(15);
++	xusbps_otg_chrg_vbus(0);
++
++	/* Enable interrupt - b_sess_vld*/
++	val = readl(xotg->base + CI_OTGSC);
++	dev_dbg(xotg->dev, "after VBUS pulse otgsc = %x\n", val);
++
++	val |= (OTGSC_BSVIE | OTGSC_BSEIE);
++	writel(val, xotg->base + CI_OTGSC);
++
++	/* If Vbus is valid, then update the hsm */
++	if (val & OTGSC_BSV) {
++		dev_dbg(xotg->dev, "no b_sess_vld interrupt\n");
++
++		xotg->hsm.b_sess_vld = 1;
++		xusbps_update_transceiver();
++	}
++
++	dev_dbg(xotg->dev, "%s <---\n", __func__);
++	return 0;
++}
++
++/* Start HNP */
++static int xusbps_otg_start_hnp(struct usb_otg *otg)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	unsigned long flag = 0;
++
++	dev_warn(xotg->dev, "Starting HNP...\n");
++	dev_dbg(xotg->dev, "%s --->\n", __func__);
++
++	if (xotg->otg.otg->default_a && xotg->otg.otg->host &&
++			xotg->otg.otg->host->b_hnp_enable) {
++		xotg->hsm.a_suspend_req = 1;
++		flag = 1;
++	}
++
++	if (!xotg->otg.otg->default_a && xotg->otg.otg->host &&
++			xotg->hsm.b_bus_req) {
++		xotg->hsm.b_bus_req = 0;
++		flag = 1;
++	}
++
++	if (flag) {
++		if (spin_trylock(&xotg->wq_lock)) {
++			xusbps_update_transceiver();
++			spin_unlock(&xotg->wq_lock);
++		}
++	} else
++		dev_warn(xotg->dev, "HNP not supported\n");
++
++	dev_dbg(xotg->dev, "%s <---\n", __func__);
++	return 0;
++}
++
++/* stop SOF via bus_suspend */
++static void xusbps_otg_loc_sof(int on)
++{
++	/* Not used */
++}
++
++static void xusbps_otg_phy_low_power(int on)
++{
++	/* Not used */
++}
++
++/* After drv vbus, add 2 ms delay to set PHCD */
++static void xusbps_otg_phy_low_power_wait(int on)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++
++	dev_dbg(xotg->dev, "add 2ms delay before programing PHCD\n");
++
++	mdelay(2);
++	xusbps_otg_phy_low_power(on);
++}
++
++#ifdef CONFIG_PM_SLEEP
++/* Enable/Disable OTG interrupt */
++static void xusbps_otg_intr(int on)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	u32				val;
++
++	dev_dbg(xotg->dev, "%s ---> %s\n", __func__, on ? "on" : "off");
++
++	val = readl(xotg->base + CI_OTGSC);
++
++	/* OTGSC_INT_MASK doesn't contains 1msInt */
++	if (on) {
++		val = val | (OTGSC_INT_MASK);
++		writel(val, xotg->base + CI_OTGSC);
++	} else {
++		val = val & ~(OTGSC_INT_MASK);
++		writel(val, xotg->base + CI_OTGSC);
++	}
++
++	dev_dbg(xotg->dev, "%s <---\n", __func__);
++}
++#endif
++
++/* set HAAR: Hardware Assist Auto-Reset */
++static void xusbps_otg_HAAR(int on)
++{
++	/* Not used */
++}
++
++/* set HABA: Hardware Assist B-Disconnect to A-Connect */
++static void xusbps_otg_HABA(int on)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	u32				val;
++
++	dev_dbg(xotg->dev, "%s ---> %s\n", __func__, on ? "on" : "off");
++
++	val = readl(xotg->base + CI_OTGSC);
++	if (on)
++		writel((val & ~OTGSC_INTSTS_MASK) | OTGSC_HABA,
++					xotg->base + CI_OTGSC);
++	else
++		writel((val & ~OTGSC_INTSTS_MASK) & ~OTGSC_HABA,
++					xotg->base + CI_OTGSC);
++
++	dev_dbg(xotg->dev, "%s <---\n", __func__);
++}
++
++static int xusbps_otg_check_se0_srp(int on)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	int			delay_time = TB_SE0_SRP * 10;
++	u32			val;
++
++	dev_dbg(xotg->dev, "%s --->\n", __func__);
++
++	do {
++		udelay(100);
++		if (!delay_time--)
++			break;
++		val = readl(xotg->base + CI_PORTSC1);
++		val &= PORTSC_LS;
++	} while (!val);
++
++	dev_dbg(xotg->dev, "%s <---\n", __func__);
++	return val;
++}
++
++/* The timeout callback function to set time out bit */
++static void set_tmout(unsigned long indicator)
++{
++	*(int *)indicator = 1;
++}
++
++static void xusbps_otg_msg(unsigned long indicator)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++
++	switch (indicator) {
++	case 2:
++	case 4:
++	case 6:
++	case 7:
++		dev_warn(xotg->dev,
++			"OTG:%lu - deivce not responding\n", indicator);
++		break;
++	case 3:
++		dev_warn(xotg->dev,
++			"OTG:%lu - deivce not supported\n", indicator);
++		break;
++	default:
++		dev_warn(xotg->dev, "Do not have this msg\n");
++		break;
++	}
++}
++
++/* Initialize timers */
++static int xusbps_otg_init_timers(struct otg_hsm *hsm)
++{
++	/* HSM used timers */
++	a_wait_vrise_tmr = otg_timer_initializer(&set_tmout, TA_WAIT_VRISE,
++				(unsigned long)&hsm->a_wait_vrise_tmout);
++	if (a_wait_vrise_tmr == NULL)
++		return -ENOMEM;
++	a_aidl_bdis_tmr = otg_timer_initializer(&set_tmout, TA_AIDL_BDIS,
++				(unsigned long)&hsm->a_aidl_bdis_tmout);
++	if (a_aidl_bdis_tmr == NULL)
++		return -ENOMEM;
++	b_se0_srp_tmr = otg_timer_initializer(&set_tmout, TB_SE0_SRP,
++				(unsigned long)&hsm->b_se0_srp);
++	if (b_se0_srp_tmr == NULL)
++		return -ENOMEM;
++	b_srp_init_tmr = otg_timer_initializer(&set_tmout, TB_SRP_INIT,
++				(unsigned long)&hsm->b_srp_init_tmout);
++	if (b_srp_init_tmr == NULL)
++		return -ENOMEM;
++
++	return 0;
++}
++
++/* Free timers */
++static void xusbps_otg_free_timers(void)
++{
++	kfree(a_wait_vrise_tmr);
++	kfree(a_aidl_bdis_tmr);
++	kfree(b_se0_srp_tmr);
++	kfree(b_srp_init_tmr);
++}
++
++/* The timeout callback function to set time out bit */
++static void xusbps_otg_timer_fn(unsigned long indicator)
++{
++	struct xusbps_otg *xotg = the_transceiver;
++
++	*(int *)indicator = 1;
++
++	dev_dbg(xotg->dev, "kernel timer - timeout\n");
++
++	xusbps_update_transceiver();
++}
++
++/* kernel timer used instead of HW based interrupt */
++static void xusbps_otg_add_ktimer(enum xusbps_otg_timer_type timers)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	unsigned long		j = jiffies;
++	unsigned long		data, time;
++
++	switch (timers) {
++	case TA_WAIT_VRISE_TMR:
++		xotg->hsm.a_wait_vrise_tmout = 0;
++		data = (unsigned long)&xotg->hsm.a_wait_vrise_tmout;
++		time = TA_WAIT_VRISE;
++		break;
++	case TA_WAIT_BCON_TMR:
++		xotg->hsm.a_wait_bcon_tmout = 0;
++		data = (unsigned long)&xotg->hsm.a_wait_bcon_tmout;
++		time = TA_WAIT_BCON;
++		break;
++	case TA_AIDL_BDIS_TMR:
++		xotg->hsm.a_aidl_bdis_tmout = 0;
++		data = (unsigned long)&xotg->hsm.a_aidl_bdis_tmout;
++		time = TA_AIDL_BDIS;
++		break;
++	case TB_ASE0_BRST_TMR:
++		xotg->hsm.b_ase0_brst_tmout = 0;
++		data = (unsigned long)&xotg->hsm.b_ase0_brst_tmout;
++		time = TB_ASE0_BRST;
++		break;
++	case TB_SRP_INIT_TMR:
++		xotg->hsm.b_srp_init_tmout = 0;
++		data = (unsigned long)&xotg->hsm.b_srp_init_tmout;
++		time = TB_SRP_INIT;
++		break;
++	case TB_SRP_FAIL_TMR:
++		xotg->hsm.b_srp_fail_tmout = 0;
++		data = (unsigned long)&xotg->hsm.b_srp_fail_tmout;
++		time = TB_SRP_FAIL;
++		break;
++	case TB_BUS_SUSPEND_TMR:
++		xotg->hsm.b_bus_suspend_tmout = 0;
++		data = (unsigned long)&xotg->hsm.b_bus_suspend_tmout;
++		time = TB_BUS_SUSPEND;
++		break;
++	default:
++		dev_dbg(xotg->dev, "unkown timer, cannot enable it\n");
++		return;
++	}
++
++	xotg->hsm_timer.data = data;
++	xotg->hsm_timer.function = xusbps_otg_timer_fn;
++	xotg->hsm_timer.expires = j + time * HZ / 1000; /* milliseconds */
++
++	add_timer(&xotg->hsm_timer);
++
++	dev_dbg(xotg->dev, "add timer successfully\n");
++}
++
++/* Add timer to timer list */
++static void xusbps_otg_add_timer(void *gtimer)
++{
++	struct xusbps_otg *xotg = the_transceiver;
++	struct xusbps_otg_timer *timer = (struct xusbps_otg_timer *)gtimer;
++	struct xusbps_otg_timer *tmp_timer;
++	u32	val32;
++
++	/* Check if the timer is already in the active list,
++	 * if so update timer count
++	 */
++	list_for_each_entry(tmp_timer, &active_timers, list)
++		if (tmp_timer == timer) {
++			timer->count = timer->expires;
++			return;
++		}
++	timer->count = timer->expires;
++
++	if (list_empty(&active_timers)) {
++		val32 = readl(xotg->base + CI_OTGSC);
++		writel(val32 | OTGSC_1MSE, xotg->base + CI_OTGSC);
++	}
++
++	list_add_tail(&timer->list, &active_timers);
++}
++
++/* Remove timer from the timer list; clear timeout status */
++static void xusbps_otg_del_timer(void *gtimer)
++{
++	struct xusbps_otg *xotg = the_transceiver;
++	struct xusbps_otg_timer *timer = (struct xusbps_otg_timer *)gtimer;
++	struct xusbps_otg_timer *tmp_timer, *del_tmp;
++	u32 val32;
++
++	list_for_each_entry_safe(tmp_timer, del_tmp, &active_timers, list)
++		if (tmp_timer == timer)
++			list_del(&timer->list);
++
++	if (list_empty(&active_timers)) {
++		val32 = readl(xotg->base + CI_OTGSC);
++		writel(val32 & ~OTGSC_1MSE, xotg->base + CI_OTGSC);
++	}
++}
++
++/* Reduce timer count by 1, and find timeout conditions.*/
++static int xusbps_otg_tick_timer(u32 *int_sts)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	struct xusbps_otg_timer *tmp_timer, *del_tmp;
++	int expired = 0;
++
++	list_for_each_entry_safe(tmp_timer, del_tmp, &active_timers, list) {
++		tmp_timer->count--;
++		/* check if timer expires */
++		if (!tmp_timer->count) {
++			list_del(&tmp_timer->list);
++			tmp_timer->function(tmp_timer->data);
++			expired = 1;
++		}
++	}
++
++	if (list_empty(&active_timers)) {
++		dev_dbg(xotg->dev, "tick timer: disable 1ms int\n");
++		*int_sts = *int_sts & ~OTGSC_1MSE;
++	}
++	return expired;
++}
++
++static void reset_otg(void)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	int			delay_time = 1000;
++	u32			val;
++
++	dev_dbg(xotg->dev, "reseting OTG controller ...\n");
++	val = readl(xotg->base + CI_USBCMD);
++	writel(val | USBCMD_RST, xotg->base + CI_USBCMD);
++	do {
++		udelay(100);
++		if (!delay_time--)
++			dev_dbg(xotg->dev, "reset timeout\n");
++		val = readl(xotg->base + CI_USBCMD);
++		val &= USBCMD_RST;
++	} while (val != 0);
++	dev_dbg(xotg->dev, "reset done.\n");
++}
++
++static void set_host_mode(void)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	u32			val;
++
++	reset_otg();
++	val = readl(xotg->base + CI_USBMODE);
++	val = (val & (~USBMODE_CM)) | USBMODE_HOST;
++	writel(val, xotg->base + CI_USBMODE);
++}
++
++static void set_client_mode(void)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	u32			val;
++
++	reset_otg();
++	val = readl(xotg->base + CI_USBMODE);
++	val = (val & (~USBMODE_CM)) | USBMODE_DEVICE;
++	writel(val, xotg->base + CI_USBMODE);
++}
++
++static void init_hsm(void)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	u32				val32;
++
++	/* read OTGSC after reset */
++	val32 = readl(xotg->base + CI_OTGSC);
++
++	/* set init state */
++	if (val32 & OTGSC_ID) {
++		xotg->hsm.id = 1;
++		xotg->otg.otg->default_a = 0;
++		set_client_mode();
++		xotg->otg.state = OTG_STATE_B_IDLE;
++	} else {
++		xotg->hsm.id = 0;
++		xotg->otg.otg->default_a = 1;
++		set_host_mode();
++		xotg->otg.state = OTG_STATE_A_IDLE;
++	}
++
++	/* set session indicator */
++	if (!xotg->otg.otg->default_a) {
++		if (val32 & OTGSC_BSE)
++			xotg->hsm.b_sess_end = 1;
++		if (val32 & OTGSC_BSV)
++			xotg->hsm.b_sess_vld = 1;
++	} else {
++		if (val32 & OTGSC_ASV)
++			xotg->hsm.a_sess_vld = 1;
++		if (val32 & OTGSC_AVV)
++			xotg->hsm.a_vbus_vld = 1;
++	}
++
++	/* defautly power the bus */
++	xotg->hsm.a_bus_req = 0;
++	xotg->hsm.a_bus_drop = 0;
++	/* defautly don't request bus as B device */
++	xotg->hsm.b_bus_req = 0;
++	/* no system error */
++	xotg->hsm.a_clr_err = 0;
++
++	xusbps_otg_phy_low_power_wait(1);
++}
++
++#ifdef CONFIG_PM_SLEEP
++static void update_hsm(void)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	u32				val32;
++
++	/* read OTGSC */
++	val32 = readl(xotg->base + CI_OTGSC);
++
++	xotg->hsm.id = !!(val32 & OTGSC_ID);
++	if (!xotg->otg.otg->default_a) {
++		xotg->hsm.b_sess_end = !!(val32 & OTGSC_BSE);
++		xotg->hsm.b_sess_vld = !!(val32 & OTGSC_BSV);
++	} else {
++		xotg->hsm.a_sess_vld = !!(val32 & OTGSC_ASV);
++		xotg->hsm.a_vbus_vld = !!(val32 & OTGSC_AVV);
++	}
++}
++#endif
++
++static irqreturn_t otg_dummy_irq(int irq, void *_dev)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	void __iomem		*reg_base = _dev;
++	u32			val;
++	u32			int_mask = 0;
++
++	val = readl(reg_base + CI_USBMODE);
++	if ((val & USBMODE_CM) != USBMODE_DEVICE)
++		return IRQ_NONE;
++
++	val = readl(reg_base + CI_USBSTS);
++	int_mask = val & INTR_DUMMY_MASK;
++
++	if (int_mask == 0)
++		return IRQ_NONE;
++
++	/* Clear interrupts */
++	writel(int_mask, reg_base + CI_USBSTS);
++
++	/* clear hsm.b_conn here since host driver can't detect it
++	*  otg_dummy_irq called means B-disconnect happened.
++	*/
++	if (xotg->hsm.b_conn) {
++		xotg->hsm.b_conn = 0;
++		if (spin_trylock(&xotg->wq_lock)) {
++			xusbps_update_transceiver();
++			spin_unlock(&xotg->wq_lock);
++		}
++	}
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t otg_irq(int irq, void *_dev)
++{
++	struct xusbps_otg		*xotg = _dev;
++	u32				int_sts, int_en;
++	u32				int_mask = 0;
++	int				flag = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&xotg->lock, flags);
++	int_sts = readl(xotg->base + CI_OTGSC);
++	int_en = (int_sts & OTGSC_INTEN_MASK) >> 8;
++	int_mask = int_sts & int_en;
++
++	if (int_mask == 0) {
++		spin_unlock_irqrestore(&xotg->lock, flags);
++		return IRQ_NONE;
++	}
++
++	writel((int_sts & ~OTGSC_INTSTS_MASK) | int_mask,
++					xotg->base + CI_OTGSC);
++	if (int_mask & OTGSC_IDIS) {
++		dev_dbg(xotg->dev, "%s: id change int\n", __func__);
++		xotg->hsm.id = (int_sts & OTGSC_ID) ? 1 : 0;
++		dev_dbg(xotg->dev, "id = %d\n", xotg->hsm.id);
++		flag = 1;
++	}
++	if (int_mask & OTGSC_DPIS) {
++		dev_dbg(xotg->dev, "%s: data pulse int\n", __func__);
++		if (xotg->otg.otg->default_a)
++			xotg->hsm.a_srp_det = (int_sts & OTGSC_DPS) ? 1 : 0;
++		dev_dbg(xotg->dev, "data pulse = %d\n", xotg->hsm.a_srp_det);
++		flag = 1;
++	}
++	if (int_mask & OTGSC_BSEIS) {
++		dev_dbg(xotg->dev, "%s: b session end int\n", __func__);
++		if (!xotg->otg.otg->default_a)
++			xotg->hsm.b_sess_end = (int_sts & OTGSC_BSE) ? 1 : 0;
++		dev_dbg(xotg->dev, "b_sess_end = %d\n", xotg->hsm.b_sess_end);
++		flag = 1;
++	}
++	if (int_mask & OTGSC_BSVIS) {
++		dev_dbg(xotg->dev, "%s: b session valid int\n", __func__);
++		if (!xotg->otg.otg->default_a)
++			xotg->hsm.b_sess_vld = (int_sts & OTGSC_BSV) ? 1 : 0;
++		dev_dbg(xotg->dev, "b_sess_vld = %d\n", xotg->hsm.b_sess_vld);
++		flag = 1;
++	}
++	if (int_mask & OTGSC_ASVIS) {
++		dev_dbg(xotg->dev, "%s: a session valid int\n", __func__);
++		if (xotg->otg.otg->default_a)
++			xotg->hsm.a_sess_vld = (int_sts & OTGSC_ASV) ? 1 : 0;
++		dev_dbg(xotg->dev, "a_sess_vld = %d\n", xotg->hsm.a_sess_vld);
++		flag = 1;
++	}
++	if (int_mask & OTGSC_AVVIS) {
++		dev_dbg(xotg->dev, "%s: a vbus valid int\n", __func__);
++		if (xotg->otg.otg->default_a)
++			xotg->hsm.a_vbus_vld = (int_sts & OTGSC_AVV) ? 1 : 0;
++		dev_dbg(xotg->dev, "a_vbus_vld = %d\n", xotg->hsm.a_vbus_vld);
++		flag = 1;
++	}
++
++	if (int_mask & OTGSC_1MSS) {
++		/* need to schedule otg_work if any timer is expired */
++		if (xusbps_otg_tick_timer(&int_sts))
++			flag = 1;
++	}
++
++	if (flag)
++		xusbps_update_transceiver();
++
++	spin_unlock_irqrestore(&xotg->lock, flags);
++	return IRQ_HANDLED;
++}
++
++/**
++ * xotg_usbdev_notify - Notifier function called by usb core.
++ * @self:	Pointer to notifier_block structure
++ * @action:	action which caused the notifier function call.
++ * @dev:	Pointer to the usb device structure.
++ *
++ * This function is a call back function used by usb core to notify
++ * device attach/detach events. This is used by OTG state machine.
++ *
++ * returns:	Always returns NOTIFY_OK.
++ **/
++static int xotg_usbdev_notify(struct notifier_block *self,
++			       unsigned long action, void *dev)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	struct usb_phy *otg = &xotg->otg;
++	unsigned long otg_port;
++	struct usb_device *udev_otg = NULL;
++	struct usb_device *udev;
++	u32 flag;
++
++	udev = (struct usb_device *)dev;
++
++	if (!otg->otg->host)
++		return NOTIFY_OK;
++
++	otg_port = otg->otg->host->otg_port;
++
++	if (otg->otg->host->root_hub)
++		udev_otg = usb_hub_find_child(otg->otg->host->root_hub,
++								otg_port - 1);
++
++	/* Not otg device notification */
++	if (udev != udev_otg)
++		return NOTIFY_OK;
++
++	switch (action) {
++	case USB_DEVICE_ADD:
++		if (xotg->otg.otg->default_a == 1)
++			xotg->hsm.b_conn = 1;
++		else
++			xotg->hsm.a_conn = 1;
++		flag = 1;
++		break;
++	case USB_DEVICE_REMOVE:
++		if (xotg->otg.otg->default_a == 1)
++			xotg->hsm.b_conn = 0;
++		else
++			xotg->hsm.a_conn = 0;
++		flag = 1;
++		break;
++	}
++	if (flag)
++		xusbps_update_transceiver();
++
++	return NOTIFY_OK;
++}
++
++static void xusbps_otg_work(struct work_struct *work)
++{
++	struct xusbps_otg		*xotg;
++	int				retval;
++
++	xotg = container_of(work, struct xusbps_otg, work);
++
++	dev_dbg(xotg->dev, "%s: old state = %s\n", __func__,
++		usb_otg_state_string(xotg->otg.state));
++
++	switch (xotg->otg.state) {
++	case OTG_STATE_UNDEFINED:
++	case OTG_STATE_B_IDLE:
++		if (!xotg->hsm.id) {
++			xusbps_otg_del_timer(b_srp_init_tmr);
++			del_timer_sync(&xotg->hsm_timer);
++
++			xotg->otg.otg->default_a = 1;
++			xotg->hsm.a_srp_det = 0;
++
++			xusbps_otg_chrg_vbus(0);
++			set_host_mode();
++			xusbps_otg_phy_low_power(1);
++
++			xotg->otg.state = OTG_STATE_A_IDLE;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.b_sess_vld) {
++			xusbps_otg_del_timer(b_srp_init_tmr);
++			del_timer_sync(&xotg->hsm_timer);
++			xotg->hsm.b_bus_req = 0;
++			xotg->hsm.b_sess_end = 0;
++			xotg->hsm.a_bus_suspend = 0;
++			xusbps_otg_chrg_vbus(0);
++
++			if (xotg->start_peripheral) {
++				xotg->start_peripheral(&xotg->otg);
++				xotg->otg.state = OTG_STATE_B_PERIPHERAL;
++			} else
++				dev_dbg(xotg->dev,
++					"client driver not loaded\n");
++		} else if (xotg->hsm.b_srp_init_tmout) {
++			xotg->hsm.b_srp_init_tmout = 0;
++			dev_warn(xotg->dev, "SRP init timeout\n");
++		} else if (xotg->hsm.b_srp_fail_tmout) {
++			xotg->hsm.b_srp_fail_tmout = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			/* No silence failure */
++			xusbps_otg_msg(6);
++			dev_warn(xotg->dev, "SRP failed\n");
++		} else if (xotg->hsm.b_bus_req && xotg->hsm.b_sess_end) {
++			del_timer_sync(&xotg->hsm_timer);
++			/* workaround for b_se0_srp detection */
++			retval = xusbps_otg_check_se0_srp(0);
++			if (retval) {
++				xotg->hsm.b_bus_req = 0;
++				dev_dbg(xotg->dev, "LS isn't SE0, try later\n");
++			} else {
++				/* clear the PHCD before start srp */
++				xusbps_otg_phy_low_power(0);
++
++				/* Start SRP */
++				xusbps_otg_add_timer(b_srp_init_tmr);
++				xotg->otg.otg->start_srp(xotg->otg.otg);
++				xusbps_otg_del_timer(b_srp_init_tmr);
++				xusbps_otg_add_ktimer(TB_SRP_FAIL_TMR);
++
++				/* reset PHY low power mode here */
++				xusbps_otg_phy_low_power_wait(1);
++			}
++		}
++		break;
++	case OTG_STATE_B_SRP_INIT:
++		if (!xotg->hsm.id) {
++			xotg->otg.otg->default_a = 1;
++			xotg->hsm.a_srp_det = 0;
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xusbps_otg_chrg_vbus(0);
++			set_host_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_A_IDLE;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.b_sess_vld) {
++			xusbps_otg_chrg_vbus(0);
++			if (xotg->start_peripheral) {
++				xotg->start_peripheral(&xotg->otg);
++				xotg->otg.state = OTG_STATE_B_PERIPHERAL;
++			} else
++				dev_dbg(xotg->dev,
++					"client driver not loaded\n");
++		}
++		break;
++	case OTG_STATE_B_PERIPHERAL:
++		if (!xotg->hsm.id) {
++			xotg->otg.otg->default_a = 1;
++			xotg->hsm.a_srp_det = 0;
++
++			xusbps_otg_chrg_vbus(0);
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			set_host_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_A_IDLE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.b_sess_vld) {
++			xotg->hsm.b_hnp_enable = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			xotg->otg.state = OTG_STATE_B_IDLE;
++		} else if (xotg->hsm.b_bus_req && xotg->otg.otg->gadget &&
++					xotg->otg.otg->gadget->b_hnp_enable &&
++					xotg->hsm.a_bus_suspend) {
++			dev_warn(xotg->dev, "HNP detected\n");
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			xusbps_otg_HAAR(1);
++			xotg->hsm.a_conn = 0;
++
++			xotg->otg.state = OTG_STATE_B_WAIT_ACON;
++			if (xotg->start_host) {
++				xotg->start_host(&xotg->otg);
++			} else
++				dev_dbg(xotg->dev,
++						"host driver not loaded.\n");
++
++			xotg->hsm.a_bus_resume = 0;
++			xusbps_otg_add_ktimer(TB_ASE0_BRST_TMR);
++		}
++		break;
++
++	case OTG_STATE_B_WAIT_ACON:
++		if (!xotg->hsm.id) {
++			/* delete hsm timer for b_ase0_brst_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			xotg->otg.otg->default_a = 1;
++			xotg->hsm.a_srp_det = 0;
++
++			xusbps_otg_chrg_vbus(0);
++
++			xusbps_otg_HAAR(0);
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			set_host_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_A_IDLE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.b_sess_vld) {
++			/* delete hsm timer for b_ase0_brst_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			xotg->hsm.b_hnp_enable = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			xusbps_otg_chrg_vbus(0);
++			xusbps_otg_HAAR(0);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			set_client_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++		} else if (xotg->hsm.a_conn) {
++			/* delete hsm timer for b_ase0_brst_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			xusbps_otg_HAAR(0);
++			xotg->otg.state = OTG_STATE_B_HOST;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.a_bus_resume ||
++				xotg->hsm.b_ase0_brst_tmout) {
++			dev_warn(xotg->dev, "A device connect failed\n");
++			/* delete hsm timer for b_ase0_brst_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			xusbps_otg_HAAR(0);
++			xusbps_otg_msg(7);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			xotg->hsm.a_bus_suspend = 0;
++			xotg->hsm.b_bus_req = 0;
++			xotg->otg.state = OTG_STATE_B_PERIPHERAL;
++			if (xotg->start_peripheral)
++				xotg->start_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver not loaded.\n");
++		}
++		break;
++
++	case OTG_STATE_B_HOST:
++		if (!xotg->hsm.id) {
++			xotg->otg.otg->default_a = 1;
++			xotg->hsm.a_srp_det = 0;
++
++			xusbps_otg_chrg_vbus(0);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			set_host_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_A_IDLE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.b_sess_vld) {
++			xotg->hsm.b_hnp_enable = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			xusbps_otg_chrg_vbus(0);
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			set_client_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++		} else if ((!xotg->hsm.b_bus_req) ||
++				(!xotg->hsm.a_conn)) {
++			xotg->hsm.b_bus_req = 0;
++			xusbps_otg_loc_sof(0);
++
++			/* Fix: The kernel crash in usb_port_suspend
++				during HNP */
++			msleep(20);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			xotg->hsm.a_bus_suspend = 0;
++			xotg->otg.state = OTG_STATE_B_PERIPHERAL;
++			if (xotg->start_peripheral)
++				xotg->start_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++						"client driver not loaded.\n");
++		}
++		break;
++
++	case OTG_STATE_A_IDLE:
++		xotg->otg.otg->default_a = 1;
++		if (xotg->hsm.id) {
++			xotg->otg.otg->default_a = 0;
++			xotg->hsm.b_bus_req = 0;
++			xotg->hsm.vbus_srp_up = 0;
++
++			xusbps_otg_chrg_vbus(0);
++			set_client_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.a_bus_drop &&
++			(xotg->hsm.a_srp_det || xotg->hsm.a_bus_req)) {
++			dev_warn(xotg->dev,
++			"SRP detected or User has requested for the Bus\n");
++			xusbps_otg_phy_low_power(0);
++
++			/* Turn on VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, true);
++
++			xotg->hsm.vbus_srp_up = 0;
++			xotg->hsm.a_wait_vrise_tmout = 0;
++			xusbps_otg_add_timer(a_wait_vrise_tmr);
++			xotg->otg.state = OTG_STATE_A_WAIT_VRISE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.a_bus_drop && xotg->hsm.a_sess_vld) {
++			xotg->hsm.vbus_srp_up = 1;
++		} else if (!xotg->hsm.a_sess_vld && xotg->hsm.vbus_srp_up) {
++			msleep(10);
++			xusbps_otg_phy_low_power(0);
++
++			/* Turn on VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, true);
++			xotg->hsm.a_srp_det = 1;
++			xotg->hsm.vbus_srp_up = 0;
++			xotg->hsm.a_wait_vrise_tmout = 0;
++			xusbps_otg_add_timer(a_wait_vrise_tmr);
++			xotg->otg.state = OTG_STATE_A_WAIT_VRISE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.a_sess_vld &&
++				!xotg->hsm.vbus_srp_up) {
++			xusbps_otg_phy_low_power(1);
++		}
++		break;
++	case OTG_STATE_A_WAIT_VRISE:
++		if (xotg->hsm.id) {
++			xusbps_otg_del_timer(a_wait_vrise_tmr);
++			xotg->hsm.b_bus_req = 0;
++			xotg->otg.otg->default_a = 0;
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			set_client_mode();
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++		} else if (xotg->hsm.a_vbus_vld) {
++			xusbps_otg_del_timer(a_wait_vrise_tmr);
++			xotg->hsm.b_conn = 0;
++			if (xotg->start_host)
++				xotg->start_host(&xotg->otg);
++			else {
++				dev_dbg(xotg->dev, "host driver not loaded.\n");
++				break;
++			}
++			xusbps_otg_add_ktimer(TA_WAIT_BCON_TMR);
++			xotg->otg.state = OTG_STATE_A_WAIT_BCON;
++		} else if (xotg->hsm.a_wait_vrise_tmout) {
++			xotg->hsm.b_conn = 0;
++			if (xotg->hsm.a_vbus_vld) {
++				if (xotg->start_host)
++					xotg->start_host(&xotg->otg);
++				else {
++					dev_dbg(xotg->dev,
++						"host driver not loaded.\n");
++					break;
++				}
++				xusbps_otg_add_ktimer(TA_WAIT_BCON_TMR);
++				xotg->otg.state = OTG_STATE_A_WAIT_BCON;
++			} else {
++
++				/* Turn off VBus */
++				xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++				xusbps_otg_phy_low_power_wait(1);
++				xotg->otg.state = OTG_STATE_A_VBUS_ERR;
++			}
++		}
++		break;
++	case OTG_STATE_A_WAIT_BCON:
++		if (xotg->hsm.id) {
++			/* delete hsm timer for a_wait_bcon_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			xotg->otg.otg->default_a = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			set_client_mode();
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.a_vbus_vld) {
++			/* delete hsm timer for a_wait_bcon_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_A_VBUS_ERR;
++		} else if (xotg->hsm.a_bus_drop ||
++				(xotg->hsm.a_wait_bcon_tmout &&
++				!xotg->hsm.a_bus_req)) {
++			dev_warn(xotg->dev, "B connect timeout\n");
++			/* delete hsm timer for a_wait_bcon_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xotg->otg.state = OTG_STATE_A_WAIT_VFALL;
++		} else if (xotg->hsm.b_conn) {
++			/* delete hsm timer for a_wait_bcon_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			xotg->hsm.a_suspend_req = 0;
++			/* Make it zero as it should not be used by driver */
++			xotg->hsm.a_bus_req = 0;
++			xotg->hsm.a_srp_det = 0;
++			xotg->otg.state = OTG_STATE_A_HOST;
++		}
++		break;
++	case OTG_STATE_A_HOST:
++		if (xotg->hsm.id) {
++			xotg->otg.otg->default_a = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			set_client_mode();
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.a_bus_drop ||
++				(xotg->otg.otg->host &&
++				!xotg->otg.otg->host->b_hnp_enable &&
++					!xotg->hsm.a_bus_req)) {
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xotg->otg.state = OTG_STATE_A_WAIT_VFALL;
++		} else if (!xotg->hsm.a_vbus_vld) {
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_A_VBUS_ERR;
++		} else if (xotg->otg.otg->host &&
++				xotg->otg.otg->host->b_hnp_enable &&
++				(!xotg->hsm.a_bus_req ||
++					xotg->hsm.a_suspend_req)) {
++			/* Set HABA to enable hardware assistance to signal
++			 *  A-connect after receiver B-disconnect. Hardware
++			 *  will then set client mode and enable URE, SLE and
++			 *  PCE after the assistance. otg_dummy_irq is used to
++			 *  clean these ints when client driver is not resumed.
++			 */
++			if (request_irq(xotg->irq, otg_dummy_irq, IRQF_SHARED,
++					driver_name, xotg->base) != 0) {
++				dev_dbg(xotg->dev,
++					"request interrupt %d failed\n",
++						xotg->irq);
++			}
++			/* set HABA */
++			xusbps_otg_HABA(1);
++			xotg->hsm.b_bus_resume = 0;
++			xotg->hsm.a_aidl_bdis_tmout = 0;
++			xusbps_otg_loc_sof(0);
++			/* clear PHCD to enable HW timer */
++			xusbps_otg_phy_low_power(0);
++			xusbps_otg_add_timer(a_aidl_bdis_tmr);
++			xotg->otg.state = OTG_STATE_A_SUSPEND;
++		} else if (!xotg->hsm.b_conn || !xotg->hsm.a_bus_req) {
++			xusbps_otg_add_ktimer(TA_WAIT_BCON_TMR);
++			xotg->otg.state = OTG_STATE_A_WAIT_BCON;
++		}
++		break;
++	case OTG_STATE_A_SUSPEND:
++		if (xotg->hsm.id) {
++			xusbps_otg_del_timer(a_aidl_bdis_tmr);
++			xusbps_otg_HABA(0);
++			free_irq(xotg->irq, xotg->base);
++			xotg->otg.otg->default_a = 0;
++			xotg->hsm.b_bus_req = 0;
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			set_client_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.a_bus_req ||
++				xotg->hsm.b_bus_resume) {
++			xusbps_otg_del_timer(a_aidl_bdis_tmr);
++			xusbps_otg_HABA(0);
++			free_irq(xotg->irq, xotg->base);
++			xotg->hsm.a_suspend_req = 0;
++			xusbps_otg_loc_sof(1);
++			xotg->otg.state = OTG_STATE_A_HOST;
++		} else if (xotg->hsm.a_aidl_bdis_tmout ||
++				xotg->hsm.a_bus_drop) {
++			dev_warn(xotg->dev, "B disconnect timeout\n");
++			xusbps_otg_del_timer(a_aidl_bdis_tmr);
++			xusbps_otg_HABA(0);
++			free_irq(xotg->irq, xotg->base);
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xotg->otg.state = OTG_STATE_A_WAIT_VFALL;
++		} else if (!xotg->hsm.b_conn && xotg->otg.otg->host &&
++				xotg->otg.otg->host->b_hnp_enable) {
++			xusbps_otg_del_timer(a_aidl_bdis_tmr);
++			xusbps_otg_HABA(0);
++			free_irq(xotg->irq, xotg->base);
++
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			xotg->hsm.b_bus_suspend = 0;
++			xotg->hsm.b_bus_suspend_vld = 0;
++
++			xotg->otg.state = OTG_STATE_A_PERIPHERAL;
++			/* msleep(200); */
++			if (xotg->start_peripheral)
++				xotg->start_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver not loaded.\n");
++			xusbps_otg_add_ktimer(TB_BUS_SUSPEND_TMR);
++			break;
++		} else if (!xotg->hsm.a_vbus_vld) {
++			xusbps_otg_del_timer(a_aidl_bdis_tmr);
++			xusbps_otg_HABA(0);
++			free_irq(xotg->irq, xotg->base);
++			if (xotg->stop_host)
++				xotg->stop_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"host driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_A_VBUS_ERR;
++		}
++		break;
++	case OTG_STATE_A_PERIPHERAL:
++		if (xotg->hsm.id) {
++			/* delete hsm timer for b_bus_suspend_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++			xotg->otg.otg->default_a = 0;
++			xotg->hsm.b_bus_req = 0;
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			set_client_mode();
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (!xotg->hsm.a_vbus_vld) {
++			/* delete hsm timer for b_bus_suspend_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xusbps_otg_phy_low_power_wait(1);
++			xotg->otg.state = OTG_STATE_A_VBUS_ERR;
++		} else if (xotg->hsm.a_bus_drop) {
++			/* delete hsm timer for b_bus_suspend_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			/* Turn off VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++			xotg->otg.state = OTG_STATE_A_WAIT_VFALL;
++		} else if (xotg->hsm.b_bus_suspend) {
++			dev_warn(xotg->dev, "HNP detected\n");
++			/* delete hsm timer for b_bus_suspend_tmr */
++			del_timer_sync(&xotg->hsm_timer);
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			xotg->otg.state = OTG_STATE_A_WAIT_BCON;
++			if (xotg->start_host)
++				xotg->start_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++						"host driver not loaded.\n");
++			xusbps_otg_add_ktimer(TA_WAIT_BCON_TMR);
++		} else if (xotg->hsm.b_bus_suspend_tmout) {
++			u32	val;
++			val = readl(xotg->base + CI_PORTSC1);
++			if (!(val & PORTSC_SUSP))
++				break;
++
++			if (xotg->stop_peripheral)
++				xotg->stop_peripheral(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++					"client driver has been removed.\n");
++
++			xotg->otg.state = OTG_STATE_A_WAIT_BCON;
++			if (xotg->start_host)
++				xotg->start_host(&xotg->otg);
++			else
++				dev_dbg(xotg->dev,
++						"host driver not loaded.\n");
++			xusbps_otg_add_ktimer(TA_WAIT_BCON_TMR);
++		}
++		break;
++	case OTG_STATE_A_VBUS_ERR:
++		if (xotg->hsm.id) {
++			xotg->otg.otg->default_a = 0;
++			xotg->hsm.a_clr_err = 0;
++			xotg->hsm.a_srp_det = 0;
++			set_client_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.a_clr_err) {
++			xotg->hsm.a_clr_err = 0;
++			xotg->hsm.a_srp_det = 0;
++			reset_otg();
++			init_hsm();
++			if (xotg->otg.state == OTG_STATE_A_IDLE)
++				xusbps_update_transceiver();
++		} else {
++			/* FW will clear PHCD bit when any VBus
++			 * event detected. Reset PHCD to 1 again */
++			xusbps_otg_phy_low_power(1);
++		}
++		break;
++	case OTG_STATE_A_WAIT_VFALL:
++		if (xotg->hsm.id) {
++			xotg->otg.otg->default_a = 0;
++			set_client_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_B_IDLE;
++			xusbps_update_transceiver();
++		} else if (xotg->hsm.a_bus_req) {
++
++			/* Turn on VBus */
++			xotg->otg.otg->set_vbus(xotg->otg.otg, true);
++			xotg->hsm.a_wait_vrise_tmout = 0;
++			xusbps_otg_add_timer(a_wait_vrise_tmr);
++			xotg->otg.state = OTG_STATE_A_WAIT_VRISE;
++		} else if (!xotg->hsm.a_sess_vld) {
++			xotg->hsm.a_srp_det = 0;
++			set_host_mode();
++			xusbps_otg_phy_low_power(1);
++			xotg->otg.state = OTG_STATE_A_IDLE;
++		}
++		break;
++	default:
++		break;
++	}
++
++	dev_dbg(xotg->dev, "%s: new state = %s\n", __func__,
++		usb_otg_state_string(xotg->otg.state));
++}
++
++static ssize_t
++show_registers(struct device *_dev, struct device_attribute *attr, char *buf)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	char			*next;
++	unsigned		size, t;
++
++	next = buf;
++	size = PAGE_SIZE;
++
++	t = scnprintf(next, size,
++		"\n"
++		"USBCMD = 0x%08x\n"
++		"USBSTS = 0x%08x\n"
++		"USBINTR = 0x%08x\n"
++		"ASYNCLISTADDR = 0x%08x\n"
++		"PORTSC1 = 0x%08x\n"
++		"OTGSC = 0x%08x\n"
++		"USBMODE = 0x%08x\n",
++		readl(xotg->base + 0x140),
++		readl(xotg->base + 0x144),
++		readl(xotg->base + 0x148),
++		readl(xotg->base + 0x158),
++		readl(xotg->base + 0x184),
++		readl(xotg->base + 0x1a4),
++		readl(xotg->base + 0x1a8)
++	     );
++	size -= t;
++	next += t;
++
++	return PAGE_SIZE - size;
++}
++static DEVICE_ATTR(registers, S_IRUGO, show_registers, NULL);
++
++static ssize_t
++show_hsm(struct device *_dev, struct device_attribute *attr, char *buf)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	char				*next;
++	unsigned			size, t;
++
++	next = buf;
++	size = PAGE_SIZE;
++
++	if (xotg->otg.otg->host)
++		xotg->hsm.a_set_b_hnp_en = xotg->otg.otg->host->b_hnp_enable;
++
++	if (xotg->otg.otg->gadget)
++		xotg->hsm.b_hnp_enable = xotg->otg.otg->gadget->b_hnp_enable;
++
++	t = scnprintf(next, size,
++		"\n"
++		"current state = %s\n"
++		"a_bus_resume = \t%d\n"
++		"a_bus_suspend = \t%d\n"
++		"a_conn = \t%d\n"
++		"a_sess_vld = \t%d\n"
++		"a_srp_det = \t%d\n"
++		"a_vbus_vld = \t%d\n"
++		"b_bus_resume = \t%d\n"
++		"b_bus_suspend = \t%d\n"
++		"b_conn = \t%d\n"
++		"b_se0_srp = \t%d\n"
++		"b_sess_end = \t%d\n"
++		"b_sess_vld = \t%d\n"
++		"id = \t%d\n"
++		"a_set_b_hnp_en = \t%d\n"
++		"b_srp_done = \t%d\n"
++		"b_hnp_enable = \t%d\n"
++		"a_wait_vrise_tmout = \t%d\n"
++		"a_wait_bcon_tmout = \t%d\n"
++		"a_aidl_bdis_tmout = \t%d\n"
++		"b_ase0_brst_tmout = \t%d\n"
++		"a_bus_drop = \t%d\n"
++		"a_bus_req = \t%d\n"
++		"a_clr_err = \t%d\n"
++		"a_suspend_req = \t%d\n"
++		"b_bus_req = \t%d\n"
++		"b_bus_suspend_tmout = \t%d\n"
++		"b_bus_suspend_vld = \t%d\n",
++		usb_otg_state_string(xotg->otg.state),
++		xotg->hsm.a_bus_resume,
++		xotg->hsm.a_bus_suspend,
++		xotg->hsm.a_conn,
++		xotg->hsm.a_sess_vld,
++		xotg->hsm.a_srp_det,
++		xotg->hsm.a_vbus_vld,
++		xotg->hsm.b_bus_resume,
++		xotg->hsm.b_bus_suspend,
++		xotg->hsm.b_conn,
++		xotg->hsm.b_se0_srp,
++		xotg->hsm.b_sess_end,
++		xotg->hsm.b_sess_vld,
++		xotg->hsm.id,
++		xotg->hsm.a_set_b_hnp_en,
++		xotg->hsm.b_srp_done,
++		xotg->hsm.b_hnp_enable,
++		xotg->hsm.a_wait_vrise_tmout,
++		xotg->hsm.a_wait_bcon_tmout,
++		xotg->hsm.a_aidl_bdis_tmout,
++		xotg->hsm.b_ase0_brst_tmout,
++		xotg->hsm.a_bus_drop,
++		xotg->hsm.a_bus_req,
++		xotg->hsm.a_clr_err,
++		xotg->hsm.a_suspend_req,
++		xotg->hsm.b_bus_req,
++		xotg->hsm.b_bus_suspend_tmout,
++		xotg->hsm.b_bus_suspend_vld
++		);
++	size -= t;
++	next += t;
++
++	return PAGE_SIZE - size;
++}
++static DEVICE_ATTR(hsm, S_IRUGO, show_hsm, NULL);
++
++static ssize_t
++get_a_bus_req(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	char			*next;
++	unsigned		size, t;
++
++	next = buf;
++	size = PAGE_SIZE;
++
++	t = scnprintf(next, size, "%d", xotg->hsm.a_bus_req);
++	size -= t;
++	next += t;
++
++	return PAGE_SIZE - size;
++}
++
++static ssize_t
++set_a_bus_req(struct device *dev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++
++	if (!xotg->otg.otg->default_a)
++		return -1;
++	if (count > 2)
++		return -1;
++
++	if (buf[0] == '0') {
++		xotg->hsm.a_bus_req = 0;
++		dev_dbg(xotg->dev, "User request: a_bus_req = 0\n");
++	} else if (buf[0] == '1') {
++		/* If a_bus_drop is TRUE, a_bus_req can't be set */
++		if (xotg->hsm.a_bus_drop)
++			return -1;
++		xotg->hsm.a_bus_req = 1;
++		dev_dbg(xotg->dev, "User request: a_bus_req = 1\n");
++	}
++	if (spin_trylock(&xotg->wq_lock)) {
++		xusbps_update_transceiver();
++		spin_unlock(&xotg->wq_lock);
++	}
++	return count;
++}
++static DEVICE_ATTR(a_bus_req, S_IRUGO | S_IWUSR, get_a_bus_req, set_a_bus_req);
++
++static ssize_t
++get_a_bus_drop(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	char			*next;
++	unsigned		size, t;
++
++	next = buf;
++	size = PAGE_SIZE;
++
++	t = scnprintf(next, size, "%d", xotg->hsm.a_bus_drop);
++	size -= t;
++	next += t;
++
++	return PAGE_SIZE - size;
++}
++
++static ssize_t
++set_a_bus_drop(struct device *dev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++
++	if (!xotg->otg.otg->default_a)
++		return -1;
++	if (count > 2)
++		return -1;
++
++	if (buf[0] == '0') {
++		xotg->hsm.a_bus_drop = 0;
++		dev_dbg(xotg->dev, "User request: a_bus_drop = 0\n");
++	} else if (buf[0] == '1') {
++		xotg->hsm.a_bus_drop = 1;
++		xotg->hsm.a_bus_req = 0;
++		dev_dbg(xotg->dev, "User request: a_bus_drop = 1\n");
++		dev_dbg(xotg->dev, "User request: and a_bus_req = 0\n");
++	}
++	if (spin_trylock(&xotg->wq_lock)) {
++		xusbps_update_transceiver();
++		spin_unlock(&xotg->wq_lock);
++	}
++	return count;
++}
++static DEVICE_ATTR(a_bus_drop, S_IRUGO | S_IWUSR, get_a_bus_drop,
++		set_a_bus_drop);
++
++static ssize_t
++get_b_bus_req(struct device *dev, struct device_attribute *attr, char *buf)
++{
++	struct xusbps_otg	*xotg = the_transceiver;
++	char			*next;
++	unsigned		size, t;
++
++	next = buf;
++	size = PAGE_SIZE;
++
++	t = scnprintf(next, size, "%d", xotg->hsm.b_bus_req);
++	size -= t;
++	next += t;
++
++	return PAGE_SIZE - size;
++}
++
++static ssize_t
++set_b_bus_req(struct device *dev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++
++	if (xotg->otg.otg->default_a)
++		return -1;
++
++	if (count > 2)
++		return -1;
++
++	if (buf[0] == '0') {
++		xotg->hsm.b_bus_req = 0;
++		dev_dbg(xotg->dev, "User request: b_bus_req = 0\n");
++	} else if (buf[0] == '1') {
++		xotg->hsm.b_bus_req = 1;
++		dev_dbg(xotg->dev, "User request: b_bus_req = 1\n");
++	}
++	if (spin_trylock(&xotg->wq_lock)) {
++		xusbps_update_transceiver();
++		spin_unlock(&xotg->wq_lock);
++	}
++	return count;
++}
++static DEVICE_ATTR(b_bus_req, S_IRUGO | S_IWUSR, get_b_bus_req, set_b_bus_req);
++
++static ssize_t
++set_a_clr_err(struct device *dev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++
++	if (!xotg->otg.otg->default_a)
++		return -1;
++	if (count > 2)
++		return -1;
++
++	if (buf[0] == '1') {
++		xotg->hsm.a_clr_err = 1;
++		dev_dbg(xotg->dev, "User request: a_clr_err = 1\n");
++	}
++	if (spin_trylock(&xotg->wq_lock)) {
++		xusbps_update_transceiver();
++		spin_unlock(&xotg->wq_lock);
++	}
++	return count;
++}
++static DEVICE_ATTR(a_clr_err, S_IWUSR, NULL, set_a_clr_err);
++
++/**
++ * suspend_otg_device - suspend the otg device.
++ *
++ * @otg:	Pointer to the otg transceiver structure.
++ *
++ * This function suspends usb devices connected to the otg port
++ * of the host controller.
++ *
++ * returns:	0 on success or error value on failure
++ **/
++static int suspend_otg_device(struct usb_phy *otg)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	unsigned long otg_port = otg->otg->host->otg_port;
++	struct usb_device *udev;
++	int err;
++
++	udev = usb_hub_find_child(otg->otg->host->root_hub, otg_port - 1);
++
++	if (udev) {
++		err = usb_port_suspend(udev, PMSG_SUSPEND);
++		if (err < 0)
++			dev_dbg(xotg->dev, "HNP fail, %d\n", err);
++
++		/* Change the state of the usb device if HNP is successful */
++		usb_set_device_state(udev, USB_STATE_NOTATTACHED);
++	} else {
++		err = -ENODEV;
++		dev_dbg(xotg->dev, "No device connected to roothub\n");
++	}
++	return err;
++}
++
++static ssize_t
++do_hnp(struct device *dev, struct device_attribute *attr,
++		const char *buf, size_t count)
++{
++	struct xusbps_otg		*xotg = the_transceiver;
++	unsigned long ret;
++
++	if (count > 2)
++		return -1;
++
++	if (buf[0] == '1') {
++		if (xotg->otg.otg->default_a && xotg->otg.otg->host &&
++				xotg->otg.otg->host->b_hnp_enable &&
++				(xotg->otg.state == OTG_STATE_A_HOST)) {
++			ret = suspend_otg_device(&xotg->otg);
++			if (ret)
++				return -1;
++		}
++
++		if (!xotg->otg.otg->default_a && xotg->otg.otg->host &&
++				xotg->hsm.b_bus_req) {
++			ret = suspend_otg_device(&xotg->otg);
++			if (ret)
++				return -1;
++		}
++	}
++	return count;
++}
++static DEVICE_ATTR(do_hnp, S_IWUSR, NULL, do_hnp);
++
++static int xusbps_otg_clk_notifier_cb(struct notifier_block *nb,
++		unsigned long event, void *data)
++{
++
++	switch (event) {
++	case PRE_RATE_CHANGE:
++		/* if a rate change is announced we need to check whether we can
++		 * maintain the current frequency by changing the clock
++		 * dividers.
++		 */
++		/* fall through */
++	case POST_RATE_CHANGE:
++		return NOTIFY_OK;
++	case ABORT_RATE_CHANGE:
++	default:
++		return NOTIFY_DONE;
++	}
++}
++
++static struct attribute *inputs_attrs[] = {
++	&dev_attr_a_bus_req.attr,
++	&dev_attr_a_bus_drop.attr,
++	&dev_attr_b_bus_req.attr,
++	&dev_attr_a_clr_err.attr,
++	&dev_attr_do_hnp.attr,
++	NULL,
++};
++
++static struct attribute_group debug_dev_attr_group = {
++	.name = "inputs",
++	.attrs = inputs_attrs,
++};
++
++static int xusbps_otg_remove(struct platform_device *pdev)
++{
++	struct xusbps_otg *xotg = the_transceiver;
++
++	if (xotg->qwork) {
++		flush_workqueue(xotg->qwork);
++		destroy_workqueue(xotg->qwork);
++	}
++	xusbps_otg_free_timers();
++
++	/* disable OTGSC interrupt as OTGSC doesn't change in reset */
++	writel(0, xotg->base + CI_OTGSC);
++
++	usb_remove_phy(&xotg->otg);
++	sysfs_remove_group(&pdev->dev.kobj, &debug_dev_attr_group);
++	device_remove_file(&pdev->dev, &dev_attr_hsm);
++	device_remove_file(&pdev->dev, &dev_attr_registers);
++	clk_notifier_unregister(xotg->clk, &xotg->clk_rate_change_nb);
++	clk_disable_unprepare(xotg->clk);
++
++	return 0;
++}
++
++static int xusbps_otg_probe(struct platform_device *pdev)
++{
++	int			retval;
++	u32			val32;
++	struct xusbps_otg	*xotg;
++	char			qname[] = "xusbps_otg_queue";
++	struct xusbps_usb2_platform_data *pdata;
++
++	pdata = pdev->dev.platform_data;
++	if (!pdata)
++		return -ENODEV;
++
++	dev_dbg(&pdev->dev, "\notg controller is detected.\n");
++
++	xotg = devm_kzalloc(&pdev->dev, sizeof(*xotg), GFP_KERNEL);
++	if (xotg == NULL)
++		return -ENOMEM;
++
++	the_transceiver = xotg;
++
++	/* Setup ulpi phy for OTG */
++	xotg->ulpi = pdata->ulpi;
++
++	xotg->otg.otg = devm_kzalloc(sizeof(struct usb_otg), GFP_KERNEL);
++	if (!xotg->otg.otg)
++		return -ENOMEM;
++
++	xotg->base = pdata->regs;
++	xotg->irq = pdata->irq;
++	if (!xotg->base || !xotg->irq) {
++		retval = -ENODEV;
++		goto err;
++	}
++
++	xotg->qwork = create_singlethread_workqueue(qname);
++	if (!xotg->qwork) {
++		dev_dbg(&pdev->dev, "cannot create workqueue %s\n", qname);
++		retval = -ENOMEM;
++		goto err;
++	}
++	INIT_WORK(&xotg->work, xusbps_otg_work);
++
++	xotg->clk = pdata->clk;
++	retval = clk_prepare_enable(xotg->clk);
++	if (retval) {
++		dev_err(&pdev->dev, "Unable to enable APER clock.\n");
++		goto err;
++	}
++
++	xotg->clk_rate_change_nb.notifier_call = xusbps_otg_clk_notifier_cb;
++	xotg->clk_rate_change_nb.next = NULL;
++	if (clk_notifier_register(xotg->clk, &xotg->clk_rate_change_nb))
++		dev_warn(&pdev->dev, "Unable to register clock notifier.\n");
++
++	/* OTG common part */
++	xotg->dev = &pdev->dev;
++	xotg->otg.dev = xotg->dev;
++	xotg->otg.label = driver_name;
++	xotg->otg.otg->set_host = xusbps_otg_set_host;
++	xotg->otg.otg->set_peripheral = xusbps_otg_set_peripheral;
++	xotg->otg.set_power = xusbps_otg_set_power;
++	xotg->otg.otg->set_vbus = xusbps_otg_set_vbus;
++	xotg->otg.otg->start_srp = xusbps_otg_start_srp;
++	xotg->otg.otg->start_hnp = xusbps_otg_start_hnp;
++	xotg->otg.state = OTG_STATE_UNDEFINED;
++
++	if (usb_add_phy(&xotg->otg, USB_PHY_TYPE_USB2)) {
++		dev_dbg(xotg->dev, "can't set transceiver\n");
++		retval = -EBUSY;
++		goto err_out_clk_disable;
++	}
++
++	pdata->otg = &xotg->otg;
++	reset_otg();
++	init_hsm();
++
++	spin_lock_init(&xotg->lock);
++	spin_lock_init(&xotg->wq_lock);
++	INIT_LIST_HEAD(&active_timers);
++	retval = xusbps_otg_init_timers(&xotg->hsm);
++	if (retval) {
++		dev_dbg(&pdev->dev, "Failed to init timers\n");
++		goto err_out_clk_disable;
++	}
++
++	init_timer(&xotg->hsm_timer);
++
++	xotg->xotg_notifier.notifier_call = xotg_usbdev_notify;
++	usb_register_notify((struct notifier_block *)
++					&xotg->xotg_notifier.notifier_call);
++
++	retval = devm_request_irq(&pdev->dev, xotg->irq, otg_irq, IRQF_SHARED,
++				driver_name, xotg);
++	if (retval) {
++		dev_dbg(xotg->dev, "request interrupt %d failed\n", xotg->irq);
++		retval = -EBUSY;
++		goto err_out_clk_disable;
++	}
++
++	/* enable OTGSC int */
++	val32 = OTGSC_DPIE | OTGSC_BSEIE | OTGSC_BSVIE |
++		OTGSC_ASVIE | OTGSC_AVVIE | OTGSC_IDIE | OTGSC_IDPU;
++	writel(val32, xotg->base + CI_OTGSC);
++
++	retval = device_create_file(&pdev->dev, &dev_attr_registers);
++	if (retval < 0) {
++		dev_dbg(xotg->dev,
++			"Can't register sysfs attribute: %d\n", retval);
++		goto err_out_clk_disable;
++	}
++
++	retval = device_create_file(&pdev->dev, &dev_attr_hsm);
++	if (retval < 0) {
++		dev_dbg(xotg->dev, "Can't hsm sysfs attribute: %d\n", retval);
++		goto err_out_clk_disable;
++	}
++
++	retval = sysfs_create_group(&pdev->dev.kobj, &debug_dev_attr_group);
++	if (retval < 0) {
++		dev_dbg(xotg->dev,
++			"Can't register sysfs attr group: %d\n", retval);
++		goto err_out_clk_disable;
++	}
++
++	if (xotg->otg.state == OTG_STATE_A_IDLE)
++		xusbps_update_transceiver();
++
++	return 0;
++
++err_out_clk_disable:
++	clk_notifier_unregister(xotg->clk, &xotg->clk_rate_change_nb);
++	clk_disable_unprepare(xotg->clk);
++err:
++	xusbps_otg_remove(pdev);
++
++	return retval;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static void transceiver_suspend(struct platform_device *pdev)
++{
++	xusbps_otg_phy_low_power(1);
++}
++
++static int xusbps_otg_suspend(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct xusbps_otg		*xotg = the_transceiver;
++	int				ret = 0;
++
++	/* Disbale OTG interrupts */
++	xusbps_otg_intr(0);
++
++	if (xotg->irq)
++		free_irq(xotg->irq, xotg);
++
++	/* Prevent more otg_work */
++	flush_workqueue(xotg->qwork);
++	destroy_workqueue(xotg->qwork);
++	xotg->qwork = NULL;
++
++	/* start actions */
++	switch (xotg->otg.state) {
++	case OTG_STATE_A_WAIT_VFALL:
++		xotg->otg.state = OTG_STATE_A_IDLE;
++	case OTG_STATE_A_IDLE:
++	case OTG_STATE_B_IDLE:
++	case OTG_STATE_A_VBUS_ERR:
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_A_WAIT_VRISE:
++		xusbps_otg_del_timer(a_wait_vrise_tmr);
++		xotg->hsm.a_srp_det = 0;
++
++		/* Turn off VBus */
++		xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++		xotg->otg.state = OTG_STATE_A_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_A_WAIT_BCON:
++		del_timer_sync(&xotg->hsm_timer);
++		if (xotg->stop_host)
++			xotg->stop_host(&xotg->otg);
++		else
++			dev_dbg(&pdev->dev, "host driver has been removed.\n");
++
++		xotg->hsm.a_srp_det = 0;
++
++		/* Turn off VBus */
++		xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++		xotg->otg.state = OTG_STATE_A_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_A_HOST:
++		if (xotg->stop_host)
++			xotg->stop_host(&xotg->otg);
++		else
++			dev_dbg(&pdev->dev, "host driver has been removed.\n");
++
++		xotg->hsm.a_srp_det = 0;
++
++		/* Turn off VBus */
++		xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++
++		xotg->otg.state = OTG_STATE_A_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_A_SUSPEND:
++		xusbps_otg_del_timer(a_aidl_bdis_tmr);
++		xusbps_otg_HABA(0);
++		if (xotg->stop_host)
++			xotg->stop_host(&xotg->otg);
++		else
++			dev_dbg(xotg->dev, "host driver has been removed.\n");
++		xotg->hsm.a_srp_det = 0;
++
++		/* Turn off VBus */
++		xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++		xotg->otg.state = OTG_STATE_A_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_A_PERIPHERAL:
++		del_timer_sync(&xotg->hsm_timer);
++
++		if (xotg->stop_peripheral)
++			xotg->stop_peripheral(&xotg->otg);
++		else
++			dev_dbg(&pdev->dev,
++				"client driver has been removed.\n");
++		xotg->hsm.a_srp_det = 0;
++
++		/* Turn off VBus */
++		xotg->otg.otg->set_vbus(xotg->otg.otg, false);
++		xotg->otg.state = OTG_STATE_A_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_B_HOST:
++		if (xotg->stop_host)
++			xotg->stop_host(&xotg->otg);
++		else
++			dev_dbg(&pdev->dev, "host driver has been removed.\n");
++		xotg->hsm.b_bus_req = 0;
++		xotg->otg.state = OTG_STATE_B_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_B_PERIPHERAL:
++		if (xotg->stop_peripheral)
++			xotg->stop_peripheral(&xotg->otg);
++		else
++			dev_dbg(&pdev->dev,
++				"client driver has been removed.\n");
++		xotg->otg.state = OTG_STATE_B_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	case OTG_STATE_B_WAIT_ACON:
++		/* delete hsm timer for b_ase0_brst_tmr */
++		del_timer_sync(&xotg->hsm_timer);
++
++		xusbps_otg_HAAR(0);
++
++		if (xotg->stop_host)
++			xotg->stop_host(&xotg->otg);
++		else
++			dev_dbg(&pdev->dev, "host driver has been removed.\n");
++		xotg->hsm.b_bus_req = 0;
++		xotg->otg.state = OTG_STATE_B_IDLE;
++		transceiver_suspend(pdev);
++		break;
++	default:
++		dev_dbg(xotg->dev, "error state before suspend\n");
++		break;
++	}
++
++	if (!ret)
++		clk_disable(xotg->clk);
++	return ret;
++}
++
++static void transceiver_resume(struct platform_device *pdev)
++{
++	/* Not used */
++}
++
++static int xusbps_otg_resume(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct xusbps_otg	*xotg = the_transceiver;
++	int			ret = 0;
++
++	ret = clk_enable(xotg->clk);
++	if (ret) {
++		dev_err(&pdev->dev, "cannot enable clock. resume failed.\n");
++		return ret;
++	}
++
++	transceiver_resume(pdev);
++
++	xotg->qwork = create_singlethread_workqueue("xusbps_otg_queue");
++	if (!xotg->qwork) {
++		dev_dbg(&pdev->dev, "cannot create xusbps otg workqueuen");
++		ret = -ENOMEM;
++		goto error;
++	}
++
++	if (request_irq(xotg->irq, otg_irq, IRQF_SHARED,
++				driver_name, xotg) != 0) {
++		dev_dbg(&pdev->dev, "request interrupt %d failed\n", xotg->irq);
++		ret = -EBUSY;
++		goto error;
++	}
++
++	/* enable OTG interrupts */
++	xusbps_otg_intr(1);
++
++	update_hsm();
++
++	xusbps_update_transceiver();
++
++	return ret;
++error:
++	xusbps_otg_intr(0);
++	transceiver_suspend(pdev);
++	return ret;
++}
++
++static const struct dev_pm_ops xusbps_otg_dev_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(xusbps_otg_suspend, xusbps_otg_resume)
++};
++#define XUSBPS_OTG_PM	(&xusbps_otg_dev_pm_ops)
++
++#else /* ! CONFIG_PM_SLEEP */
++#define XUSBPS_OTG_PM	NULL
++#endif /* ! CONFIG_PM_SLEEP */
++
++#ifndef CONFIG_USB_XUSBPS_DR_OF
++static struct platform_driver xusbps_otg_driver = {
++#else
++struct platform_driver xusbps_otg_driver = {
++#endif
++	.probe		= xusbps_otg_probe,
++	.remove		= xusbps_otg_remove,
++	.driver		= {
++		.owner	= THIS_MODULE,
++		.name	= DRIVER_NAME,
++		.pm	= XUSBPS_OTG_PM,
++	},
++};
++
++#ifndef CONFIG_USB_XUSBPS_DR_OF
++module_platform_driver(xusbps_otg_driver);
++#endif
++
++MODULE_AUTHOR("Xilinx, Inc.");
++MODULE_DESCRIPTION("Xilinx PS USB OTG driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" DRIVER_NAME);
+--- /dev/null
++++ b/include/linux/usb/xilinx_usbps_otg.h
+@@ -0,0 +1,216 @@
++/*
++ * Xilinx PS USB OTG Driver Header file.
++ *
++ * Copyright 2011 Xilinx, Inc.
++ *
++ * This file is based on langwell_otg.h file with few minor modifications
++ * to support Xilinx PS USB controller.
++ *
++ * This program is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License version 2 as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++#ifndef __XILINX_XUSBPS_OTG_H
++#define __XILINX_XUSBPS_OTG_H
++
++#define CI_USBCMD		0x140
++#	define USBCMD_RST		BIT(1)
++#	define USBCMD_RS		BIT(0)
++#define CI_USBSTS		0x144
++#	define USBSTS_SLI		BIT(8)
++#	define USBSTS_URI		BIT(6)
++#	define USBSTS_PCI		BIT(2)
++#define CI_PORTSC1		0x184
++#	define PORTSC_PP		BIT(12)
++#	define PORTSC_LS		(BIT(11) | BIT(10))
++#	define PORTSC_SUSP		BIT(7)
++#	define PORTSC_CCS		BIT(0)
++#define CI_OTGSC		0x1a4
++#	define OTGSC_DPIE		BIT(30)
++#	define OTGSC_1MSE		BIT(29)
++#	define OTGSC_BSEIE		BIT(28)
++#	define OTGSC_BSVIE		BIT(27)
++#	define OTGSC_ASVIE		BIT(26)
++#	define OTGSC_AVVIE		BIT(25)
++#	define OTGSC_IDIE		BIT(24)
++#	define OTGSC_DPIS		BIT(22)
++#	define OTGSC_1MSS		BIT(21)
++#	define OTGSC_BSEIS		BIT(20)
++#	define OTGSC_BSVIS		BIT(19)
++#	define OTGSC_ASVIS		BIT(18)
++#	define OTGSC_AVVIS		BIT(17)
++#	define OTGSC_IDIS		BIT(16)
++#	define OTGSC_DPS		BIT(14)
++#	define OTGSC_1MST		BIT(13)
++#	define OTGSC_BSE		BIT(12)
++#	define OTGSC_BSV		BIT(11)
++#	define OTGSC_ASV		BIT(10)
++#	define OTGSC_AVV		BIT(9)
++#	define OTGSC_ID			BIT(8)
++#	define OTGSC_HABA		BIT(7)
++#	define OTGSC_HADP		BIT(6)
++#	define OTGSC_IDPU		BIT(5)
++#	define OTGSC_DP			BIT(4)
++#	define OTGSC_OT			BIT(3)
++#	define OTGSC_HAAR		BIT(2)
++#	define OTGSC_VC			BIT(1)
++#	define OTGSC_VD			BIT(0)
++#	define OTGSC_INTEN_MASK		(0x7f << 24)
++#	define OTGSC_INT_MASK		(0x5f << 24)
++#	define OTGSC_INTSTS_MASK	(0x7f << 16)
++#define CI_USBMODE		0x1a8
++#	define USBMODE_CM		(BIT(1) | BIT(0))
++#	define USBMODE_IDLE		0
++#	define USBMODE_DEVICE		0x2
++#	define USBMODE_HOST		0x3
++
++#define INTR_DUMMY_MASK (USBSTS_SLI | USBSTS_URI | USBSTS_PCI)
++
++enum xusbps_otg_timer_type {
++	TA_WAIT_VRISE_TMR,
++	TA_WAIT_BCON_TMR,
++	TA_AIDL_BDIS_TMR,
++	TB_ASE0_BRST_TMR,
++	TB_SE0_SRP_TMR,
++	TB_SRP_INIT_TMR,
++	TB_SRP_FAIL_TMR,
++	TB_BUS_SUSPEND_TMR
++};
++
++#define TA_WAIT_VRISE	100
++#define TA_WAIT_BCON	30000
++#define TA_AIDL_BDIS	15000
++#define TB_ASE0_BRST	5000
++#define TB_SE0_SRP	2
++#define TB_SRP_INIT	100
++#define TB_SRP_FAIL	5500
++#define TB_BUS_SUSPEND	500
++
++struct xusbps_otg_timer {
++	unsigned long expires;	/* Number of count increase to timeout */
++	unsigned long count;	/* Tick counter */
++	void (*function)(unsigned long);	/* Timeout function */
++	unsigned long data;	/* Data passed to function */
++	struct list_head list;
++};
++
++/* This is a common data structure to
++ * save values of the OTG state machine */
++struct otg_hsm {
++	/* Input */
++	int a_bus_resume;
++	int a_bus_suspend;
++	int a_conn;
++	int a_sess_vld;
++	int a_srp_det;
++	int a_vbus_vld;
++	int b_bus_resume;
++	int b_bus_suspend;
++	int b_conn;
++	int b_se0_srp;
++	int b_ssend_srp;
++	int b_sess_end;
++	int b_sess_vld;
++	int id;
++/* id values */
++#define ID_B		0x05
++#define ID_A		0x04
++#define ID_ACA_C	0x03
++#define ID_ACA_B	0x02
++#define ID_ACA_A	0x01
++	int power_up;
++	int adp_change;
++	int test_device;
++
++	/* Internal variables */
++	int a_set_b_hnp_en;
++	int b_srp_done;
++	int b_hnp_enable;
++	int hnp_poll_enable;
++
++	/* Timeout indicator for timers */
++	int a_wait_vrise_tmout;
++	int a_wait_bcon_tmout;
++	int a_aidl_bdis_tmout;
++	int a_bidl_adis_tmout;
++	int a_bidl_adis_tmr;
++	int a_wait_vfall_tmout;
++	int b_ase0_brst_tmout;
++	int b_bus_suspend_tmout;
++	int b_srp_init_tmout;
++	int b_srp_fail_tmout;
++	int b_srp_fail_tmr;
++	int b_adp_sense_tmout;
++
++	/* Informative variables */
++	int a_bus_drop;
++	int a_bus_req;
++	int a_clr_err;
++	int b_bus_req;
++	int a_suspend_req;
++	int b_bus_suspend_vld;
++
++	/* Output */
++	int drv_vbus;
++	int loc_conn;
++	int loc_sof;
++
++	/* Others */
++	int vbus_srp_up;
++};
++
++struct xusbps_otg {
++	struct usb_phy		otg;
++	struct usb_phy		*ulpi;
++
++	struct otg_hsm		hsm;
++
++	/* base address */
++	void __iomem		*base;
++
++	/* irq */
++	int			irq;
++
++	/* clk */
++	struct clk		*clk;
++	struct notifier_block	clk_rate_change_nb;
++
++	/* atomic notifier for interrupt context */
++	struct atomic_notifier_head	otg_notifier;
++
++	/* start/stop USB Host function */
++	int	(*start_host)(struct usb_phy *otg);
++	int	(*stop_host)(struct usb_phy *otg);
++
++	/* start/stop USB Peripheral function */
++	int	(*start_peripheral)(struct usb_phy *otg);
++	int	(*stop_peripheral)(struct usb_phy *otg);
++
++	struct device			*dev;
++
++	unsigned			region;
++
++	struct work_struct		work;
++	struct workqueue_struct		*qwork;
++	struct timer_list		hsm_timer;
++
++	spinlock_t			lock;
++	spinlock_t			wq_lock;
++
++	struct notifier_block		xotg_notifier;
++};
++
++static inline
++struct xusbps_otg *xceiv_to_xotg(struct usb_phy *otg)
++{
++	return container_of(otg, struct xusbps_otg, otg);
++}
++
++void xusbps_update_transceiver(void);
++
++#endif /* __XILINX_XUSBPS_OTG_H__ */
+--- /dev/null
++++ b/include/linux/xilinx_devices.h
+@@ -0,0 +1,70 @@
++/*
++ * include/linux/xilinx_devices.h
++ *
++ * Definitions for any platform device related flags or structures for
++ * Xilinx EDK IPs
++ *
++ * Author: MontaVista Software, Inc.
++ *         source@mvista.com
++ *
++ * 2002-2005 (c) MontaVista Software, Inc.  This file is licensed under the
++ * terms of the GNU General Public License version 2.  This program is licensed
++ * "as is" without any warranty of any kind, whether express or implied.
++ */
++
++#ifdef __KERNEL__
++#ifndef _XILINX_DEVICE_H_
++#define _XILINX_DEVICE_H_
++
++#include <linux/types.h>
++#include <linux/version.h>
++#include <linux/platform_device.h>
++
++/*- PS USB Controller IP -*/
++enum xusbps_usb2_operating_modes {
++	XUSBPS_USB2_MPH_HOST,
++	XUSBPS_USB2_DR_HOST,
++	XUSBPS_USB2_DR_DEVICE,
++	XUSBPS_USB2_DR_OTG,
++};
++
++enum xusbps_usb2_phy_modes {
++	XUSBPS_USB2_PHY_NONE,
++	XUSBPS_USB2_PHY_ULPI,
++	XUSBPS_USB2_PHY_UTMI,
++	XUSBPS_USB2_PHY_UTMI_WIDE,
++	XUSBPS_USB2_PHY_SERIAL,
++};
++
++struct clk;
++struct platform_device;
++
++struct xusbps_usb2_platform_data {
++	/* board specific information */
++	enum xusbps_usb2_operating_modes	operating_mode;
++	enum xusbps_usb2_phy_modes	phy_mode;
++	unsigned int			port_enables;
++	unsigned int			workaround;
++
++	int		(*init)(struct platform_device *);
++	void		(*exit)(struct platform_device *);
++	void __iomem	*regs;		/* ioremap'd register base */
++	struct usb_phy	*otg;
++	struct usb_phy	*ulpi;
++	int		irq;
++	struct clk	*clk;
++	struct notifier_block clk_rate_change_nb;
++	unsigned	big_endian_mmio:1;
++	unsigned	big_endian_desc:1;
++	unsigned	es:1;		/* need USBMODE:ES */
++	unsigned	le_setup_buf:1;
++	unsigned	have_sysif_regs:1;
++	unsigned	invert_drvvbus:1;
++	unsigned	invert_pwr_fault:1;
++};
++
++#define XUSBPS_USB2_PORT0_ENABLED	0x00000001
++#define XUSBPS_USB2_PORT1_ENABLED	0x00000002
++
++#endif /* _XILINX_DEVICE_H_ */
++#endif /* __KERNEL__ */

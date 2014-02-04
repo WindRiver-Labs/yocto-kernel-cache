@@ -1,0 +1,554 @@
+From cdb746eb29c2c2311e08b7f33d5ff1910e19c7bc Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 25 Sep 2013 17:34:56 +0100
+Subject: drm/i915: Boost RPS frequency for CPU stalls
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+If we encounter a situation where the CPU blocks waiting for results
+from the GPU, give the GPU a kick to boost its the frequency.
+
+This should work to reduce user interface stalls and to quickly promote
+mesa to high frequencies - but the cost is that our requested frequency
+stalls high (as we do not idle for long enough before rc6 to start
+reducing frequencies, nor are we aggressive at down clocking an
+underused GPU). However, this should be mitigated by rc6 itself powering
+off the GPU when idle, and that energy use is dependent upon the workload
+of the GPU in addition to its frequency (e.g. the math or sampler
+functions only consume power when used). Still, this is likely to
+adversely affect light workloads.
+
+In particular, this nearly eliminates the highly noticeable wake-up lag
+in animations from idle. For example, expose or workspace transitions.
+(However, given the situation where we fail to downclock, our requested
+frequency is almost always the maximum, except for Baytrail where we
+manually downclock upon idling. This often masks the latency of
+upclocking after being idle, so animations are typically smooth - at the
+cost of increased power consumption.)
+
+Stéphane raised the concern that this will punish good applications and
+reward bad applications - but due to the nature of how mesa performs its
+client throttling, I believe all mesa applications will be roughly
+equally affected. To address this concern, and to prevent applications
+like compositors from permanently boosting the RPS state, we ratelimit the
+frequency of the wait-boosts each client recieves.
+
+Unfortunately, this techinique is ineffective with Ironlake - which also
+has dynamic render power states and suffers just as dramatically. For
+Ironlake, the thermal/power headroom is shared with the CPU through
+Intelligent Power Sharing and the intel-ips module. This leaves us with
+no GPU boost frequencies available when coming out of idle, and due to
+hardware limitations we cannot change the arbitration between the CPU and
+GPU quickly enough to be effective.
+
+v2: Limit each client to receiving a single boost for each active period.
+    Tested by QA to only marginally increase power, and to demonstrably
+    increase throughput in games. No latency measurements yet.
+
+v3: Cater for front-buffer rendering with manual throttling.
+
+v4: Tidy up.
+
+v5: Sadly the compositor needs frequent boosts as it may never idle, but
+due to its picking mechanism (using ReadPixels) may require frequent
+waits. Those waits, along with the waits for the vrefresh swap, conspire
+to keep the GPU at low frequencies despite the interactive latency. To
+overcome this we ditch the one-boost-per-active-period and just ratelimit
+the number of wait-boosts each client can receive.
+
+Reported-and-tested-by: Paul Neumann <paul104x@yahoo.de>
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=68716
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Kenneth Graunke <kenneth@whitecape.org>
+Cc: Stéphane Marchesin <stephane.marchesin@gmail.com>
+Cc: Owen Taylor <otaylor@redhat.com>
+Cc: "Meng, Mengmeng" <mengmeng.meng@intel.com>
+Cc: "Zhuang, Lena" <lena.zhuang@intel.com>
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+[danvet: No extern for function prototypes in headers.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit b29c19b645287f7062e17d70fa4e9781a01a5d88)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |   16 +---
+ drivers/gpu/drm/i915/i915_drv.h      |   19 +++-
+ drivers/gpu/drm/i915/i915_gem.c      |  135 ++++++++++++++++++++++++-----------
+ drivers/gpu/drm/i915/i915_irq.c      |   11 --
+ drivers/gpu/drm/i915/intel_display.c |    3 
+ drivers/gpu/drm/i915/intel_drv.h     |    3 
+ drivers/gpu/drm/i915/intel_pm.c      |   42 +++++-----
+ 7 files changed, 138 insertions(+), 91 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1835,19 +1835,11 @@ int i915_driver_unload(struct drm_device
+ 
+ int i915_driver_open(struct drm_device *dev, struct drm_file *file)
+ {
+-	struct drm_i915_file_private *file_priv;
++	int ret;
+ 
+-	DRM_DEBUG_DRIVER("\n");
+-	file_priv = kzalloc(sizeof(*file_priv), GFP_KERNEL);
+-	if (!file_priv)
+-		return -ENOMEM;
+-
+-	file->driver_priv = file_priv;
+-
+-	spin_lock_init(&file_priv->mm.lock);
+-	INIT_LIST_HEAD(&file_priv->mm.request_list);
+-
+-	idr_init(&file_priv->context_idr);
++	ret = i915_gem_open(dev, file);
++	if (ret)
++		return ret;
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -844,9 +844,6 @@ struct intel_gen6_power_mgmt {
+ 	struct work_struct work;
+ 	u32 pm_iir;
+ 
+-	/* On vlv we need to manually drop to Vmin with a delayed work. */
+-	struct delayed_work vlv_work;
+-
+ 	/* The below variables an all the rps hw state are protected by
+ 	 * dev->struct mutext. */
+ 	u8 cur_delay;
+@@ -965,6 +962,15 @@ struct i915_gem_mm {
+ 	struct delayed_work retire_work;
+ 
+ 	/**
++	 * When we detect an idle GPU, we want to turn on
++	 * powersaving features. So once we see that there
++	 * are no more requests outstanding and no more
++	 * arrive within a small period of time, we fire
++	 * off the idle_work.
++	 */
++	struct delayed_work idle_work;
++
++	/**
+ 	 * Are we in a non-interruptible section of code like
+ 	 * modesetting?
+ 	 */
+@@ -1597,13 +1603,17 @@ struct drm_i915_gem_request {
+ };
+ 
+ struct drm_i915_file_private {
++	struct drm_i915_private *dev_priv;
++
+ 	struct {
+ 		spinlock_t lock;
+ 		struct list_head request_list;
++		struct delayed_work idle_work;
+ 	} mm;
+ 	struct idr context_idr;
+ 
+ 	struct i915_ctx_hang_stats hang_stats;
++	atomic_t rps_wait_boost;
+ };
+ 
+ #define INTEL_INFO(dev)	(to_i915(dev)->info)
+@@ -1953,7 +1963,7 @@ i915_gem_object_unpin_fence(struct drm_i
+ 	}
+ }
+ 
+-void i915_gem_retire_requests(struct drm_device *dev);
++bool i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_retire_requests_ring(struct intel_ring_buffer *ring);
+ int __must_check i915_gem_check_wedge(struct i915_gpu_error *error,
+ 				      bool interruptible);
+@@ -2004,6 +2014,7 @@ int i915_gem_attach_phys_object(struct d
+ void i915_gem_detach_phys_object(struct drm_device *dev,
+ 				 struct drm_i915_gem_object *obj);
+ void i915_gem_free_all_phys_object(struct drm_device *dev);
++int i915_gem_open(struct drm_device *dev, struct drm_file *file);
+ void i915_gem_release(struct drm_device *dev, struct drm_file *file);
+ 
+ uint32_t
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -980,6 +980,14 @@ static bool missed_irq(struct drm_i915_p
+ 	return test_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings);
+ }
+ 
++static bool can_wait_boost(struct drm_i915_file_private *file_priv)
++{
++	if (file_priv == NULL)
++		return true;
++
++	return !atomic_xchg(&file_priv->rps_wait_boost, true);
++}
++
+ /**
+  * __wait_seqno - wait until execution of seqno has finished
+  * @ring: the ring expected to report seqno
+@@ -1000,7 +1008,9 @@ static bool missed_irq(struct drm_i915_p
+  */
+ static int __wait_seqno(struct intel_ring_buffer *ring, u32 seqno,
+ 			unsigned reset_counter,
+-			bool interruptible, struct timespec *timeout)
++			bool interruptible,
++			struct timespec *timeout,
++			struct drm_i915_file_private *file_priv)
+ {
+ 	drm_i915_private_t *dev_priv = ring->dev->dev_private;
+ 	struct timespec before, now;
+@@ -1015,6 +1025,14 @@ static int __wait_seqno(struct intel_rin
+ 
+ 	timeout_jiffies = timeout ? timespec_to_jiffies_timeout(timeout) : 1;
+ 
++	if (dev_priv->info->gen >= 6 && can_wait_boost(file_priv)) {
++		gen6_rps_boost(dev_priv);
++		if (file_priv)
++			mod_delayed_work(dev_priv->wq,
++					 &file_priv->mm.idle_work,
++					 msecs_to_jiffies(100));
++	}
++
+ 	if (!(dev_priv->gpu_error.test_irq_rings & intel_ring_flag(ring)) &&
+ 	    WARN_ON(!ring->irq_get(ring)))
+ 		return -ENODEV;
+@@ -1114,7 +1132,7 @@ i915_wait_seqno(struct intel_ring_buffer
+ 
+ 	return __wait_seqno(ring, seqno,
+ 			    atomic_read(&dev_priv->gpu_error.reset_counter),
+-			    interruptible, NULL);
++			    interruptible, NULL, NULL);
+ }
+ 
+ static int
+@@ -1164,6 +1182,7 @@ i915_gem_object_wait_rendering(struct dr
+  */
+ static __must_check int
+ i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
++					    struct drm_file *file,
+ 					    bool readonly)
+ {
+ 	struct drm_device *dev = obj->base.dev;
+@@ -1190,7 +1209,7 @@ i915_gem_object_wait_rendering__nonblock
+ 
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
+ 	mutex_unlock(&dev->struct_mutex);
+-	ret = __wait_seqno(ring, seqno, reset_counter, true, NULL);
++	ret = __wait_seqno(ring, seqno, reset_counter, true, NULL, file->driver_priv);
+ 	mutex_lock(&dev->struct_mutex);
+ 	if (ret)
+ 		return ret;
+@@ -1239,7 +1258,7 @@ i915_gem_set_domain_ioctl(struct drm_dev
+ 	 * We will repeat the flush holding the lock in the normal manner
+ 	 * to catch cases where we are gazumped.
+ 	 */
+-	ret = i915_gem_object_wait_rendering__nonblocking(obj, !write_domain);
++	ret = i915_gem_object_wait_rendering__nonblocking(obj, file, !write_domain);
+ 	if (ret)
+ 		goto unref;
+ 
+@@ -2155,6 +2174,7 @@ int __i915_add_request(struct intel_ring
+ 		i915_queue_hangcheck(ring->dev);
+ 
+ 		if (was_empty) {
++			cancel_delayed_work_sync(&dev_priv->mm.idle_work);
+ 			queue_delayed_work(dev_priv->wq,
+ 					   &dev_priv->mm.retire_work,
+ 					   round_jiffies_up_relative(HZ));
+@@ -2176,10 +2196,8 @@ i915_gem_request_remove_from_client(stru
+ 		return;
+ 
+ 	spin_lock(&file_priv->mm.lock);
+-	if (request->file_priv) {
+-		list_del(&request->client_list);
+-		request->file_priv = NULL;
+-	}
++	list_del(&request->client_list);
++	request->file_priv = NULL;
+ 	spin_unlock(&file_priv->mm.lock);
+ }
+ 
+@@ -2443,57 +2461,53 @@ i915_gem_retire_requests_ring(struct int
+ 	WARN_ON(i915_verify_lists(ring->dev));
+ }
+ 
+-void
++bool
+ i915_gem_retire_requests(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct intel_ring_buffer *ring;
++	bool idle = true;
+ 	int i;
+ 
+-	for_each_ring(ring, dev_priv, i)
++	for_each_ring(ring, dev_priv, i) {
+ 		i915_gem_retire_requests_ring(ring);
++		idle &= list_empty(&ring->request_list);
++	}
++
++	if (idle)
++		mod_delayed_work(dev_priv->wq,
++				   &dev_priv->mm.idle_work,
++				   msecs_to_jiffies(100));
++
++	return idle;
+ }
+ 
+ static void
+ i915_gem_retire_work_handler(struct work_struct *work)
+ {
+-	drm_i915_private_t *dev_priv;
+-	struct drm_device *dev;
+-	struct intel_ring_buffer *ring;
++	struct drm_i915_private *dev_priv =
++		container_of(work, typeof(*dev_priv), mm.retire_work.work);
++	struct drm_device *dev = dev_priv->dev;
+ 	bool idle;
+-	int i;
+-
+-	dev_priv = container_of(work, drm_i915_private_t,
+-				mm.retire_work.work);
+-	dev = dev_priv->dev;
+ 
+ 	/* Come back later if the device is busy... */
+-	if (!mutex_trylock(&dev->struct_mutex)) {
+-		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work,
+-				   round_jiffies_up_relative(HZ));
+-		return;
+-	}
+-
+-	i915_gem_retire_requests(dev);
+-
+-	/* Send a periodic flush down the ring so we don't hold onto GEM
+-	 * objects indefinitely.
+-	 */
+-	idle = true;
+-	for_each_ring(ring, dev_priv, i) {
+-		if (ring->gpu_caches_dirty)
+-			i915_add_request(ring, NULL);
+-
+-		idle &= list_empty(&ring->request_list);
++	idle = false;
++	if (mutex_trylock(&dev->struct_mutex)) {
++		idle = i915_gem_retire_requests(dev);
++		mutex_unlock(&dev->struct_mutex);
+ 	}
+-
+-	if (!dev_priv->ums.mm_suspended && !idle)
++	if (!idle)
+ 		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work,
+ 				   round_jiffies_up_relative(HZ));
+-	if (idle)
+-		intel_mark_idle(dev);
++}
+ 
+-	mutex_unlock(&dev->struct_mutex);
++static void
++i915_gem_idle_work_handler(struct work_struct *work)
++{
++	struct drm_i915_private *dev_priv =
++		container_of(work, typeof(*dev_priv), mm.idle_work.work);
++
++	intel_mark_idle(dev_priv->dev);
+ }
+ 
+ /**
+@@ -2591,7 +2605,7 @@ i915_gem_wait_ioctl(struct drm_device *d
+ 	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+-	ret = __wait_seqno(ring, seqno, reset_counter, true, timeout);
++	ret = __wait_seqno(ring, seqno, reset_counter, true, timeout, file->driver_priv);
+ 	if (timeout)
+ 		args->timeout_ns = timespec_to_ns(timeout);
+ 	return ret;
+@@ -3802,7 +3816,7 @@ i915_gem_ring_throttle(struct drm_device
+ 	if (seqno == 0)
+ 		return 0;
+ 
+-	ret = __wait_seqno(ring, seqno, reset_counter, true, NULL);
++	ret = __wait_seqno(ring, seqno, reset_counter, true, NULL, NULL);
+ 	if (ret == 0)
+ 		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, 0);
+ 
+@@ -4272,6 +4286,7 @@ i915_gem_idle(struct drm_device *dev)
+ 
+ 	/* Cancel the retire work handler, which should be idle now. */
+ 	cancel_delayed_work_sync(&dev_priv->mm.retire_work);
++	cancel_delayed_work_sync(&dev_priv->mm.idle_work);
+ 
+ 	return 0;
+ }
+@@ -4605,6 +4620,8 @@ i915_gem_load(struct drm_device *dev)
+ 		INIT_LIST_HEAD(&dev_priv->fence_regs[i].lru_list);
+ 	INIT_DELAYED_WORK(&dev_priv->mm.retire_work,
+ 			  i915_gem_retire_work_handler);
++	INIT_DELAYED_WORK(&dev_priv->mm.idle_work,
++			  i915_gem_idle_work_handler);
+ 	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
+ 
+ 	/* On GEN3 we really need to make sure the ARB C3 LP bit is set */
+@@ -4828,6 +4845,8 @@ void i915_gem_release(struct drm_device
+ {
+ 	struct drm_i915_file_private *file_priv = file->driver_priv;
+ 
++	cancel_delayed_work_sync(&file_priv->mm.idle_work);
++
+ 	/* Clean up our request list when the client is going away, so that
+ 	 * later retire_requests won't dereference our soon-to-be-gone
+ 	 * file_priv.
+@@ -4845,6 +4864,38 @@ void i915_gem_release(struct drm_device
+ 	spin_unlock(&file_priv->mm.lock);
+ }
+ 
++static void
++i915_gem_file_idle_work_handler(struct work_struct *work)
++{
++	struct drm_i915_file_private *file_priv =
++		container_of(work, typeof(*file_priv), mm.idle_work.work);
++
++	atomic_set(&file_priv->rps_wait_boost, false);
++}
++
++int i915_gem_open(struct drm_device *dev, struct drm_file *file)
++{
++	struct drm_i915_file_private *file_priv;
++
++	DRM_DEBUG_DRIVER("\n");
++
++	file_priv = kzalloc(sizeof(*file_priv), GFP_KERNEL);
++	if (!file_priv)
++		return -ENOMEM;
++
++	file->driver_priv = file_priv;
++	file_priv->dev_priv = dev->dev_private;
++
++	spin_lock_init(&file_priv->mm.lock);
++	INIT_LIST_HEAD(&file_priv->mm.request_list);
++	INIT_DELAYED_WORK(&file_priv->mm.idle_work,
++			  i915_gem_file_idle_work_handler);
++
++	idr_init(&file_priv->context_idr);
++
++	return 0;
++}
++
+ static bool mutex_is_locked_by(struct mutex *mutex, struct task_struct *task)
+ {
+ 	if (!mutex_is_locked(mutex))
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -859,17 +859,6 @@ static void gen6_pm_rps_work(struct work
+ 			gen6_set_rps(dev_priv->dev, new_delay);
+ 	}
+ 
+-	if (IS_VALLEYVIEW(dev_priv->dev)) {
+-		/*
+-		 * On VLV, when we enter RC6 we may not be at the minimum
+-		 * voltage level, so arm a timer to check.  It should only
+-		 * fire when there's activity or once after we've entered
+-		 * RC6, and then won't be re-armed until the next RPS interrupt.
+-		 */
+-		mod_delayed_work(dev_priv->wq, &dev_priv->rps.vlv_work,
+-				 msecs_to_jiffies(100));
+-	}
+-
+ 	mutex_unlock(&dev_priv->rps.hw_lock);
+ }
+ 
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -7726,6 +7726,9 @@ void intel_mark_idle(struct drm_device *
+ 
+ 		intel_decrease_pllclock(crtc);
+ 	}
++
++	if (dev_priv->info->gen >= 6)
++		gen6_rps_idle(dev->dev_private);
+ }
+ 
+ void intel_mark_fb_busy(struct drm_i915_gem_object *obj,
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -825,4 +825,7 @@ int intel_sprite_get_colorkey(struct drm
+ /* intel_tv.c */
+ void intel_tv_init(struct drm_device *dev);
+ 
++void gen6_rps_idle(struct drm_i915_private *dev_priv);
++void gen6_rps_boost(struct drm_i915_private *dev_priv);
++
+ #endif /* __INTEL_DRV_H__ */
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -3345,6 +3345,26 @@ void gen6_set_rps(struct drm_device *dev
+ 	trace_intel_gpu_freq_change(val * 50);
+ }
+ 
++void gen6_rps_idle(struct drm_i915_private *dev_priv)
++{
++	mutex_lock(&dev_priv->rps.hw_lock);
++	if (dev_priv->info->is_valleyview)
++		valleyview_set_rps(dev_priv->dev, dev_priv->rps.min_delay);
++	else
++		gen6_set_rps(dev_priv->dev, dev_priv->rps.min_delay);
++	mutex_unlock(&dev_priv->rps.hw_lock);
++}
++
++void gen6_rps_boost(struct drm_i915_private *dev_priv)
++{
++	mutex_lock(&dev_priv->rps.hw_lock);
++	if (dev_priv->info->is_valleyview)
++		valleyview_set_rps(dev_priv->dev, dev_priv->rps.max_delay);
++	else
++		gen6_set_rps(dev_priv->dev, dev_priv->rps.max_delay);
++	mutex_unlock(&dev_priv->rps.hw_lock);
++}
++
+ /*
+  * Wait until the previous freq change has completed,
+  * or the timeout elapsed, and then update our notion
+@@ -3734,24 +3754,6 @@ int valleyview_rps_min_freq(struct drm_i
+ 	return vlv_punit_read(dev_priv, PUNIT_REG_GPU_LFM) & 0xff;
+ }
+ 
+-static void vlv_rps_timer_work(struct work_struct *work)
+-{
+-	drm_i915_private_t *dev_priv = container_of(work, drm_i915_private_t,
+-						    rps.vlv_work.work);
+-
+-	/*
+-	 * Timer fired, we must be idle.  Drop to min voltage state.
+-	 * Note: we use RPe here since it should match the
+-	 * Vmin we were shooting for.  That should give us better
+-	 * perf when we come back out of RC6 than if we used the
+-	 * min freq available.
+-	 */
+-	mutex_lock(&dev_priv->rps.hw_lock);
+-	if (dev_priv->rps.cur_delay > dev_priv->rps.rpe_delay)
+-		valleyview_set_rps(dev_priv->dev, dev_priv->rps.rpe_delay);
+-	mutex_unlock(&dev_priv->rps.hw_lock);
+-}
+-
+ static void valleyview_setup_pctx(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -3894,8 +3896,6 @@ static void valleyview_enable_rps(struct
+ 				      dev_priv->rps.rpe_delay),
+ 			 dev_priv->rps.rpe_delay);
+ 
+-	INIT_DELAYED_WORK(&dev_priv->rps.vlv_work, vlv_rps_timer_work);
+-
+ 	valleyview_set_rps(dev_priv->dev, dev_priv->rps.rpe_delay);
+ 
+ 	gen6_enable_rps_interrupts(dev);
+@@ -4635,8 +4635,6 @@ void intel_disable_gt_powersave(struct d
+ 	} else if (INTEL_INFO(dev)->gen >= 6) {
+ 		cancel_delayed_work_sync(&dev_priv->rps.delayed_resume_work);
+ 		cancel_work_sync(&dev_priv->rps.work);
+-		if (IS_VALLEYVIEW(dev))
+-			cancel_delayed_work_sync(&dev_priv->rps.vlv_work);
+ 		mutex_lock(&dev_priv->rps.hw_lock);
+ 		if (IS_VALLEYVIEW(dev))
+ 			valleyview_disable_rps(dev);

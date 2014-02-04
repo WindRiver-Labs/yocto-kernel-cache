@@ -1,0 +1,463 @@
+From 84bdf1674c7cd6f2c240e94f369e5ca4cdb14c4c Mon Sep 17 00:00:00 2001
+From: ymohanma <yogesh.mohan.marimuthu@intel.com>
+Date: Tue, 27 Aug 2013 23:40:56 +0300
+Subject: drm/i915: add VLV DSI PLL Calculations
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+v2:
+ - Grab dpio_lock mutex in vlv_enable_dsi_pll().
+ - Add and call vlv_disable_dsi_pll().
+
+v3: Mostly based on Ville's review comments.
+ - Only pipe A has DSI PLL lock bit.
+ - Add more of CCK REG bit definitions for DSI PLL.
+ - Make tables static.
+ - Move clock gating out of the clock calculation functions.
+ - DSI PLL LDO power gating.
+ - Put alternative MNP from table calc behind #ifdef.
+
+v4: s/CKK/CLK/ in the CCK REG bit definitions (Ville).
+
+Signed-off-by: ymohanma <yogesh.mohan.marimuthu@intel.com>
+Signed-off-by: Shobhit Kumar <shobhit.kumar@intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit be4fc046bed35f7a50c8d5751abf555933d864ae)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/Makefile        |   1 +
+ drivers/gpu/drm/i915/i915_reg.h      |  32 ++++
+ drivers/gpu/drm/i915/intel_dsi.c     |   7 +
+ drivers/gpu/drm/i915/intel_dsi.h     |   3 +
+ drivers/gpu/drm/i915/intel_dsi_pll.c | 317 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 360 insertions(+)
+ create mode 100644 drivers/gpu/drm/i915/intel_dsi_pll.c
+
+diff --git a/drivers/gpu/drm/i915/Makefile b/drivers/gpu/drm/i915/Makefile
+index 5864c5ba44b7..65e60d26891b 100644
+--- a/drivers/gpu/drm/i915/Makefile
++++ b/drivers/gpu/drm/i915/Makefile
+@@ -23,6 +23,7 @@ i915-y := i915_drv.o i915_dma.o i915_irq.o \
+ 	  intel_lvds.o \
+ 	  intel_dsi.o \
+ 	  intel_dsi_cmd.o \
++	  intel_dsi_pll.o \
+ 	  intel_bios.o \
+ 	  intel_ddi.o \
+ 	  intel_dp.o \
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index b26cf9b5b1e4..f626a16a14fa 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -376,6 +376,38 @@
+ #define   FB_FMAX_VMIN_FREQ_LO_SHIFT		27
+ #define   FB_FMAX_VMIN_FREQ_LO_MASK		0xf8000000
+ 
++/* vlv2 north clock has */
++#define CCK_REG_DSI_PLL_FUSE			0x44
++#define CCK_REG_DSI_PLL_CONTROL			0x48
++#define  DSI_PLL_VCO_EN				(1 << 31)
++#define  DSI_PLL_LDO_GATE			(1 << 30)
++#define  DSI_PLL_P1_POST_DIV_SHIFT		17
++#define  DSI_PLL_P1_POST_DIV_MASK		(0x1ff << 17)
++#define  DSI_PLL_P2_MUX_DSI0_DIV2		(1 << 13)
++#define  DSI_PLL_P3_MUX_DSI1_DIV2		(1 << 12)
++#define  DSI_PLL_MUX_MASK			(3 << 9)
++#define  DSI_PLL_MUX_DSI0_DSIPLL		(0 << 10)
++#define  DSI_PLL_MUX_DSI0_CCK			(1 << 10)
++#define  DSI_PLL_MUX_DSI1_DSIPLL		(0 << 9)
++#define  DSI_PLL_MUX_DSI1_CCK			(1 << 9)
++#define  DSI_PLL_CLK_GATE_MASK			(0xf << 5)
++#define  DSI_PLL_CLK_GATE_DSI0_DSIPLL		(1 << 8)
++#define  DSI_PLL_CLK_GATE_DSI1_DSIPLL		(1 << 7)
++#define  DSI_PLL_CLK_GATE_DSI0_CCK		(1 << 6)
++#define  DSI_PLL_CLK_GATE_DSI1_CCK		(1 << 5)
++#define  DSI_PLL_LOCK				(1 << 0)
++#define CCK_REG_DSI_PLL_DIVIDER			0x4c
++#define  DSI_PLL_LFSR				(1 << 31)
++#define  DSI_PLL_FRACTION_EN			(1 << 30)
++#define  DSI_PLL_FRAC_COUNTER_SHIFT		27
++#define  DSI_PLL_FRAC_COUNTER_MASK		(7 << 27)
++#define  DSI_PLL_USYNC_CNT_SHIFT		18
++#define  DSI_PLL_USYNC_CNT_MASK			(0x1ff << 18)
++#define  DSI_PLL_N1_DIV_SHIFT			16
++#define  DSI_PLL_N1_DIV_MASK			(3 << 16)
++#define  DSI_PLL_M1_DIV_SHIFT			0
++#define  DSI_PLL_M1_DIV_MASK			(0x1ff << 0)
++
+ /*
+  * DPIO - a special bus for various display related registers to hide behind
+  *
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 0dfb28fba47e..263c8d2603b6 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -83,6 +83,8 @@ static bool intel_dsi_compute_config(struct intel_encoder *encoder,
+ static void intel_dsi_pre_pll_enable(struct intel_encoder *encoder)
+ {
+ 	DRM_DEBUG_KMS("\n");
++
++	vlv_enable_dsi_pll(encoder);
+ }
+ 
+ static void intel_dsi_pre_enable(struct intel_encoder *encoder)
+@@ -167,6 +169,8 @@ static void intel_dsi_disable(struct intel_encoder *encoder)
+ static void intel_dsi_post_disable(struct intel_encoder *encoder)
+ {
+ 	DRM_DEBUG_KMS("\n");
++
++	vlv_disable_dsi_pll(encoder);
+ }
+ 
+ static bool intel_dsi_get_hw_state(struct intel_encoder *encoder,
+@@ -303,6 +307,9 @@ static void intel_dsi_mode_set(struct intel_encoder *intel_encoder)
+ 
+ 	DRM_DEBUG_KMS("pipe %d\n", pipe);
+ 
++	/* Update the DSI PLL */
++	vlv_enable_dsi_pll(intel_encoder);
++
+ 	/* escape clock divider, 20MHz, shared for A and C. device ready must be
+ 	 * off when doing this! txclkesc? */
+ 	tmp = I915_READ(MIPI_CTRL(0));
+diff --git a/drivers/gpu/drm/i915/intel_dsi.h b/drivers/gpu/drm/i915/intel_dsi.h
+index f308269cd87c..c7765f33d524 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.h
++++ b/drivers/gpu/drm/i915/intel_dsi.h
+@@ -96,4 +96,7 @@ static inline struct intel_dsi *enc_to_intel_dsi(struct drm_encoder *encoder)
+ 	return container_of(encoder, struct intel_dsi, base.base);
+ }
+ 
++extern void vlv_enable_dsi_pll(struct intel_encoder *encoder);
++extern void vlv_disable_dsi_pll(struct intel_encoder *encoder);
++
+ #endif /* _INTEL_DSI_H */
+diff --git a/drivers/gpu/drm/i915/intel_dsi_pll.c b/drivers/gpu/drm/i915/intel_dsi_pll.c
+new file mode 100644
+index 000000000000..582f626a99f6
+--- /dev/null
++++ b/drivers/gpu/drm/i915/intel_dsi_pll.c
+@@ -0,0 +1,317 @@
++/*
++ * Copyright © 2013 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ *
++ * Authors:
++ *	Shobhit Kumar <shobhit.kumar@intel.com>
++ *	Yogesh Mohan Marimuthu <yogesh.mohan.marimuthu@intel.com>
++ */
++
++#include <linux/kernel.h>
++#include "intel_drv.h"
++#include "i915_drv.h"
++#include "intel_dsi.h"
++
++#define DSI_HSS_PACKET_SIZE		4
++#define DSI_HSE_PACKET_SIZE		4
++#define DSI_HSA_PACKET_EXTRA_SIZE	6
++#define DSI_HBP_PACKET_EXTRA_SIZE	6
++#define DSI_HACTIVE_PACKET_EXTRA_SIZE	6
++#define DSI_HFP_PACKET_EXTRA_SIZE	6
++#define DSI_EOTP_PACKET_SIZE		4
++
++struct dsi_mnp {
++	u32 dsi_pll_ctrl;
++	u32 dsi_pll_div;
++};
++
++static const u32 lfsr_converts[] = {
++	426, 469, 234, 373, 442, 221, 110, 311, 411,		/* 62 - 70 */
++	461, 486, 243, 377, 188, 350, 175, 343, 427, 213,	/* 71 - 80 */
++	106, 53, 282, 397, 354, 227, 113, 56, 284, 142,		/* 81 - 90 */
++	71, 35							/* 91 - 92 */
++};
++
++static u32 dsi_rr_formula(struct drm_display_mode *mode,
++			  int pixel_format, int video_mode_format,
++			  int lane_count, bool eotp)
++{
++	u32 bpp;
++	u32 hactive, vactive, hfp, hsync, hbp, vfp, vsync, vbp;
++	u32 hsync_bytes, hbp_bytes, hactive_bytes, hfp_bytes;
++	u32 bytes_per_line, bytes_per_frame;
++	u32 num_frames;
++	u32 bytes_per_x_frames, bytes_per_x_frames_x_lanes;
++	u32 dsi_bit_clock_hz;
++	u32 dsi_clk;
++
++	switch (pixel_format) {
++	default:
++	case VID_MODE_FORMAT_RGB888:
++	case VID_MODE_FORMAT_RGB666_LOOSE:
++		bpp = 24;
++		break;
++	case VID_MODE_FORMAT_RGB666:
++		bpp = 18;
++		break;
++	case VID_MODE_FORMAT_RGB565:
++		bpp = 16;
++		break;
++	}
++
++	hactive = mode->hdisplay;
++	vactive = mode->vdisplay;
++	hfp = mode->hsync_start - mode->hdisplay;
++	hsync = mode->hsync_end - mode->hsync_start;
++	hbp = mode->htotal - mode->hsync_end;
++
++	vfp = mode->vsync_start - mode->vdisplay;
++	vsync = mode->vsync_end - mode->vsync_start;
++	vbp = mode->vtotal - mode->vsync_end;
++
++	hsync_bytes = DIV_ROUND_UP(hsync * bpp, 8);
++	hbp_bytes = DIV_ROUND_UP(hbp * bpp, 8);
++	hactive_bytes = DIV_ROUND_UP(hactive * bpp, 8);
++	hfp_bytes = DIV_ROUND_UP(hfp * bpp, 8);
++
++	bytes_per_line = DSI_HSS_PACKET_SIZE + hsync_bytes +
++		DSI_HSA_PACKET_EXTRA_SIZE + DSI_HSE_PACKET_SIZE +
++		hbp_bytes + DSI_HBP_PACKET_EXTRA_SIZE +
++		hactive_bytes + DSI_HACTIVE_PACKET_EXTRA_SIZE +
++		hfp_bytes + DSI_HFP_PACKET_EXTRA_SIZE;
++
++	/*
++	 * XXX: Need to accurately calculate LP to HS transition timeout and add
++	 * it to bytes_per_line/bytes_per_frame.
++	 */
++
++	if (eotp && video_mode_format == VIDEO_MODE_BURST)
++		bytes_per_line += DSI_EOTP_PACKET_SIZE;
++
++	bytes_per_frame = vsync * bytes_per_line + vbp * bytes_per_line +
++		vactive * bytes_per_line + vfp * bytes_per_line;
++
++	if (eotp &&
++	    (video_mode_format == VIDEO_MODE_NON_BURST_WITH_SYNC_PULSE ||
++	     video_mode_format == VIDEO_MODE_NON_BURST_WITH_SYNC_EVENTS))
++		bytes_per_frame += DSI_EOTP_PACKET_SIZE;
++
++	num_frames = drm_mode_vrefresh(mode);
++	bytes_per_x_frames = num_frames * bytes_per_frame;
++
++	bytes_per_x_frames_x_lanes = bytes_per_x_frames / lane_count;
++
++	/* the dsi clock is divided by 2 in the hardware to get dsi ddr clock */
++	dsi_bit_clock_hz = bytes_per_x_frames_x_lanes * 8;
++	dsi_clk = dsi_bit_clock_hz / (1000 * 1000);
++
++	if (eotp && video_mode_format == VIDEO_MODE_BURST)
++		dsi_clk *= 2;
++
++	return dsi_clk;
++}
++
++#ifdef MNP_FROM_TABLE
++
++struct dsi_clock_table {
++	u32 freq;
++	u8 m;
++	u8 p;
++};
++
++static const struct dsi_clock_table dsi_clk_tbl[] = {
++	{300, 72, 6}, {313, 75, 6}, {323, 78, 6}, {333, 80, 6},
++	{343, 82, 6}, {353, 85, 6}, {363, 87, 6}, {373, 90, 6},
++	{383, 92, 6}, {390, 78, 5}, {393, 79, 5}, {400, 80, 5},
++	{401, 80, 5}, {402, 80, 5}, {403, 81, 5}, {404, 81, 5},
++	{405, 81, 5}, {406, 81, 5}, {407, 81, 5}, {408, 82, 5},
++	{409, 82, 5}, {410, 82, 5}, {411, 82, 5}, {412, 82, 5},
++	{413, 83, 5}, {414, 83, 5}, {415, 83, 5}, {416, 83, 5},
++	{417, 83, 5}, {418, 84, 5}, {419, 84, 5}, {420, 84, 5},
++	{430, 86, 5}, {440, 88, 5}, {450, 90, 5}, {460, 92, 5},
++	{470, 75, 4}, {480, 77, 4}, {490, 78, 4}, {500, 80, 4},
++	{510, 82, 4}, {520, 83, 4}, {530, 85, 4}, {540, 86, 4},
++	{550, 88, 4}, {560, 90, 4}, {570, 91, 4}, {580, 70, 3},
++	{590, 71, 3}, {600, 72, 3}, {610, 73, 3}, {620, 74, 3},
++	{630, 76, 3}, {640, 77, 3}, {650, 78, 3}, {660, 79, 3},
++	{670, 80, 3}, {680, 82, 3}, {690, 83, 3}, {700, 84, 3},
++	{710, 85, 3}, {720, 86, 3}, {730, 88, 3}, {740, 89, 3},
++	{750, 90, 3}, {760, 91, 3}, {770, 92, 3}, {780, 62, 2},
++	{790, 63, 2}, {800, 64, 2}, {880, 70, 2}, {900, 72, 2},
++	{1000, 80, 2},		/* dsi clock frequency in Mhz*/
++};
++
++static int dsi_calc_mnp(u32 dsi_clk, struct dsi_mnp *dsi_mnp)
++{
++	unsigned int i;
++	u8 m;
++	u8 n;
++	u8 p;
++	u32 m_seed;
++
++	if (dsi_clk < 300 || dsi_clk > 1000)
++		return -ECHRNG;
++
++	for (i = 0; i <= ARRAY_SIZE(dsi_clk_tbl); i++) {
++		if (dsi_clk_tbl[i].freq > dsi_clk)
++			break;
++	}
++
++	m = dsi_clk_tbl[i].m;
++	p = dsi_clk_tbl[i].p;
++	m_seed = lfsr_converts[m - 62];
++	n = 1;
++	dsi_mnp->dsi_pll_ctrl = 1 << (DSI_PLL_P1_POST_DIV_SHIFT + p - 2);
++	dsi_mnp->dsi_pll_div = (n - 1) << DSI_PLL_N1_DIV_SHIFT |
++		m_seed << DSI_PLL_M1_DIV_SHIFT;
++
++	return 0;
++}
++
++#else
++
++static int dsi_calc_mnp(u32 dsi_clk, struct dsi_mnp *dsi_mnp)
++{
++	u32 m, n, p;
++	u32 ref_clk;
++	u32 error;
++	u32 tmp_error;
++	u32 target_dsi_clk;
++	u32 calc_dsi_clk;
++	u32 calc_m;
++	u32 calc_p;
++	u32 m_seed;
++
++	if (dsi_clk < 300 || dsi_clk > 1150) {
++		DRM_ERROR("DSI CLK Out of Range\n");
++		return -ECHRNG;
++	}
++
++	ref_clk = 25000;
++	target_dsi_clk = dsi_clk * 1000;
++	error = 0xFFFFFFFF;
++	calc_m = 0;
++	calc_p = 0;
++
++	for (m = 62; m <= 92; m++) {
++		for (p = 2; p <= 6; p++) {
++
++			calc_dsi_clk = (m * ref_clk) / p;
++			if (calc_dsi_clk >= target_dsi_clk) {
++				tmp_error = calc_dsi_clk - target_dsi_clk;
++				if (tmp_error < error) {
++					error = tmp_error;
++					calc_m = m;
++					calc_p = p;
++				}
++			}
++		}
++	}
++
++	m_seed = lfsr_converts[calc_m - 62];
++	n = 1;
++	dsi_mnp->dsi_pll_ctrl = 1 << (DSI_PLL_P1_POST_DIV_SHIFT + calc_p - 2);
++	dsi_mnp->dsi_pll_div = (n - 1) << DSI_PLL_N1_DIV_SHIFT |
++		m_seed << DSI_PLL_M1_DIV_SHIFT;
++
++	return 0;
++}
++
++#endif
++
++/*
++ * XXX: The muxing and gating is hard coded for now. Need to add support for
++ * sharing PLLs with two DSI outputs.
++ */
++static void vlv_configure_dsi_pll(struct intel_encoder *encoder)
++{
++	struct drm_i915_private *dev_priv = encoder->base.dev->dev_private;
++	struct intel_crtc *intel_crtc = to_intel_crtc(encoder->base.crtc);
++	struct drm_display_mode *mode = &intel_crtc->config.requested_mode;
++	struct intel_dsi *intel_dsi = enc_to_intel_dsi(&encoder->base);
++	int ret;
++	struct dsi_mnp dsi_mnp;
++	u32 dsi_clk;
++
++	dsi_clk = dsi_rr_formula(mode, intel_dsi->pixel_format,
++				 intel_dsi->video_mode_format,
++				 intel_dsi->lane_count, !intel_dsi->eot_disable);
++
++	ret = dsi_calc_mnp(dsi_clk, &dsi_mnp);
++	if (ret) {
++		DRM_DEBUG_KMS("dsi_calc_mnp failed\n");
++		return;
++	}
++
++	dsi_mnp.dsi_pll_ctrl |= DSI_PLL_CLK_GATE_DSI0_DSIPLL;
++
++	DRM_DEBUG_KMS("dsi pll div %08x, ctrl %08x\n",
++		      dsi_mnp.dsi_pll_div, dsi_mnp.dsi_pll_ctrl);
++
++	vlv_cck_write(dev_priv, CCK_REG_DSI_PLL_CONTROL, 0);
++	vlv_cck_write(dev_priv, CCK_REG_DSI_PLL_DIVIDER, dsi_mnp.dsi_pll_div);
++	vlv_cck_write(dev_priv, CCK_REG_DSI_PLL_CONTROL, dsi_mnp.dsi_pll_ctrl);
++}
++
++void vlv_enable_dsi_pll(struct intel_encoder *encoder)
++{
++	struct drm_i915_private *dev_priv = encoder->base.dev->dev_private;
++	u32 tmp;
++
++	DRM_DEBUG_KMS("\n");
++
++	mutex_lock(&dev_priv->dpio_lock);
++
++	vlv_configure_dsi_pll(encoder);
++
++	/* wait at least 0.5 us after ungating before enabling VCO */
++	usleep_range(1, 10);
++
++	tmp = vlv_cck_read(dev_priv, CCK_REG_DSI_PLL_CONTROL);
++	tmp |= DSI_PLL_VCO_EN;
++	vlv_cck_write(dev_priv, CCK_REG_DSI_PLL_CONTROL, tmp);
++
++	mutex_unlock(&dev_priv->dpio_lock);
++
++	if (wait_for(I915_READ(PIPECONF(PIPE_A)) & PIPECONF_DSI_PLL_LOCKED, 20)) {
++		DRM_ERROR("DSI PLL lock failed\n");
++		return;
++	}
++
++	DRM_DEBUG_KMS("DSI PLL locked\n");
++}
++
++void vlv_disable_dsi_pll(struct intel_encoder *encoder)
++{
++	struct drm_i915_private *dev_priv = encoder->base.dev->dev_private;
++	u32 tmp;
++
++	DRM_DEBUG_KMS("\n");
++
++	mutex_lock(&dev_priv->dpio_lock);
++
++	tmp = vlv_cck_read(dev_priv, CCK_REG_DSI_PLL_CONTROL);
++	tmp &= ~DSI_PLL_VCO_EN;
++	tmp |= DSI_PLL_LDO_GATE;
++	vlv_cck_write(dev_priv, CCK_REG_DSI_PLL_CONTROL, tmp);
++
++	mutex_unlock(&dev_priv->dpio_lock);
++}
+-- 
+1.8.5.rc3
+

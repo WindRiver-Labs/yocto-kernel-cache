@@ -1,0 +1,132 @@
+From 2398fcd316955ec37343d396ebfc068b6f699ed5 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Wed, 14 Aug 2013 11:38:34 +0200
+Subject: drm/i915: Switch eviction code to use vmas
+
+The execbuf wants to do relocations usings vmas, so we need a
+vma->exec_list. The eviction code also uses the old obj execbuf list
+for it's own book-keeping, but would really prefer to deal in vmas
+only. So switch it over to the new list.
+
+Again this is just a prep patch for the big execbuf vma conversion.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+[danvet: Split out from Ben's big execbuf vma patch.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit 82a55ad1a0585e4e01a47f72fe81fb5a2d2c0fb1)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h       |  4 ++++
+ drivers/gpu/drm/i915/i915_gem.c       |  1 +
+ drivers/gpu/drm/i915/i915_gem_evict.c | 31 ++++++++++++++-----------------
+ 3 files changed, 19 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 315e530c6488..3f1f65865d3c 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -563,6 +563,10 @@ struct i915_vma {
+ 	struct list_head mm_list;
+ 
+ 	struct list_head vma_link; /* Link in the object's VMA list */
++
++	/** This vma's place in the batchbuffer or on the eviction list */
++	struct list_head exec_list;
++
+ };
+ 
+ struct i915_ctx_hang_stats {
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6223a71a640a..10e3c536f911 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4120,6 +4120,7 @@ struct i915_vma *i915_gem_vma_create(struct drm_i915_gem_object *obj,
+ 
+ 	INIT_LIST_HEAD(&vma->vma_link);
+ 	INIT_LIST_HEAD(&vma->mm_list);
++	INIT_LIST_HEAD(&vma->exec_list);
+ 	vma->vm = vm;
+ 	vma->obj = obj;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_evict.c b/drivers/gpu/drm/i915/i915_gem_evict.c
+index 425939b7d343..87875884770c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_evict.c
++++ b/drivers/gpu/drm/i915/i915_gem_evict.c
+@@ -37,7 +37,7 @@ mark_free(struct i915_vma *vma, struct list_head *unwind)
+ 	if (vma->obj->pin_count)
+ 		return false;
+ 
+-	list_add(&vma->obj->exec_list, unwind);
++	list_add(&vma->exec_list, unwind);
+ 	return drm_mm_scan_add_block(&vma->node);
+ }
+ 
+@@ -49,7 +49,6 @@ i915_gem_evict_something(struct drm_device *dev, struct i915_address_space *vm,
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct list_head eviction_list, unwind_list;
+ 	struct i915_vma *vma;
+-	struct drm_i915_gem_object *obj;
+ 	int ret = 0;
+ 
+ 	trace_i915_gem_evict(dev, min_size, alignment, mappable);
+@@ -104,14 +103,13 @@ i915_gem_evict_something(struct drm_device *dev, struct i915_address_space *vm,
+ none:
+ 	/* Nothing found, clean up and bail out! */
+ 	while (!list_empty(&unwind_list)) {
+-		obj = list_first_entry(&unwind_list,
+-				       struct drm_i915_gem_object,
++		vma = list_first_entry(&unwind_list,
++				       struct i915_vma,
+ 				       exec_list);
+-		vma = i915_gem_obj_to_vma(obj, vm);
+ 		ret = drm_mm_scan_remove_block(&vma->node);
+ 		BUG_ON(ret);
+ 
+-		list_del_init(&obj->exec_list);
++		list_del_init(&vma->exec_list);
+ 	}
+ 
+ 	/* We expect the caller to unpin, evict all and try again, or give up.
+@@ -125,28 +123,27 @@ found:
+ 	 * temporary list. */
+ 	INIT_LIST_HEAD(&eviction_list);
+ 	while (!list_empty(&unwind_list)) {
+-		obj = list_first_entry(&unwind_list,
+-				       struct drm_i915_gem_object,
++		vma = list_first_entry(&unwind_list,
++				       struct i915_vma,
+ 				       exec_list);
+-		vma = i915_gem_obj_to_vma(obj, vm);
+ 		if (drm_mm_scan_remove_block(&vma->node)) {
+-			list_move(&obj->exec_list, &eviction_list);
+-			drm_gem_object_reference(&obj->base);
++			list_move(&vma->exec_list, &eviction_list);
++			drm_gem_object_reference(&vma->obj->base);
+ 			continue;
+ 		}
+-		list_del_init(&obj->exec_list);
++		list_del_init(&vma->exec_list);
+ 	}
+ 
+ 	/* Unbinding will emit any required flushes */
+ 	while (!list_empty(&eviction_list)) {
+-		obj = list_first_entry(&eviction_list,
+-				       struct drm_i915_gem_object,
++		vma = list_first_entry(&eviction_list,
++				       struct i915_vma,
+ 				       exec_list);
+ 		if (ret == 0)
+-			ret = i915_vma_unbind(i915_gem_obj_to_vma(obj, vm));
++			ret = i915_vma_unbind(vma);
+ 
+-		list_del_init(&obj->exec_list);
+-		drm_gem_object_unreference(&obj->base);
++		list_del_init(&vma->exec_list);
++		drm_gem_object_unreference(&vma->obj->base);
+ 	}
+ 
+ 	return ret;
+-- 
+1.8.5.rc3
+

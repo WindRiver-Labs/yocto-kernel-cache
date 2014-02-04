@@ -1,0 +1,100 @@
+From 4609be6ede808afa10b534d13b88efd09aa17e63 Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Fri, 9 Aug 2013 17:04:36 -0300
+Subject: drm/i915: fix how we mask PMIMR when adding work to the queue
+
+It seems we've been doing this ever since we started processing the
+RPS events on a work queue, on commit "drm/i915: move gen6 rps
+handling to workqueue", 4912d04193733a825216b926ffd290fada88ab07.
+
+The problem is: when we add work to the queue, instead of just masking
+the bits we queued and leaving all the others on their current state,
+we mask the bits we queued and unmask all the others. This basically
+means we'll be unmasking a bunch of interrupts we're not going to
+process. And if you look at gen6_pm_rps_work, we unmask back only
+GEN6_PM_RPS_EVENTS, which means the bits we unmasked when adding work
+to the queue will remain unmasked after we process the queue.
+
+Notice that even though we unmask those unrelated interrupts, we never
+enable them on IER, so they don't fire our interrupt handler, they
+just stay there on IIR waiting to be cleared when something else
+triggers the interrupt handler.
+
+So this patch does what seems to make more sense: mask only the bits
+we add to the queue, without unmasking anything else, and so we'll
+unmask them after we process the queue.
+
+As a side effect we also have to remove that WARN, because it is not
+only making sure we don't mask useful interrupts, it is also making
+sure we do unmask useless interrupts! That piece of code should not be
+responsible for knowing which bits should be unmasked, so just don't
+assert anything, and trust that snb_disable_pm_irq should be doing the
+right thing.
+
+With i915.enable_pc8=1 I was getting ocasional "GEN6_PMIIR is not 0"
+error messages due to the fact that we unmask those unrelated
+interrupts but don't enable them.
+
+Note: if bugs start bisecting to this patch, then it probably means
+someone was relying on the fact that we unmask everything by accident,
+then we should fix gen5_gt_irq_postinstall or whoever needs the
+accidentally unmasked interrupts. Or maybe I was just wrong and we
+need to revert this patch :)
+
+Note: This started to be a more real issue with the addition of the
+VEBOX support since now we do enable more than just the minimal set of
+RPS interrupts in the IER register. Which means after the first rps
+interrupt has happened we will never mask the VEBOX user interrupts
+again and so will blow through cpu time needlessly when running video
+workloads.
+
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+[danvet: Add note that this started to matter with VEBOX much more.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+(cherry picked from commit 4d3b3d5fd7d42a522a6c444388826bb23264db9f)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_irq.c | 11 ++---------
+ 1 file changed, 2 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index b04130e7bff2..aaad8c639a3a 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -167,11 +167,6 @@ void snb_disable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask)
+ 	snb_update_pm_irq(dev_priv, mask, 0);
+ }
+ 
+-static void snb_set_pm_irq(struct drm_i915_private *dev_priv, uint32_t val)
+-{
+-	snb_update_pm_irq(dev_priv, 0xffffffff, ~val);
+-}
+-
+ static bool ivb_can_enable_err_int(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -963,7 +958,7 @@ static void gen6_rps_irq_handler(struct drm_i915_private *dev_priv,
+ 
+ 	spin_lock(&dev_priv->irq_lock);
+ 	dev_priv->rps.pm_iir |= pm_iir & GEN6_PM_RPS_EVENTS;
+-	snb_set_pm_irq(dev_priv, dev_priv->rps.pm_iir);
++	snb_disable_pm_irq(dev_priv, pm_iir & GEN6_PM_RPS_EVENTS);
+ 	spin_unlock(&dev_priv->irq_lock);
+ 
+ 	queue_work(dev_priv->wq, &dev_priv->rps.work);
+@@ -1046,9 +1041,7 @@ static void hsw_pm_irq_handler(struct drm_i915_private *dev_priv,
+ 	if (pm_iir & GEN6_PM_RPS_EVENTS) {
+ 		spin_lock(&dev_priv->irq_lock);
+ 		dev_priv->rps.pm_iir |= pm_iir & GEN6_PM_RPS_EVENTS;
+-		snb_set_pm_irq(dev_priv, dev_priv->rps.pm_iir);
+-		/* never want to mask useful interrupts. */
+-		WARN_ON(I915_READ_NOTRACE(GEN6_PMIMR) & ~GEN6_PM_RPS_EVENTS);
++		snb_disable_pm_irq(dev_priv, pm_iir & GEN6_PM_RPS_EVENTS);
+ 		spin_unlock(&dev_priv->irq_lock);
+ 
+ 		queue_work(dev_priv->wq, &dev_priv->rps.work);
+-- 
+1.8.5.rc3
+

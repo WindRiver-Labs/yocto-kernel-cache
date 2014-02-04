@@ -1,0 +1,480 @@
+From 4c71e663d3eaf3c798e034bdc96e5cb63dd996c9 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Thu, 19 Sep 2013 11:13:41 -0700
+Subject: drm/i915: Add second slice l3 remapping
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Certain HSW SKUs have a second bank of L3. This L3 remapping has a
+separate register set, and interrupt from the first "slice". A slice is
+simply a term to define some subset of the GPU's l3 cache. This patch
+implements both the interrupt handler, and ability to communicate with
+userspace about this second slice.
+
+v2:  Remove redundant check about non-existent slice.
+Change warning about interrupts of unknown slices to WARN_ON_ONCE
+Handle the case where we get 2 slice interrupts concurrently, and switch
+the tracking of interrupts to be non-destructive (all Ville)
+Don't enable/mask the second slice parity interrupt for ivb/vlv (even
+though all docs I can find claim it's rsvd) (Ville + Bryan)
+Keep BYT excluded from L3 parity
+
+v3: Fix the slice = ffs to be decremented by one (found by Ville). When
+I initially did my testing on the series, I was using 1-based slice
+counting, so this code was correct. Not sure why my simpler tests that
+I've been running since then didn't pick it up sooner.
+
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+(cherry picked from commit 35a85ac60618521d41cfdb14f3fbfc8ad7329e9e)
+Signed-off-by: Darren Hart <dvhart@linux.intel.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |  7 ++-
+ drivers/gpu/drm/i915/i915_gem.c         | 26 +++++-----
+ drivers/gpu/drm/i915/i915_irq.c         | 89 +++++++++++++++++++++------------
+ drivers/gpu/drm/i915/i915_reg.h         |  7 +++
+ drivers/gpu/drm/i915/i915_sysfs.c       | 34 ++++++++++---
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  7 ++-
+ include/uapi/drm/i915_drm.h             |  8 +--
+ 7 files changed, 117 insertions(+), 61 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 8b16d47280f9..c6e8df737566 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -917,9 +917,11 @@ struct i915_ums_state {
+ 	int mm_suspended;
+ };
+ 
++#define MAX_L3_SLICES 2
+ struct intel_l3_parity {
+-	u32 *remap_info;
++	u32 *remap_info[MAX_L3_SLICES];
+ 	struct work_struct error_work;
++	int which_slice;
+ };
+ 
+ struct i915_gem_mm {
+@@ -1686,6 +1688,7 @@ struct drm_i915_file_private {
+ #define HAS_FORCE_WAKE(dev) (INTEL_INFO(dev)->has_force_wake)
+ 
+ #define HAS_L3_GPU_CACHE(dev) (IS_IVYBRIDGE(dev) || IS_HASWELL(dev))
++#define NUM_L3_SLICES(dev) (IS_HSW_GT3(dev) ? 2 : HAS_L3_GPU_CACHE(dev))
+ 
+ #define GT_FREQUENCY_MULTIPLIER 50
+ 
+@@ -1946,7 +1949,7 @@ bool i915_gem_clflush_object(struct drm_i915_gem_object *obj, bool force);
+ int __must_check i915_gem_object_finish_gpu(struct drm_i915_gem_object *obj);
+ int __must_check i915_gem_init(struct drm_device *dev);
+ int __must_check i915_gem_init_hw(struct drm_device *dev);
+-void i915_gem_l3_remap(struct drm_device *dev);
++void i915_gem_l3_remap(struct drm_device *dev, int slice);
+ void i915_gem_init_swizzling(struct drm_device *dev);
+ void i915_gem_cleanup_ringbuffer(struct drm_device *dev);
+ int __must_check i915_gpu_idle(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 3d3de6eba1e8..66bf75dce783 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4252,16 +4252,15 @@ i915_gem_idle(struct drm_device *dev)
+ 	return 0;
+ }
+ 
+-void i915_gem_l3_remap(struct drm_device *dev)
++void i915_gem_l3_remap(struct drm_device *dev, int slice)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
++	u32 reg_base = GEN7_L3LOG_BASE + (slice * 0x200);
++	u32 *remap_info = dev_priv->l3_parity.remap_info[slice];
+ 	u32 misccpctl;
+ 	int i;
+ 
+-	if (!HAS_L3_GPU_CACHE(dev))
+-		return;
+-
+-	if (!dev_priv->l3_parity.remap_info)
++	if (!HAS_L3_GPU_CACHE(dev) || !remap_info)
+ 		return;
+ 
+ 	misccpctl = I915_READ(GEN7_MISCCPCTL);
+@@ -4269,17 +4268,17 @@ void i915_gem_l3_remap(struct drm_device *dev)
+ 	POSTING_READ(GEN7_MISCCPCTL);
+ 
+ 	for (i = 0; i < GEN7_L3LOG_SIZE; i += 4) {
+-		u32 remap = I915_READ(GEN7_L3LOG_BASE + i);
+-		if (remap && remap != dev_priv->l3_parity.remap_info[i/4])
++		u32 remap = I915_READ(reg_base + i);
++		if (remap && remap != remap_info[i/4])
+ 			DRM_DEBUG("0x%x was already programmed to %x\n",
+-				  GEN7_L3LOG_BASE + i, remap);
+-		if (remap && !dev_priv->l3_parity.remap_info[i/4])
++				  reg_base + i, remap);
++		if (remap && !remap_info[i/4])
+ 			DRM_DEBUG_DRIVER("Clearing remapped register\n");
+-		I915_WRITE(GEN7_L3LOG_BASE + i, dev_priv->l3_parity.remap_info[i/4]);
++		I915_WRITE(reg_base + i, remap_info[i/4]);
+ 	}
+ 
+ 	/* Make sure all the writes land before disabling dop clock gating */
+-	POSTING_READ(GEN7_L3LOG_BASE);
++	POSTING_READ(reg_base);
+ 
+ 	I915_WRITE(GEN7_MISCCPCTL, misccpctl);
+ }
+@@ -4373,7 +4372,7 @@ int
+ i915_gem_init_hw(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+-	int ret;
++	int ret, i;
+ 
+ 	if (INTEL_INFO(dev)->gen < 6 && !intel_enable_gtt())
+ 		return -EIO;
+@@ -4392,7 +4391,8 @@ i915_gem_init_hw(struct drm_device *dev)
+ 		I915_WRITE(GEN7_MSG_CTL, temp);
+ 	}
+ 
+-	i915_gem_l3_remap(dev);
++	for (i = 0; i < NUM_L3_SLICES(dev); i++)
++		i915_gem_l3_remap(dev, i);
+ 
+ 	i915_gem_init_swizzling(dev);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index a42f30b9cdba..1c7f6abe0bc5 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -888,9 +888,10 @@ static void ivybridge_parity_work(struct work_struct *work)
+ 	drm_i915_private_t *dev_priv = container_of(work, drm_i915_private_t,
+ 						    l3_parity.error_work);
+ 	u32 error_status, row, bank, subbank;
+-	char *parity_event[5];
++	char *parity_event[6];
+ 	uint32_t misccpctl;
+ 	unsigned long flags;
++	uint8_t slice = 0;
+ 
+ 	/* We must turn off DOP level clock gating to access the L3 registers.
+ 	 * In order to prevent a get/put style interface, acquire struct mutex
+@@ -898,45 +899,64 @@ static void ivybridge_parity_work(struct work_struct *work)
+ 	 */
+ 	mutex_lock(&dev_priv->dev->struct_mutex);
+ 
++	/* If we've screwed up tracking, just let the interrupt fire again */
++	if (WARN_ON(!dev_priv->l3_parity.which_slice))
++		goto out;
++
+ 	misccpctl = I915_READ(GEN7_MISCCPCTL);
+ 	I915_WRITE(GEN7_MISCCPCTL, misccpctl & ~GEN7_DOP_CLOCK_GATE_ENABLE);
+ 	POSTING_READ(GEN7_MISCCPCTL);
+ 
+-	error_status = I915_READ(GEN7_L3CDERRST1);
+-	row = GEN7_PARITY_ERROR_ROW(error_status);
+-	bank = GEN7_PARITY_ERROR_BANK(error_status);
+-	subbank = GEN7_PARITY_ERROR_SUBBANK(error_status);
++	while ((slice = ffs(dev_priv->l3_parity.which_slice)) != 0) {
++		u32 reg;
+ 
+-	I915_WRITE(GEN7_L3CDERRST1, GEN7_PARITY_ERROR_VALID |
+-				    GEN7_L3CDERRST1_ENABLE);
+-	POSTING_READ(GEN7_L3CDERRST1);
++		slice--;
++		if (WARN_ON_ONCE(slice >= NUM_L3_SLICES(dev_priv->dev)))
++			break;
+ 
+-	I915_WRITE(GEN7_MISCCPCTL, misccpctl);
++		dev_priv->l3_parity.which_slice &= ~(1<<slice);
+ 
+-	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+-	ilk_enable_gt_irq(dev_priv, GT_RENDER_L3_PARITY_ERROR_INTERRUPT);
+-	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
++		reg = GEN7_L3CDERRST1 + (slice * 0x200);
+ 
+-	mutex_unlock(&dev_priv->dev->struct_mutex);
++		error_status = I915_READ(reg);
++		row = GEN7_PARITY_ERROR_ROW(error_status);
++		bank = GEN7_PARITY_ERROR_BANK(error_status);
++		subbank = GEN7_PARITY_ERROR_SUBBANK(error_status);
++
++		I915_WRITE(reg, GEN7_PARITY_ERROR_VALID | GEN7_L3CDERRST1_ENABLE);
++		POSTING_READ(reg);
++
++		parity_event[0] = I915_L3_PARITY_UEVENT "=1";
++		parity_event[1] = kasprintf(GFP_KERNEL, "ROW=%d", row);
++		parity_event[2] = kasprintf(GFP_KERNEL, "BANK=%d", bank);
++		parity_event[3] = kasprintf(GFP_KERNEL, "SUBBANK=%d", subbank);
++		parity_event[4] = kasprintf(GFP_KERNEL, "SLICE=%d", slice);
++		parity_event[5] = NULL;
++
++		kobject_uevent_env(&dev_priv->dev->primary->kdev.kobj,
++				   KOBJ_CHANGE, parity_event);
+ 
+-	parity_event[0] = I915_L3_PARITY_UEVENT "=1";
+-	parity_event[1] = kasprintf(GFP_KERNEL, "ROW=%d", row);
+-	parity_event[2] = kasprintf(GFP_KERNEL, "BANK=%d", bank);
+-	parity_event[3] = kasprintf(GFP_KERNEL, "SUBBANK=%d", subbank);
+-	parity_event[4] = NULL;
++		DRM_DEBUG("Parity error: Slice = %d, Row = %d, Bank = %d, Sub bank = %d.\n",
++			  slice, row, bank, subbank);
+ 
+-	kobject_uevent_env(&dev_priv->dev->primary->kdev.kobj,
+-			   KOBJ_CHANGE, parity_event);
++		kfree(parity_event[4]);
++		kfree(parity_event[3]);
++		kfree(parity_event[2]);
++		kfree(parity_event[1]);
++	}
+ 
+-	DRM_DEBUG("Parity error: Row = %d, Bank = %d, Sub bank = %d.\n",
+-		  row, bank, subbank);
++	I915_WRITE(GEN7_MISCCPCTL, misccpctl);
+ 
+-	kfree(parity_event[3]);
+-	kfree(parity_event[2]);
+-	kfree(parity_event[1]);
++out:
++	WARN_ON(dev_priv->l3_parity.which_slice);
++	spin_lock_irqsave(&dev_priv->irq_lock, flags);
++	ilk_enable_gt_irq(dev_priv, GT_PARITY_ERROR(dev_priv->dev));
++	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
++
++	mutex_unlock(&dev_priv->dev->struct_mutex);
+ }
+ 
+-static void ivybridge_parity_error_irq_handler(struct drm_device *dev)
++static void ivybridge_parity_error_irq_handler(struct drm_device *dev, u32 iir)
+ {
+ 	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+ 
+@@ -944,9 +964,16 @@ static void ivybridge_parity_error_irq_handler(struct drm_device *dev)
+ 		return;
+ 
+ 	spin_lock(&dev_priv->irq_lock);
+-	ilk_disable_gt_irq(dev_priv, GT_RENDER_L3_PARITY_ERROR_INTERRUPT);
++	ilk_disable_gt_irq(dev_priv, GT_PARITY_ERROR(dev));
+ 	spin_unlock(&dev_priv->irq_lock);
+ 
++	iir &= GT_PARITY_ERROR(dev);
++	if (iir & GT_RENDER_L3_PARITY_ERROR_INTERRUPT_S1)
++		dev_priv->l3_parity.which_slice |= 1 << 1;
++
++	if (iir & GT_RENDER_L3_PARITY_ERROR_INTERRUPT)
++		dev_priv->l3_parity.which_slice |= 1 << 0;
++
+ 	queue_work(dev_priv->wq, &dev_priv->l3_parity.error_work);
+ }
+ 
+@@ -981,8 +1008,8 @@ static void snb_gt_irq_handler(struct drm_device *dev,
+ 		i915_handle_error(dev, false);
+ 	}
+ 
+-	if (gt_iir & GT_RENDER_L3_PARITY_ERROR_INTERRUPT)
+-		ivybridge_parity_error_irq_handler(dev);
++	if (gt_iir & GT_PARITY_ERROR(dev))
++		ivybridge_parity_error_irq_handler(dev, gt_iir);
+ }
+ 
+ #define HPD_STORM_DETECT_PERIOD 1000
+@@ -2267,8 +2294,8 @@ static void gen5_gt_irq_postinstall(struct drm_device *dev)
+ 	dev_priv->gt_irq_mask = ~0;
+ 	if (HAS_L3_GPU_CACHE(dev)) {
+ 		/* L3 parity interrupt is always unmasked. */
+-		dev_priv->gt_irq_mask = ~GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
+-		gt_irqs |= GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
++		dev_priv->gt_irq_mask = ~GT_PARITY_ERROR(dev);
++		gt_irqs |= GT_PARITY_ERROR(dev);
+ 	}
+ 
+ 	gt_irqs |= GT_RENDER_USER_INTERRUPT;
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index af6f93ca7296..c4f9bef6d073 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -927,6 +927,7 @@
+ #define GT_BLT_USER_INTERRUPT			(1 << 22)
+ #define GT_BSD_CS_ERROR_INTERRUPT		(1 << 15)
+ #define GT_BSD_USER_INTERRUPT			(1 << 12)
++#define GT_RENDER_L3_PARITY_ERROR_INTERRUPT_S1	(1 << 11) /* hsw+; rsvd on snb, ivb, vlv */
+ #define GT_RENDER_L3_PARITY_ERROR_INTERRUPT	(1 <<  5) /* !snb */
+ #define GT_RENDER_PIPECTL_NOTIFY_INTERRUPT	(1 <<  4)
+ #define GT_RENDER_CS_MASTER_ERROR_INTERRUPT	(1 <<  3)
+@@ -937,6 +938,10 @@
+ #define PM_VEBOX_CS_ERROR_INTERRUPT		(1 << 12) /* hsw+ */
+ #define PM_VEBOX_USER_INTERRUPT			(1 << 10) /* hsw+ */
+ 
++#define GT_PARITY_ERROR(dev) \
++	(GT_RENDER_L3_PARITY_ERROR_INTERRUPT | \
++	 IS_HASWELL(dev) ? GT_RENDER_L3_PARITY_ERROR_INTERRUPT_S1 : 0)
++
+ /* These are all the "old" interrupts */
+ #define ILK_BSD_USER_INTERRUPT				(1<<5)
+ #define I915_PIPE_CONTROL_NOTIFY_INTERRUPT		(1<<18)
+@@ -4747,6 +4752,7 @@
+ 
+ /* IVYBRIDGE DPF */
+ #define GEN7_L3CDERRST1			0xB008 /* L3CD Error Status 1 */
++#define HSW_L3CDERRST11			0xB208 /* L3CD Error Status register 1 slice 1 */
+ #define   GEN7_L3CDERRST1_ROW_MASK	(0x7ff<<14)
+ #define   GEN7_PARITY_ERROR_VALID	(1<<13)
+ #define   GEN7_L3CDERRST1_BANK_MASK	(3<<11)
+@@ -4760,6 +4766,7 @@
+ #define   GEN7_L3CDERRST1_ENABLE	(1<<7)
+ 
+ #define GEN7_L3LOG_BASE			0xB070
++#define HSW_L3LOG_BASE_SLICE1		0xB270
+ #define GEN7_L3LOG_SIZE			0x80
+ 
+ #define GEN7_HALF_SLICE_CHICKEN1	0xe100 /* IVB GT1 + VLV */
+diff --git a/drivers/gpu/drm/i915/i915_sysfs.c b/drivers/gpu/drm/i915/i915_sysfs.c
+index 71f6de24444e..3a8bf0c9b5ce 100644
+--- a/drivers/gpu/drm/i915/i915_sysfs.c
++++ b/drivers/gpu/drm/i915/i915_sysfs.c
+@@ -119,6 +119,7 @@ i915_l3_read(struct file *filp, struct kobject *kobj,
+ 	struct drm_device *drm_dev = dminor->dev;
+ 	struct drm_i915_private *dev_priv = drm_dev->dev_private;
+ 	uint32_t misccpctl;
++	int slice = (int)(uintptr_t)attr->private;
+ 	int i, ret;
+ 
+ 	count = round_down(count, 4);
+@@ -134,9 +135,9 @@ i915_l3_read(struct file *filp, struct kobject *kobj,
+ 		return ret;
+ 
+ 	if (IS_HASWELL(drm_dev)) {
+-		if (dev_priv->l3_parity.remap_info)
++		if (dev_priv->l3_parity.remap_info[slice])
+ 			memcpy(buf,
+-			       dev_priv->l3_parity.remap_info + (offset/4),
++			       dev_priv->l3_parity.remap_info[slice] + (offset/4),
+ 			       count);
+ 		else
+ 			memset(buf, 0, count);
+@@ -168,6 +169,7 @@ i915_l3_write(struct file *filp, struct kobject *kobj,
+ 	struct drm_device *drm_dev = dminor->dev;
+ 	struct drm_i915_private *dev_priv = drm_dev->dev_private;
+ 	u32 *temp = NULL; /* Just here to make handling failures easy */
++	int slice = (int)(uintptr_t)attr->private;
+ 	int ret;
+ 
+ 	ret = l3_access_valid(drm_dev, offset);
+@@ -178,7 +180,7 @@ i915_l3_write(struct file *filp, struct kobject *kobj,
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!dev_priv->l3_parity.remap_info) {
++	if (!dev_priv->l3_parity.remap_info[slice]) {
+ 		temp = kzalloc(GEN7_L3LOG_SIZE, GFP_KERNEL);
+ 		if (!temp) {
+ 			mutex_unlock(&drm_dev->struct_mutex);
+@@ -198,11 +200,11 @@ i915_l3_write(struct file *filp, struct kobject *kobj,
+ 	 * at this point it is left as a TODO.
+ 	*/
+ 	if (temp)
+-		dev_priv->l3_parity.remap_info = temp;
++		dev_priv->l3_parity.remap_info[slice] = temp;
+ 
+-	memcpy(dev_priv->l3_parity.remap_info + (offset/4), buf, count);
++	memcpy(dev_priv->l3_parity.remap_info[slice] + (offset/4), buf, count);
+ 
+-	i915_gem_l3_remap(drm_dev);
++	i915_gem_l3_remap(drm_dev, slice);
+ 
+ 	mutex_unlock(&drm_dev->struct_mutex);
+ 
+@@ -214,7 +216,17 @@ static struct bin_attribute dpf_attrs = {
+ 	.size = GEN7_L3LOG_SIZE,
+ 	.read = i915_l3_read,
+ 	.write = i915_l3_write,
+-	.mmap = NULL
++	.mmap = NULL,
++	.private = (void *)0
++};
++
++static struct bin_attribute dpf_attrs_1 = {
++	.attr = {.name = "l3_parity_slice_1", .mode = (S_IRUSR | S_IWUSR)},
++	.size = GEN7_L3LOG_SIZE,
++	.read = i915_l3_read,
++	.write = i915_l3_write,
++	.mmap = NULL,
++	.private = (void *)1
+ };
+ 
+ static ssize_t gt_cur_freq_mhz_show(struct device *kdev,
+@@ -525,6 +537,13 @@ void i915_setup_sysfs(struct drm_device *dev)
+ 		ret = device_create_bin_file(&dev->primary->kdev, &dpf_attrs);
+ 		if (ret)
+ 			DRM_ERROR("l3 parity sysfs setup failed\n");
++
++		if (NUM_L3_SLICES(dev) > 1) {
++			ret = device_create_bin_file(&dev->primary->kdev,
++						     &dpf_attrs_1);
++			if (ret)
++				DRM_ERROR("l3 parity slice 1 setup failed\n");
++		}
+ 	}
+ 
+ 	ret = 0;
+@@ -548,6 +567,7 @@ void i915_teardown_sysfs(struct drm_device *dev)
+ 		sysfs_remove_files(&dev->primary->kdev.kobj, vlv_attrs);
+ 	else
+ 		sysfs_remove_files(&dev->primary->kdev.kobj, gen6_attrs);
++	device_remove_bin_file(&dev->primary->kdev,  &dpf_attrs_1);
+ 	device_remove_bin_file(&dev->primary->kdev,  &dpf_attrs);
+ #ifdef CONFIG_PM
+ 	sysfs_unmerge_group(&dev->primary->kdev.kobj, &rc6_attr_group);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 686e5b23481d..958b7d8fea8b 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -570,7 +570,7 @@ static int init_render_ring(struct intel_ring_buffer *ring)
+ 		I915_WRITE(INSTPM, _MASKED_BIT_ENABLE(INSTPM_FORCE_ORDERING));
+ 
+ 	if (HAS_L3_GPU_CACHE(dev))
+-		I915_WRITE_IMR(ring, ~GT_RENDER_L3_PARITY_ERROR_INTERRUPT);
++		I915_WRITE_IMR(ring, ~GT_PARITY_ERROR(dev));
+ 
+ 	return ret;
+ }
+@@ -1000,7 +1000,7 @@ gen6_ring_get_irq(struct intel_ring_buffer *ring)
+ 		if (HAS_L3_GPU_CACHE(dev) && ring->id == RCS)
+ 			I915_WRITE_IMR(ring,
+ 				       ~(ring->irq_enable_mask |
+-					 GT_RENDER_L3_PARITY_ERROR_INTERRUPT));
++					 GT_PARITY_ERROR(dev)));
+ 		else
+ 			I915_WRITE_IMR(ring, ~ring->irq_enable_mask);
+ 		ilk_enable_gt_irq(dev_priv, ring->irq_enable_mask);
+@@ -1020,8 +1020,7 @@ gen6_ring_put_irq(struct intel_ring_buffer *ring)
+ 	spin_lock_irqsave(&dev_priv->irq_lock, flags);
+ 	if (--ring->irq_refcount == 0) {
+ 		if (HAS_L3_GPU_CACHE(dev) && ring->id == RCS)
+-			I915_WRITE_IMR(ring,
+-				       ~GT_RENDER_L3_PARITY_ERROR_INTERRUPT);
++			I915_WRITE_IMR(ring, ~GT_PARITY_ERROR(dev));
+ 		else
+ 			I915_WRITE_IMR(ring, ~0);
+ 		ilk_disable_gt_irq(dev_priv, ring->irq_enable_mask);
+diff --git a/include/uapi/drm/i915_drm.h b/include/uapi/drm/i915_drm.h
+index 55bb5729bd78..3a4e97bd8607 100644
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@ -38,10 +38,10 @@
+  *
+  * I915_L3_PARITY_UEVENT - Generated when the driver receives a parity mismatch
+  *	event from the gpu l3 cache. Additional information supplied is ROW,
+- *	BANK, SUBBANK of the affected cacheline. Userspace should keep track of
+- *	these events and if a specific cache-line seems to have a persistent
+- *	error remap it with the l3 remapping tool supplied in intel-gpu-tools.
+- *	The value supplied with the event is always 1.
++ *	BANK, SUBBANK, SLICE of the affected cacheline. Userspace should keep
++ *	track of these events and if a specific cache-line seems to have a
++ *	persistent error remap it with the l3 remapping tool supplied in
++ *	intel-gpu-tools.  The value supplied with the event is always 1.
+  *
+  * I915_ERROR_UEVENT - Generated upon error detection, currently only via
+  *	hangcheck. The error detection event is a good indicator of when things
+-- 
+1.8.5.rc3
+
