@@ -12,26 +12,43 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
 Signed-off-by: Ingo Molnar <mingo@elte.hu>
 
 ---
- include/linux/hrtimer.h  |    4 +
+ include/linux/hrtimer.h  |    7 ++
  kernel/sched/core.c      |    1 
  kernel/sched/rt.c        |    1 
- kernel/time/hrtimer.c    |  142 +++++++++++++++++++++++++++++++++++++++++++----
+ kernel/time/hrtimer.c    |  137 +++++++++++++++++++++++++++++++++++++++++++----
  kernel/time/tick-sched.c |    1 
  kernel/watchdog.c        |    1 
- 6 files changed, 139 insertions(+), 11 deletions(-)
+ 6 files changed, 139 insertions(+), 9 deletions(-)
 
 --- a/include/linux/hrtimer.h
 +++ b/include/linux/hrtimer.h
-@@ -102,6 +102,8 @@ struct hrtimer {
+@@ -87,6 +87,8 @@ enum hrtimer_restart {
+  * @function:	timer expiry callback function
+  * @base:	pointer to the timer base (per cpu and per clock)
+  * @state:	state information (See bit values above)
++ * @cb_entry:	list entry to defer timers from hardirq context
++ * @irqsafe:	timer can run in hardirq context
+  * @praecox:	timer expiry time if expired at the time of programming
+  * @is_rel:	Set if the timer was armed relative
+  * @start_pid:  timer statistics field to store the pid of the task which
+@@ -104,6 +106,8 @@ struct hrtimer {
  	enum hrtimer_restart		(*function)(struct hrtimer *);
  	struct hrtimer_clock_base	*base;
- 	unsigned long			state;
+ 	u8				state;
 +	struct list_head		cb_entry;
 +	int				irqsafe;
  #ifdef CONFIG_MISSED_TIMER_OFFSETS_HIST
  	ktime_t				praecox;
  #endif
-@@ -141,6 +143,7 @@ struct hrtimer_clock_base {
+@@ -136,6 +140,7 @@ struct hrtimer_sleeper {
+  *			timer to a base on another cpu.
+  * @clockid:		clock id for per_cpu support
+  * @active:		red black tree root node for the active timers
++ * @expired:		list head for deferred timers.
+  * @get_time:		function to retrieve the current time of the clock
+  * @offset:		offset of this clock to the monotonic base
+  */
+@@ -144,6 +149,7 @@ struct hrtimer_clock_base {
  	int			index;
  	clockid_t		clockid;
  	struct timerqueue_head	active;
@@ -39,7 +56,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  	ktime_t			(*get_time)(void);
  	ktime_t			offset;
  } __attribute__((__aligned__(HRTIMER_CLOCK_BASE_ALIGN)));
-@@ -184,6 +187,7 @@ struct hrtimer_cpu_base {
+@@ -187,6 +193,7 @@ struct hrtimer_cpu_base {
  	raw_spinlock_t			lock;
  	seqcount_t			seq;
  	struct hrtimer			*running;
@@ -104,7 +121,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  	if (!timerqueue_del(&base->active, &timer->node))
  		cpu_base->active_bases &= ~(1 << base->index);
  
-@@ -1162,6 +1164,7 @@ static void __hrtimer_init(struct hrtime
+@@ -1173,6 +1175,7 @@ static void __hrtimer_init(struct hrtime
  
  	base = hrtimer_clockid_to_base(clock_id);
  	timer->base = &cpu_base->clock_base[base];
@@ -112,7 +129,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  	timerqueue_init(&timer->node);
  
  #ifdef CONFIG_TIMER_STATS
-@@ -1202,6 +1205,7 @@ bool hrtimer_active(const struct hrtimer
+@@ -1213,6 +1216,7 @@ bool hrtimer_active(const struct hrtimer
  		seq = raw_read_seqcount_begin(&cpu_base->seq);
  
  		if (timer->state != HRTIMER_STATE_INACTIVE ||
@@ -120,7 +137,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  		    cpu_base->running == timer)
  			return true;
  
-@@ -1292,10 +1296,111 @@ static void __run_hrtimer(struct hrtimer
+@@ -1311,12 +1315,112 @@ static void __run_hrtimer(struct hrtimer
  	cpu_base->running = NULL;
  }
  
@@ -223,7 +240,8 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
 +
 +#endif
 +
-+
+ static enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer);
+ 
  static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now)
  {
  	struct hrtimer_clock_base *base = cpu_base->clock_base;
@@ -232,31 +250,23 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  
  	for (; active; base++, active >>= 1) {
  		struct timerqueue_node *node;
-@@ -1335,15 +1440,20 @@ static void __hrtimer_run_queues(struct
+@@ -1356,9 +1460,14 @@ static void __hrtimer_run_queues(struct
  			if (basenow.tv64 < hrtimer_get_softexpires_tv64(timer))
  				break;
  
 -			__run_hrtimer(cpu_base, base, timer, &basenow);
-+			 if (!hrtimer_rt_defer(timer))
-+				 __run_hrtimer(cpu_base, base, timer, &basenow);
-+			 else
-+				 raise = 1;
++			if (!hrtimer_rt_defer(timer))
++				__run_hrtimer(cpu_base, base, timer, &basenow);
++			else
++				raise = 1;
  		}
  	}
 +	if (raise)
 +		raise_softirq_irqoff(HRTIMER_SOFTIRQ);
  }
  
--#ifdef CONFIG_HIGH_RES_TIMERS
--
- static enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer);
- 
-+#ifdef CONFIG_HIGH_RES_TIMERS
-+
- /*
-  * High resolution timer interrupt
-  * Called with interrupts disabled
-@@ -1481,8 +1591,6 @@ void hrtimer_run_queues(void)
+ #ifdef CONFIG_HIGH_RES_TIMERS
+@@ -1500,8 +1609,6 @@ void hrtimer_run_queues(void)
  	now = hrtimer_update_base(cpu_base);
  	__hrtimer_run_queues(cpu_base, now);
  	raw_spin_unlock(&cpu_base->lock);
@@ -265,7 +275,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  }
  
  /*
-@@ -1504,6 +1612,7 @@ static enum hrtimer_restart hrtimer_wake
+@@ -1523,6 +1630,7 @@ static enum hrtimer_restart hrtimer_wake
  void hrtimer_init_sleeper(struct hrtimer_sleeper *sl, struct task_struct *task)
  {
  	sl->timer.function = hrtimer_wakeup;
@@ -273,7 +283,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  	sl->task = task;
  }
  EXPORT_SYMBOL_GPL(hrtimer_init_sleeper);
-@@ -1638,6 +1747,7 @@ static void init_hrtimers_cpu(int cpu)
+@@ -1657,6 +1765,7 @@ static void init_hrtimers_cpu(int cpu)
  	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++) {
  		cpu_base->clock_base[i].cpu_base = cpu_base;
  		timerqueue_init_head(&cpu_base->clock_base[i].active);
@@ -281,7 +291,7 @@ Signed-off-by: Ingo Molnar <mingo@elte.hu>
  	}
  
  	cpu_base->cpu = cpu;
-@@ -1742,11 +1852,21 @@ static struct notifier_block hrtimers_nb
+@@ -1761,11 +1870,21 @@ static struct notifier_block hrtimers_nb
  	.notifier_call = hrtimer_cpu_notify,
  };
  

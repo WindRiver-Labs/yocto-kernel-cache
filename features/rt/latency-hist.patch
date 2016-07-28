@@ -14,16 +14,16 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
 
 ---
  Documentation/trace/histograms.txt  |  186 +++++
- include/linux/hrtimer.h             |    3 
+ include/linux/hrtimer.h             |    4 
  include/linux/sched.h               |    6 
- include/trace/events/hist.h         |   72 ++
+ include/trace/events/hist.h         |   73 ++
  include/trace/events/latency_hist.h |   29 
  kernel/time/hrtimer.c               |   21 
  kernel/trace/Kconfig                |  104 +++
  kernel/trace/Makefile               |    4 
  kernel/trace/latency_hist.c         | 1178 ++++++++++++++++++++++++++++++++++++
  kernel/trace/trace_irqsoff.c        |   11 
- 10 files changed, 1614 insertions(+)
+ 10 files changed, 1616 insertions(+)
 
 --- /dev/null
 +++ b/Documentation/trace/histograms.txt
@@ -216,19 +216,27 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
 +These data are also reset when the wakeup histogram is reset.
 --- a/include/linux/hrtimer.h
 +++ b/include/linux/hrtimer.h
-@@ -102,6 +102,9 @@ struct hrtimer {
+@@ -87,6 +87,7 @@ enum hrtimer_restart {
+  * @function:	timer expiry callback function
+  * @base:	pointer to the timer base (per cpu and per clock)
+  * @state:	state information (See bit values above)
++ * @praecox:	timer expiry time if expired at the time of programming
+  * @is_rel:	Set if the timer was armed relative
+  * @start_pid:  timer statistics field to store the pid of the task which
+  *		started the timer
+@@ -103,6 +104,9 @@ struct hrtimer {
  	enum hrtimer_restart		(*function)(struct hrtimer *);
  	struct hrtimer_clock_base	*base;
- 	unsigned long			state;
+ 	u8				state;
 +#ifdef CONFIG_MISSED_TIMER_OFFSETS_HIST
 +	ktime_t				praecox;
 +#endif
+ 	u8				is_rel;
  #ifdef CONFIG_TIMER_STATS
  	int				start_pid;
- 	void				*start_site;
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -1794,6 +1794,12 @@ struct task_struct {
+@@ -1796,6 +1796,12 @@ struct task_struct {
  	unsigned long trace;
  	/* bitmask and counter of trace recursion */
  	unsigned long trace_recursion;
@@ -243,7 +251,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  	struct mem_cgroup *memcg_in_oom;
 --- /dev/null
 +++ b/include/trace/events/hist.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +#undef TRACE_SYSTEM
 +#define TRACE_SYSTEM hist
 +
@@ -255,6 +263,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
 +
 +#if !defined(CONFIG_PREEMPT_OFF_HIST) && !defined(CONFIG_INTERRUPT_OFF_HIST)
 +#define trace_preemptirqsoff_hist(a, b)
++#define trace_preemptirqsoff_hist_rcuidle(a, b)
 +#else
 +TRACE_EVENT(preemptirqsoff_hist,
 +
@@ -358,7 +367,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  
  #include "tick-internal.h"
  
-@@ -994,7 +995,16 @@ void hrtimer_start_range_ns(struct hrtim
+@@ -1001,7 +1002,16 @@ void hrtimer_start_range_ns(struct hrtim
  	new_base = switch_hrtimer_base(timer, base, mode & HRTIMER_MODE_PINNED);
  
  	timer_stats_hrtimer_set_start_info(timer);
@@ -375,7 +384,16 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  	leftmost = enqueue_hrtimer(timer, new_base);
  	if (!leftmost)
  		goto unlock;
-@@ -1275,6 +1285,15 @@ static void __hrtimer_run_queues(struct
+@@ -1275,6 +1285,8 @@ static void __run_hrtimer(struct hrtimer
+ 	cpu_base->running = NULL;
+ }
+ 
++static enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer);
++
+ static void __hrtimer_run_queues(struct hrtimer_cpu_base *cpu_base, ktime_t now)
+ {
+ 	struct hrtimer_clock_base *base = cpu_base->clock_base;
+@@ -1294,6 +1306,15 @@ static void __hrtimer_run_queues(struct
  
  			timer = container_of(node, struct hrtimer, node);
  
@@ -391,15 +409,6 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  			/*
  			 * The immediate goal for using the softexpires is
  			 * minimizing wakeups, not running timers at the
-@@ -1297,6 +1316,8 @@ static void __hrtimer_run_queues(struct
- 
- #ifdef CONFIG_HIGH_RES_TIMERS
- 
-+static enum hrtimer_restart hrtimer_wakeup(struct hrtimer *timer);
-+
- /*
-  * High resolution timer interrupt
-  * Called with interrupts disabled
 --- a/kernel/trace/Kconfig
 +++ b/kernel/trace/Kconfig
 @@ -187,6 +187,24 @@ config IRQSOFF_TRACER
@@ -1731,7 +1740,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  
  #include "trace.h"
  
-@@ -420,11 +421,13 @@ void start_critical_timings(void)
+@@ -424,11 +425,13 @@ void start_critical_timings(void)
  {
  	if (preempt_trace() || irq_trace())
  		start_critical_timing(CALLER_ADDR0, CALLER_ADDR1);
@@ -1745,7 +1754,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  	if (preempt_trace() || irq_trace())
  		stop_critical_timing(CALLER_ADDR0, CALLER_ADDR1);
  }
-@@ -434,6 +437,7 @@ EXPORT_SYMBOL_GPL(stop_critical_timings)
+@@ -438,6 +441,7 @@ EXPORT_SYMBOL_GPL(stop_critical_timings)
  #ifdef CONFIG_PROVE_LOCKING
  void time_hardirqs_on(unsigned long a0, unsigned long a1)
  {
@@ -1753,7 +1762,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  	if (!preempt_trace() && irq_trace())
  		stop_critical_timing(a0, a1);
  }
-@@ -442,6 +446,7 @@ void time_hardirqs_off(unsigned long a0,
+@@ -446,6 +450,7 @@ void time_hardirqs_off(unsigned long a0,
  {
  	if (!preempt_trace() && irq_trace())
  		start_critical_timing(a0, a1);
@@ -1761,7 +1770,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  }
  
  #else /* !CONFIG_PROVE_LOCKING */
-@@ -467,6 +472,7 @@ inline void print_irqtrace_events(struct
+@@ -471,6 +476,7 @@ inline void print_irqtrace_events(struct
   */
  void trace_hardirqs_on(void)
  {
@@ -1769,7 +1778,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  	if (!preempt_trace() && irq_trace())
  		stop_critical_timing(CALLER_ADDR0, CALLER_ADDR1);
  }
-@@ -476,11 +482,13 @@ void trace_hardirqs_off(void)
+@@ -480,11 +486,13 @@ void trace_hardirqs_off(void)
  {
  	if (!preempt_trace() && irq_trace())
  		start_critical_timing(CALLER_ADDR0, CALLER_ADDR1);
@@ -1783,7 +1792,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  	if (!preempt_trace() && irq_trace())
  		stop_critical_timing(CALLER_ADDR0, caller_addr);
  }
-@@ -490,6 +498,7 @@ EXPORT_SYMBOL(trace_hardirqs_on_caller);
+@@ -494,6 +502,7 @@ EXPORT_SYMBOL(trace_hardirqs_on_caller);
  {
  	if (!preempt_trace() && irq_trace())
  		start_critical_timing(CALLER_ADDR0, caller_addr);
@@ -1791,7 +1800,7 @@ Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
  }
  EXPORT_SYMBOL(trace_hardirqs_off_caller);
  
-@@ -499,12 +508,14 @@ EXPORT_SYMBOL(trace_hardirqs_off_caller)
+@@ -503,12 +512,14 @@ EXPORT_SYMBOL(trace_hardirqs_off_caller)
  #ifdef CONFIG_PREEMPT_TRACER
  void trace_preempt_on(unsigned long a0, unsigned long a1)
  {
