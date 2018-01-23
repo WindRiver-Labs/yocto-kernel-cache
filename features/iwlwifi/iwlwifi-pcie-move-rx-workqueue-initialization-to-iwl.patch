@@ -1,0 +1,117 @@
+From fba7875cbf2b82ee0aab6b81983cd4b3c8e60c96 Mon Sep 17 00:00:00 2001
+From: Luca Coelho <luciano.coelho@intel.com>
+Date: Tue, 22 Aug 2017 10:37:29 +0300
+Subject: [PATCH 222/310] iwlwifi: pcie: move rx workqueue initialization to
+ iwl_trans_pcie_alloc()
+
+commit 10a54d8196d11f6cc0db2f71249f93854cb9fe55 upstream.
+
+Work queues cannot be allocated when a mutex is held because the mutex
+may be in use and that would make it sleep.  Doing so generates the
+following splat with 4.13+:
+
+[   19.513298] ======================================================
+[   19.513429] WARNING: possible circular locking dependency detected
+[   19.513557] 4.13.0-rc5+ #6 Not tainted
+[   19.513638] ------------------------------------------------------
+[   19.513767] cpuhp/0/12 is trying to acquire lock:
+[   19.513867]  (&tz->lock){+.+.+.}, at: [<ffffffff924afebb>] thermal_zone_get_temp+0x5b/0xb0
+[   19.514047]
+[   19.514047] but task is already holding lock:
+[   19.514166]  (cpuhp_state){+.+.+.}, at: [<ffffffff91cc4baa>] cpuhp_thread_fun+0x3a/0x210
+[   19.514338]
+[   19.514338] which lock already depends on the new lock.
+
+This lock dependency already existed with previous kernel versions,
+but it was not detected until commit 49dfe2a67797 ("cpuhotplug: Link
+lock stacks for hotplug callbacks") was introduced.
+
+Reported-by: David Weinehall <david.weinehall@intel.com>
+Reported-by: Jiri Kosina <jikos@kernel.org>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/pcie/internal.h |  2 ++
+ drivers/net/wireless/intel/iwlwifi/pcie/rx.c       | 10 +---------
+ drivers/net/wireless/intel/iwlwifi/pcie/trans.c    |  9 +++++++++
+ 3 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+index 79020cf8c79c..4fb7647995c3 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+@@ -788,6 +788,8 @@ int iwl_pci_fw_enter_d0i3(struct iwl_trans *trans);
+ 
+ void iwl_pcie_enable_rx_wake(struct iwl_trans *trans, bool enable);
+ 
++void iwl_pcie_rx_allocator_work(struct work_struct *data);
++
+ /* common functions that are used by gen2 transport */
+ void iwl_pcie_apm_config(struct iwl_trans *trans);
+ int iwl_pcie_prepare_card_hw(struct iwl_trans *trans);
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/rx.c b/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+index e5d2bf0bde37..a06b6612b658 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+@@ -597,7 +597,7 @@ static void iwl_pcie_rx_allocator_get(struct iwl_trans *trans,
+ 	rxq->free_count += RX_CLAIM_REQ_ALLOC;
+ }
+ 
+-static void iwl_pcie_rx_allocator_work(struct work_struct *data)
++void iwl_pcie_rx_allocator_work(struct work_struct *data)
+ {
+ 	struct iwl_rb_allocator *rba_p =
+ 		container_of(data, struct iwl_rb_allocator, rx_alloc);
+@@ -900,10 +900,6 @@ static int _iwl_pcie_rx_init(struct iwl_trans *trans)
+ 			return err;
+ 	}
+ 	def_rxq = trans_pcie->rxq;
+-	if (!rba->alloc_wq)
+-		rba->alloc_wq = alloc_workqueue("rb_allocator",
+-						WQ_HIGHPRI | WQ_UNBOUND, 1);
+-	INIT_WORK(&rba->rx_alloc, iwl_pcie_rx_allocator_work);
+ 
+ 	spin_lock(&rba->lock);
+ 	atomic_set(&rba->req_pending, 0);
+@@ -1017,10 +1013,6 @@ void iwl_pcie_rx_free(struct iwl_trans *trans)
+ 	}
+ 
+ 	cancel_work_sync(&rba->rx_alloc);
+-	if (rba->alloc_wq) {
+-		destroy_workqueue(rba->alloc_wq);
+-		rba->alloc_wq = NULL;
+-	}
+ 
+ 	iwl_pcie_free_rbs_pool(trans);
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+index 58873cc27396..2e3e013ec95a 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@ -1786,6 +1786,11 @@ void iwl_trans_pcie_free(struct iwl_trans *trans)
+ 		iwl_pcie_tx_free(trans);
+ 	iwl_pcie_rx_free(trans);
+ 
++	if (trans_pcie->rba.alloc_wq) {
++		destroy_workqueue(trans_pcie->rba.alloc_wq);
++		trans_pcie->rba.alloc_wq = NULL;
++	}
++
+ 	if (trans_pcie->msix_enabled) {
+ 		for (i = 0; i < trans_pcie->alloc_vecs; i++) {
+ 			irq_set_affinity_hint(
+@@ -3181,6 +3186,10 @@ struct iwl_trans *iwl_trans_pcie_alloc(struct pci_dev *pdev,
+ 		trans_pcie->inta_mask = CSR_INI_SET_MASK;
+ 	 }
+ 
++	trans_pcie->rba.alloc_wq = alloc_workqueue("rb_allocator",
++						   WQ_HIGHPRI | WQ_UNBOUND, 1);
++	INIT_WORK(&trans_pcie->rba.rx_alloc, iwl_pcie_rx_allocator_work);
++
+ #ifdef CONFIG_IWLWIFI_PCIE_RTPM
+ 	trans->runtime_pm_mode = IWL_PLAT_PM_MODE_D0I3;
+ #else
+-- 
+2.5.0
+

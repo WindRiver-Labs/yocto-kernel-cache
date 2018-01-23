@@ -1,0 +1,266 @@
+From ef694dd2c96a2bf0cfc26e7512ef3b6720e0ec03 Mon Sep 17 00:00:00 2001
+From: David Spinadel <david.spinadel@intel.com>
+Date: Thu, 30 Mar 2017 19:43:53 +0300
+Subject: [PATCH 049/310] iwlwifi: mvm: Enable security on new TX API
+
+commit 85aeb58cec1a7a0395e14b45a7c6c1a9dad209fe upstream.
+
+Install GTKs on AP side for new TX API.
+Don't add IV space, it's added by the HW.
+
+While at that fix GCMP abnd GCMP-256 GTK installation
+which work similarly to the new TX API.
+
+Signed-off-by: David Spinadel <david.spinadel@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c |  12 ++-
+ drivers/net/wireless/intel/iwlwifi/mvm/sta.c      | 108 ++++++++++++++--------
+ 2 files changed, 80 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index 178b41ded320..cae68b9d105b 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -2909,7 +2909,8 @@ static int iwl_mvm_mac_set_key(struct ieee80211_hw *hw,
+ 	case WLAN_CIPHER_SUITE_CCMP:
+ 	case WLAN_CIPHER_SUITE_GCMP:
+ 	case WLAN_CIPHER_SUITE_GCMP_256:
+-		key->flags |= IEEE80211_KEY_FLAG_PUT_IV_SPACE;
++		if (!iwl_mvm_has_new_tx_api(mvm))
++			key->flags |= IEEE80211_KEY_FLAG_PUT_IV_SPACE;
+ 		break;
+ 	case WLAN_CIPHER_SUITE_AES_CMAC:
+ 	case WLAN_CIPHER_SUITE_BIP_GMAC_128:
+@@ -2955,8 +2956,13 @@ static int iwl_mvm_mac_set_key(struct ieee80211_hw *hw,
+ 				ret = -EOPNOTSUPP;
+ 			else
+ 				ret = 0;
+-			key->hw_key_idx = STA_KEY_IDX_INVALID;
+-			break;
++
++			if (key->cipher != WLAN_CIPHER_SUITE_GCMP &&
++			    key->cipher != WLAN_CIPHER_SUITE_GCMP_256 &&
++			    !iwl_mvm_has_new_tx_api(mvm)) {
++				key->hw_key_idx = STA_KEY_IDX_INVALID;
++				break;
++			}
+ 		}
+ 
+ 		/* During FW restart, in order to restore the state as it was,
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+index afd916c91c6b..84b95043c072 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+@@ -2983,7 +2983,7 @@ static struct iwl_mvm_sta *iwl_mvm_get_key_sta(struct iwl_mvm *mvm,
+ }
+ 
+ static int iwl_mvm_send_sta_key(struct iwl_mvm *mvm,
+-				struct iwl_mvm_sta *mvm_sta,
++				u32 sta_id,
+ 				struct ieee80211_key_conf *key, bool mcast,
+ 				u32 tkip_iv32, u16 *tkip_p1k, u32 cmd_flags,
+ 				u8 key_offset)
+@@ -3001,6 +3001,9 @@ static int iwl_mvm_send_sta_key(struct iwl_mvm *mvm,
+ 	bool new_api = fw_has_api(&mvm->fw->ucode_capa,
+ 				  IWL_UCODE_TLV_API_TKIP_MIC_KEYS);
+ 
++	if (sta_id == IWL_MVM_INVALID_STA)
++		return -EINVAL;
++
+ 	keyidx = (key->keyidx << STA_KEY_FLG_KEYID_POS) &
+ 		 STA_KEY_FLG_KEYID_MSK;
+ 	key_flags = cpu_to_le16(keyidx);
+@@ -3059,7 +3062,7 @@ static int iwl_mvm_send_sta_key(struct iwl_mvm *mvm,
+ 
+ 	u.cmd.common.key_offset = key_offset;
+ 	u.cmd.common.key_flags = key_flags;
+-	u.cmd.common.sta_id = mvm_sta->sta_id;
++	u.cmd.common.sta_id = sta_id;
+ 
+ 	if (new_api) {
+ 		u.cmd.transmit_seq_cnt = cpu_to_le64(pn);
+@@ -3192,19 +3195,37 @@ static int __iwl_mvm_set_sta_key(struct iwl_mvm *mvm,
+ 				 u8 key_offset,
+ 				 bool mcast)
+ {
+-	struct iwl_mvm_sta *mvm_sta = iwl_mvm_sta_from_mac80211(sta);
+ 	int ret;
+ 	const u8 *addr;
+ 	struct ieee80211_key_seq seq;
+ 	u16 p1k[5];
++	u32 sta_id;
++
++	if (sta) {
++		struct iwl_mvm_sta *mvm_sta = iwl_mvm_sta_from_mac80211(sta);
++
++		sta_id = mvm_sta->sta_id;
++	} else if (vif->type == NL80211_IFTYPE_AP &&
++		   !(keyconf->flags & IEEE80211_KEY_FLAG_PAIRWISE)) {
++		struct iwl_mvm_vif *mvmvif = iwl_mvm_vif_from_mac80211(vif);
++
++		sta_id = mvmvif->mcast_sta.sta_id;
++	} else {
++		IWL_ERR(mvm, "Failed to find station id\n");
++		return -EINVAL;
++	}
+ 
+ 	switch (keyconf->cipher) {
+ 	case WLAN_CIPHER_SUITE_TKIP:
++		if (vif->type == NL80211_IFTYPE_AP) {
++			ret = -EINVAL;
++			break;
++		}
+ 		addr = iwl_mvm_get_mac_addr(mvm, vif, sta);
+ 		/* get phase 1 key from mac80211 */
+ 		ieee80211_get_key_rx_seq(keyconf, 0, &seq);
+ 		ieee80211_get_tkip_rx_p1k(keyconf, addr, seq.tkip.iv32, p1k);
+-		ret = iwl_mvm_send_sta_key(mvm, mvm_sta, keyconf, mcast,
++		ret = iwl_mvm_send_sta_key(mvm, sta_id, keyconf, mcast,
+ 					   seq.tkip.iv32, p1k, 0, key_offset);
+ 		break;
+ 	case WLAN_CIPHER_SUITE_CCMP:
+@@ -3212,11 +3233,11 @@ static int __iwl_mvm_set_sta_key(struct iwl_mvm *mvm,
+ 	case WLAN_CIPHER_SUITE_WEP104:
+ 	case WLAN_CIPHER_SUITE_GCMP:
+ 	case WLAN_CIPHER_SUITE_GCMP_256:
+-		ret = iwl_mvm_send_sta_key(mvm, mvm_sta, keyconf, mcast,
++		ret = iwl_mvm_send_sta_key(mvm, sta_id, keyconf, mcast,
+ 					   0, NULL, 0, key_offset);
+ 		break;
+ 	default:
+-		ret = iwl_mvm_send_sta_key(mvm, mvm_sta, keyconf, mcast,
++		ret = iwl_mvm_send_sta_key(mvm, sta_id, keyconf, mcast,
+ 					   0, NULL, 0, key_offset);
+ 	}
+ 
+@@ -3237,6 +3258,9 @@ static int __iwl_mvm_remove_sta_key(struct iwl_mvm *mvm, u8 sta_id,
+ 	int ret, size;
+ 	u32 status;
+ 
++	if (sta_id == IWL_MVM_INVALID_STA)
++		return -EINVAL;
++
+ 	key_flags = cpu_to_le16((keyconf->keyidx << STA_KEY_FLG_KEYID_POS) &
+ 				 STA_KEY_FLG_KEYID_MSK);
+ 	key_flags |= cpu_to_le16(STA_KEY_FLG_NO_ENC | STA_KEY_FLG_WEP_KEY_MAP);
+@@ -3280,42 +3304,48 @@ int iwl_mvm_set_sta_key(struct iwl_mvm *mvm,
+ {
+ 	bool mcast = !(keyconf->flags & IEEE80211_KEY_FLAG_PAIRWISE);
+ 	struct iwl_mvm_sta *mvm_sta;
+-	u8 sta_id;
++	u8 sta_id = IWL_MVM_INVALID_STA;
+ 	int ret;
+ 	static const u8 __maybe_unused zero_addr[ETH_ALEN] = {0};
+ 
+ 	lockdep_assert_held(&mvm->mutex);
+ 
+-	/* Get the station id from the mvm local station table */
+-	mvm_sta = iwl_mvm_get_key_sta(mvm, vif, sta);
+-	if (!mvm_sta) {
+-		IWL_ERR(mvm, "Failed to find station\n");
+-		return -EINVAL;
+-	}
+-	sta_id = mvm_sta->sta_id;
++	if (vif->type != NL80211_IFTYPE_AP ||
++	    keyconf->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
++		/* Get the station id from the mvm local station table */
++		mvm_sta = iwl_mvm_get_key_sta(mvm, vif, sta);
++		if (!mvm_sta) {
++			IWL_ERR(mvm, "Failed to find station\n");
++			return -EINVAL;
++		}
++		sta_id = mvm_sta->sta_id;
+ 
+-	if (keyconf->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
+-	    keyconf->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
+-	    keyconf->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256) {
+-		ret = iwl_mvm_send_sta_igtk(mvm, keyconf, sta_id, false);
+-		goto end;
+-	}
++		if (keyconf->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
++		    keyconf->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
++		    keyconf->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256) {
++			ret = iwl_mvm_send_sta_igtk(mvm, keyconf, sta_id,
++						    false);
++			goto end;
++		}
+ 
+-	/*
+-	 * It is possible that the 'sta' parameter is NULL, and thus
+-	 * there is a need to retrieve  the sta from the local station table.
+-	 */
+-	if (!sta) {
+-		sta = rcu_dereference_protected(mvm->fw_id_to_mac_id[sta_id],
+-						lockdep_is_held(&mvm->mutex));
+-		if (IS_ERR_OR_NULL(sta)) {
+-			IWL_ERR(mvm, "Invalid station id\n");
+-			return -EINVAL;
++		/*
++		 * It is possible that the 'sta' parameter is NULL, and thus
++		 * there is a need to retrieve  the sta from the local station
++		 * table.
++		 */
++		if (!sta) {
++			sta = rcu_dereference_protected(
++				mvm->fw_id_to_mac_id[sta_id],
++				lockdep_is_held(&mvm->mutex));
++			if (IS_ERR_OR_NULL(sta)) {
++				IWL_ERR(mvm, "Invalid station id\n");
++				return -EINVAL;
++			}
+ 		}
+-	}
+ 
+-	if (WARN_ON_ONCE(iwl_mvm_sta_from_mac80211(sta)->vif != vif))
+-		return -EINVAL;
++		if (WARN_ON_ONCE(iwl_mvm_sta_from_mac80211(sta)->vif != vif))
++			return -EINVAL;
++	}
+ 
+ 	/* If the key_offset is not pre-assigned, we need to find a
+ 	 * new offset to use.  In normal cases, the offset is not
+@@ -3345,8 +3375,9 @@ int iwl_mvm_set_sta_key(struct iwl_mvm *mvm,
+ 	 * to the same key slot (offset).
+ 	 * If this fails, remove the original as well.
+ 	 */
+-	if (keyconf->cipher == WLAN_CIPHER_SUITE_WEP40 ||
+-	    keyconf->cipher == WLAN_CIPHER_SUITE_WEP104) {
++	if ((keyconf->cipher == WLAN_CIPHER_SUITE_WEP40 ||
++	     keyconf->cipher == WLAN_CIPHER_SUITE_WEP104) &&
++	    sta) {
+ 		ret = __iwl_mvm_set_sta_key(mvm, vif, sta, keyconf,
+ 					    key_offset, !mcast);
+ 		if (ret) {
+@@ -3380,6 +3411,9 @@ int iwl_mvm_remove_sta_key(struct iwl_mvm *mvm,
+ 	mvm_sta = iwl_mvm_get_key_sta(mvm, vif, sta);
+ 	if (mvm_sta)
+ 		sta_id = mvm_sta->sta_id;
++	else if (!sta && vif->type == NL80211_IFTYPE_AP && mcast)
++		sta_id = iwl_mvm_vif_from_mac80211(vif)->mcast_sta.sta_id;
++
+ 
+ 	IWL_DEBUG_WEP(mvm, "mvm remove dynamic key: idx=%d sta=%d\n",
+ 		      keyconf->keyidx, sta_id);
+@@ -3402,7 +3436,7 @@ int iwl_mvm_remove_sta_key(struct iwl_mvm *mvm,
+ 	}
+ 	mvm->fw_key_deleted[keyconf->hw_key_idx] = 0;
+ 
+-	if (!mvm_sta) {
++	if (sta && !mvm_sta) {
+ 		IWL_DEBUG_WEP(mvm, "station non-existent, early return.\n");
+ 		return 0;
+ 	}
+@@ -3433,7 +3467,7 @@ void iwl_mvm_update_tkip_key(struct iwl_mvm *mvm,
+ 	mvm_sta = iwl_mvm_get_key_sta(mvm, vif, sta);
+ 	if (WARN_ON_ONCE(!mvm_sta))
+ 		goto unlock;
+-	iwl_mvm_send_sta_key(mvm, mvm_sta, keyconf, mcast,
++	iwl_mvm_send_sta_key(mvm, mvm_sta->sta_id, keyconf, mcast,
+ 			     iv32, phase1key, CMD_ASYNC, keyconf->hw_key_idx);
+ 
+  unlock:
+-- 
+2.5.0
+
