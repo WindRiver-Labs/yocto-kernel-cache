@@ -1,0 +1,175 @@
+From 2753298603246679e46f35395aea78889092b3f1 Mon Sep 17 00:00:00 2001
+From: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Date: Thu, 31 Aug 2017 11:52:30 +0300
+Subject: [PATCH 247/310] iwlwifi: mvm: support firmware debug trigger on frame
+ reorder timeout
+
+commit 528a542aa6654a9ec03830cc75142cc94276739e upstream.
+
+The trigger that collects data when a frame is released
+because of the timer of the reordering buffer was not
+implemented for 9000 devices.
+Fix this.
+
+Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c | 28 ++---------------------
+ drivers/net/wireless/intel/iwlwifi/mvm/mvm.h      |  6 +++++
+ drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c     |  5 ++++
+ drivers/net/wireless/intel/iwlwifi/mvm/sta.c      |  1 +
+ drivers/net/wireless/intel/iwlwifi/mvm/utils.c    | 25 ++++++++++++++++++++
+ 5 files changed, 39 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index 6a913e4a2a94..8d03bf9fc924 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -4249,31 +4249,6 @@ static void iwl_mvm_event_bar_rx_callback(struct iwl_mvm *mvm,
+ 				event->u.ba.ssn);
+ }
+ 
+-static void
+-iwl_mvm_event_frame_timeout_callback(struct iwl_mvm *mvm,
+-				     struct ieee80211_vif *vif,
+-				     const struct ieee80211_event *event)
+-{
+-	struct iwl_fw_dbg_trigger_tlv *trig;
+-	struct iwl_fw_dbg_trigger_ba *ba_trig;
+-
+-	if (!iwl_fw_dbg_trigger_enabled(mvm->fw, FW_DBG_TRIGGER_BA))
+-		return;
+-
+-	trig = iwl_fw_dbg_get_trigger(mvm->fw, FW_DBG_TRIGGER_BA);
+-	ba_trig = (void *)trig->data;
+-	if (!iwl_fw_dbg_trigger_check_stop(&mvm->fwrt,
+-					   ieee80211_vif_to_wdev(vif), trig))
+-		return;
+-
+-	if (!(le16_to_cpu(ba_trig->frame_timeout) & BIT(event->u.ba.tid)))
+-		return;
+-
+-	iwl_fw_dbg_collect_trig(&mvm->fwrt, trig,
+-				"Frame from %pM timed out, tid %d",
+-				event->u.ba.sta->addr, event->u.ba.tid);
+-}
+-
+ static void iwl_mvm_mac_event_callback(struct ieee80211_hw *hw,
+ 				       struct ieee80211_vif *vif,
+ 				       const struct ieee80211_event *event)
+@@ -4288,7 +4263,8 @@ static void iwl_mvm_mac_event_callback(struct ieee80211_hw *hw,
+ 		iwl_mvm_event_bar_rx_callback(mvm, vif, event);
+ 		break;
+ 	case BA_FRAME_TIMEOUT:
+-		iwl_mvm_event_frame_timeout_callback(mvm, vif, event);
++		iwl_mvm_event_frame_timeout_callback(mvm, vif, event->u.ba.sta,
++						     event->u.ba.tid);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index f7df3b0e1817..0969cbc5f9f5 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -586,6 +586,7 @@ enum iwl_mvm_tdls_cs_state {
+  * @queue: queue of this reorder buffer
+  * @last_amsdu: track last ASMDU SN for duplication detection
+  * @last_sub_index: track ASMDU sub frame index for duplication detection
++ * @tid: the tid
+  * @entries: list of skbs stored
+  * @reorder_time: time the packet was stored in the reorder buffer
+  * @reorder_timer: timer for frames are in the reorder buffer. For AMSDU
+@@ -603,6 +604,7 @@ struct iwl_mvm_reorder_buffer {
+ 	int queue;
+ 	u16 last_amsdu;
+ 	u8 last_sub_index;
++	u8 tid;
+ 	struct sk_buff_head entries[IEEE80211_MAX_AMPDU_BUF];
+ 	unsigned long reorder_time[IEEE80211_MAX_AMPDU_BUF];
+ 	struct timer_list reorder_timer;
+@@ -1842,6 +1844,10 @@ unsigned int iwl_mvm_get_wd_timeout(struct iwl_mvm *mvm,
+ 				    bool tdls, bool cmd_q);
+ void iwl_mvm_connection_loss(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
+ 			     const char *errmsg);
++void iwl_mvm_event_frame_timeout_callback(struct iwl_mvm *mvm,
++					  struct ieee80211_vif *vif,
++					  const struct ieee80211_sta *sta,
++					  u16 tid);
+ 
+ int iwl_mvm_sar_select_profile(struct iwl_mvm *mvm, int prof_a, int prof_b);
+ int iwl_mvm_get_sar_geo_profile(struct iwl_mvm *mvm);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+index 1e5ca54a0151..f3e6ff0a20e6 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+@@ -495,13 +495,18 @@ void iwl_mvm_reorder_timer_expired(unsigned long data)
+ 
+ 	if (expired) {
+ 		struct ieee80211_sta *sta;
++		struct iwl_mvm_sta *mvmsta;
+ 
+ 		rcu_read_lock();
+ 		sta = rcu_dereference(buf->mvm->fw_id_to_mac_id[buf->sta_id]);
++		mvmsta = iwl_mvm_sta_from_mac80211(sta);
++
+ 		/* SN is set to the last expired frame + 1 */
+ 		IWL_DEBUG_HT(buf->mvm,
+ 			     "Releasing expired frames for sta %u, sn %d\n",
+ 			     buf->sta_id, sn);
++		iwl_mvm_event_frame_timeout_callback(buf->mvm, mvmsta->vif,
++						     sta, buf->tid);
+ 		iwl_mvm_release_frames(buf->mvm, sta, NULL, buf, sn);
+ 		rcu_read_unlock();
+ 	} else {
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+index c4a343534c5e..282424f40c43 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+@@ -2158,6 +2158,7 @@ static void iwl_mvm_init_reorder_buffer(struct iwl_mvm *mvm,
+ 		reorder_buf->mvm = mvm;
+ 		reorder_buf->queue = i;
+ 		reorder_buf->sta_id = sta_id;
++		reorder_buf->tid = data->tid;
+ 		reorder_buf->valid = false;
+ 		for (j = 0; j < reorder_buf->buf_size; j++)
+ 			__skb_queue_head_init(&reorder_buf->entries[j]);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/utils.c b/drivers/net/wireless/intel/iwlwifi/mvm/utils.c
+index 328035640669..2da1b088ac01 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/utils.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/utils.c
+@@ -1368,6 +1368,31 @@ void iwl_mvm_inactivity_check(struct iwl_mvm *mvm)
+ 	rcu_read_unlock();
+ }
+ 
++void iwl_mvm_event_frame_timeout_callback(struct iwl_mvm *mvm,
++					  struct ieee80211_vif *vif,
++					  const struct ieee80211_sta *sta,
++					  u16 tid)
++{
++	struct iwl_fw_dbg_trigger_tlv *trig;
++	struct iwl_fw_dbg_trigger_ba *ba_trig;
++
++	if (!iwl_fw_dbg_trigger_enabled(mvm->fw, FW_DBG_TRIGGER_BA))
++		return;
++
++	trig = iwl_fw_dbg_get_trigger(mvm->fw, FW_DBG_TRIGGER_BA);
++	ba_trig = (void *)trig->data;
++	if (!iwl_fw_dbg_trigger_check_stop(&mvm->fwrt,
++					   ieee80211_vif_to_wdev(vif), trig))
++		return;
++
++	if (!(le16_to_cpu(ba_trig->frame_timeout) & BIT(tid)))
++		return;
++
++	iwl_fw_dbg_collect_trig(&mvm->fwrt, trig,
++				"Frame from %pM timed out, tid %d",
++				sta->addr, tid);
++}
++
+ void iwl_mvm_get_sync_time(struct iwl_mvm *mvm, u32 *gp2, u64 *boottime)
+ {
+ 	bool ps_disabled;
+-- 
+2.5.0
+

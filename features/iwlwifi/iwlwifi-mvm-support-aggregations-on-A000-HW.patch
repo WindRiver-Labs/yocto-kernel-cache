@@ -1,0 +1,198 @@
+From 476da255e452872e681a25214ead58d2ac2ac410 Mon Sep 17 00:00:00 2001
+From: Liad Kaufman <liad.kaufman@intel.com>
+Date: Wed, 5 Apr 2017 16:25:11 +0300
+Subject: [PATCH 067/310] iwlwifi: mvm: support aggregations on A000 HW
+
+commit dd32162da4e5b3c9c81adf9a1f6e3a839a35d5f0 upstream.
+
+On A000 HW, the SCD rdptr has only 8 bits allocated
+for it, thus when checking if a queue is full, or
+when checking if the SSN is equal to the TID's
+next_reclaimed, A000 HW should trim the SSN.
+
+Fix this by "normalizing" the SSN to wrap around
+0xFF when comparing to the next_reclaimed on A000
+HW.
+
+Signed-off-by: Liad Kaufman <liad.kaufman@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c |  2 +-
+ drivers/net/wireless/intel/iwlwifi/mvm/ops.c      |  2 +-
+ drivers/net/wireless/intel/iwlwifi/mvm/sta.c      | 27 +++++++++++++++++++++--
+ drivers/net/wireless/intel/iwlwifi/mvm/sta.h      |  8 ++-----
+ drivers/net/wireless/intel/iwlwifi/mvm/tx.c       | 15 ++++++++++---
+ drivers/net/wireless/intel/iwlwifi/mvm/utils.c    |  2 +-
+ 6 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index 4be72eadf5e1..5ea88ac397f9 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -2421,7 +2421,7 @@ static void __iwl_mvm_mac_sta_notify(struct ieee80211_hw *hw,
+ 
+ 		__set_bit(tid_data->txq_id, &txqs);
+ 
+-		if (iwl_mvm_tid_queued(tid_data) == 0)
++		if (iwl_mvm_tid_queued(mvm, tid_data) == 0)
+ 			continue;
+ 
+ 		__set_bit(tid, &tids);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+index 262550abfded..122f78c54323 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+@@ -1323,7 +1323,7 @@ static bool iwl_mvm_disallow_offloading(struct iwl_mvm *mvm,
+ 		 * for offloading in order to prevent reuse of the same
+ 		 * qos seq counters.
+ 		 */
+-		if (iwl_mvm_tid_queued(tid_data))
++		if (iwl_mvm_tid_queued(mvm, tid_data))
+ 			continue;
+ 
+ 		if (tid_data->state != IWL_AGG_OFF)
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+index 84b95043c072..02d947c78a46 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.c
+@@ -2529,6 +2529,7 @@ int iwl_mvm_sta_tx_agg_start(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
+ {
+ 	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
+ 	struct iwl_mvm_tid_data *tid_data;
++	u16 normalized_ssn;
+ 	int txq_id;
+ 	int ret;
+ 
+@@ -2616,7 +2617,15 @@ int iwl_mvm_sta_tx_agg_start(struct iwl_mvm *mvm, struct ieee80211_vif *vif,
+ 			    mvmsta->sta_id, tid, txq_id, tid_data->ssn,
+ 			    tid_data->next_reclaimed);
+ 
+-	if (tid_data->ssn == tid_data->next_reclaimed) {
++	/*
++	 * In A000 HW, the next_reclaimed index is only 8 bit, so we'll need
++	 * to align the wrap around of ssn so we compare relevant values.
++	 */
++	normalized_ssn = tid_data->ssn;
++	if (mvm->trans->cfg->gen2)
++		normalized_ssn &= 0xff;
++
++	if (normalized_ssn == tid_data->next_reclaimed) {
+ 		tid_data->state = IWL_AGG_STARTING;
+ 		ieee80211_start_tx_ba_cb_irqsafe(vif, sta->addr, tid);
+ 	} else {
+@@ -3543,7 +3552,7 @@ void iwl_mvm_sta_modify_sleep_tx_count(struct iwl_mvm *mvm,
+ 				return;
+ 			}
+ 
+-			n_queued = iwl_mvm_tid_queued(tid_data);
++			n_queued = iwl_mvm_tid_queued(mvm, tid_data);
+ 			if (n_queued > remaining) {
+ 				more_data = true;
+ 				remaining = 0;
+@@ -3725,3 +3734,17 @@ void iwl_mvm_csa_client_absent(struct iwl_mvm *mvm, struct ieee80211_vif *vif)
+ 
+ 	rcu_read_unlock();
+ }
++
++u16 iwl_mvm_tid_queued(struct iwl_mvm *mvm, struct iwl_mvm_tid_data *tid_data)
++{
++	u16 sn = IEEE80211_SEQ_TO_SN(tid_data->seq_number);
++
++	/*
++	 * In A000 HW, the next_reclaimed index is only 8 bit, so we'll need
++	 * to align the wrap around of ssn so we compare relevant values.
++	 */
++	if (mvm->trans->cfg->gen2)
++		sn &= 0xff;
++
++	return ieee80211_sn_sub(sn, tid_data->next_reclaimed);
++}
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/sta.h b/drivers/net/wireless/intel/iwlwifi/mvm/sta.h
+index 357ff2bf75c1..05fecbe87da4 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/sta.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/sta.h
+@@ -341,12 +341,6 @@ struct iwl_mvm_tid_data {
+ 	bool is_tid_active;
+ };
+ 
+-static inline u16 iwl_mvm_tid_queued(struct iwl_mvm_tid_data *tid_data)
+-{
+-	return ieee80211_sn_sub(IEEE80211_SEQ_TO_SN(tid_data->seq_number),
+-				tid_data->next_reclaimed);
+-}
+-
+ struct iwl_mvm_key_pn {
+ 	struct rcu_head rcu_head;
+ 	struct {
+@@ -447,6 +441,8 @@ struct iwl_mvm_sta {
+ 	u8 avg_energy;
+ };
+ 
++u16 iwl_mvm_tid_queued(struct iwl_mvm *mvm, struct iwl_mvm_tid_data *tid_data);
++
+ static inline struct iwl_mvm_sta *
+ iwl_mvm_sta_from_mac80211(struct ieee80211_sta *sta)
+ {
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+index acefaac0f0e3..b6ae5631378c 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+@@ -1129,13 +1129,14 @@ static void iwl_mvm_check_ratid_empty(struct iwl_mvm *mvm,
+ 	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
+ 	struct iwl_mvm_tid_data *tid_data = &mvmsta->tid_data[tid];
+ 	struct ieee80211_vif *vif = mvmsta->vif;
++	u16 normalized_ssn;
+ 
+ 	lockdep_assert_held(&mvmsta->lock);
+ 
+ 	if ((tid_data->state == IWL_AGG_ON ||
+ 	     tid_data->state == IWL_EMPTYING_HW_QUEUE_DELBA ||
+ 	     iwl_mvm_is_dqa_supported(mvm)) &&
+-	    iwl_mvm_tid_queued(tid_data) == 0) {
++	    iwl_mvm_tid_queued(mvm, tid_data) == 0) {
+ 		/*
+ 		 * Now that this aggregation or DQA queue is empty tell
+ 		 * mac80211 so it knows we no longer have frames buffered for
+@@ -1144,7 +1145,15 @@ static void iwl_mvm_check_ratid_empty(struct iwl_mvm *mvm,
+ 		ieee80211_sta_set_buffered(sta, tid, false);
+ 	}
+ 
+-	if (tid_data->ssn != tid_data->next_reclaimed)
++	/*
++	 * In A000 HW, the next_reclaimed index is only 8 bit, so we'll need
++	 * to align the wrap around of ssn so we compare relevant values.
++	 */
++	normalized_ssn = tid_data->ssn;
++	if (mvm->trans->cfg->gen2)
++		normalized_ssn &= 0xff;
++
++	if (normalized_ssn != tid_data->next_reclaimed)
+ 		return;
+ 
+ 	switch (tid_data->state) {
+@@ -1488,7 +1497,7 @@ static void iwl_mvm_rx_tx_cmd_single(struct iwl_mvm *mvm,
+ 			if (mvmsta->sleep_tx_count) {
+ 				mvmsta->sleep_tx_count--;
+ 				if (mvmsta->sleep_tx_count &&
+-				    !iwl_mvm_tid_queued(tid_data)) {
++				    !iwl_mvm_tid_queued(mvm, tid_data)) {
+ 					/*
+ 					 * The number of frames in the queue
+ 					 * dropped to 0 even if we sent less
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/utils.c b/drivers/net/wireless/intel/iwlwifi/mvm/utils.c
+index cc5a56818db8..dc8104d846f9 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/utils.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/utils.c
+@@ -1181,7 +1181,7 @@ static void iwl_mvm_remove_inactive_tids(struct iwl_mvm *mvm,
+ 	/* Go over all non-active TIDs, incl. IWL_MAX_TID_COUNT (for mgmt) */
+ 	for_each_set_bit(tid, &tid_bitmap, IWL_MAX_TID_COUNT + 1) {
+ 		/* If some TFDs are still queued - don't mark TID as inactive */
+-		if (iwl_mvm_tid_queued(&mvmsta->tid_data[tid]))
++		if (iwl_mvm_tid_queued(mvm, &mvmsta->tid_data[tid]))
+ 			tid_bitmap &= ~BIT(tid);
+ 	}
+ 
+-- 
+2.5.0
+

@@ -1,0 +1,308 @@
+From dc5fc94c7ad3ce26bbac33e5db56809c51777a53 Mon Sep 17 00:00:00 2001
+From: Sara Sharon <sara.sharon@intel.com>
+Date: Sun, 8 Jan 2017 16:46:14 +0200
+Subject: [PATCH 001/310] iwlwifi: mvm: support getting nvm data from firmware
+
+commit e9e1ba3dbf00bb2eed4e681ae59f433e45d2e78f upstream.
+
+This API replaces the complex NVM parsing of the iwlwifi module.
+Instead, we get all needed data from firmware.
+
+Signed-off-by: Sara Sharon <sara.sharon@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+[adjust patch for dc1cd1d5ac22 ("iwlwifi: fix host command memory leaks") used]
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h | 77 +++++++++++++++++++++
+ drivers/net/wireless/intel/iwlwifi/mvm/fw.c     | 37 +++++-----
+ drivers/net/wireless/intel/iwlwifi/mvm/mvm.h    |  2 +
+ drivers/net/wireless/intel/iwlwifi/mvm/nvm.c    | 90 ++++++++++++++++++++++++-
+ drivers/net/wireless/intel/iwlwifi/mvm/ops.c    |  1 +
+ 5 files changed, 188 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h b/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h
+index f545c5f9e4e3..0996127897c1 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h
+@@ -345,6 +345,7 @@ enum iwl_prot_offload_subcmd_ids {
+ 
+ enum iwl_regulatory_and_nvm_subcmd_ids {
+ 	NVM_ACCESS_COMPLETE = 0x0,
++	NVM_GET_INFO = 0x2,
+ };
+ 
+ enum iwl_debug_cmds {
+@@ -2259,4 +2260,80 @@ struct iwl_init_extended_cfg_cmd {
+ 	__le32 init_flags;
+ } __packed; /* INIT_EXTENDED_CFG_CMD_API_S_VER_1 */
+ 
++/*
++ * struct iwl_nvm_get_info - request to get NVM data
++ */
++struct iwl_nvm_get_info {
++	__le32 reserved;
++} __packed; /* GRP_REGULATORY_NVM_GET_INFO_CMD_S_VER_1 */
++
++/**
++ * struct iwl_nvm_get_info_general - general NVM data
++ * @flags: 1 - empty, 0 - valid
++ * @nvm_version: nvm version
++ * @board_type: board type
++ */
++struct iwl_nvm_get_info_general {
++	__le32 flags;
++	__le16 nvm_version;
++	u8 board_type;
++	u8 reserved;
++} __packed; /* GRP_REGULATORY_NVM_GET_INFO_GENERAL_S_VER_1 */
++
++/**
++ * struct iwl_nvm_get_info_sku - mac information
++ * @enable_24g: band 2.4G enabled
++ * @enable_5g: band 5G enabled
++ * @enable_11n: 11n enabled
++ * @enable_11ac: 11ac enabled
++ * @mimo_disable: MIMO enabled
++ * @ext_crypto: Extended crypto enabled
++ */
++struct iwl_nvm_get_info_sku {
++	__le32 enable_24g;
++	__le32 enable_5g;
++	__le32 enable_11n;
++	__le32 enable_11ac;
++	__le32 mimo_disable;
++	__le32 ext_crypto;
++} __packed; /* GRP_REGULATORY_NVM_GET_INFO_MAC_SKU_SECTION_S_VER_1 */
++
++/**
++ * struct iwl_nvm_get_info_phy - phy information
++ * @tx_chains: BIT 0 chain A, BIT 1 chain B
++ * @rx_chains: BIT 0 chain A, BIT 1 chain B
++ */
++struct iwl_nvm_get_info_phy {
++	__le32 tx_chains;
++	__le32 rx_chains;
++} __packed; /* GRP_REGULATORY_NVM_GET_INFO_PHY_SKU_SECTION_S_VER_1 */
++
++#define IWL_NUM_CHANNELS (51)
++
++/**
++ * struct iwl_nvm_get_info_regulatory - regulatory information
++ * @lar_enabled: is LAR enabled
++ * @channel_profile: regulatory data of this channel
++ * @regulatory: regulatory data, see &enum iwl_nvm_channel_flags for data
++ */
++struct iwl_nvm_get_info_regulatory {
++	__le32 lar_enabled;
++	__le16 channel_profile[IWL_NUM_CHANNELS];
++	__le16 reserved;
++} __packed; /* GRP_REGULATORY_NVM_GET_INFO_REGULATORY_S_VER_1 */
++
++/**
++ * struct iwl_nvm_get_info_rsp - response to get NVM data
++ * @general: general NVM data
++ * @mac_sku: data relating to MAC sku
++ * @phy_sku: data relating to PHY sku
++ * @regulatory: regulatory data
++ */
++struct iwl_nvm_get_info_rsp {
++	struct iwl_nvm_get_info_general general;
++	struct iwl_nvm_get_info_sku mac_sku;
++	struct iwl_nvm_get_info_phy phy_sku;
++	struct iwl_nvm_get_info_regulatory regulatory;
++} __packed; /* GRP_REGULATORY_NVM_GET_INFO_CMD_RSP_S_VER_1 */
++
+ #endif /* __fw_api_h__ */
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/fw.c b/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+index e6c9528eeeda..3d68595243fc 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+@@ -738,23 +738,11 @@ static int iwl_run_unified_mvm_ucode(struct iwl_mvm *mvm, bool read_nvm)
+ 		goto error;
+ 	}
+ 
+-	/* Read the NVM only at driver load time, no need to do this twice */
+-	if (read_nvm) {
+-		/* Read nvm */
+-		ret = iwl_nvm_init(mvm, true);
+-		if (ret) {
+-			IWL_ERR(mvm, "Failed to read NVM: %d\n", ret);
+-			goto error;
+-		}
+-	}
+-
+-	/* In case we read the NVM from external file, load it to the NIC */
+-	if (mvm->nvm_file_name)
++	/* Load NVM to NIC if needed */
++	if (mvm->nvm_file_name) {
++		iwl_mvm_read_external_nvm(mvm);
+ 		iwl_mvm_load_nvm_to_nic(mvm);
+-
+-	ret = iwl_nvm_check_version(mvm->nvm_data, mvm->trans);
+-	if (WARN_ON(ret))
+-		goto error;
++	}
+ 
+ 	ret = iwl_mvm_send_cmd_pdu(mvm, WIDE_ID(REGULATORY_AND_NVM_GROUP,
+ 						NVM_ACCESS_COMPLETE), 0,
+@@ -766,8 +754,21 @@ static int iwl_run_unified_mvm_ucode(struct iwl_mvm *mvm, bool read_nvm)
+ 	}
+ 
+ 	/* We wait for the INIT complete notification */
+-	return iwl_wait_notification(&mvm->notif_wait, &init_wait,
+-				     MVM_UCODE_ALIVE_TIMEOUT);
++	ret = iwl_wait_notification(&mvm->notif_wait, &init_wait,
++				    MVM_UCODE_ALIVE_TIMEOUT);
++	if (ret)
++		return ret;
++
++	/* Read the NVM only at driver load time, no need to do this twice */
++	if (read_nvm) {
++		ret = iwl_mvm_nvm_get_from_fw(mvm);
++		if (ret) {
++			IWL_ERR(mvm, "Failed to read NVM: %d\n", ret);
++			return ret;
++		}
++	}
++
++	return 0;
+ 
+ error:
+ 	iwl_remove_notification(&mvm->notif_wait, &init_wait);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index f98032b08ee3..906d6356ab06 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -1390,7 +1390,9 @@ void iwl_mvm_accu_radio_stats(struct iwl_mvm *mvm);
+ 
+ /* NVM */
+ int iwl_nvm_init(struct iwl_mvm *mvm, bool read_nvm_from_nic);
++int iwl_mvm_nvm_get_from_fw(struct iwl_mvm *mvm);
+ int iwl_mvm_load_nvm_to_nic(struct iwl_mvm *mvm);
++int iwl_mvm_read_external_nvm(struct iwl_mvm *mvm);
+ 
+ static inline u8 iwl_mvm_get_valid_tx_ant(struct iwl_mvm *mvm)
+ {
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c b/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
+index 283c41df622c..67a6c9c9af27 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/nvm.c
+@@ -374,7 +374,7 @@ iwl_parse_nvm_sections(struct iwl_mvm *mvm)
+  *
+  * 4. save as "iNVM_xxx.bin" under /lib/firmware
+  */
+-static int iwl_mvm_read_external_nvm(struct iwl_mvm *mvm)
++int iwl_mvm_read_external_nvm(struct iwl_mvm *mvm)
+ {
+ 	int ret, section_size;
+ 	u16 section_id;
+@@ -551,6 +551,94 @@ int iwl_mvm_load_nvm_to_nic(struct iwl_mvm *mvm)
+ 	return ret;
+ }
+ 
++int iwl_mvm_nvm_get_from_fw(struct iwl_mvm *mvm)
++{
++	struct iwl_nvm_get_info cmd = {};
++	struct iwl_nvm_get_info_rsp *rsp;
++	struct iwl_trans *trans = mvm->trans;
++	struct iwl_host_cmd hcmd = {
++		.flags = CMD_WANT_SKB | CMD_SEND_IN_RFKILL,
++		.data = { &cmd, },
++		.len = { sizeof(cmd) },
++		.id = WIDE_ID(REGULATORY_AND_NVM_GROUP, NVM_GET_INFO)
++	};
++	int  ret;
++	bool lar_fw_supported = !iwlwifi_mod_params.lar_disable &&
++				fw_has_capa(&mvm->fw->ucode_capa,
++					    IWL_UCODE_TLV_CAPA_LAR_SUPPORT);
++
++	lockdep_assert_held(&mvm->mutex);
++
++	ret = iwl_mvm_send_cmd(mvm, &hcmd);
++	if (ret)
++		return ret;
++
++	if (WARN(iwl_rx_packet_payload_len(hcmd.resp_pkt) != sizeof(*rsp),
++		 "Invalid payload len in NVM response from FW %d",
++		 iwl_rx_packet_payload_len(hcmd.resp_pkt))) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	rsp = (void *)hcmd.resp_pkt->data;
++	if (le32_to_cpu(rsp->general.flags)) {
++		IWL_ERR(mvm, "Invalid NVM data from FW\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	mvm->nvm_data = kzalloc(sizeof(*mvm->nvm_data) +
++				sizeof(struct ieee80211_channel) *
++				IWL_NUM_CHANNELS, GFP_KERNEL);
++	if (!mvm->nvm_data) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	iwl_set_hw_address_from_csr(trans, mvm->nvm_data);
++	/* TODO: if platform NVM has MAC address - override it here */
++
++	if (!is_valid_ether_addr(mvm->nvm_data->hw_addr)) {
++		IWL_ERR(trans, "no valid mac address was found\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* Initialize general data */
++	mvm->nvm_data->nvm_version = le16_to_cpu(rsp->general.nvm_version);
++
++	/* Initialize MAC sku data */
++	mvm->nvm_data->sku_cap_11ac_enable =
++		le32_to_cpu(rsp->mac_sku.enable_11ac);
++	mvm->nvm_data->sku_cap_11n_enable =
++		le32_to_cpu(rsp->mac_sku.enable_11n);
++	mvm->nvm_data->sku_cap_band_24GHz_enable =
++		le32_to_cpu(rsp->mac_sku.enable_24g);
++	mvm->nvm_data->sku_cap_band_52GHz_enable =
++		le32_to_cpu(rsp->mac_sku.enable_5g);
++	mvm->nvm_data->sku_cap_mimo_disabled =
++		le32_to_cpu(rsp->mac_sku.mimo_disable);
++
++	/* Initialize PHY sku data */
++	mvm->nvm_data->valid_tx_ant = (u8)le32_to_cpu(rsp->phy_sku.tx_chains);
++	mvm->nvm_data->valid_rx_ant = (u8)le32_to_cpu(rsp->phy_sku.rx_chains);
++
++	/* Initialize regulatory data */
++	mvm->nvm_data->lar_enabled =
++		le32_to_cpu(rsp->regulatory.lar_enabled) && lar_fw_supported;
++
++	iwl_init_sbands(trans->dev, trans->cfg, mvm->nvm_data,
++			rsp->regulatory.channel_profile,
++			mvm->nvm_data->valid_tx_ant & mvm->fw->valid_tx_ant,
++			mvm->nvm_data->valid_rx_ant & mvm->fw->valid_rx_ant,
++			rsp->regulatory.lar_enabled && lar_fw_supported);
++
++	ret = 0;
++out:
++	iwl_free_resp(&hcmd);
++	return ret;
++}
++
+ int iwl_nvm_init(struct iwl_mvm *mvm, bool read_nvm_from_nic)
+ {
+ 	int ret, section;
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+index e9cb29223c9b..2ead0fe3f4a8 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+@@ -483,6 +483,7 @@ static const struct iwl_hcmd_names iwl_mvm_prot_offload_names[] = {
+  */
+ static const struct iwl_hcmd_names iwl_mvm_regulatory_and_nvm_names[] = {
+ 	HCMD_NAME(NVM_ACCESS_COMPLETE),
++	HCMD_NAME(NVM_GET_INFO),
+ };
+ 
+ static const struct iwl_hcmd_arr iwl_mvm_groups[] = {
+-- 
+2.5.0
+

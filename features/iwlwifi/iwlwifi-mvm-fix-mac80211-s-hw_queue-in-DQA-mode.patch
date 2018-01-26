@@ -1,0 +1,111 @@
+From dd9d9e230b3b26a979882dd8f196ebdee25feb63 Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Mon, 19 Jun 2017 23:26:55 +0200
+Subject: [PATCH 130/310] iwlwifi: mvm: fix mac80211's hw_queue in DQA mode
+
+commit 32026e8f709ff29bd00cce58036da8381eaa7592 upstream.
+
+When in non-DQA mode, mac80211 actually gets a pretty much perfect
+idea (in vif->hw_queue/cab_queue) of which queues we're using. But
+in DQA mode, this isn't true - nonetheless, we were adding all the
+queues, even the ones stations are using, to the queue allocation
+bitmap.
+
+Fix this, we should only add the queues we really are using in DQA
+mode:
+ * IWL_MVM_OFFCHANNEL_QUEUE, as we use this in both modes
+ * mvm->aux_queue, as we use this in both modes - mac80211
+   never really knows about it but we use it as a cookie
+   internally, so can't reuse it
+ * possibly the GCAST queue (cab_queue)
+ * all the "queues" we told mac80211 about we were using on each
+   interface (vif->hw_queue), these are entirely virtual in this
+   mode
+
+Also add back the failure now when we can't allocate any more of
+these - now virtual - queues; this was skipped in DQA mode and
+would lead to having multiple ACs or even interfaces use the same
+queue number in mac80211 (10, since that's the limit), which would
+stop far too many queues if stopped.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c | 32 ++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
+index f06751598fb8..7ceaefcd570d 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac-ctxt.c
+@@ -257,7 +257,7 @@ unsigned long iwl_mvm_get_used_hw_queues(struct iwl_mvm *mvm,
+ 	};
+ 
+ 	if (iwl_mvm_is_dqa_supported(mvm))
+-		data.used_hw_queues |= BIT(IWL_MVM_DQA_CMD_QUEUE);
++		data.used_hw_queues |= BIT(IWL_MVM_DQA_GCAST_QUEUE);
+ 	else
+ 		data.used_hw_queues |= BIT(IWL_MVM_CMD_QUEUE);
+ 
+@@ -268,6 +268,14 @@ unsigned long iwl_mvm_get_used_hw_queues(struct iwl_mvm *mvm,
+ 		mvm->hw, IEEE80211_IFACE_ITER_RESUME_ALL,
+ 		iwl_mvm_iface_hw_queues_iter, &data);
+ 
++	/*
++	 * for DQA, the hw_queue in mac80211 is never really used for
++	 * real traffic (only the few queue IDs covered above), so
++	 * we can reuse the real HW queue IDs the stations use
++	 */
++	if (iwl_mvm_is_dqa_supported(mvm))
++		return data.used_hw_queues;
++
+ 	/* don't assign the same hw queues as TDLS stations */
+ 	ieee80211_iterate_stations_atomic(mvm->hw,
+ 					  iwl_mvm_mac_sta_hw_queues_iter,
+@@ -344,7 +352,7 @@ static int iwl_mvm_mac_ctxt_allocate_resources(struct iwl_mvm *mvm,
+ 		.found_vif = false,
+ 	};
+ 	u32 ac;
+-	int ret, i;
++	int ret, i, queue_limit;
+ 	unsigned long used_hw_queues;
+ 
+ 	/*
+@@ -430,17 +438,29 @@ static int iwl_mvm_mac_ctxt_allocate_resources(struct iwl_mvm *mvm,
+ 		return 0;
+ 	}
+ 
++	if (iwl_mvm_is_dqa_supported(mvm)) {
++		/*
++		 * queues in mac80211 almost entirely independent of
++		 * the ones here - no real limit
++		 */
++		queue_limit = IEEE80211_MAX_QUEUES;
++		BUILD_BUG_ON(IEEE80211_MAX_QUEUES >
++			     BITS_PER_BYTE *
++			     sizeof(mvm->hw_queue_to_mac80211[0]));
++	} else {
++		/* need to not use too many in this case */
++		queue_limit = mvm->first_agg_queue;
++	}
++
+ 	/*
+ 	 * Find available queues, and allocate them to the ACs. When in
+ 	 * DQA-mode they aren't really used, and this is done only so the
+ 	 * mac80211 ieee80211_check_queues() function won't fail
+ 	 */
+ 	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+-		u8 queue = find_first_zero_bit(&used_hw_queues,
+-					       mvm->first_agg_queue);
++		u8 queue = find_first_zero_bit(&used_hw_queues, queue_limit);
+ 
+-		if (!iwl_mvm_is_dqa_supported(mvm) &&
+-		    queue >= mvm->first_agg_queue) {
++		if (queue >= queue_limit) {
+ 			IWL_ERR(mvm, "Failed to allocate queue\n");
+ 			ret = -EIO;
+ 			goto exit_fail;
+-- 
+2.5.0
+

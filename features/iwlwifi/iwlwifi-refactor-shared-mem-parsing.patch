@@ -1,0 +1,672 @@
+From 2e8f9d07d43371f435f95ca393a37ef63b67d90b Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Thu, 1 Jun 2017 14:44:40 +0200
+Subject: [PATCH 155/310] iwlwifi: refactor shared mem parsing
+
+commit d0b813fcdc22d091f8c9eee3a1484dca162667c8 upstream.
+
+Refactor the shared memory command parsing into common code.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/wireless/intel/iwlwifi/Makefile     |   2 +-
+ drivers/net/wireless/intel/iwlwifi/fw/api.h     |  87 +++++++++++++
+ drivers/net/wireless/intel/iwlwifi/fw/runtime.h |  19 +++
+ drivers/net/wireless/intel/iwlwifi/fw/smem.c    | 156 ++++++++++++++++++++++++
+ drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h |  87 -------------
+ drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c |  18 +--
+ drivers/net/wireless/intel/iwlwifi/mvm/fw.c     |  91 +-------------
+ drivers/net/wireless/intel/iwlwifi/mvm/mvm.h    |  14 ---
+ drivers/net/wireless/intel/iwlwifi/mvm/tx.c     |   3 +-
+ 9 files changed, 275 insertions(+), 202 deletions(-)
+ create mode 100644 drivers/net/wireless/intel/iwlwifi/fw/smem.c
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/Makefile b/drivers/net/wireless/intel/iwlwifi/Makefile
+index 186a5b2fb6e3..ddc2bfb501c1 100644
+--- a/drivers/net/wireless/intel/iwlwifi/Makefile
++++ b/drivers/net/wireless/intel/iwlwifi/Makefile
+@@ -11,7 +11,7 @@ iwlwifi-$(CONFIG_IWLDVM) += cfg/1000.o cfg/2000.o cfg/5000.o cfg/6000.o
+ iwlwifi-$(CONFIG_IWLMVM) += cfg/7000.o cfg/8000.o cfg/9000.o cfg/a000.o
+ iwlwifi-objs		+= iwl-trans.o
+ iwlwifi-objs		+= fw/notif-wait.o
+-iwlwifi-$(CONFIG_IWLMVM) += fw/paging.o
++iwlwifi-$(CONFIG_IWLMVM) += fw/paging.o fw/smem.o
+ 
+ iwlwifi-objs += $(iwlwifi-m)
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api.h b/drivers/net/wireless/intel/iwlwifi/fw/api.h
+index f9bcbaf87ce2..afd333e57790 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api.h
+@@ -269,4 +269,91 @@ struct iwl_fw_get_item_resp {
+ 	__le32 item_val;
+ } __packed; /* FW_GET_ITEM_RSP_S_VER_1 */
+ 
++#define TX_FIFO_MAX_NUM_9000		8
++#define TX_FIFO_MAX_NUM			15
++#define RX_FIFO_MAX_NUM			2
++#define TX_FIFO_INTERNAL_MAX_NUM	6
++
++/**
++ * struct iwl_shared_mem_cfg_v2 - Shared memory configuration information
++ *
++ * @shared_mem_addr: shared memory addr (pre 8000 HW set to 0x0 as MARBH is not
++ *	accessible)
++ * @shared_mem_size: shared memory size
++ * @sample_buff_addr: internal sample (mon/adc) buff addr (pre 8000 HW set to
++ *	0x0 as accessible only via DBGM RDAT)
++ * @sample_buff_size: internal sample buff size
++ * @txfifo_addr: start addr of TXF0 (excluding the context table 0.5KB), (pre
++ *	8000 HW set to 0x0 as not accessible)
++ * @txfifo_size: size of TXF0 ... TXF7
++ * @rxfifo_size: RXF1, RXF2 sizes. If there is no RXF2, it'll have a value of 0
++ * @page_buff_addr: used by UMAC and performance debug (page miss analysis),
++ *	when paging is not supported this should be 0
++ * @page_buff_size: size of %page_buff_addr
++ * @rxfifo_addr: Start address of rxFifo
++ * @internal_txfifo_addr: start address of internalFifo
++ * @internal_txfifo_size: internal fifos' size
++ *
++ * NOTE: on firmware that don't have IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG
++ *	 set, the last 3 members don't exist.
++ */
++struct iwl_shared_mem_cfg_v2 {
++	__le32 shared_mem_addr;
++	__le32 shared_mem_size;
++	__le32 sample_buff_addr;
++	__le32 sample_buff_size;
++	__le32 txfifo_addr;
++	__le32 txfifo_size[TX_FIFO_MAX_NUM_9000];
++	__le32 rxfifo_size[RX_FIFO_MAX_NUM];
++	__le32 page_buff_addr;
++	__le32 page_buff_size;
++	__le32 rxfifo_addr;
++	__le32 internal_txfifo_addr;
++	__le32 internal_txfifo_size[TX_FIFO_INTERNAL_MAX_NUM];
++} __packed; /* SHARED_MEM_ALLOC_API_S_VER_2 */
++
++/**
++ * struct iwl_shared_mem_lmac_cfg - LMAC shared memory configuration
++ *
++ * @txfifo_addr: start addr of TXF0 (excluding the context table 0.5KB)
++ * @txfifo_size: size of TX FIFOs
++ * @rxfifo1_addr: RXF1 addr
++ * @rxfifo1_size: RXF1 size
++ */
++struct iwl_shared_mem_lmac_cfg {
++	__le32 txfifo_addr;
++	__le32 txfifo_size[TX_FIFO_MAX_NUM];
++	__le32 rxfifo1_addr;
++	__le32 rxfifo1_size;
++
++} __packed; /* SHARED_MEM_ALLOC_LMAC_API_S_VER_1 */
++
++/**
++ * struct iwl_shared_mem_cfg - Shared memory configuration information
++ *
++ * @shared_mem_addr: shared memory address
++ * @shared_mem_size: shared memory size
++ * @sample_buff_addr: internal sample (mon/adc) buff addr
++ * @sample_buff_size: internal sample buff size
++ * @rxfifo2_addr: start addr of RXF2
++ * @rxfifo2_size: size of RXF2
++ * @page_buff_addr: used by UMAC and performance debug (page miss analysis),
++ *	when paging is not supported this should be 0
++ * @page_buff_size: size of %page_buff_addr
++ * @lmac_num: number of LMACs (1 or 2)
++ * @lmac_smem: per - LMAC smem data
++ */
++struct iwl_shared_mem_cfg {
++	__le32 shared_mem_addr;
++	__le32 shared_mem_size;
++	__le32 sample_buff_addr;
++	__le32 sample_buff_size;
++	__le32 rxfifo2_addr;
++	__le32 rxfifo2_size;
++	__le32 page_buff_addr;
++	__le32 page_buff_size;
++	__le32 lmac_num;
++	struct iwl_shared_mem_lmac_cfg lmac_smem[2];
++} __packed; /* SHARED_MEM_ALLOC_API_S_VER_3 */
++
+ #endif /* __iwl_fw_api_h__*/
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/runtime.h b/drivers/net/wireless/intel/iwlwifi/fw/runtime.h
+index c5d564305d30..185902ce7e13 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/runtime.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/runtime.h
+@@ -63,6 +63,19 @@
+ #include "img.h"
+ #include "api.h"
+ 
++#define MAX_NUM_LMAC 2
++struct iwl_fwrt_shared_mem_cfg {
++	int num_lmacs;
++	int num_txfifo_entries;
++	struct {
++		u32 txfifo_size[TX_FIFO_MAX_NUM];
++		u32 rxfifo1_size;
++	} lmac[MAX_NUM_LMAC];
++	u32 rxfifo2_size;
++	u32 internal_txfifo_addr;
++	u32 internal_txfifo_size[TX_FIFO_INTERNAL_MAX_NUM];
++};
++
+ /**
+  * struct iwl_fw_runtime - runtime data for firmware
+  * @fw: firmware image
+@@ -71,6 +84,7 @@
+  * @fw_paging_db: paging database
+  * @num_of_paging_blk: number of paging blocks
+  * @num_of_pages_in_last_blk: number of pages in the last block
++ * @smem_cfg: saved firmware SMEM configuration
+  */
+ struct iwl_fw_runtime {
+ 	struct iwl_trans *trans;
+@@ -81,6 +95,9 @@ struct iwl_fw_runtime {
+ 	struct iwl_fw_paging fw_paging_db[NUM_OF_FW_PAGING_BLOCKS];
+ 	u16 num_of_paging_blk;
+ 	u16 num_of_pages_in_last_blk;
++
++	/* memory configuration */
++	struct iwl_fwrt_shared_mem_cfg smem_cfg;
+ };
+ 
+ static inline void iwl_fw_runtime_init(struct iwl_fw_runtime *fwrt,
+@@ -96,4 +113,6 @@ static inline void iwl_fw_runtime_init(struct iwl_fw_runtime *fwrt,
+ int iwl_init_paging(struct iwl_fw_runtime *fwrt, enum iwl_ucode_type type);
+ void iwl_free_fw_paging(struct iwl_fw_runtime *fwrt);
+ 
++void iwl_get_shared_mem_conf(struct iwl_fw_runtime *fwrt);
++
+ #endif /* __iwl_fw_runtime_h__ */
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/smem.c b/drivers/net/wireless/intel/iwlwifi/fw/smem.c
+new file mode 100644
+index 000000000000..053993bf00f9
+--- /dev/null
++++ b/drivers/net/wireless/intel/iwlwifi/fw/smem.c
+@@ -0,0 +1,156 @@
++/******************************************************************************
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * Copyright(c) 2012 - 2014 Intel Corporation. All rights reserved.
++ * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
++ * Copyright(c) 2016 - 2017 Intel Deutschland GmbH
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * The full GNU General Public License is included in this distribution
++ * in the file called COPYING.
++ *
++ * Contact Information:
++ *  Intel Linux Wireless <linuxwifi@intel.com>
++ * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
++ *
++ * BSD LICENSE
++ *
++ * Copyright(c) 2012 - 2014 Intel Corporation. All rights reserved.
++ * Copyright(c) 2013 - 2015 Intel Mobile Communications GmbH
++ * Copyright(c) 2016 - 2017 Intel Deutschland GmbH
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  * Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *  * Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *  * Neither the name Intel Corporation nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ *****************************************************************************/
++#include "iwl-drv.h"
++#include "runtime.h"
++
++/* FIXME */
++#define SHARED_MEM_CFG_CMD 0x00
++#define SYSTEM_GROUP 0x2
++#define SHARED_MEM_CFG 0x25
++
++static void iwl_parse_shared_mem_a000(struct iwl_fw_runtime *fwrt,
++				      struct iwl_rx_packet *pkt)
++{
++	struct iwl_shared_mem_cfg *mem_cfg = (void *)pkt->data;
++	int i, lmac;
++	int lmac_num = le32_to_cpu(mem_cfg->lmac_num);
++
++	if (WARN_ON(lmac_num > ARRAY_SIZE(mem_cfg->lmac_smem)))
++		return;
++
++	fwrt->smem_cfg.num_lmacs = lmac_num;
++	fwrt->smem_cfg.num_txfifo_entries =
++		ARRAY_SIZE(mem_cfg->lmac_smem[0].txfifo_size);
++	fwrt->smem_cfg.rxfifo2_size = le32_to_cpu(mem_cfg->rxfifo2_size);
++
++	for (lmac = 0; lmac < lmac_num; lmac++) {
++		struct iwl_shared_mem_lmac_cfg *lmac_cfg =
++			&mem_cfg->lmac_smem[lmac];
++
++		for (i = 0; i < ARRAY_SIZE(lmac_cfg->txfifo_size); i++)
++			fwrt->smem_cfg.lmac[lmac].txfifo_size[i] =
++				le32_to_cpu(lmac_cfg->txfifo_size[i]);
++		fwrt->smem_cfg.lmac[lmac].rxfifo1_size =
++			le32_to_cpu(lmac_cfg->rxfifo1_size);
++	}
++}
++
++static void iwl_parse_shared_mem(struct iwl_fw_runtime *fwrt,
++				 struct iwl_rx_packet *pkt)
++{
++	struct iwl_shared_mem_cfg_v2 *mem_cfg = (void *)pkt->data;
++	int i;
++
++	fwrt->smem_cfg.num_lmacs = 1;
++
++	fwrt->smem_cfg.num_txfifo_entries = ARRAY_SIZE(mem_cfg->txfifo_size);
++	for (i = 0; i < ARRAY_SIZE(mem_cfg->txfifo_size); i++)
++		fwrt->smem_cfg.lmac[0].txfifo_size[i] =
++			le32_to_cpu(mem_cfg->txfifo_size[i]);
++
++	fwrt->smem_cfg.lmac[0].rxfifo1_size =
++		le32_to_cpu(mem_cfg->rxfifo_size[0]);
++	fwrt->smem_cfg.rxfifo2_size = le32_to_cpu(mem_cfg->rxfifo_size[1]);
++
++	/* new API has more data, from rxfifo_addr field and on */
++	if (fw_has_capa(&fwrt->fw->ucode_capa,
++			IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG)) {
++		BUILD_BUG_ON(sizeof(fwrt->smem_cfg.internal_txfifo_size) !=
++			     sizeof(mem_cfg->internal_txfifo_size));
++
++		for (i = 0;
++		     i < ARRAY_SIZE(fwrt->smem_cfg.internal_txfifo_size);
++		     i++)
++			fwrt->smem_cfg.internal_txfifo_size[i] =
++				le32_to_cpu(mem_cfg->internal_txfifo_size[i]);
++	}
++}
++
++void iwl_get_shared_mem_conf(struct iwl_fw_runtime *fwrt)
++{
++	struct iwl_host_cmd cmd = {
++		.flags = CMD_WANT_SKB,
++		.data = { NULL, },
++		.len = { 0, },
++	};
++	struct iwl_rx_packet *pkt;
++
++	if (fw_has_capa(&fwrt->fw->ucode_capa,
++			IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG))
++		cmd.id = iwl_cmd_id(SHARED_MEM_CFG_CMD, SYSTEM_GROUP, 0);
++	else
++		cmd.id = SHARED_MEM_CFG;
++
++	if (WARN_ON(iwl_trans_send_cmd(fwrt->trans, &cmd)))
++		return;
++
++	pkt = cmd.resp_pkt;
++	if (fwrt->trans->cfg->device_family == IWL_DEVICE_FAMILY_A000)
++		iwl_parse_shared_mem_a000(fwrt, pkt);
++	else
++		iwl_parse_shared_mem(fwrt, pkt);
++
++	IWL_DEBUG_INFO(fwrt, "SHARED MEM CFG: got memory offsets/sizes\n");
++
++	iwl_free_resp(&cmd);
++}
++IWL_EXPORT_SYMBOL(iwl_get_shared_mem_conf);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h b/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h
+index e1a29cde92d9..bfc865ad8904 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw-api.h
+@@ -2481,93 +2481,6 @@ struct iwl_tdls_config_res {
+ 	struct iwl_tdls_config_sta_info_res sta_info[IWL_MVM_TDLS_STA_COUNT];
+ } __packed; /* TDLS_CONFIG_RSP_API_S_VER_1 */
+ 
+-#define TX_FIFO_MAX_NUM_9000		8
+-#define TX_FIFO_MAX_NUM			15
+-#define RX_FIFO_MAX_NUM			2
+-#define TX_FIFO_INTERNAL_MAX_NUM	6
+-
+-/**
+- * struct iwl_shared_mem_cfg_v2 - Shared memory configuration information
+- *
+- * @shared_mem_addr: shared memory addr (pre 8000 HW set to 0x0 as MARBH is not
+- *	accessible)
+- * @shared_mem_size: shared memory size
+- * @sample_buff_addr: internal sample (mon/adc) buff addr (pre 8000 HW set to
+- *	0x0 as accessible only via DBGM RDAT)
+- * @sample_buff_size: internal sample buff size
+- * @txfifo_addr: start addr of TXF0 (excluding the context table 0.5KB), (pre
+- *	8000 HW set to 0x0 as not accessible)
+- * @txfifo_size: size of TXF0 ... TXF7
+- * @rxfifo_size: RXF1, RXF2 sizes. If there is no RXF2, it'll have a value of 0
+- * @page_buff_addr: used by UMAC and performance debug (page miss analysis),
+- *	when paging is not supported this should be 0
+- * @page_buff_size: size of %page_buff_addr
+- * @rxfifo_addr: Start address of rxFifo
+- * @internal_txfifo_addr: start address of internalFifo
+- * @internal_txfifo_size: internal fifos' size
+- *
+- * NOTE: on firmware that don't have IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG
+- *	 set, the last 3 members don't exist.
+- */
+-struct iwl_shared_mem_cfg_v2 {
+-	__le32 shared_mem_addr;
+-	__le32 shared_mem_size;
+-	__le32 sample_buff_addr;
+-	__le32 sample_buff_size;
+-	__le32 txfifo_addr;
+-	__le32 txfifo_size[TX_FIFO_MAX_NUM_9000];
+-	__le32 rxfifo_size[RX_FIFO_MAX_NUM];
+-	__le32 page_buff_addr;
+-	__le32 page_buff_size;
+-	__le32 rxfifo_addr;
+-	__le32 internal_txfifo_addr;
+-	__le32 internal_txfifo_size[TX_FIFO_INTERNAL_MAX_NUM];
+-} __packed; /* SHARED_MEM_ALLOC_API_S_VER_2 */
+-
+-/**
+- * struct iwl_shared_mem_lmac_cfg - LMAC shared memory configuration
+- *
+- * @txfifo_addr: start addr of TXF0 (excluding the context table 0.5KB)
+- * @txfifo_size: size of TX FIFOs
+- * @rxfifo1_addr: RXF1 addr
+- * @rxfifo1_size: RXF1 size
+- */
+-struct iwl_shared_mem_lmac_cfg {
+-	__le32 txfifo_addr;
+-	__le32 txfifo_size[TX_FIFO_MAX_NUM];
+-	__le32 rxfifo1_addr;
+-	__le32 rxfifo1_size;
+-
+-} __packed; /* SHARED_MEM_ALLOC_LMAC_API_S_VER_1 */
+-
+-/**
+- * struct iwl_shared_mem_cfg - Shared memory configuration information
+- *
+- * @shared_mem_addr: shared memory address
+- * @shared_mem_size: shared memory size
+- * @sample_buff_addr: internal sample (mon/adc) buff addr
+- * @sample_buff_size: internal sample buff size
+- * @rxfifo2_addr: start addr of RXF2
+- * @rxfifo2_size: size of RXF2
+- * @page_buff_addr: used by UMAC and performance debug (page miss analysis),
+- *	when paging is not supported this should be 0
+- * @page_buff_size: size of %page_buff_addr
+- * @lmac_num: number of LMACs (1 or 2)
+- * @lmac_smem: per - LMAC smem data
+- */
+-struct iwl_shared_mem_cfg {
+-	__le32 shared_mem_addr;
+-	__le32 shared_mem_size;
+-	__le32 sample_buff_addr;
+-	__le32 sample_buff_size;
+-	__le32 rxfifo2_addr;
+-	__le32 rxfifo2_size;
+-	__le32 page_buff_addr;
+-	__le32 page_buff_size;
+-	__le32 lmac_num;
+-	struct iwl_shared_mem_lmac_cfg lmac_smem[2];
+-} __packed; /* SHARED_MEM_ALLOC_API_S_VER_3 */
+-
+ /**
+  * struct iwl_mu_group_mgmt_cmd - VHT MU-MIMO group configuration
+  *
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c b/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+index ba32753fda5a..9d54005b6d50 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw-dbg.c
+@@ -212,7 +212,7 @@ static void iwl_mvm_dump_fifos(struct iwl_mvm *mvm,
+ 			       struct iwl_fw_error_dump_data **dump_data)
+ {
+ 	struct iwl_fw_error_dump_fifo *fifo_hdr;
+-	struct iwl_mvm_shared_mem_cfg *cfg = &mvm->smem_cfg;
++	struct iwl_fwrt_shared_mem_cfg *cfg = &mvm->fwrt.smem_cfg;
+ 	u32 *fifo_data;
+ 	u32 fifo_len;
+ 	unsigned long flags;
+@@ -227,12 +227,12 @@ static void iwl_mvm_dump_fifos(struct iwl_mvm *mvm,
+ 	iwl_mvm_dump_rxf(mvm, dump_data, cfg->rxfifo2_size,
+ 			 RXF_DIFF_FROM_PREV, 1);
+ 	/* Pull LMAC2 RXF1 */
+-	if (mvm->smem_cfg.num_lmacs > 1)
++	if (mvm->fwrt.smem_cfg.num_lmacs > 1)
+ 		iwl_mvm_dump_rxf(mvm, dump_data, cfg->lmac[1].rxfifo1_size,
+ 				 LMAC2_PRPH_OFFSET, 2);
+ 
+ 	/* Pull TXF data from LMAC1 */
+-	for (i = 0; i < mvm->smem_cfg.num_txfifo_entries; i++) {
++	for (i = 0; i < mvm->fwrt.smem_cfg.num_txfifo_entries; i++) {
+ 		/* Mark the number of TXF we're pulling now */
+ 		iwl_trans_write_prph(mvm->trans, TXF_LARC_NUM, i);
+ 		iwl_mvm_dump_txf(mvm, dump_data, cfg->lmac[0].txfifo_size[i],
+@@ -240,8 +240,8 @@ static void iwl_mvm_dump_fifos(struct iwl_mvm *mvm,
+ 	}
+ 
+ 	/* Pull TXF data from LMAC2 */
+-	if (mvm->smem_cfg.num_lmacs > 1) {
+-		for (i = 0; i < mvm->smem_cfg.num_txfifo_entries; i++) {
++	if (mvm->fwrt.smem_cfg.num_lmacs > 1) {
++		for (i = 0; i < mvm->fwrt.smem_cfg.num_txfifo_entries; i++) {
+ 			/* Mark the number of TXF we're pulling now */
+ 			iwl_trans_write_prph(mvm->trans,
+ 					     TXF_LARC_NUM + LMAC2_PRPH_OFFSET,
+@@ -257,11 +257,11 @@ static void iwl_mvm_dump_fifos(struct iwl_mvm *mvm,
+ 			IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG)) {
+ 		/* Pull UMAC internal TXF data from all TXFs */
+ 		for (i = 0;
+-		     i < ARRAY_SIZE(mvm->smem_cfg.internal_txfifo_size);
++		     i < ARRAY_SIZE(mvm->fwrt.smem_cfg.internal_txfifo_size);
+ 		     i++) {
+ 			fifo_hdr = (void *)(*dump_data)->data;
+ 			fifo_data = (void *)fifo_hdr->data;
+-			fifo_len = mvm->smem_cfg.internal_txfifo_size[i];
++			fifo_len = mvm->fwrt.smem_cfg.internal_txfifo_size[i];
+ 
+ 			/* No need to try to read the data if the length is 0 */
+ 			if (fifo_len == 0)
+@@ -277,7 +277,7 @@ static void iwl_mvm_dump_fifos(struct iwl_mvm *mvm,
+ 
+ 			/* Mark the number of TXF we're pulling now */
+ 			iwl_trans_write_prph(mvm->trans, TXF_CPU2_NUM, i +
+-				mvm->smem_cfg.num_txfifo_entries);
++				mvm->fwrt.smem_cfg.num_txfifo_entries);
+ 
+ 			fifo_hdr->available_bytes =
+ 				cpu_to_le32(iwl_trans_read_prph(mvm->trans,
+@@ -582,7 +582,7 @@ void iwl_mvm_fw_error_dump(struct iwl_mvm *mvm)
+ 
+ 	/* reading RXF/TXF sizes */
+ 	if (test_bit(STATUS_FW_ERROR, &mvm->trans->status)) {
+-		struct iwl_mvm_shared_mem_cfg *mem_cfg = &mvm->smem_cfg;
++		struct iwl_fwrt_shared_mem_cfg *mem_cfg = &mvm->fwrt.smem_cfg;
+ 
+ 		fifo_data_len = 0;
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/fw.c b/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+index 47715eec22e6..161b7452baa2 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/fw.c
+@@ -568,95 +568,6 @@ int iwl_run_init_mvm_ucode(struct iwl_mvm *mvm, bool read_nvm)
+ 	return ret;
+ }
+ 
+-static void iwl_mvm_parse_shared_mem_a000(struct iwl_mvm *mvm,
+-					  struct iwl_rx_packet *pkt)
+-{
+-	struct iwl_shared_mem_cfg *mem_cfg = (void *)pkt->data;
+-	int i, lmac;
+-	int lmac_num = le32_to_cpu(mem_cfg->lmac_num);
+-
+-	if (WARN_ON(lmac_num > ARRAY_SIZE(mem_cfg->lmac_smem)))
+-		return;
+-
+-	mvm->smem_cfg.num_lmacs = lmac_num;
+-	mvm->smem_cfg.num_txfifo_entries =
+-		ARRAY_SIZE(mem_cfg->lmac_smem[0].txfifo_size);
+-	mvm->smem_cfg.rxfifo2_size = le32_to_cpu(mem_cfg->rxfifo2_size);
+-
+-	for (lmac = 0; lmac < lmac_num; lmac++) {
+-		struct iwl_shared_mem_lmac_cfg *lmac_cfg =
+-			&mem_cfg->lmac_smem[lmac];
+-
+-		for (i = 0; i < ARRAY_SIZE(lmac_cfg->txfifo_size); i++)
+-			mvm->smem_cfg.lmac[lmac].txfifo_size[i] =
+-				le32_to_cpu(lmac_cfg->txfifo_size[i]);
+-		mvm->smem_cfg.lmac[lmac].rxfifo1_size =
+-			le32_to_cpu(lmac_cfg->rxfifo1_size);
+-	}
+-}
+-
+-static void iwl_mvm_parse_shared_mem(struct iwl_mvm *mvm,
+-				     struct iwl_rx_packet *pkt)
+-{
+-	struct iwl_shared_mem_cfg_v2 *mem_cfg = (void *)pkt->data;
+-	int i;
+-
+-	mvm->smem_cfg.num_lmacs = 1;
+-
+-	mvm->smem_cfg.num_txfifo_entries = ARRAY_SIZE(mem_cfg->txfifo_size);
+-	for (i = 0; i < ARRAY_SIZE(mem_cfg->txfifo_size); i++)
+-		mvm->smem_cfg.lmac[0].txfifo_size[i] =
+-			le32_to_cpu(mem_cfg->txfifo_size[i]);
+-
+-	mvm->smem_cfg.lmac[0].rxfifo1_size =
+-		le32_to_cpu(mem_cfg->rxfifo_size[0]);
+-	mvm->smem_cfg.rxfifo2_size = le32_to_cpu(mem_cfg->rxfifo_size[1]);
+-
+-	/* new API has more data, from rxfifo_addr field and on */
+-	if (fw_has_capa(&mvm->fw->ucode_capa,
+-			IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG)) {
+-		BUILD_BUG_ON(sizeof(mvm->smem_cfg.internal_txfifo_size) !=
+-			     sizeof(mem_cfg->internal_txfifo_size));
+-
+-		for (i = 0;
+-		     i < ARRAY_SIZE(mvm->smem_cfg.internal_txfifo_size);
+-		     i++)
+-			mvm->smem_cfg.internal_txfifo_size[i] =
+-				le32_to_cpu(mem_cfg->internal_txfifo_size[i]);
+-	}
+-}
+-
+-static void iwl_mvm_get_shared_mem_conf(struct iwl_mvm *mvm)
+-{
+-	struct iwl_host_cmd cmd = {
+-		.flags = CMD_WANT_SKB,
+-		.data = { NULL, },
+-		.len = { 0, },
+-	};
+-	struct iwl_rx_packet *pkt;
+-
+-	lockdep_assert_held(&mvm->mutex);
+-
+-	if (fw_has_capa(&mvm->fw->ucode_capa,
+-			IWL_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG))
+-		cmd.id = iwl_cmd_id(SHARED_MEM_CFG_CMD, SYSTEM_GROUP, 0);
+-	else
+-		cmd.id = SHARED_MEM_CFG;
+-
+-	if (WARN_ON(iwl_mvm_send_cmd(mvm, &cmd)))
+-		return;
+-
+-	pkt = cmd.resp_pkt;
+-	if (iwl_mvm_has_new_tx_api(mvm))
+-		iwl_mvm_parse_shared_mem_a000(mvm, pkt);
+-	else
+-		iwl_mvm_parse_shared_mem(mvm, pkt);
+-
+-	IWL_DEBUG_INFO(mvm, "SHARED MEM CFG: got memory offsets/sizes\n");
+-
+-	iwl_free_resp(&cmd);
+-}
+-
+ static int iwl_mvm_config_ltr(struct iwl_mvm *mvm)
+ {
+ 	struct iwl_ltr_config_cmd cmd = {
+@@ -1174,7 +1085,7 @@ int iwl_mvm_up(struct iwl_mvm *mvm)
+ 		goto error;
+ 	}
+ 
+-	iwl_mvm_get_shared_mem_conf(mvm);
++	iwl_get_shared_mem_conf(&mvm->fwrt);
+ 
+ 	ret = iwl_mvm_sf_update(mvm, NULL, false);
+ 	if (ret)
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index b482306f100d..ff1ef4b99453 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -607,19 +607,6 @@ enum iwl_mvm_tdls_cs_state {
+ 	IWL_MVM_TDLS_SW_ACTIVE,
+ };
+ 
+-#define MAX_NUM_LMAC 2
+-struct iwl_mvm_shared_mem_cfg {
+-	int num_lmacs;
+-	int num_txfifo_entries;
+-	struct {
+-		u32 txfifo_size[TX_FIFO_MAX_NUM];
+-		u32 rxfifo1_size;
+-	} lmac[MAX_NUM_LMAC];
+-	u32 rxfifo2_size;
+-	u32 internal_txfifo_addr;
+-	u32 internal_txfifo_size[TX_FIFO_INTERNAL_MAX_NUM];
+-};
+-
+ /**
+  * struct iwl_mvm_reorder_buffer - per ra/tid/queue reorder buffer
+  * @head_sn: reorder window head sn
+@@ -1053,7 +1040,6 @@ struct iwl_mvm {
+ 		} peer;
+ 	} tdls_cs;
+ 
+-	struct iwl_mvm_shared_mem_cfg smem_cfg;
+ 
+ 	u32 ciphers[IWL_MVM_NUM_CIPHERS];
+ 	struct ieee80211_cipher_scheme cs[IWL_UCODE_MAX_CS];
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+index 5fcc9dd6be56..b31362bc34fe 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+@@ -767,7 +767,8 @@ static int iwl_mvm_tx_tso(struct iwl_mvm *mvm, struct sk_buff *skb,
+ 	 * fifo to be able to send bursts.
+ 	 */
+ 	max_amsdu_len = min_t(unsigned int, max_amsdu_len,
+-			      mvm->smem_cfg.lmac[0].txfifo_size[txf] - 256);
++			      mvm->fwrt.smem_cfg.lmac[0].txfifo_size[txf] -
++			      256);
+ 
+ 	if (unlikely(dbg_max_amsdu_len))
+ 		max_amsdu_len = min_t(unsigned int, max_amsdu_len,
+-- 
+2.5.0
+
