@@ -1,0 +1,108 @@
+From 62245695f85365d7a1a61ad4755784eb30813bae Mon Sep 17 00:00:00 2001
+From: Zumeng Chen <zumeng.chen@windriver.com>
+Date: Wed, 18 Apr 2018 15:32:28 +0800
+Subject: [PATCH 2/3] spi: zynqmp-gqspi: fix jffs2 write issue
+
+This changes come from the Merge commits, and there is a related git comments
+from fef2cc45 as follows shown for spi-nor:
+ "When validating data integrity using jffs2 file system, if we
+ do write and erase in multiple iterations, we are getting SPI
+ timed out error. this patch fixes that."
+
+Unlucky, that commit is obsolete, anyway this patch should fix SPI_DATA_STRIPE
+issue, and it does actually.
+
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x01080004: 0x000c instead
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x01080010: 0x8015 instead
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x01080028: 0x5816 instead
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x0108002c: 0x40c6 instead
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x01080034: 0x0080 instead
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x01080044: 0xd240 instead
+jffs2: jffs2_scan_eraseblock(): Magic bitmask 0x1985 not found at 0x01080048: 0x1808 instead
+jffs2: Further such events for this erase block will not be printed
+jffs2: Old JFFS2 bitmask found at 0
+
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/spi/spi-zynqmp-gqspi.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/spi/spi-zynqmp-gqspi.c b/drivers/spi/spi-zynqmp-gqspi.c
+index 68e522b..fe1c4a7 100644
+--- a/drivers/spi/spi-zynqmp-gqspi.c
++++ b/drivers/spi/spi-zynqmp-gqspi.c
+@@ -177,6 +177,7 @@
+  * @dma_addr:		DMA address after mapping the kernel buffer
+  * @rx_bus_width:	Used to represent number of data wires
+  * @genfifoentry:	Used for storing the genfifoentry instruction.
++ * @isinstr:		To determine whether the transfer is instruction
+  * @mode:		Defines the mode in which QSPI is operating
+  * @speed_hz:		Current SPI bus clock speed in hz
+  * @io_mode:		Defines the operating mode, either IO or dma
+@@ -197,6 +198,7 @@ struct zynqmp_qspi {
+ 	dma_addr_t dma_addr;
+ 	u32 rx_bus_width;
+ 	u32 genfifoentry;
++	bool isinstr;
+ 	enum mode_type mode;
+ 	u32 speed_hz;
+ 	bool io_mode;
+@@ -461,11 +463,27 @@ static void zynqmp_qspi_chipselect(struct spi_device *qspi, bool is_high)
+ 	u32 genfifoentry = 0x0, statusreg;
+ 
+ 	genfifoentry |= GQSPI_GENFIFO_MODE_SPI;
++
++	if (qspi->master->flags & SPI_MASTER_BOTH_CS) {
++		zynqmp_gqspi_selectslave(xqspi,
++			GQSPI_SELECT_FLASH_CS_BOTH,
++			GQSPI_SELECT_FLASH_BUS_BOTH);
++	} else if (qspi->master->flags & SPI_MASTER_U_PAGE) {
++		zynqmp_gqspi_selectslave(xqspi,
++			GQSPI_SELECT_FLASH_CS_UPPER,
++			GQSPI_SELECT_FLASH_BUS_LOWER);
++	} else {
++		zynqmp_gqspi_selectslave(xqspi,
++			GQSPI_SELECT_FLASH_CS_LOWER,
++			GQSPI_SELECT_FLASH_BUS_LOWER);
++	}
++
+ 	genfifoentry |= xqspi->genfifobus;
+ 
+ 	if (!is_high) {
+ 		genfifoentry |= xqspi->genfifocs;
+ 		genfifoentry |= GQSPI_GENFIFO_CS_SETUP;
++		xqspi->isinstr = true;
+ 	} else {
+ 		genfifoentry |= GQSPI_GENFIFO_CS_HOLD;
+ 	}
+@@ -617,7 +635,7 @@ static void zynqmp_qspi_readrxfifo(struct zynqmp_qspi *xqspi, u32 size)
+ 	while ((count < size) && (xqspi->bytes_to_receive > 0)) {
+ 		if (xqspi->bytes_to_receive >= 4) {
+ 			(*(u32 *) xqspi->rxbuf) =
+-			zynqmp_gqspi_read(xqspi, GQSPI_RXD_OFST);
++				zynqmp_gqspi_read(xqspi, GQSPI_RXD_OFST);
+ 			xqspi->rxbuf += 4;
+ 			xqspi->bytes_to_receive -= 4;
+ 			count += 4;
+@@ -760,6 +778,7 @@ static irqreturn_t zynqmp_qspi_irq(int irq, void *dev_id)
+ 	if ((xqspi->bytes_to_receive == 0) && (xqspi->bytes_to_transfer == 0)
+ 			&& ((status & GQSPI_IRQ_MASK) == GQSPI_IRQ_MASK)) {
+ 		zynqmp_gqspi_write(xqspi, GQSPI_IDR_OFST, GQSPI_ISR_IDR_MASK);
++		xqspi->isinstr = false;
+ 		spi_finalize_current_transfer(master);
+ 		ret = IRQ_HANDLED;
+ 	}
+@@ -923,6 +942,10 @@ static int zynqmp_qspi_start_transfer(struct spi_master *master,
+ 	genfifoentry |= xqspi->genfifocs;
+ 	genfifoentry |= xqspi->genfifobus;
+ 
++	if ((!xqspi->isinstr) &&
++		(master->flags & SPI_MASTER_DATA_STRIPE))
++		genfifoentry |= GQSPI_GENFIFO_STRIPE;
++
+ 	zynqmp_qspi_txrxsetup(xqspi, transfer, &genfifoentry);
+ 
+ 	if (xqspi->mode == GQSPI_MODE_DMA)
+-- 
+1.8.5.2.233.g932f7e4
+
