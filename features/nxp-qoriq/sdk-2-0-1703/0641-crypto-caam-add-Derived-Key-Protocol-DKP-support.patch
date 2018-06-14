@@ -1,0 +1,929 @@
+From ae582705ee497cea71a5bbe27c332d9144967a09 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Horia=20Geant=C4=83?= <horia.geanta@nxp.com>
+Date: Tue, 7 Nov 2017 17:11:23 +0200
+Subject: [PATCH 641/666] crypto: caam - add Derived Key Protocol (DKP) support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit d21bcff981839ae7e8a1a506f68634bd1feffc94 from
+https://github.com/qoriq-open-source/linux.git
+
+Offload split key generation in CAAM engine, using DKP.
+DKP is supported starting with Era 6.
+
+Note that the way assoclen is transmitted from the job descriptor
+to the shared descriptor changes - DPOVRD register is used instead
+of MATH3 (where available), since DKP protocol thrashes the MATH
+registers.
+
+Signed-off-by: Horia Geantă <horia.geanta@nxp.com>
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/crypto/caam/caamalg.c      |  52 +++++++++--
+ drivers/crypto/caam/caamalg_desc.c | 176 ++++++++++++++++++++++---------------
+ drivers/crypto/caam/caamalg_desc.h |  10 +--
+ drivers/crypto/caam/caamalg_qi.c   |  31 ++++++-
+ drivers/crypto/caam/caamhash.c     |  56 ++++++++----
+ drivers/crypto/caam/desc.h         |  29 ++++++
+ drivers/crypto/caam/desc_constr.h  |  41 +++++++++
+ drivers/crypto/caam/key_gen.c      |  30 -------
+ drivers/crypto/caam/key_gen.h      |  30 +++++++
+ 9 files changed, 323 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/crypto/caam/caamalg.c b/drivers/crypto/caam/caamalg.c
+index 54f3b37..a63b1c3 100644
+--- a/drivers/crypto/caam/caamalg.c
++++ b/drivers/crypto/caam/caamalg.c
+@@ -118,6 +118,7 @@ static int aead_null_set_sh_desc(struct crypto_aead *aead)
+ {
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	struct device *jrdev = ctx->jrdev;
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(jrdev->parent);
+ 	u32 *desc;
+ 	int rem_bytes = CAAM_DESC_BYTES_MAX - AEAD_DESC_JOB_IO_LEN -
+ 			ctx->adata.keylen_pad;
+@@ -136,7 +137,8 @@ static int aead_null_set_sh_desc(struct crypto_aead *aead)
+ 
+ 	/* aead_encrypt shared descriptor */
+ 	desc = ctx->sh_desc_enc;
+-	cnstr_shdsc_aead_null_encap(desc, &ctx->adata, ctx->authsize);
++	cnstr_shdsc_aead_null_encap(desc, &ctx->adata, ctx->authsize,
++				    ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_enc_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ 
+@@ -154,7 +156,8 @@ static int aead_null_set_sh_desc(struct crypto_aead *aead)
+ 
+ 	/* aead_decrypt shared descriptor */
+ 	desc = ctx->sh_desc_dec;
+-	cnstr_shdsc_aead_null_decap(desc, &ctx->adata, ctx->authsize);
++	cnstr_shdsc_aead_null_decap(desc, &ctx->adata, ctx->authsize,
++				    ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_dec_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ 
+@@ -168,6 +171,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 	unsigned int ivsize = crypto_aead_ivsize(aead);
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	struct device *jrdev = ctx->jrdev;
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(jrdev->parent);
+ 	u32 ctx1_iv_off = 0;
+ 	u32 *desc, *nonce = NULL;
+ 	u32 inl_mask;
+@@ -234,7 +238,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 	desc = ctx->sh_desc_enc;
+ 	cnstr_shdsc_aead_encap(desc, &ctx->cdata, &ctx->adata, ivsize,
+ 			       ctx->authsize, is_rfc3686, nonce, ctx1_iv_off,
+-			       false);
++			       false, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_enc_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ 
+@@ -266,7 +270,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 	desc = ctx->sh_desc_dec;
+ 	cnstr_shdsc_aead_decap(desc, &ctx->cdata, &ctx->adata, ivsize,
+ 			       ctx->authsize, alg->caam.geniv, is_rfc3686,
+-			       nonce, ctx1_iv_off, false);
++			       nonce, ctx1_iv_off, false, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_dec_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ 
+@@ -300,7 +304,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 	desc = ctx->sh_desc_enc;
+ 	cnstr_shdsc_aead_givencap(desc, &ctx->cdata, &ctx->adata, ivsize,
+ 				  ctx->authsize, is_rfc3686, nonce,
+-				  ctx1_iv_off, false);
++				  ctx1_iv_off, false, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_enc_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ 
+@@ -503,6 +507,7 @@ static int aead_setkey(struct crypto_aead *aead,
+ {
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	struct device *jrdev = ctx->jrdev;
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(jrdev->parent);
+ 	struct crypto_authenc_keys keys;
+ 	int ret = 0;
+ 
+@@ -517,6 +522,27 @@ static int aead_setkey(struct crypto_aead *aead,
+ 		       DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
+ #endif
+ 
++	/*
++	 * If DKP is supported, use it in the shared descriptor to generate
++	 * the split key.
++	 */
++	if (ctrlpriv->era >= 6) {
++		ctx->adata.keylen = keys.authkeylen;
++		ctx->adata.keylen_pad = split_key_len(ctx->adata.algtype &
++						      OP_ALG_ALGSEL_MASK);
++
++		if (ctx->adata.keylen_pad + keys.enckeylen > CAAM_MAX_KEY_SIZE)
++			goto badkey;
++
++		memcpy(ctx->key, keys.authkey, keys.authkeylen);
++		memcpy(ctx->key + ctx->adata.keylen_pad, keys.enckey,
++		       keys.enckeylen);
++		dma_sync_single_for_device(jrdev, ctx->key_dma,
++					   ctx->adata.keylen_pad +
++					   keys.enckeylen, DMA_TO_DEVICE);
++		goto skip_split_key;
++	}
++
+ 	ret = gen_split_key(ctx->jrdev, ctx->key, &ctx->adata, keys.authkey,
+ 			    keys.authkeylen, CAAM_MAX_KEY_SIZE -
+ 			    keys.enckeylen);
+@@ -533,6 +559,8 @@ static int aead_setkey(struct crypto_aead *aead,
+ 		       DUMP_PREFIX_ADDRESS, 16, 4, ctx->key,
+ 		       ctx->adata.keylen_pad + keys.enckeylen, 1);
+ #endif
++
++skip_split_key:
+ 	ctx->cdata.keylen = keys.enckeylen;
+ 	return aead_set_sh_desc(aead);
+ badkey:
+@@ -979,9 +1007,6 @@ static void init_aead_job(struct aead_request *req,
+ 		append_seq_out_ptr(desc, dst_dma,
+ 				   req->assoclen + req->cryptlen - authsize,
+ 				   out_options);
+-
+-	/* REG3 = assoclen */
+-	append_math_add_imm_u32(desc, REG3, ZERO, IMM, req->assoclen);
+ }
+ 
+ static void init_gcm_job(struct aead_request *req,
+@@ -996,6 +1021,7 @@ static void init_gcm_job(struct aead_request *req,
+ 	unsigned int last;
+ 
+ 	init_aead_job(req, edesc, all_contig, encrypt);
++	append_math_add_imm_u32(desc, REG3, ZERO, IMM, req->assoclen);
+ 
+ 	/* BUG This should not be specific to generic GCM. */
+ 	last = 0;
+@@ -1022,6 +1048,7 @@ static void init_authenc_job(struct aead_request *req,
+ 						 struct caam_aead_alg, aead);
+ 	unsigned int ivsize = crypto_aead_ivsize(aead);
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(ctx->jrdev->parent);
+ 	const bool ctr_mode = ((ctx->cdata.algtype & OP_ALG_AAI_MASK) ==
+ 			       OP_ALG_AAI_CTR_MOD128);
+ 	const bool is_rfc3686 = alg->caam.rfc3686;
+@@ -1045,6 +1072,15 @@ static void init_authenc_job(struct aead_request *req,
+ 
+ 	init_aead_job(req, edesc, all_contig, encrypt);
+ 
++	/*
++	 * {REG3, DPOVRD} = assoclen, depending on whether MATH command supports
++	 * having DPOVRD as destination.
++	 */
++	if (ctrlpriv->era < 3)
++		append_math_add_imm_u32(desc, REG3, ZERO, IMM, req->assoclen);
++	else
++		append_math_add_imm_u32(desc, DPOVRD, ZERO, IMM, req->assoclen);
++
+ 	if (ivsize && ((is_rfc3686 && encrypt) || !alg->caam.geniv))
+ 		append_load_as_imm(desc, req->iv, ivsize,
+ 				   LDST_CLASS_1_CCB |
+diff --git a/drivers/crypto/caam/caamalg_desc.c b/drivers/crypto/caam/caamalg_desc.c
+index 530c14e..a0a1b3a 100644
+--- a/drivers/crypto/caam/caamalg_desc.c
++++ b/drivers/crypto/caam/caamalg_desc.c
+@@ -45,16 +45,16 @@ static inline void append_dec_op1(u32 *desc, u32 type)
+  * cnstr_shdsc_aead_null_encap - IPSec ESP encapsulation shared descriptor
+  *                               (non-protocol) with no (null) encryption.
+  * @desc: pointer to buffer used for descriptor construction
+- * @adata: pointer to authentication transform definitions. Note that since a
+- *         split key is to be used, the size of the split key itself is
+- *         specified. Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1,
+- *         SHA224, SHA256, SHA384, SHA512} ANDed with OP_ALG_AAI_HMAC_PRECOMP.
++ * @adata: pointer to authentication transform definitions.
++ *         A split key is required for SEC Era < 6; the size of the split key
++ *         is specified in this case. Valid algorithm values - one of
++ *         OP_ALG_ALGSEL_{MD5, SHA1, SHA224, SHA256, SHA384, SHA512} ANDed
++ *         with OP_ALG_AAI_HMAC_PRECOMP.
+  * @icvsize: integrity check value (ICV) size (truncated or full)
+- *
+- * Note: Requires an MDHA split key.
++ * @era: SEC Era
+  */
+ void cnstr_shdsc_aead_null_encap(u32 * const desc, struct alginfo *adata,
+-				 unsigned int icvsize)
++				 unsigned int icvsize, int era)
+ {
+ 	u32 *key_jump_cmd, *read_move_cmd, *write_move_cmd;
+ 
+@@ -63,13 +63,18 @@ void cnstr_shdsc_aead_null_encap(u32 * const desc, struct alginfo *adata,
+ 	/* Skip if already shared */
+ 	key_jump_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
+ 				   JUMP_COND_SHRD);
+-	if (adata->key_inline)
+-		append_key_as_imm(desc, adata->key_virt, adata->keylen_pad,
+-				  adata->keylen, CLASS_2 | KEY_DEST_MDHA_SPLIT |
+-				  KEY_ENC);
+-	else
+-		append_key(desc, adata->key_dma, adata->keylen, CLASS_2 |
+-			   KEY_DEST_MDHA_SPLIT | KEY_ENC);
++	if (era < 6) {
++		if (adata->key_inline)
++			append_key_as_imm(desc, adata->key_virt,
++					  adata->keylen_pad, adata->keylen,
++					  CLASS_2 | KEY_DEST_MDHA_SPLIT |
++					  KEY_ENC);
++		else
++			append_key(desc, adata->key_dma, adata->keylen,
++				   CLASS_2 | KEY_DEST_MDHA_SPLIT | KEY_ENC);
++	} else {
++		append_proto_dkp(desc, adata);
++	}
+ 	set_jump_tgt_here(desc, key_jump_cmd);
+ 
+ 	/* assoclen + cryptlen = seqinlen */
+@@ -121,16 +126,16 @@ EXPORT_SYMBOL(cnstr_shdsc_aead_null_encap);
+  * cnstr_shdsc_aead_null_decap - IPSec ESP decapsulation shared descriptor
+  *                               (non-protocol) with no (null) decryption.
+  * @desc: pointer to buffer used for descriptor construction
+- * @adata: pointer to authentication transform definitions. Note that since a
+- *         split key is to be used, the size of the split key itself is
+- *         specified. Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1,
+- *         SHA224, SHA256, SHA384, SHA512} ANDed with OP_ALG_AAI_HMAC_PRECOMP.
++ * @adata: pointer to authentication transform definitions.
++ *         A split key is required for SEC Era < 6; the size of the split key
++ *         is specified in this case. Valid algorithm values - one of
++ *         OP_ALG_ALGSEL_{MD5, SHA1, SHA224, SHA256, SHA384, SHA512} ANDed
++ *         with OP_ALG_AAI_HMAC_PRECOMP.
+  * @icvsize: integrity check value (ICV) size (truncated or full)
+- *
+- * Note: Requires an MDHA split key.
++ * @era: SEC Era
+  */
+ void cnstr_shdsc_aead_null_decap(u32 * const desc, struct alginfo *adata,
+-				 unsigned int icvsize)
++				 unsigned int icvsize, int era)
+ {
+ 	u32 *key_jump_cmd, *read_move_cmd, *write_move_cmd, *jump_cmd;
+ 
+@@ -139,13 +144,18 @@ void cnstr_shdsc_aead_null_decap(u32 * const desc, struct alginfo *adata,
+ 	/* Skip if already shared */
+ 	key_jump_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
+ 				   JUMP_COND_SHRD);
+-	if (adata->key_inline)
+-		append_key_as_imm(desc, adata->key_virt, adata->keylen_pad,
+-				  adata->keylen, CLASS_2 |
+-				  KEY_DEST_MDHA_SPLIT | KEY_ENC);
+-	else
+-		append_key(desc, adata->key_dma, adata->keylen, CLASS_2 |
+-			   KEY_DEST_MDHA_SPLIT | KEY_ENC);
++	if (era < 6) {
++		if (adata->key_inline)
++			append_key_as_imm(desc, adata->key_virt,
++					  adata->keylen_pad, adata->keylen,
++					  CLASS_2 | KEY_DEST_MDHA_SPLIT |
++					  KEY_ENC);
++		else
++			append_key(desc, adata->key_dma, adata->keylen,
++				   CLASS_2 | KEY_DEST_MDHA_SPLIT | KEY_ENC);
++	} else {
++		append_proto_dkp(desc, adata);
++	}
+ 	set_jump_tgt_here(desc, key_jump_cmd);
+ 
+ 	/* Class 2 operation */
+@@ -204,7 +214,7 @@ EXPORT_SYMBOL(cnstr_shdsc_aead_null_decap);
+ static void init_sh_desc_key_aead(u32 * const desc,
+ 				  struct alginfo * const cdata,
+ 				  struct alginfo * const adata,
+-				  const bool is_rfc3686, u32 *nonce)
++				  const bool is_rfc3686, u32 *nonce, int era)
+ {
+ 	u32 *key_jump_cmd;
+ 	unsigned int enckeylen = cdata->keylen;
+@@ -224,13 +234,18 @@ static void init_sh_desc_key_aead(u32 * const desc,
+ 	if (is_rfc3686)
+ 		enckeylen -= CTR_RFC3686_NONCE_SIZE;
+ 
+-	if (adata->key_inline)
+-		append_key_as_imm(desc, adata->key_virt, adata->keylen_pad,
+-				  adata->keylen, CLASS_2 |
+-				  KEY_DEST_MDHA_SPLIT | KEY_ENC);
+-	else
+-		append_key(desc, adata->key_dma, adata->keylen, CLASS_2 |
+-			   KEY_DEST_MDHA_SPLIT | KEY_ENC);
++	if (era < 6) {
++		if (adata->key_inline)
++			append_key_as_imm(desc, adata->key_virt,
++					  adata->keylen_pad, adata->keylen,
++					  CLASS_2 | KEY_DEST_MDHA_SPLIT |
++					  KEY_ENC);
++		else
++			append_key(desc, adata->key_dma, adata->keylen,
++				   CLASS_2 | KEY_DEST_MDHA_SPLIT | KEY_ENC);
++	} else {
++		append_proto_dkp(desc, adata);
++	}
+ 
+ 	if (cdata->key_inline)
+ 		append_key_as_imm(desc, cdata->key_virt, enckeylen,
+@@ -261,26 +276,27 @@ static void init_sh_desc_key_aead(u32 * const desc,
+  * @cdata: pointer to block cipher transform definitions
+  *         Valid algorithm values - one of OP_ALG_ALGSEL_{AES, DES, 3DES} ANDed
+  *         with OP_ALG_AAI_CBC or OP_ALG_AAI_CTR_MOD128.
+- * @adata: pointer to authentication transform definitions. Note that since a
+- *         split key is to be used, the size of the split key itself is
+- *         specified. Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1,
+- *         SHA224, SHA256, SHA384, SHA512} ANDed with OP_ALG_AAI_HMAC_PRECOMP.
++ * @adata: pointer to authentication transform definitions.
++ *         A split key is required for SEC Era < 6; the size of the split key
++ *         is specified in this case. Valid algorithm values - one of
++ *         OP_ALG_ALGSEL_{MD5, SHA1, SHA224, SHA256, SHA384, SHA512} ANDed
++ *         with OP_ALG_AAI_HMAC_PRECOMP.
+  * @ivsize: initialization vector size
+  * @icvsize: integrity check value (ICV) size (truncated or full)
+  * @is_rfc3686: true when ctr(aes) is wrapped by rfc3686 template
+  * @nonce: pointer to rfc3686 nonce
+  * @ctx1_iv_off: IV offset in CONTEXT1 register
+  * @is_qi: true when called from caam/qi
+- *
+- * Note: Requires an MDHA split key.
++ * @era: SEC Era
+  */
+ void cnstr_shdsc_aead_encap(u32 * const desc, struct alginfo *cdata,
+ 			    struct alginfo *adata, unsigned int ivsize,
+ 			    unsigned int icvsize, const bool is_rfc3686,
+-			    u32 *nonce, const u32 ctx1_iv_off, const bool is_qi)
++			    u32 *nonce, const u32 ctx1_iv_off, const bool is_qi,
++			    int era)
+ {
+ 	/* Note: Context registers are saved. */
+-	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce);
++	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce, era);
+ 
+ 	/* Class 2 operation */
+ 	append_operation(desc, adata->algtype | OP_ALG_AS_INITFINAL |
+@@ -306,8 +322,13 @@ void cnstr_shdsc_aead_encap(u32 * const desc, struct alginfo *cdata,
+ 	}
+ 
+ 	/* Read and write assoclen bytes */
+-	append_math_add(desc, VARSEQINLEN, ZERO, REG3, CAAM_CMD_SZ);
+-	append_math_add(desc, VARSEQOUTLEN, ZERO, REG3, CAAM_CMD_SZ);
++	if (is_qi || era < 3) {
++		append_math_add(desc, VARSEQINLEN, ZERO, REG3, CAAM_CMD_SZ);
++		append_math_add(desc, VARSEQOUTLEN, ZERO, REG3, CAAM_CMD_SZ);
++	} else {
++		append_math_add(desc, VARSEQINLEN, ZERO, DPOVRD, CAAM_CMD_SZ);
++		append_math_add(desc, VARSEQOUTLEN, ZERO, DPOVRD, CAAM_CMD_SZ);
++	}
+ 
+ 	/* Skip assoc data */
+ 	append_seq_fifo_store(desc, 0, FIFOST_TYPE_SKIP | FIFOLDST_VLF);
+@@ -350,27 +371,27 @@ EXPORT_SYMBOL(cnstr_shdsc_aead_encap);
+  * @cdata: pointer to block cipher transform definitions
+  *         Valid algorithm values - one of OP_ALG_ALGSEL_{AES, DES, 3DES} ANDed
+  *         with OP_ALG_AAI_CBC or OP_ALG_AAI_CTR_MOD128.
+- * @adata: pointer to authentication transform definitions. Note that since a
+- *         split key is to be used, the size of the split key itself is
+- *         specified. Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1,
+- *         SHA224, SHA256, SHA384, SHA512} ANDed with OP_ALG_AAI_HMAC_PRECOMP.
++ * @adata: pointer to authentication transform definitions.
++ *         A split key is required for SEC Era < 6; the size of the split key
++ *         is specified in this case. Valid algorithm values - one of
++ *         OP_ALG_ALGSEL_{MD5, SHA1, SHA224, SHA256, SHA384, SHA512} ANDed
++ *         with OP_ALG_AAI_HMAC_PRECOMP.
+  * @ivsize: initialization vector size
+  * @icvsize: integrity check value (ICV) size (truncated or full)
+  * @is_rfc3686: true when ctr(aes) is wrapped by rfc3686 template
+  * @nonce: pointer to rfc3686 nonce
+  * @ctx1_iv_off: IV offset in CONTEXT1 register
+  * @is_qi: true when called from caam/qi
+- *
+- * Note: Requires an MDHA split key.
++ * @era: SEC Era
+  */
+ void cnstr_shdsc_aead_decap(u32 * const desc, struct alginfo *cdata,
+ 			    struct alginfo *adata, unsigned int ivsize,
+ 			    unsigned int icvsize, const bool geniv,
+ 			    const bool is_rfc3686, u32 *nonce,
+-			    const u32 ctx1_iv_off, const bool is_qi)
++			    const u32 ctx1_iv_off, const bool is_qi, int era)
+ {
+ 	/* Note: Context registers are saved. */
+-	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce);
++	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce, era);
+ 
+ 	/* Class 2 operation */
+ 	append_operation(desc, adata->algtype | OP_ALG_AS_INITFINAL |
+@@ -397,11 +418,23 @@ void cnstr_shdsc_aead_decap(u32 * const desc, struct alginfo *cdata,
+ 	}
+ 
+ 	/* Read and write assoclen bytes */
+-	append_math_add(desc, VARSEQINLEN, ZERO, REG3, CAAM_CMD_SZ);
+-	if (geniv)
+-		append_math_add_imm_u32(desc, VARSEQOUTLEN, REG3, IMM, ivsize);
+-	else
+-		append_math_add(desc, VARSEQOUTLEN, ZERO, REG3, CAAM_CMD_SZ);
++	if (is_qi || era < 3) {
++		append_math_add(desc, VARSEQINLEN, ZERO, REG3, CAAM_CMD_SZ);
++		if (geniv)
++			append_math_add_imm_u32(desc, VARSEQOUTLEN, REG3, IMM,
++						ivsize);
++		else
++			append_math_add(desc, VARSEQOUTLEN, ZERO, REG3,
++					CAAM_CMD_SZ);
++	} else {
++		append_math_add(desc, VARSEQINLEN, ZERO, DPOVRD, CAAM_CMD_SZ);
++		if (geniv)
++			append_math_add_imm_u32(desc, VARSEQOUTLEN, DPOVRD, IMM,
++						ivsize);
++		else
++			append_math_add(desc, VARSEQOUTLEN, ZERO, DPOVRD,
++					CAAM_CMD_SZ);
++	}
+ 
+ 	/* Skip assoc data */
+ 	append_seq_fifo_store(desc, 0, FIFOST_TYPE_SKIP | FIFOLDST_VLF);
+@@ -456,29 +489,29 @@ EXPORT_SYMBOL(cnstr_shdsc_aead_decap);
+  * @cdata: pointer to block cipher transform definitions
+  *         Valid algorithm values - one of OP_ALG_ALGSEL_{AES, DES, 3DES} ANDed
+  *         with OP_ALG_AAI_CBC or OP_ALG_AAI_CTR_MOD128.
+- * @adata: pointer to authentication transform definitions. Note that since a
+- *         split key is to be used, the size of the split key itself is
+- *         specified. Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1,
+- *         SHA224, SHA256, SHA384, SHA512} ANDed with OP_ALG_AAI_HMAC_PRECOMP.
++ * @adata: pointer to authentication transform definitions.
++ *         A split key is required for SEC Era < 6; the size of the split key
++ *         is specified in this case. Valid algorithm values - one of
++ *         OP_ALG_ALGSEL_{MD5, SHA1, SHA224, SHA256, SHA384, SHA512} ANDed
++ *         with OP_ALG_AAI_HMAC_PRECOMP.
+  * @ivsize: initialization vector size
+  * @icvsize: integrity check value (ICV) size (truncated or full)
+  * @is_rfc3686: true when ctr(aes) is wrapped by rfc3686 template
+  * @nonce: pointer to rfc3686 nonce
+  * @ctx1_iv_off: IV offset in CONTEXT1 register
+  * @is_qi: true when called from caam/qi
+- *
+- * Note: Requires an MDHA split key.
++ * @era: SEC Era
+  */
+ void cnstr_shdsc_aead_givencap(u32 * const desc, struct alginfo *cdata,
+ 			       struct alginfo *adata, unsigned int ivsize,
+ 			       unsigned int icvsize, const bool is_rfc3686,
+ 			       u32 *nonce, const u32 ctx1_iv_off,
+-			       const bool is_qi)
++			       const bool is_qi, int era)
+ {
+ 	u32 geniv, moveiv;
+ 
+ 	/* Note: Context registers are saved. */
+-	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce);
++	init_sh_desc_key_aead(desc, cdata, adata, is_rfc3686, nonce, era);
+ 
+ 	if (is_qi) {
+ 		u32 *wait_load_cmd;
+@@ -528,8 +561,13 @@ void cnstr_shdsc_aead_givencap(u32 * const desc, struct alginfo *cdata,
+ 			 OP_ALG_ENCRYPT);
+ 
+ 	/* Read and write assoclen bytes */
+-	append_math_add(desc, VARSEQINLEN, ZERO, REG3, CAAM_CMD_SZ);
+-	append_math_add(desc, VARSEQOUTLEN, ZERO, REG3, CAAM_CMD_SZ);
++	if (is_qi || era < 3) {
++		append_math_add(desc, VARSEQINLEN, ZERO, REG3, CAAM_CMD_SZ);
++		append_math_add(desc, VARSEQOUTLEN, ZERO, REG3, CAAM_CMD_SZ);
++	} else {
++		append_math_add(desc, VARSEQINLEN, ZERO, DPOVRD, CAAM_CMD_SZ);
++		append_math_add(desc, VARSEQOUTLEN, ZERO, DPOVRD, CAAM_CMD_SZ);
++	}
+ 
+ 	/* Skip assoc data */
+ 	append_seq_fifo_store(desc, 0, FIFOST_TYPE_SKIP | FIFOLDST_VLF);
+diff --git a/drivers/crypto/caam/caamalg_desc.h b/drivers/crypto/caam/caamalg_desc.h
+index 8731e4a..d1018e2 100644
+--- a/drivers/crypto/caam/caamalg_desc.h
++++ b/drivers/crypto/caam/caamalg_desc.h
+@@ -42,28 +42,28 @@
+ 					 15 * CAAM_CMD_SZ)
+ 
+ void cnstr_shdsc_aead_null_encap(u32 * const desc, struct alginfo *adata,
+-				 unsigned int icvsize);
++				 unsigned int icvsize, int era);
+ 
+ void cnstr_shdsc_aead_null_decap(u32 * const desc, struct alginfo *adata,
+-				 unsigned int icvsize);
++				 unsigned int icvsize, int era);
+ 
+ void cnstr_shdsc_aead_encap(u32 * const desc, struct alginfo *cdata,
+ 			    struct alginfo *adata, unsigned int ivsize,
+ 			    unsigned int icvsize, const bool is_rfc3686,
+ 			    u32 *nonce, const u32 ctx1_iv_off,
+-			    const bool is_qi);
++			    const bool is_qi, int era);
+ 
+ void cnstr_shdsc_aead_decap(u32 * const desc, struct alginfo *cdata,
+ 			    struct alginfo *adata, unsigned int ivsize,
+ 			    unsigned int icvsize, const bool geniv,
+ 			    const bool is_rfc3686, u32 *nonce,
+-			    const u32 ctx1_iv_off, const bool is_qi);
++			    const u32 ctx1_iv_off, const bool is_qi, int era);
+ 
+ void cnstr_shdsc_aead_givencap(u32 * const desc, struct alginfo *cdata,
+ 			       struct alginfo *adata, unsigned int ivsize,
+ 			       unsigned int icvsize, const bool is_rfc3686,
+ 			       u32 *nonce, const u32 ctx1_iv_off,
+-			       const bool is_qi);
++			       const bool is_qi, int era);
+ 
+ void cnstr_shdsc_gcm_encap(u32 * const desc, struct alginfo *cdata,
+ 			   unsigned int icvsize);
+diff --git a/drivers/crypto/caam/caamalg_qi.c b/drivers/crypto/caam/caamalg_qi.c
+index f9f08fc..6b28ced 100644
+--- a/drivers/crypto/caam/caamalg_qi.c
++++ b/drivers/crypto/caam/caamalg_qi.c
+@@ -74,6 +74,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 	const bool ctr_mode = ((ctx->cdata.algtype & OP_ALG_AAI_MASK) ==
+ 			       OP_ALG_AAI_CTR_MOD128);
+ 	const bool is_rfc3686 = alg->caam.rfc3686;
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(ctx->jrdev->parent);
+ 
+ 	if (!ctx->cdata.keylen || !ctx->authsize)
+ 		return 0;
+@@ -124,7 +125,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 
+ 	cnstr_shdsc_aead_encap(ctx->sh_desc_enc, &ctx->cdata, &ctx->adata,
+ 			       ivsize, ctx->authsize, is_rfc3686, nonce,
+-			       ctx1_iv_off, true);
++			       ctx1_iv_off, true, ctrlpriv->era);
+ 
+ skip_enc:
+ 	/* aead_decrypt shared descriptor */
+@@ -149,7 +150,8 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 
+ 	cnstr_shdsc_aead_decap(ctx->sh_desc_dec, &ctx->cdata, &ctx->adata,
+ 			       ivsize, ctx->authsize, alg->caam.geniv,
+-			       is_rfc3686, nonce, ctx1_iv_off, true);
++			       is_rfc3686, nonce, ctx1_iv_off, true,
++			       ctrlpriv->era);
+ 
+ 	if (!alg->caam.geniv)
+ 		goto skip_givenc;
+@@ -176,7 +178,7 @@ static int aead_set_sh_desc(struct crypto_aead *aead)
+ 
+ 	cnstr_shdsc_aead_givencap(ctx->sh_desc_enc, &ctx->cdata, &ctx->adata,
+ 				  ivsize, ctx->authsize, is_rfc3686, nonce,
+-				  ctx1_iv_off, true);
++				  ctx1_iv_off, true, ctrlpriv->era);
+ 
+ skip_givenc:
+ 	return 0;
+@@ -197,6 +199,7 @@ static int aead_setkey(struct crypto_aead *aead, const u8 *key,
+ {
+ 	struct caam_ctx *ctx = crypto_aead_ctx(aead);
+ 	struct device *jrdev = ctx->jrdev;
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(jrdev->parent);
+ 	struct crypto_authenc_keys keys;
+ 	int ret = 0;
+ 
+@@ -211,6 +214,27 @@ static int aead_setkey(struct crypto_aead *aead, const u8 *key,
+ 		       DUMP_PREFIX_ADDRESS, 16, 4, key, keylen, 1);
+ #endif
+ 
++	/*
++	 * If DKP is supported, use it in the shared descriptor to generate
++	 * the split key.
++	 */
++	if (ctrlpriv->era >= 6) {
++		ctx->adata.keylen = keys.authkeylen;
++		ctx->adata.keylen_pad = split_key_len(ctx->adata.algtype &
++						      OP_ALG_ALGSEL_MASK);
++
++		if (ctx->adata.keylen_pad + keys.enckeylen > CAAM_MAX_KEY_SIZE)
++			goto badkey;
++
++		memcpy(ctx->key, keys.authkey, keys.authkeylen);
++		memcpy(ctx->key + ctx->adata.keylen_pad, keys.enckey,
++		       keys.enckeylen);
++		dma_sync_single_for_device(jrdev, ctx->key_dma,
++					   ctx->adata.keylen_pad +
++					   keys.enckeylen, DMA_TO_DEVICE);
++		goto skip_split_key;
++	}
++
+ 	ret = gen_split_key(jrdev, ctx->key, &ctx->adata, keys.authkey,
+ 			    keys.authkeylen, CAAM_MAX_KEY_SIZE -
+ 			    keys.enckeylen);
+@@ -227,6 +251,7 @@ static int aead_setkey(struct crypto_aead *aead, const u8 *key,
+ 		       ctx->adata.keylen_pad + keys.enckeylen, 1);
+ #endif
+ 
++skip_split_key:
+ 	ctx->cdata.keylen = keys.enckeylen;
+ 
+ 	ret = aead_set_sh_desc(aead);
+diff --git a/drivers/crypto/caam/caamhash.c b/drivers/crypto/caam/caamhash.c
+index 616720a..877446c 100644
+--- a/drivers/crypto/caam/caamhash.c
++++ b/drivers/crypto/caam/caamhash.c
+@@ -241,7 +241,8 @@ static inline int ctx_map_to_sec4_sg(struct device *jrdev,
+  *     read and write to seqout
+  */
+ static inline void ahash_gen_sh_desc(u32 *desc, u32 state, int digestsize,
+-				     struct caam_hash_ctx *ctx, bool import_ctx)
++				     struct caam_hash_ctx *ctx, bool import_ctx,
++				     int era)
+ {
+ 	u32 op = ctx->adata.algtype;
+ 	u32 *skip_key_load;
+@@ -254,9 +255,12 @@ static inline void ahash_gen_sh_desc(u32 *desc, u32 state, int digestsize,
+ 		skip_key_load = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
+ 					    JUMP_COND_SHRD);
+ 
+-		append_key_as_imm(desc, ctx->key, ctx->adata.keylen_pad,
+-				  ctx->adata.keylen, CLASS_2 |
+-				  KEY_DEST_MDHA_SPLIT | KEY_ENC);
++		if (era < 6)
++			append_key_as_imm(desc, ctx->key, ctx->adata.keylen_pad,
++					  ctx->adata.keylen, CLASS_2 |
++					  KEY_DEST_MDHA_SPLIT | KEY_ENC);
++		else
++			append_proto_dkp(desc, &ctx->adata);
+ 
+ 		set_jump_tgt_here(desc, skip_key_load);
+ 
+@@ -289,11 +293,15 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 	struct caam_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+ 	int digestsize = crypto_ahash_digestsize(ahash);
+ 	struct device *jrdev = ctx->jrdev;
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(jrdev->parent);
+ 	u32 *desc;
+ 
++	ctx->adata.key_virt = ctx->key;
++
+ 	/* ahash_update shared descriptor */
+ 	desc = ctx->sh_desc_update;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_UPDATE, ctx->ctx_len, ctx, true);
++	ahash_gen_sh_desc(desc, OP_ALG_AS_UPDATE, ctx->ctx_len, ctx, true,
++			  ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_update_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ #ifdef DEBUG
+@@ -304,7 +312,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_update_first shared descriptor */
+ 	desc = ctx->sh_desc_update_first;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_INIT, ctx->ctx_len, ctx, false);
++	ahash_gen_sh_desc(desc, OP_ALG_AS_INIT, ctx->ctx_len, ctx, false,
++			  ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_update_first_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ #ifdef DEBUG
+@@ -315,7 +324,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_final shared descriptor */
+ 	desc = ctx->sh_desc_fin;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_FINALIZE, digestsize, ctx, true);
++	ahash_gen_sh_desc(desc, OP_ALG_AS_FINALIZE, digestsize, ctx, true,
++			  ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_fin_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ #ifdef DEBUG
+@@ -326,7 +336,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_digest shared descriptor */
+ 	desc = ctx->sh_desc_digest;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_INITFINAL, digestsize, ctx, false);
++	ahash_gen_sh_desc(desc, OP_ALG_AS_INITFINAL, digestsize, ctx, false,
++			  ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_digest_dma,
+ 				   desc_bytes(desc), DMA_TO_DEVICE);
+ #ifdef DEBUG
+@@ -421,6 +432,7 @@ static int ahash_setkey(struct crypto_ahash *ahash,
+ 	struct caam_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+ 	int blocksize = crypto_tfm_alg_blocksize(&ahash->base);
+ 	int digestsize = crypto_ahash_digestsize(ahash);
++	struct caam_drv_private *ctrlpriv = dev_get_drvdata(ctx->jrdev->parent);
+ 	int ret;
+ 	u8 *hashed_key = NULL;
+ 
+@@ -441,16 +453,26 @@ static int ahash_setkey(struct crypto_ahash *ahash,
+ 		key = hashed_key;
+ 	}
+ 
+-	ret = gen_split_key(ctx->jrdev, ctx->key, &ctx->adata, key, keylen,
+-			    CAAM_MAX_HASH_KEY_SIZE);
+-	if (ret)
+-		goto bad_free_key;
++	/*
++	 * If DKP is supported, use it in the shared descriptor to generate
++	 * the split key.
++	 */
++	if (ctrlpriv->era >= 6) {
++		ctx->adata.key_inline = true;
++		ctx->adata.keylen = keylen;
++		ctx->adata.keylen_pad = split_key_len(ctx->adata.algtype &
++						      OP_ALG_ALGSEL_MASK);
+ 
+-#ifdef DEBUG
+-	print_hex_dump(KERN_ERR, "ctx.key@"__stringify(__LINE__)": ",
+-		       DUMP_PREFIX_ADDRESS, 16, 4, ctx->key,
+-		       ctx->adata.keylen_pad, 1);
+-#endif
++		if (ctx->adata.keylen_pad > CAAM_MAX_HASH_KEY_SIZE)
++			goto bad_free_key;
++
++		memcpy(ctx->key, key, keylen);
++	} else {
++		ret = gen_split_key(ctx->jrdev, ctx->key, &ctx->adata, key,
++				    keylen, CAAM_MAX_HASH_KEY_SIZE);
++		if (ret)
++			goto bad_free_key;
++	}
+ 
+ 	kfree(hashed_key);
+ 	return ahash_set_sh_desc(ahash);
+diff --git a/drivers/crypto/caam/desc.h b/drivers/crypto/caam/desc.h
+index 53fb51e..d5f69f8 100644
+--- a/drivers/crypto/caam/desc.h
++++ b/drivers/crypto/caam/desc.h
+@@ -443,6 +443,18 @@
+ #define OP_PCLID_DSAVERIFY	(0x16 << OP_PCLID_SHIFT)
+ #define OP_PCLID_RSAENC_PUBKEY  (0x18 << OP_PCLID_SHIFT)
+ #define OP_PCLID_RSADEC_PRVKEY  (0x19 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_MD5	(0x20 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_SHA1	(0x21 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_SHA224	(0x22 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_SHA256	(0x23 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_SHA384	(0x24 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_SHA512	(0x25 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_RIF_MD5	(0x60 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_RIF_SHA1	(0x61 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_RIF_SHA224	(0x62 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_RIF_SHA256	(0x63 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_RIF_SHA384	(0x64 << OP_PCLID_SHIFT)
++#define OP_PCLID_DKP_RIF_SHA512	(0x65 << OP_PCLID_SHIFT)
+ 
+ /* Assuming OP_TYPE = OP_TYPE_DECAP_PROTOCOL/ENCAP_PROTOCOL */
+ #define OP_PCLID_IPSEC		(0x01 << OP_PCLID_SHIFT)
+@@ -1093,6 +1105,22 @@
+ /* MacSec protinfos */
+ #define OP_PCL_MACSEC				 0x0001
+ 
++/* Derived Key Protocol (DKP) Protinfo */
++#define OP_PCL_DKP_SRC_SHIFT	14
++#define OP_PCL_DKP_SRC_MASK	(3 << OP_PCL_DKP_SRC_SHIFT)
++#define OP_PCL_DKP_SRC_IMM	(0 << OP_PCL_DKP_SRC_SHIFT)
++#define OP_PCL_DKP_SRC_SEQ	(1 << OP_PCL_DKP_SRC_SHIFT)
++#define OP_PCL_DKP_SRC_PTR	(2 << OP_PCL_DKP_SRC_SHIFT)
++#define OP_PCL_DKP_SRC_SGF	(3 << OP_PCL_DKP_SRC_SHIFT)
++#define OP_PCL_DKP_DST_SHIFT	12
++#define OP_PCL_DKP_DST_MASK	(3 << OP_PCL_DKP_DST_SHIFT)
++#define OP_PCL_DKP_DST_IMM	(0 << OP_PCL_DKP_DST_SHIFT)
++#define OP_PCL_DKP_DST_SEQ	(1 << OP_PCL_DKP_DST_SHIFT)
++#define OP_PCL_DKP_DST_PTR	(2 << OP_PCL_DKP_DST_SHIFT)
++#define OP_PCL_DKP_DST_SGF	(3 << OP_PCL_DKP_DST_SHIFT)
++#define OP_PCL_DKP_KEY_SHIFT	0
++#define OP_PCL_DKP_KEY_MASK	(0xfff << OP_PCL_DKP_KEY_SHIFT)
++
+ /* PKI unidirectional protocol protinfo bits */
+ #define OP_PCL_PKPROT_TEST			 0x0008
+ #define OP_PCL_PKPROT_DECRYPT			 0x0004
+@@ -1452,6 +1480,7 @@
+ #define MATH_DEST_REG1		(0x01 << MATH_DEST_SHIFT)
+ #define MATH_DEST_REG2		(0x02 << MATH_DEST_SHIFT)
+ #define MATH_DEST_REG3		(0x03 << MATH_DEST_SHIFT)
++#define MATH_DEST_DPOVRD	(0x07 << MATH_DEST_SHIFT)
+ #define MATH_DEST_SEQINLEN	(0x08 << MATH_DEST_SHIFT)
+ #define MATH_DEST_SEQOUTLEN	(0x09 << MATH_DEST_SHIFT)
+ #define MATH_DEST_VARSEQINLEN	(0x0a << MATH_DEST_SHIFT)
+diff --git a/drivers/crypto/caam/desc_constr.h b/drivers/crypto/caam/desc_constr.h
+index dcedab68..241187ee 100644
+--- a/drivers/crypto/caam/desc_constr.h
++++ b/drivers/crypto/caam/desc_constr.h
+@@ -495,4 +495,45 @@ static inline int desc_inline_query(unsigned int sd_base_len,
+ 	return (rem_bytes >= 0) ? 0 : -1;
+ }
+ 
++/**
++ * append_proto_dkp - Derived Key Protocol (DKP): key -> split key
++ * @desc: pointer to buffer used for descriptor construction
++ * @adata: pointer to authentication transform definitions.
++ *         keylen should be the length of initial key, while keylen_pad
++ *         the length of the derived (split) key.
++ *         Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1, SHA224,
++ *         SHA256, SHA384, SHA512}.
++ */
++static inline void append_proto_dkp(u32 * const desc, struct alginfo *adata)
++{
++	u32 protid;
++
++	/*
++	 * Quick & dirty translation from OP_ALG_ALGSEL_{MD5, SHA*}
++	 * to OP_PCLID_DKP_{MD5, SHA*}
++	 */
++	protid = (adata->algtype & OP_ALG_ALGSEL_SUBMASK) |
++		 (0x20 << OP_ALG_ALGSEL_SHIFT);
++
++	if (adata->key_inline) {
++		int words;
++
++		append_operation(desc, OP_TYPE_UNI_PROTOCOL | protid |
++				 OP_PCL_DKP_SRC_IMM | OP_PCL_DKP_DST_IMM |
++				 adata->keylen);
++		append_data(desc, adata->key_virt, adata->keylen);
++
++		/* Reserve space in descriptor buffer for the derived key */
++		words = (ALIGN(adata->keylen_pad, CAAM_CMD_SZ) -
++			 ALIGN(adata->keylen, CAAM_CMD_SZ)) / CAAM_CMD_SZ;
++		if (words)
++			(*desc) = cpu_to_caam32(caam32_to_cpu(*desc) + words);
++	} else {
++		append_operation(desc, OP_TYPE_UNI_PROTOCOL | protid |
++				 OP_PCL_DKP_SRC_PTR | OP_PCL_DKP_DST_PTR |
++				 adata->keylen);
++		append_ptr(desc, adata->key_dma);
++	}
++}
++
+ #endif /* DESC_CONSTR_H */
+diff --git a/drivers/crypto/caam/key_gen.c b/drivers/crypto/caam/key_gen.c
+index c425d4a..a523ed7 100644
+--- a/drivers/crypto/caam/key_gen.c
++++ b/drivers/crypto/caam/key_gen.c
+@@ -10,36 +10,6 @@
+ #include "desc_constr.h"
+ #include "key_gen.h"
+ 
+-/**
+- * split_key_len - Compute MDHA split key length for a given algorithm
+- * @hash: Hashing algorithm selection, one of OP_ALG_ALGSEL_* - MD5, SHA1,
+- *        SHA224, SHA384, SHA512.
+- *
+- * Return: MDHA split key length
+- */
+-static inline u32 split_key_len(u32 hash)
+-{
+-	/* Sizes for MDHA pads (*not* keys): MD5, SHA1, 224, 256, 384, 512 */
+-	static const u8 mdpadlen[] = { 16, 20, 32, 32, 64, 64 };
+-	u32 idx;
+-
+-	idx = (hash & OP_ALG_ALGSEL_SUBMASK) >> OP_ALG_ALGSEL_SHIFT;
+-
+-	return (u32)(mdpadlen[idx] * 2);
+-}
+-
+-/**
+- * split_key_pad_len - Compute MDHA split key pad length for a given algorithm
+- * @hash: Hashing algorithm selection, one of OP_ALG_ALGSEL_* - MD5, SHA1,
+- *        SHA224, SHA384, SHA512.
+- *
+- * Return: MDHA split key pad length
+- */
+-static inline u32 split_key_pad_len(u32 hash)
+-{
+-	return ALIGN(split_key_len(hash), 16);
+-}
+-
+ void split_key_done(struct device *dev, u32 *desc, u32 err,
+ 			   void *context)
+ {
+diff --git a/drivers/crypto/caam/key_gen.h b/drivers/crypto/caam/key_gen.h
+index 4628f38..851a7c86 100644
+--- a/drivers/crypto/caam/key_gen.h
++++ b/drivers/crypto/caam/key_gen.h
+@@ -5,6 +5,36 @@
+  *
+  */
+ 
++/**
++ * split_key_len - Compute MDHA split key length for a given algorithm
++ * @hash: Hashing algorithm selection, one of OP_ALG_ALGSEL_* - MD5, SHA1,
++ *        SHA224, SHA384, SHA512.
++ *
++ * Return: MDHA split key length
++ */
++static inline u32 split_key_len(u32 hash)
++{
++	/* Sizes for MDHA pads (*not* keys): MD5, SHA1, 224, 256, 384, 512 */
++	static const u8 mdpadlen[] = { 16, 20, 32, 32, 64, 64 };
++	u32 idx;
++
++	idx = (hash & OP_ALG_ALGSEL_SUBMASK) >> OP_ALG_ALGSEL_SHIFT;
++
++	return (u32)(mdpadlen[idx] * 2);
++}
++
++/**
++ * split_key_pad_len - Compute MDHA split key pad length for a given algorithm
++ * @hash: Hashing algorithm selection, one of OP_ALG_ALGSEL_* - MD5, SHA1,
++ *        SHA224, SHA384, SHA512.
++ *
++ * Return: MDHA split key pad length
++ */
++static inline u32 split_key_pad_len(u32 hash)
++{
++	return ALIGN(split_key_len(hash), 16);
++}
++
+ struct split_key_result {
+ 	struct completion completion;
+ 	int err;
+-- 
+2.7.4
+
