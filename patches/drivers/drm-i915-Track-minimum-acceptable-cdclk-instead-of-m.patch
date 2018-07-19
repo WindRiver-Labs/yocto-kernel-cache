@@ -1,0 +1,540 @@
+From bf855e882bab03825bdd0251ad5302beaf17b856 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Ville=20Syrj=C3=A4l=C3=A4?= <ville.syrjala@linux.intel.com>
+Date: Wed, 30 Aug 2017 21:57:03 +0300
+Subject: [PATCH 11/22] drm/i915: Track minimum acceptable cdclk instead of
+ "minimum dotclock"
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit d305e0614601aefc6011ec60fd28b8184db09409 upstream.
+
+Make the min_pixclk thing less confusing by changing it to track
+the minimum acceptable cdclk frequency instead. This means moving
+the application of the guardbands to a slightly higher level from
+the low level platform specific calc_cdclk() functions.
+
+The immediate benefit is elimination of the confusing 2x factors
+on GLK/CNL+ in the audio workarounds (which stems from the fact
+that the pipes produce two pixels per clock).
+
+v2: Keep cdclk higher on CNL to workaround missing DDI clock voltage handling
+v3: Squash with the CNL cdclk limits patch (DK)
+v4: s/intel_min_cdclk/intel_pixel_rate_to_cdclk/ (DK)
+
+Cc: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Reviewed-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170830185703.8189-1-ville.syrjala@linux.intel.com
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h      |   12 +-
+ drivers/gpu/drm/i915/intel_cdclk.c   |  202 +++++++++++++++++-----------------
+ drivers/gpu/drm/i915/intel_display.c |   21 ++--
+ drivers/gpu/drm/i915/intel_drv.h     |    4 +-
+ 4 files changed, 125 insertions(+), 114 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index c7e447a..e7e331a 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -514,6 +514,15 @@ struct i915_hotplug {
+ 	     (__i)++) \
+ 		for_each_if (plane_state)
+ 
++#define for_each_new_intel_crtc_in_state(__state, crtc, new_crtc_state, __i) \
++	for ((__i) = 0; \
++	     (__i) < (__state)->base.dev->mode_config.num_crtc && \
++		     ((crtc) = to_intel_crtc((__state)->base.crtcs[__i].ptr), \
++		      (new_crtc_state) = to_intel_crtc_state((__state)->base.crtcs[__i].new_state), 1); \
++	     (__i)++) \
++		for_each_if (crtc)
++
++
+ struct drm_i915_private;
+ struct i915_mm_struct;
+ struct i915_mmu_object;
+@@ -2312,7 +2321,8 @@ struct drm_i915_private {
+ 	struct mutex dpll_lock;
+ 
+ 	unsigned int active_crtcs;
+-	unsigned int min_pixclk[I915_MAX_PIPES];
++	/* minimum acceptable cdclk for each pipe */
++	int min_cdclk[I915_MAX_PIPES];
+ 
+ 	int dpio_phy_iosf_port[I915_NUM_PHYS_VLV];
+ 
+diff --git a/drivers/gpu/drm/i915/intel_cdclk.c b/drivers/gpu/drm/i915/intel_cdclk.c
+index 1241e58..fafffb0 100644
+--- a/drivers/gpu/drm/i915/intel_cdclk.c
++++ b/drivers/gpu/drm/i915/intel_cdclk.c
+@@ -417,24 +417,21 @@ static void hsw_get_cdclk(struct drm_i915_private *dev_priv,
+ 		cdclk_state->cdclk = 540000;
+ }
+ 
+-static int vlv_calc_cdclk(struct drm_i915_private *dev_priv,
+-			  int max_pixclk)
++static int vlv_calc_cdclk(struct drm_i915_private *dev_priv, int min_cdclk)
+ {
+ 	int freq_320 = (dev_priv->hpll_freq <<  1) % 320000 != 0 ?
+ 		333333 : 320000;
+-	int limit = IS_CHERRYVIEW(dev_priv) ? 95 : 90;
+ 
+ 	/*
+ 	 * We seem to get an unstable or solid color picture at 200MHz.
+ 	 * Not sure what's wrong. For now use 200MHz only when all pipes
+ 	 * are off.
+ 	 */
+-	if (!IS_CHERRYVIEW(dev_priv) &&
+-	    max_pixclk > freq_320*limit/100)
++	if (IS_VALLEYVIEW(dev_priv) && min_cdclk > freq_320)
+ 		return 400000;
+-	else if (max_pixclk > 266667*limit/100)
++	else if (min_cdclk > 266667)
+ 		return freq_320;
+-	else if (max_pixclk > 0)
++	else if (min_cdclk > 0)
+ 		return 266667;
+ 	else
+ 		return 200000;
+@@ -612,13 +609,13 @@ static void chv_set_cdclk(struct drm_i915_private *dev_priv,
+ 	intel_display_power_put(dev_priv, POWER_DOMAIN_PIPE_A);
+ }
+ 
+-static int bdw_calc_cdclk(int max_pixclk)
++static int bdw_calc_cdclk(int min_cdclk)
+ {
+-	if (max_pixclk > 540000)
++	if (min_cdclk > 540000)
+ 		return 675000;
+-	else if (max_pixclk > 450000)
++	else if (min_cdclk > 450000)
+ 		return 540000;
+-	else if (max_pixclk > 337500)
++	else if (min_cdclk > 337500)
+ 		return 450000;
+ 	else
+ 		return 337500;
+@@ -724,23 +721,23 @@ static void bdw_set_cdclk(struct drm_i915_private *dev_priv,
+ 	     cdclk, dev_priv->cdclk.hw.cdclk);
+ }
+ 
+-static int skl_calc_cdclk(int max_pixclk, int vco)
++static int skl_calc_cdclk(int min_cdclk, int vco)
+ {
+ 	if (vco == 8640000) {
+-		if (max_pixclk > 540000)
++		if (min_cdclk > 540000)
+ 			return 617143;
+-		else if (max_pixclk > 432000)
++		else if (min_cdclk > 432000)
+ 			return 540000;
+-		else if (max_pixclk > 308571)
++		else if (min_cdclk > 308571)
+ 			return 432000;
+ 		else
+ 			return 308571;
+ 	} else {
+-		if (max_pixclk > 540000)
++		if (min_cdclk > 540000)
+ 			return 675000;
+-		else if (max_pixclk > 450000)
++		else if (min_cdclk > 450000)
+ 			return 540000;
+-		else if (max_pixclk > 337500)
++		else if (min_cdclk > 337500)
+ 			return 450000;
+ 		else
+ 			return 337500;
+@@ -1075,31 +1072,25 @@ void skl_uninit_cdclk(struct drm_i915_private *dev_priv)
+ 	skl_set_cdclk(dev_priv, &cdclk_state);
+ }
+ 
+-static int bxt_calc_cdclk(int max_pixclk)
++static int bxt_calc_cdclk(int min_cdclk)
+ {
+-	if (max_pixclk > 576000)
++	if (min_cdclk > 576000)
+ 		return 624000;
+-	else if (max_pixclk > 384000)
++	else if (min_cdclk > 384000)
+ 		return 576000;
+-	else if (max_pixclk > 288000)
++	else if (min_cdclk > 288000)
+ 		return 384000;
+-	else if (max_pixclk > 144000)
++	else if (min_cdclk > 144000)
+ 		return 288000;
+ 	else
+ 		return 144000;
+ }
+ 
+-static int glk_calc_cdclk(int max_pixclk)
++static int glk_calc_cdclk(int min_cdclk)
+ {
+-	/*
+-	 * FIXME: Avoid using a pixel clock that is more than 99% of the cdclk
+-	 * as a temporary workaround. Use a higher cdclk instead. (Note that
+-	 * intel_compute_max_dotclk() limits the max pixel clock to 99% of max
+-	 * cdclk.)
+-	 */
+-	if (max_pixclk > DIV_ROUND_UP(2 * 158400 * 99, 100))
++	if (min_cdclk > 158400)
+ 		return 316800;
+-	else if (max_pixclk > DIV_ROUND_UP(2 * 79200 * 99, 100))
++	else if (min_cdclk > 79200)
+ 		return 158400;
+ 	else
+ 		return 79200;
+@@ -1420,11 +1411,11 @@ void bxt_uninit_cdclk(struct drm_i915_private *dev_priv)
+ 	bxt_set_cdclk(dev_priv, &cdclk_state);
+ }
+ 
+-static int cnl_calc_cdclk(int max_pixclk)
++static int cnl_calc_cdclk(int min_cdclk)
+ {
+-	if (max_pixclk > 336000)
++	if (min_cdclk > 336000)
+ 		return 528000;
+-	else if (max_pixclk > 168000)
++	else if (min_cdclk > 168000)
+ 		return 336000;
+ 	else
+ 		return 168000;
+@@ -1732,98 +1723,106 @@ void intel_set_cdclk(struct drm_i915_private *dev_priv,
+ 	dev_priv->display.set_cdclk(dev_priv, cdclk_state);
+ }
+ 
+-static int bdw_adjust_min_pipe_pixel_rate(struct intel_crtc_state *crtc_state,
+-					  int pixel_rate)
++static int intel_pixel_rate_to_cdclk(struct drm_i915_private *dev_priv,
++				     int pixel_rate)
++{
++	if (INTEL_GEN(dev_priv) >= 10)
++		/*
++		 * FIXME: Switch to DIV_ROUND_UP(pixel_rate, 2)
++		 * once DDI clock voltage requirements are
++		 * handled correctly.
++		 */
++		return pixel_rate;
++	else if (IS_GEMINILAKE(dev_priv))
++		/*
++		 * FIXME: Avoid using a pixel clock that is more than 99% of the cdclk
++		 * as a temporary workaround. Use a higher cdclk instead. (Note that
++		 * intel_compute_max_dotclk() limits the max pixel clock to 99% of max
++		 * cdclk.)
++		 */
++		return DIV_ROUND_UP(pixel_rate * 100, 2 * 99);
++	else if (IS_GEN9(dev_priv) ||
++		 IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
++		return pixel_rate;
++	else if (IS_CHERRYVIEW(dev_priv))
++		return DIV_ROUND_UP(pixel_rate * 100, 95);
++	else
++		return DIV_ROUND_UP(pixel_rate * 100, 90);
++}
++
++int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state)
+ {
+ 	struct drm_i915_private *dev_priv =
+ 		to_i915(crtc_state->base.crtc->dev);
++	int min_cdclk;
++
++	if (!crtc_state->base.enable)
++		return 0;
++
++	min_cdclk = intel_pixel_rate_to_cdclk(dev_priv, crtc_state->pixel_rate);
+ 
+ 	/* pixel rate mustn't exceed 95% of cdclk with IPS on BDW */
+ 	if (IS_BROADWELL(dev_priv) && crtc_state->ips_enabled)
+-		pixel_rate = DIV_ROUND_UP(pixel_rate * 100, 95);
++		min_cdclk = DIV_ROUND_UP(min_cdclk * 100, 95);
+ 
+ 	/* BSpec says "Do not use DisplayPort with CDCLK less than 432 MHz,
+ 	 * audio enabled, port width x4, and link rate HBR2 (5.4 GHz), or else
+ 	 * there may be audio corruption or screen corruption." This cdclk
+-	 * restriction for GLK is 316.8 MHz and since GLK can output two
+-	 * pixels per clock, the pixel rate becomes 2 * 316.8 MHz.
++	 * restriction for GLK is 316.8 MHz.
+ 	 */
+ 	if (intel_crtc_has_dp_encoder(crtc_state) &&
+ 	    crtc_state->has_audio &&
+ 	    crtc_state->port_clock >= 540000 &&
+ 	    crtc_state->lane_count == 4) {
+-		if (IS_CANNONLAKE(dev_priv))
+-			pixel_rate = max(316800, pixel_rate);
+-		else if (IS_GEMINILAKE(dev_priv))
+-			pixel_rate = max(2 * 316800, pixel_rate);
+-		else
+-			pixel_rate = max(432000, pixel_rate);
++		if (IS_CANNONLAKE(dev_priv) || IS_GEMINILAKE(dev_priv)) {
++			/* Display WA #1145: glk,cnl */
++			min_cdclk = max(316800, min_cdclk);
++		} else if (IS_GEN9(dev_priv) || IS_BROADWELL(dev_priv)) {
++			/* Display WA #1144: skl,bxt */
++			min_cdclk = max(432000, min_cdclk);
++		}
+ 	}
+ 
+ 	/* According to BSpec, "The CD clock frequency must be at least twice
+ 	 * the frequency of the Azalia BCLK." and BCLK is 96 MHz by default.
+-	 * The check for GLK has to be adjusted as the platform can output
+-	 * two pixels per clock.
+ 	 */
+-	if (crtc_state->has_audio && INTEL_GEN(dev_priv) >= 9) {
+-		if (IS_GEMINILAKE(dev_priv))
+-			pixel_rate = max(2 * 2 * 96000, pixel_rate);
+-		else
+-			pixel_rate = max(2 * 96000, pixel_rate);
+-	}
++	if (crtc_state->has_audio && INTEL_GEN(dev_priv) >= 9)
++		min_cdclk = max(2 * 96000, min_cdclk);
+ 
+-	return pixel_rate;
++	return min_cdclk;
+ }
+ 
+-/* compute the max rate for new configuration */
+-static int intel_max_pixel_rate(struct drm_atomic_state *state)
++static int intel_compute_min_cdclk(struct drm_atomic_state *state)
+ {
+ 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+ 	struct drm_i915_private *dev_priv = to_i915(state->dev);
+-	struct drm_crtc *crtc;
+-	struct drm_crtc_state *cstate;
++	struct intel_crtc *crtc;
+ 	struct intel_crtc_state *crtc_state;
+-	unsigned int max_pixel_rate = 0, i;
++	int min_cdclk = 0, i;
+ 	enum pipe pipe;
+ 
+-	memcpy(intel_state->min_pixclk, dev_priv->min_pixclk,
+-	       sizeof(intel_state->min_pixclk));
+-
+-	for_each_new_crtc_in_state(state, crtc, cstate, i) {
+-		int pixel_rate;
+-
+-		crtc_state = to_intel_crtc_state(cstate);
+-		if (!crtc_state->base.enable) {
+-			intel_state->min_pixclk[i] = 0;
+-			continue;
+-		}
++	memcpy(intel_state->min_cdclk, dev_priv->min_cdclk,
++	       sizeof(intel_state->min_cdclk));
+ 
+-		pixel_rate = crtc_state->pixel_rate;
+-
+-		if (IS_BROADWELL(dev_priv) || INTEL_GEN(dev_priv) >= 9)
+-			pixel_rate =
+-				bdw_adjust_min_pipe_pixel_rate(crtc_state,
+-							       pixel_rate);
+-
+-		intel_state->min_pixclk[i] = pixel_rate;
+-	}
++	for_each_new_intel_crtc_in_state(intel_state, crtc, crtc_state, i)
++		intel_state->min_cdclk[i] =
++			intel_crtc_compute_min_cdclk(crtc_state);
+ 
+ 	for_each_pipe(dev_priv, pipe)
+-		max_pixel_rate = max(intel_state->min_pixclk[pipe],
+-				     max_pixel_rate);
++		min_cdclk = max(intel_state->min_cdclk[pipe], min_cdclk);
+ 
+-	return max_pixel_rate;
++	return min_cdclk;
+ }
+ 
+ static int vlv_modeset_calc_cdclk(struct drm_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->dev);
+-	int max_pixclk = intel_max_pixel_rate(state);
++	int min_cdclk = intel_compute_min_cdclk(state);
+ 	struct intel_atomic_state *intel_state =
+ 		to_intel_atomic_state(state);
+ 	int cdclk;
+ 
+-	cdclk = vlv_calc_cdclk(dev_priv, max_pixclk);
++	cdclk = vlv_calc_cdclk(dev_priv, min_cdclk);
+ 
+ 	if (cdclk > dev_priv->max_cdclk_freq) {
+ 		DRM_DEBUG_KMS("requested cdclk (%d kHz) exceeds max (%d kHz)\n",
+@@ -1849,14 +1848,14 @@ static int bdw_modeset_calc_cdclk(struct drm_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->dev);
+ 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+-	int max_pixclk = intel_max_pixel_rate(state);
++	int min_cdclk = intel_compute_min_cdclk(state);
+ 	int cdclk;
+ 
+ 	/*
+ 	 * FIXME should also account for plane ratio
+ 	 * once 64bpp pixel formats are supported.
+ 	 */
+-	cdclk = bdw_calc_cdclk(max_pixclk);
++	cdclk = bdw_calc_cdclk(min_cdclk);
+ 
+ 	if (cdclk > dev_priv->max_cdclk_freq) {
+ 		DRM_DEBUG_KMS("requested cdclk (%d kHz) exceeds max (%d kHz)\n",
+@@ -1882,7 +1881,7 @@ static int skl_modeset_calc_cdclk(struct drm_atomic_state *state)
+ {
+ 	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+ 	struct drm_i915_private *dev_priv = to_i915(state->dev);
+-	const int max_pixclk = intel_max_pixel_rate(state);
++	int min_cdclk = intel_compute_min_cdclk(state);
+ 	int cdclk, vco;
+ 
+ 	vco = intel_state->cdclk.logical.vco;
+@@ -1893,7 +1892,7 @@ static int skl_modeset_calc_cdclk(struct drm_atomic_state *state)
+ 	 * FIXME should also account for plane ratio
+ 	 * once 64bpp pixel formats are supported.
+ 	 */
+-	cdclk = skl_calc_cdclk(max_pixclk, vco);
++	cdclk = skl_calc_cdclk(min_cdclk, vco);
+ 
+ 	if (cdclk > dev_priv->max_cdclk_freq) {
+ 		DRM_DEBUG_KMS("requested cdclk (%d kHz) exceeds max (%d kHz)\n",
+@@ -1920,16 +1919,16 @@ static int skl_modeset_calc_cdclk(struct drm_atomic_state *state)
+ static int bxt_modeset_calc_cdclk(struct drm_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->dev);
+-	int max_pixclk = intel_max_pixel_rate(state);
++	int min_cdclk = intel_compute_min_cdclk(state);
+ 	struct intel_atomic_state *intel_state =
+ 		to_intel_atomic_state(state);
+ 	int cdclk, vco;
+ 
+ 	if (IS_GEMINILAKE(dev_priv)) {
+-		cdclk = glk_calc_cdclk(max_pixclk);
++		cdclk = glk_calc_cdclk(min_cdclk);
+ 		vco = glk_de_pll_vco(dev_priv, cdclk);
+ 	} else {
+-		cdclk = bxt_calc_cdclk(max_pixclk);
++		cdclk = bxt_calc_cdclk(min_cdclk);
+ 		vco = bxt_de_pll_vco(dev_priv, cdclk);
+ 	}
+ 
+@@ -1966,10 +1965,10 @@ static int cnl_modeset_calc_cdclk(struct drm_atomic_state *state)
+ 	struct drm_i915_private *dev_priv = to_i915(state->dev);
+ 	struct intel_atomic_state *intel_state =
+ 		to_intel_atomic_state(state);
+-	int max_pixclk = intel_max_pixel_rate(state);
++	int min_cdclk = intel_compute_min_cdclk(state);
+ 	int cdclk, vco;
+ 
+-	cdclk = cnl_calc_cdclk(max_pixclk);
++	cdclk = cnl_calc_cdclk(min_cdclk);
+ 	vco = cnl_cdclk_pll_vco(dev_priv, cdclk);
+ 
+ 	if (cdclk > dev_priv->max_cdclk_freq) {
+@@ -1999,14 +1998,21 @@ static int intel_compute_max_dotclk(struct drm_i915_private *dev_priv)
+ {
+ 	int max_cdclk_freq = dev_priv->max_cdclk_freq;
+ 
+-	if (IS_GEMINILAKE(dev_priv))
++	if (INTEL_GEN(dev_priv) >= 10)
++		/*
++		 * FIXME: Allow '2 * max_cdclk_freq'
++		 * once DDI clock voltage requirements are
++		 * handled correctly.
++		 */
++		return max_cdclk_freq;
++	else if (IS_GEMINILAKE(dev_priv))
+ 		/*
+ 		 * FIXME: Limiting to 99% as a temporary workaround. See
+-		 * glk_calc_cdclk() for details.
++		 * intel_min_cdclk() for details.
+ 		 */
+ 		return 2 * max_cdclk_freq * 99 / 100;
+-	else if (INTEL_INFO(dev_priv)->gen >= 9 ||
+-		 IS_HASWELL(dev_priv) || IS_BROADWELL(dev_priv))
++	else if (IS_GEN9(dev_priv) ||
++		 IS_BROADWELL(dev_priv) || IS_HASWELL(dev_priv))
+ 		return max_cdclk_freq;
+ 	else if (IS_CHERRYVIEW(dev_priv))
+ 		return max_cdclk_freq*95/100;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 2851d9e..dda3fe1 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5892,7 +5892,7 @@ static void intel_crtc_disable_noatomic(struct drm_crtc *crtc,
+ 	intel_crtc->enabled_power_domains = 0;
+ 
+ 	dev_priv->active_crtcs &= ~(1 << intel_crtc->pipe);
+-	dev_priv->min_pixclk[intel_crtc->pipe] = 0;
++	dev_priv->min_cdclk[intel_crtc->pipe] = 0;
+ }
+ 
+ /*
+@@ -13071,8 +13071,8 @@ static int intel_atomic_commit(struct drm_device *dev,
+ 	intel_atomic_track_fbs(state);
+ 
+ 	if (intel_state->modeset) {
+-		memcpy(dev_priv->min_pixclk, intel_state->min_pixclk,
+-		       sizeof(intel_state->min_pixclk));
++		memcpy(dev_priv->min_cdclk, intel_state->min_cdclk,
++		       sizeof(intel_state->min_cdclk));
+ 		dev_priv->active_crtcs = intel_state->active_crtcs;
+ 		dev_priv->cdclk.logical = intel_state->cdclk.logical;
+ 		dev_priv->cdclk.actual = intel_state->cdclk.actual;
+@@ -15447,7 +15447,7 @@ static void intel_modeset_readout_hw_state(struct drm_device *dev)
+ 	for_each_intel_crtc(dev, crtc) {
+ 		struct intel_crtc_state *crtc_state =
+ 			to_intel_crtc_state(crtc->base.state);
+-		int pixclk = 0;
++		int min_cdclk = 0;
+ 
+ 		crtc->base.hwmode = crtc_state->base.adjusted_mode;
+ 
+@@ -15470,21 +15470,14 @@ static void intel_modeset_readout_hw_state(struct drm_device *dev)
+ 
+ 			intel_crtc_compute_pixel_rate(crtc_state);
+ 
+-			if (INTEL_GEN(dev_priv) >= 9 || IS_BROADWELL(dev_priv) ||
+-			    IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv))
+-				pixclk = crtc_state->pixel_rate;
+-			else
+-				WARN_ON(dev_priv->display.modeset_calc_cdclk);
+-
+-			/* pixel rate mustn't exceed 95% of cdclk with IPS on BDW */
+-			if (IS_BROADWELL(dev_priv) && crtc_state->ips_enabled)
+-				pixclk = DIV_ROUND_UP(pixclk * 100, 95);
++			if (dev_priv->display.modeset_calc_cdclk)
++				min_cdclk = intel_crtc_compute_min_cdclk(crtc_state);
+ 
+ 			drm_calc_timestamping_constants(&crtc->base, &crtc->base.hwmode);
+ 			update_scanline_offset(crtc);
+ 		}
+ 
+-		dev_priv->min_pixclk[crtc->pipe] = pixclk;
++		dev_priv->min_cdclk[crtc->pipe] = min_cdclk;
+ 
+ 		intel_pipe_config_sanity_check(dev_priv, crtc_state);
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 47a4c70..483308f 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -366,7 +366,8 @@ struct intel_atomic_state {
+ 	unsigned int active_pipe_changes;
+ 
+ 	unsigned int active_crtcs;
+-	unsigned int min_pixclk[I915_MAX_PIPES];
++	/* minimum acceptable cdclk for each pipe */
++	int min_cdclk[I915_MAX_PIPES];
+ 
+ 	struct intel_shared_dpll_state shared_dpll[I915_NUM_PLLS];
+ 
+@@ -1269,6 +1270,7 @@ void intel_audio_codec_enable(struct intel_encoder *encoder,
+ void intel_audio_deinit(struct drm_i915_private *dev_priv);
+ 
+ /* intel_cdclk.c */
++int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state);
+ void skl_init_cdclk(struct drm_i915_private *dev_priv);
+ void skl_uninit_cdclk(struct drm_i915_private *dev_priv);
+ void cnl_init_cdclk(struct drm_i915_private *dev_priv);
+-- 
+1.7.9.5
+

@@ -1,0 +1,226 @@
+From 793ad0903044ad9794cd19b15f8c82f75a7ce751 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Tue, 28 Mar 2017 17:59:05 +0300
+Subject: [PATCH 07/22] drm/i915/dp: generate and cache sink rate array for
+ all DP, not just eDP 1.4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 68f357cb734738d60a749abb6673e7b63ccf0221 upstream.
+
+There is some conflation related to sink rates, making this change more
+complicated than it would otherwise have to be. There are three changes
+here that are rather difficult to split up:
+
+1) Use the intel_dp->sink_rates array for all DP, not just eDP 1.4. We
+   initialize it from DPCD on eDP 1.4 like before, but generate it based
+   on DP_MAX_LINK_RATE on others. This reduces code complexity when we
+   need to use the sink rates; they are all always in the sink_rates
+   array.
+
+2) Update the sink rate array whenever we read DPCD, and use the
+   information from there. This increases code readability when we need
+   the sink rates.
+
+3) Disentangle fallback rate limiting from sink rates. In the code, the
+   max rate is a dynamic property of the *link*, not of the *sink*. Do
+   the limiting after intersecting the source and sink rates, which are
+   static properties of the devices.
+
+This paves the way for follow-up refactoring that I've refrained from
+doing here to keep this change as simple as it possibly can.
+
+v2: introduce use_rate_select and handle non-confirming eDP (Ville)
+
+v3: don't clobber cached eDP rates on short pulse (Ville)
+
+Cc: Manasi Navare <manasi.d.navare@intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/071bad76467f8ab2e73f3f61ad52d5a468004c71.1490712890.git.jani.nikula@intel.com
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/gpu/drm/i915/intel_dp.c               |   81 +++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_dp_link_training.c |    3 +-
+ drivers/gpu/drm/i915/intel_drv.h              |    5 +-
+ 3 files changed, 61 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 029b98a..5543905 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -133,6 +133,34 @@ static void vlv_steal_power_sequencer(struct drm_device *dev,
+ 				      enum pipe pipe);
+ static void intel_dp_unset_edid(struct intel_dp *intel_dp);
+ 
++static int intel_dp_num_rates(u8 link_bw_code)
++{
++	switch (link_bw_code) {
++	default:
++		WARN(1, "invalid max DP link bw val %x, using 1.62Gbps\n",
++		     link_bw_code);
++	case DP_LINK_BW_1_62:
++		return 1;
++	case DP_LINK_BW_2_7:
++		return 2;
++	case DP_LINK_BW_5_4:
++		return 3;
++	}
++}
++
++/* update sink rates from dpcd */
++static void intel_dp_set_sink_rates(struct intel_dp *intel_dp)
++{
++	int i, num_rates;
++
++	num_rates = intel_dp_num_rates(intel_dp->dpcd[DP_MAX_LINK_RATE]);
++
++	for (i = 0; i < num_rates; i++)
++		intel_dp->sink_rates[i] = default_rates[i];
++
++	intel_dp->num_sink_rates = num_rates;
++}
++
+ static int
+ intel_dp_max_link_bw(struct intel_dp  *intel_dp)
+ {
+@@ -205,19 +233,6 @@ static u8 intel_dp_max_lane_count(struct intel_dp *intel_dp)
+ 	return max_dotclk;
+ }
+ 
+-static int
+-intel_dp_sink_rates(struct intel_dp *intel_dp, const int **sink_rates)
+-{
+-	if (intel_dp->num_sink_rates) {
+-		*sink_rates = intel_dp->sink_rates;
+-		return intel_dp->num_sink_rates;
+-	}
+-
+-	*sink_rates = default_rates;
+-
+-	return (intel_dp->max_sink_link_bw >> 3) + 1;
+-}
+-
+ static void
+ intel_dp_set_source_rates(struct intel_dp *intel_dp)
+ {
+@@ -274,15 +289,22 @@ static int intersect_rates(const int *source_rates, int source_len,
+ static int intel_dp_common_rates(struct intel_dp *intel_dp,
+ 				 int *common_rates)
+ {
+-	const int *sink_rates;
+-	int sink_len;
++	int max_rate = drm_dp_bw_code_to_link_rate(intel_dp->max_sink_link_bw);
++	int i, common_len;
+ 
+-	sink_len = intel_dp_sink_rates(intel_dp, &sink_rates);
++	common_len = intersect_rates(intel_dp->source_rates,
++				     intel_dp->num_source_rates,
++				     intel_dp->sink_rates,
++				     intel_dp->num_sink_rates,
++				     common_rates);
++
++	/* Limit results by potentially reduced max rate */
++	for (i = 0; i < common_len; i++) {
++		if (common_rates[common_len - i - 1] <= max_rate)
++			return common_len - i;
++	}
+ 
+-	return intersect_rates(intel_dp->source_rates,
+-			       intel_dp->num_source_rates,
+-			       sink_rates, sink_len,
+-			       common_rates);
++	return 0;
+ }
+ 
+ static int intel_dp_link_rate_index(struct intel_dp *intel_dp,
+@@ -1491,8 +1513,7 @@ static void snprintf_int_array(char *str, size_t len,
+ 
+ static void intel_dp_print_rates(struct intel_dp *intel_dp)
+ {
+-	const int *sink_rates;
+-	int sink_len, common_len;
++	int common_len;
+ 	int common_rates[DP_MAX_SUPPORTED_RATES];
+ 	char str[128]; /* FIXME: too big for stack? */
+ 
+@@ -1503,8 +1524,8 @@ static void intel_dp_print_rates(struct intel_dp *intel_dp)
+ 			   intel_dp->source_rates, intel_dp->num_source_rates);
+ 	DRM_DEBUG_KMS("source rates: %s\n", str);
+ 
+-	sink_len = intel_dp_sink_rates(intel_dp, &sink_rates);
+-	snprintf_int_array(str, sizeof(str), sink_rates, sink_len);
++	snprintf_int_array(str, sizeof(str),
++			   intel_dp->sink_rates, intel_dp->num_sink_rates);
+ 	DRM_DEBUG_KMS("sink rates: %s\n", str);
+ 
+ 	common_len = intel_dp_common_rates(intel_dp, common_rates);
+@@ -1544,7 +1565,8 @@ int intel_dp_rate_select(struct intel_dp *intel_dp, int rate)
+ void intel_dp_compute_rate(struct intel_dp *intel_dp, int port_clock,
+ 			   uint8_t *link_bw, uint8_t *rate_select)
+ {
+-	if (intel_dp->num_sink_rates) {
++	/* eDP 1.4 rate select method. */
++	if (intel_dp->use_rate_select) {
+ 		*link_bw = 0;
+ 		*rate_select =
+ 			intel_dp_rate_select(intel_dp, port_clock);
+@@ -3681,6 +3703,11 @@ void intel_dp_set_idle_link_train(struct intel_dp *intel_dp)
+ 		intel_dp->num_sink_rates = i;
+ 	}
+ 
++	if (intel_dp->num_sink_rates)
++		intel_dp->use_rate_select = true;
++	else
++		intel_dp_set_sink_rates(intel_dp);
++
+ 	return true;
+ }
+ 
+@@ -3691,6 +3718,10 @@ void intel_dp_set_idle_link_train(struct intel_dp *intel_dp)
+ 	if (!intel_dp_read_dpcd(intel_dp))
+ 		return false;
+ 
++	/* Don't clobber cached eDP rates. */
++	if (!is_edp(intel_dp))
++		intel_dp_set_sink_rates(intel_dp);
++
+ 	if (drm_dp_dpcd_read(&intel_dp->aux, DP_SINK_COUNT,
+ 			     &intel_dp->sink_count, 1) < 0)
+ 		return false;
+diff --git a/drivers/gpu/drm/i915/intel_dp_link_training.c b/drivers/gpu/drm/i915/intel_dp_link_training.c
+index 0048b52..694ad0f 100644
+--- a/drivers/gpu/drm/i915/intel_dp_link_training.c
++++ b/drivers/gpu/drm/i915/intel_dp_link_training.c
+@@ -146,7 +146,8 @@ static bool intel_dp_link_max_vswing_reached(struct intel_dp *intel_dp)
+ 		link_config[1] |= DP_LANE_COUNT_ENHANCED_FRAME_EN;
+ 	drm_dp_dpcd_write(&intel_dp->aux, DP_LINK_BW_SET, link_config, 2);
+ 
+-	if (intel_dp->num_sink_rates)
++	/* eDP 1.4 rate select method. */
++	if (!link_bw)
+ 		drm_dp_dpcd_write(&intel_dp->aux, DP_LINK_RATE_SET,
+ 				  &rate_select, 1);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index f723b86..7063944 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -943,9 +943,10 @@ struct intel_dp {
+ 	/* source rates */
+ 	int num_source_rates;
+ 	const int *source_rates;
+-	/* sink rates as reported by DP_SUPPORTED_LINK_RATES */
+-	uint8_t num_sink_rates;
++	/* sink rates as reported by DP_MAX_LINK_RATE/DP_SUPPORTED_LINK_RATES */
++	int num_sink_rates;
+ 	int sink_rates[DP_MAX_SUPPORTED_RATES];
++	bool use_rate_select;
+ 	/* Max lane count for the sink as per DPCD registers */
+ 	uint8_t max_sink_lane_count;
+ 	/* Max link BW for the sink as per DPCD registers */
+-- 
+1.7.9.5
+
