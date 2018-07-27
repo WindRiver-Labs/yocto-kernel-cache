@@ -1,0 +1,225 @@
+From e10923e6911f1c7a06fcea72f985e7610418fc4a Mon Sep 17 00:00:00 2001
+From: Stefan Chulski <stefanc@marvell.com>
+Date: Thu, 22 Sep 2016 15:22:22 +0300
+Subject: [PATCH 0519/1345] mvpp2x: map Napi ID to TX queue
+
+commit  cbefc2ac63ee50fffd309177886d0892c74afa94 from
+https://github.com/MarvellEmbeddedProcessors/linux-marvell.git
+
+- reduce Qdisk locks by mapping between Napi ID to TX queue
+- use .ndo_select_queue callback to choose TX queue
+
+Change-Id: I204e12ff82ffa2c096be36d798ccada2d4bb7f65
+Signed-off-by: Stefan Chulski <stefanc@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/33075
+Reviewed-by: Yuval Caduri <cyuval@marvell.com>
+Reviewed-by: Hanna Hawa <hannah@marvell.com>
+Tested-by: Hanna Hawa <hannah@marvell.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2x/mv_pp2x.h      |    1 +
+ drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_hw.c   |    2 +-
+ drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c |   86 ++++++++++++++++++--
+ 3 files changed, 80 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x.h b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x.h
+index bb168e8..0e28bfc 100644
+--- a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x.h
++++ b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x.h
+@@ -22,6 +22,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/string.h>
+ #include <linux/log2.h>
++#include <linux/phy.h>
+ 
+ #include "mv_pp2x_hw_type.h"
+ #include "mv_gop110_hw_type.h"
+diff --git a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_hw.c b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_hw.c
+index b2060eb..8bc0829 100644
+--- a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_hw.c
++++ b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_hw.c
+@@ -3308,7 +3308,7 @@ int mv_pp2x_cls_init(struct platform_device *pdev, struct mv_pp2x_hw *hw)
+ 	mv_pp2x_write(hw, MVPP2_CLS_MODE_REG, MVPP2_CLS_MODE_ACTIVE_MASK);
+ 
+ 	/* Clear classifier flow table */
+-	memset(&fe.data, 0, MVPP2_CLS_FLOWS_TBL_DATA_WORDS);
++	memset((char *)(&fe.data), 0, MVPP2_CLS_FLOWS_TBL_DATA_WORDS*sizeof(u32));
+ 	for (index = 0; index < MVPP2_CLS_FLOWS_TBL_SIZE; index++) {
+ 		fe.index = index;
+ 		mv_pp2x_cls_flow_write(hw, &fe);
+diff --git a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c
+index 809ec38..9a130e8 100644
+--- a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c
+@@ -44,6 +44,7 @@
+ #include <uapi/linux/ppp_defs.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
++#include <net/busy_poll.h>
+ #include <asm/cacheflush.h>
+ #include <linux/dma-mapping.h>
+ 
+@@ -2345,6 +2346,7 @@ static int mv_pp2x_rx(struct mv_pp2x_port *port, struct napi_struct *napi,
+ 		mv_pp2x_rx_csum(port, rx_status, skb);
+ 		skb_record_rx_queue(skb, (u16)rxq->id);
+ 		mv_pp2x_set_skb_hash(rx_desc, rx_status, skb);
++		skb_mark_napi_id(skb, napi);
+ 
+ 		napi_gro_receive(napi, skb);
+ 	}
+@@ -3447,6 +3449,13 @@ int mv_pp2x_open(struct net_device *dev)
+ 		netdev_err(port->dev, "cannot allocate irq's\n");
+ 		goto err_cleanup_txqs;
+ 	}
++
++#if 0
++	/* Only Mvpp22 support hot plug feature */
++	if (port->priv->pp2_version == PPV22  && !(port->flags & (MVPP2_F_IF_MUSDK | MVPP2_F_LOOPBACK)))
++		register_hotcpu_notifier(&port->port_hotplug_nb);
++#endif
++
+ 	/* In default link is down */
+ 	netif_carrier_off(port->dev);
+ 
+@@ -3508,8 +3517,13 @@ int mv_pp2x_stop(struct net_device *dev)
+ 	mv_pp2x_shared_thread_interrupts_mask(port);
+ 	mv_pp2x_cleanup_irqs(port);
+ 
+-	if (port->priv->pp2xdata->interrupt_tx_done == false) {
+-		for_each_online_cpu(cpu) {
++#if 0
++	if (port->priv->pp2_version == PPV22)
++		unregister_hotcpu_notifier(&port->port_hotplug_nb);
++#endif
++	/* Cancel tx timers in case Tx done interrupts are disabled and if port is not in Netmap mode */
++	if (!(port->flags & MVPP2_F_IFCAP_NETMAP) && !port->priv->pp2xdata->interrupt_tx_done)  {
++		for_each_present_cpu(cpu) {
+ 			port_pcpu = per_cpu_ptr(port->pcpu, cpu);
+ 			hrtimer_cancel(&port_pcpu->tx_done_timer);
+ 			port_pcpu->timer_scheduled = false;
+@@ -3709,8 +3723,29 @@ static int mv_pp2x_change_mtu(struct net_device *dev, int mtu)
+ 	return err;
+ }
+ 
+-static struct rtnl_link_stats64 *
+-mv_pp2x_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
++static int mv_pp2x_rx_add_vid(struct net_device *dev, u16 proto, u16 vid)
++{
++	int err;
++
++	if (vid >= VLAN_N_VID)
++		return -EINVAL;
++
++	err = mv_pp2x_prs_vid_entry_accept(dev, proto, vid, true);
++	return err;
++}
++
++static int mv_pp2x_rx_kill_vid(struct net_device *dev, u16 proto, u16 vid)
++{
++	int err;
++
++	if (vid >= VLAN_N_VID)
++		return -EINVAL;
++
++	err = mv_pp2x_prs_vid_entry_accept(dev, proto, vid, false);
++	return err;
++}
++
++void mv_pp2x_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+ {
+ 	struct mv_pp2x_port *port = netdev_priv(dev);
+ 	unsigned int start;
+@@ -3742,7 +3777,7 @@ static int mv_pp2x_change_mtu(struct net_device *dev, int mtu)
+ 	stats->rx_dropped	= dev->stats.rx_dropped;
+ 	stats->tx_dropped	= dev->stats.tx_dropped;
+ 
+-	return stats;
++	return;
+ }
+ 
+ static int mv_pp2x_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+@@ -3796,12 +3831,23 @@ static int mv_pp2x_netdev_set_features(struct net_device *dev,
+ 	return 0;
+ }
+ 
++u16 mv_pp2x_select_queue(struct net_device *dev, struct sk_buff *skb,
++		       void *accel_priv, select_queue_fallback_t fallback)
++
++{
++	if (skb->napi_id)
++		return skb->napi_id - 1;
++
++	return fallback(dev, skb) % mv_pp2x_txq_number;
++}
++
+ /* Device ops */
+ 
+ static const struct net_device_ops mv_pp2x_netdev_ops = {
+ 	.ndo_open		= mv_pp2x_open,
+ 	.ndo_stop		= mv_pp2x_stop,
+ 	.ndo_start_xmit		= mv_pp2x_tx,
++	.ndo_select_queue	= mv_pp2x_select_queue,
+ 	.ndo_set_rx_mode	= mv_pp2x_set_rx_mode,
+ 	.ndo_set_mac_address	= mv_pp2x_set_mac_address,
+ 	.ndo_change_mtu		= mv_pp2x_change_mtu,
+@@ -3929,7 +3975,7 @@ static void mv_pp22_queue_vectors_init(struct mv_pp2x_port *port)
+ 		    mv_pp2x_queue_mode == MVPP2_QDIST_MULTI_MODE)
+ 			q_vec[cpu].irq = port->of_irqs[irq_index++];
+ 		netif_napi_add(net_dev, &q_vec[cpu].napi, mv_pp22_poll,
+-			NAPI_POLL_WEIGHT);
++			       NAPI_POLL_WEIGHT);
+ 		if (mv_pp2x_queue_mode == MVPP2_QDIST_MULTI_MODE) {
+ 			q_vec[cpu].num_rx_queues = mv_pp2x_num_cos_queues;
+ 			q_vec[cpu].first_rx_queue = cpu*mv_pp2x_num_cos_queues;
+@@ -3948,7 +3994,7 @@ static void mv_pp22_queue_vectors_init(struct mv_pp2x_port *port)
+ 		q_vec[cpu].pending_cause_rx = 0;
+ 		q_vec[cpu].irq = port->of_irqs[irq_index];
+ 		netif_napi_add(net_dev, &q_vec[cpu].napi, mv_pp22_poll,
+-			NAPI_POLL_WEIGHT);
++			       NAPI_POLL_WEIGHT);
+ 		q_vec[cpu].first_rx_queue = 0;
+ 		q_vec[cpu].num_rx_queues = port->num_rx_queues;
+ 
+@@ -5132,6 +5178,24 @@ static int mv_pp2x_probe(struct platform_device *pdev)
+ 				MV_NETC_SECOND_PHASE);
+ 
+ 	platform_set_drvdata(pdev, priv);
++
++	priv->workqueue = create_singlethread_workqueue("mv_pp2x");
++
++	if (!priv->workqueue) {
++		err = -ENOMEM;
++		goto err_clk;
++	}
++
++#if 0
++	/* Only Mvpp22 support hot plug feature */
++	if (priv->pp2_version == PPV22 && mv_pp2x_queue_mode == MVPP2_QDIST_MULTI_MODE) {
++		priv->cp_hotplug_nb.notifier_call = mv_pp2x_cp_cpu_callback;
++		register_hotcpu_notifier(&priv->cp_hotplug_nb);
++	}
++#endif
++
++	INIT_DELAYED_WORK(&priv->stats_task, mv_pp2x_get_device_stats);
++
+ 	queue_delayed_work(priv->workqueue, &priv->stats_task, stats_delay);
+ 	pr_debug("Platform Device Name : %s\n", kobject_name(&pdev->dev.kobj));
+ 	return 0;
+@@ -5149,7 +5213,13 @@ static int mv_pp2x_remove(struct platform_device *pdev)
+ {
+ 	struct mv_pp2x *priv = platform_get_drvdata(pdev);
+ 	struct mv_pp2x_hw *hw = &priv->hw;
+-	int i, num_of_ports;
++	int i, num_of_ports, cpu;
++	struct mv_pp2x_cp_pcpu *cp_pcpu;
++
++#if 0
++	if (priv->pp2_version == PPV22 && mv_pp2x_queue_mode == MVPP2_QDIST_MULTI_MODE)
++		unregister_hotcpu_notifier(&priv->cp_hotplug_nb);
++#endif
+ 
+ 	cancel_delayed_work(&priv->stats_task);
+ 	flush_workqueue(priv->workqueue);
+-- 
+1.7.9.5
+

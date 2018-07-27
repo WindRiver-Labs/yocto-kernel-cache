@@ -1,0 +1,176 @@
+From d42953230abb324d936581f2e67f4e6eed3ab84a Mon Sep 17 00:00:00 2001
+From: Ken Ma <make@marvell.com>
+Date: Wed, 14 Feb 2018 09:57:51 +0800
+Subject: [PATCH 1316/1345] gpio: mvebu: add soc interrupt handling
+
+commit  3be0ee357ae27476e860a3b85d4a5d0304c069d0 from
+https://github.com/MarvellEmbeddedProcessors/linux-marvell.git
+
+Some gpio interrupt controllers are managed by both general interrupt
+registers and soc interrupt registers, for example, AP806 gpio
+interrupt controller.
+
+This patch adds soc interrupt cause/mask register bits set/clear
+operations in irq_ack/irq_mask/irq_unmask hook functions when the
+gpio interrupt controller needs soc interrupt handling.
+
+After this patch, AP806 gpio controller fdt regsiter should be like:
+	gpio0: gpio@6F5040 {
+		compatible = "marvell,orion-gpio";
+		reg = <0x6F5040 0x40>, /* gpio interrupt regs */
+		      <0x6F4328 0x8>; /* soc interrupt regs */
+		...
+	};
+
+Change-Id: I27a368b0d5735d673e58679d5e3536fd7c750dd6
+Signed-off-by: Ken Ma <make@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/52309
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+Reviewed-by: Hanna Hawa <hannah@marvell.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../devicetree/bindings/gpio/gpio-mvebu.txt        |   22 +++++---
+ drivers/gpio/gpio-mvebu.c                          |   59 ++++++++++++++++++++
+ 2 files changed, 72 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/gpio/gpio-mvebu.txt b/Documentation/devicetree/bindings/gpio/gpio-mvebu.txt
+index 8262c94..b91d5bb 100644
+--- a/Documentation/devicetree/bindings/gpio/gpio-mvebu.txt
++++ b/Documentation/devicetree/bindings/gpio/gpio-mvebu.txt
+@@ -4,15 +4,19 @@ Required properties:
+ 
+ - compatible : Should be "marvell,orion-gpio", "marvell,mv78200-gpio"
+   or "marvell,armadaxp-gpio". "marvell,orion-gpio" should be used for
+-  Orion, Kirkwood, Dove, Discovery (except MV78200) and Armada
+-  370. "marvell,mv78200-gpio" should be used for the Discovery
+-  MV78200. "marvel,armadaxp-gpio" should be used for all Armada XP
+-  SoCs (MV78230, MV78260, MV78460).
+-
+-- reg: Address and length of the register set for the device. Only one
+-  entry is expected, except for the "marvell,armadaxp-gpio" variant
+-  for which two entries are expected: one for the general registers,
+-  one for the per-cpu registers.
++  Orion, Kirkwood, Dove, Discovery (except MV78200), Armada 370, and
++  Armada 7k&8k AP/CP. "marvell,mv78200-gpio" should be used for the
++  Discovery MV78200. "marvel,armadaxp-gpio" should be used for all
++  Armada XP SoCs (MV78230, MV78260, MV78460).
++
++- reg: Address and length of the register sets for the device.
++  - For "marvell,mv78200-gpio" compatible, one entry for the general registers;
++  - For "marvell,armadaxp-gpio" compatible, two entries are expected:
++    one for the general registers, one for the per-cpu registers.
++  - For "marvell,orion-gpio" compatible, reg can be one entry or two entries:
++    for Armada 7k&8k AP GPIO controllers, reg has two entries: one for the general
++    registers, one for soc interrupt registers;
++    for other controllers, reg has one entry for the general registers.
+ 
+ - interrupts: The list of interrupts that are used for all the pins
+   managed by this GPIO bank. There can be more than one interrupt
+diff --git a/drivers/gpio/gpio-mvebu.c b/drivers/gpio/gpio-mvebu.c
+index 08d6db2..0a4cd3d 100644
+--- a/drivers/gpio/gpio-mvebu.c
++++ b/drivers/gpio/gpio-mvebu.c
+@@ -76,6 +76,20 @@
+ #define GPIO_LEVEL_MASK_MV78200_OFF(cpu)  ((cpu) ? 0x34 : 0x1C)
+ 
+ /*
++ * For Armada 7k & 8k, AP806 gpio interrupt is also managed by SoC interrupt
++ * registers besides its own gpio interrupt registers;
++ * Each SoC interrupt register bit manages 8 GPIOs: [0] - GPIO0-7 interrupt,
++ * [1] - GPIO8-15 interrupt, [2] - GPIO16-19 interrupt(AP806 has 20 GPIOs)
++ * and [31:3] - Reserved.
++ * SoC interrupt cause register type is RW0C;
++ * SoC interrupt mask register is active low (0 = Interrupt mask and
++ * 1 = Interrupt enable);
++ */
++#define SOC_INT_CAUSE_OFF	0x0000
++#define SOC_INT_MASK_OFF	0x0004
++#define SOC_INT_1BIT_GPIOS	8
++
++/*
+  * The Armada XP has per-CPU registers for interrupt cause, interrupt
+  * mask and interrupt level mask. Those are relative to the
+  * percpu_membase.
+@@ -109,6 +123,7 @@ struct mvebu_gpio_chip {
+ 	spinlock_t	   lock;
+ 	void __iomem	  *membase;
+ 	void __iomem	  *percpu_membase;
++	void __iomem	  *soc_int_base;
+ 	int		   irqbase;
+ 	struct irq_domain *domain;
+ 	int		   soc_variant;
+@@ -351,6 +366,10 @@ static void mvebu_gpio_irq_ack(struct irq_data *d)
+ 
+ 	irq_gc_lock(gc);
+ 	writel_relaxed(~mask, mvebu_gpioreg_edge_cause(mvchip));
++	if (mvchip->soc_int_base) {
++		mask = ~(1 << ((d->irq - gc->irq_base) / SOC_INT_1BIT_GPIOS));
++		writel_relaxed(mask, mvchip->soc_int_base + SOC_INT_CAUSE_OFF);
++	}
+ 	irq_gc_unlock(gc);
+ }
+ 
+@@ -365,6 +384,20 @@ static void mvebu_gpio_edge_irq_mask(struct irq_data *d)
+ 	ct->mask_cache_priv &= ~mask;
+ 
+ 	writel_relaxed(ct->mask_cache_priv, mvebu_gpioreg_edge_mask(mvchip));
++	if (mvchip->soc_int_base) {
++		u32 soc_int_bit = (d->irq - gc->irq_base) / SOC_INT_1BIT_GPIOS;
++		u32 reg = readl(mvchip->soc_int_base + SOC_INT_MASK_OFF);
++
++		/*
++		 * Each SoC interrupt register bit manages 8 GPIOs and is
++		 * active low. So when the 8 GPIOs' interrupts are all masked,
++		 * clear the SoC interrupt bit to mask it.
++		 */
++		if (!(ct->mask_cache_priv & (0xff << soc_int_bit))) {
++			reg &= ~(1 << soc_int_bit);
++			writel(reg, mvchip->soc_int_base + SOC_INT_MASK_OFF);
++		}
++	}
+ 	irq_gc_unlock(gc);
+ }
+ 
+@@ -378,6 +411,20 @@ static void mvebu_gpio_edge_irq_unmask(struct irq_data *d)
+ 	irq_gc_lock(gc);
+ 	ct->mask_cache_priv |= mask;
+ 	writel_relaxed(ct->mask_cache_priv, mvebu_gpioreg_edge_mask(mvchip));
++	if (mvchip->soc_int_base) {
++		u32 soc_int_bit = (d->irq - gc->irq_base) / SOC_INT_1BIT_GPIOS;
++		u32 reg = readl(mvchip->soc_int_base + SOC_INT_MASK_OFF);
++
++		/*
++		 * Each SoC interrupt register bit manages 8 GPIOs and is
++		 * active low. So when other 7 GPIOs' interrupts are not
++		 * unmasked, set the SoC interrupt bit to unmask it.
++		 */
++		if ((ct->mask_cache_priv & (0xff << soc_int_bit)) == mask) {
++			reg |= (1 << soc_int_bit);
++			writel(reg, mvchip->soc_int_base + SOC_INT_MASK_OFF);
++		}
++	}
+ 	irq_gc_unlock(gc);
+ }
+ 
+@@ -1041,6 +1088,18 @@ static int mvebu_gpio_probe(struct platform_device *pdev)
+ 			return PTR_ERR(mvchip->percpu_membase);
+ 	}
+ 
++	if (soc_variant == MVEBU_GPIO_SOC_VARIANT_ORION) {
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++		if (res) {
++			mvchip->soc_int_base =
++				devm_ioremap_resource(&pdev->dev, res);
++
++			if (IS_ERR(mvchip->soc_int_base))
++				return PTR_ERR(mvchip->soc_int_base);
++
++		}
++	}
++
+ 	/*
+ 	 * Mask and clear GPIO interrupts.
+ 	 */
+-- 
+1.7.9.5
+

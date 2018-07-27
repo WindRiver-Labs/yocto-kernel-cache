@@ -1,0 +1,349 @@
+From b385e0c588eb58ffd800270d1e478c80af26519c Mon Sep 17 00:00:00 2001
+From: Yelena Krivosheev <yelena@marvell.com>
+Date: Tue, 18 Jul 2017 12:09:33 +0300
+Subject: [PATCH 1093/1345] net: mvneta: support musdk private port init
+
+commit  46038cbca6dedfad82152244791594b3cd058eae from
+https://github.com/MarvellEmbeddedProcessors/linux-marvell.git
+
+Port belong to User Space (MUSDK) application must
+be described in DTS file with: musdk-status = "private".
+In this case kernel is responsible only for PHY and MAC
+initialization
+
+Change-Id: I9b84ea7a0efa7731913b6858dda126edae4b8850
+Signed-off-by: Yelena Krivosheev <yelena@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/41774
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+Reviewed-by: Neta Zur Hershkovits <neta@marvell.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvneta.c |  160 +++++++++++++++++++++++++--------
+ 1 file changed, 124 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index d483347..d5306a2 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -392,6 +392,7 @@ struct mvneta_pcpu_port {
+ };
+ 
+ #define MVNETA_PORT_F_CLEANUP_TIMER_BIT  0
++#define MVNETA_PORT_F_IF_MUSDK           2
+ 
+ struct mvneta_port {
+ 	u8 id;
+@@ -1065,7 +1066,7 @@ static  int mvneta_bm_port_mbus_init(struct mvneta_port *pp)
+ 	err = mvneta_mbus_io_win_set(pp, pp->bm_priv->bppi_phys_addr, wsize,
+ 				     target, attr);
+ 	if (err < 0) {
+-		dev_info(&pdev->dev, "fail to configure mbus window to BM\n");
++		dev_info(&pp->dev->dev, "fail to configure mbus window to BM\n");
+ 		return err;
+ 	}
+ 	return 0;
+@@ -1372,6 +1373,7 @@ static void mvneta_mac_config(struct mvneta_port *pp)
+ 	u32 new_ctrl2, gmac_ctrl2 = mvreg_read(pp, MVNETA_GMAC_CTRL_2);
+ 	u32 new_clk, gmac_clk = mvreg_read(pp, MVNETA_GMAC_CLOCK_DIVIDER);
+ 	u32 new_an, gmac_an = mvreg_read(pp, MVNETA_GMAC_AUTONEG_CONFIG);
++	struct net_device *ndev = pp->dev;
+ 
+ 	/* Clear all fields need to config with different work mode */
+ 	new_ctrl2 = gmac_ctrl2 & ~MVNETA_GMAC2_SGMII_INBAND_AN_MODE;
+@@ -1419,23 +1421,23 @@ static void mvneta_mac_config(struct mvneta_port *pp)
+ 		}
+ 	} else {
+ 		/* SMI auto-nego, GMAC will get info from PHY with SMI */
+-		if (pp->phy_dev) {
+-			if (pp->phy_dev->duplex)
++		if (ndev->phydev) {
++			if (ndev->phydev->duplex)
+ 				new_an |= MVNETA_GMAC_CONFIG_FULL_DUPLEX;
+ 
+-			if (pp->phy_dev->speed == SPEED_1000)
++			if (ndev->phydev->speed == SPEED_1000)
+ 				new_an |= MVNETA_GMAC_CONFIG_GMII_SPEED;
+-			else if (pp->phy_dev->speed == SPEED_100)
++			else if (ndev->phydev->speed == SPEED_100)
+ 				new_an |= MVNETA_GMAC_CONFIG_MII_SPEED;
+ 
+-			if (pp->phy_dev->pause)
++			if (ndev->phydev->pause)
+ 				new_an |= MVNETA_GMAC_CONFIG_FLOW_CTRL;
+ 
+-			if (pp->phy_dev->asym_pause)
++			if (ndev->phydev->asym_pause)
+ 				new_an |= MVNETA_GMAC_ADVERT_ASYM_FC_ADV;
+ 
+ 			/* Fixed link, Force link up */
+-			if (phy_is_pseudo_fixed_link(pp->phy_dev)) {
++			if (phy_is_pseudo_fixed_link(ndev->phydev)) {
+ 				new_an |= MVNETA_GMAC_FORCE_LINK_PASS;
+ 				new_an &= ~MVNETA_GMAC_FORCE_LINK_DOWN;
+ 			}
+@@ -2074,7 +2076,7 @@ static void mvneta_cleanup_timer_callback(unsigned long data)
+ 
+ 		/* Allocate memory, refill */
+ 		while (atomic_read(&rxq->missed)) {
+-			err = mvneta_rx_refill(pp, rx_desc);
++			err = mvneta_rx_refill(pp, rx_desc, rxq);
+ 			if (err) {
+ 				/* update missed_desc and restart timer */
+ 				rxq->missed_desc = rx_desc;
+@@ -2388,8 +2390,8 @@ static int mvneta_rx_hwbm(struct mvneta_port *pp, int rx_todo,
+ 		/* Refill processing */
+ 		err = hwbm_pool_refill(&bm_pool->hwbm_pool, GFP_ATOMIC);
+ 		if (err) {
+-			netdev_err(dev, "Linux processing - Can't refill\n");
+-			rxq->missed++;
++			netdev_dbg(dev, "Linux processing - Can't refill\n");
++			atomic_inc(&rxq->missed);
+ 			goto err_drop_frame_ret_pool;
+ 		}
+ 
+@@ -3030,9 +3032,9 @@ static int mvneta_poll(struct napi_struct *napi, int budget)
+ 	if (rx_queue) {
+ 		rx_queue = rx_queue - 1;
+ 		if (pp->bm_priv)
+-			rx_done = mvneta_rx_hwbm(pp, budget, &pp->rxqs[rx_queue]);
++			rx_done = mvneta_rx_hwbm(pp, budget, &pp->rxqs[rx_queue], napi);
+ 		else
+-			rx_done = mvneta_rx_swbm(pp, budget, &pp->rxqs[rx_queue]);
++			rx_done = mvneta_rx_swbm(pp, budget, &pp->rxqs[rx_queue], napi);
+ 	}
+ 
+ 	if (rx_done < budget) {
+@@ -3783,6 +3785,13 @@ static int mvneta_open(struct net_device *dev)
+ 	struct mvneta_port *pp = netdev_priv(dev);
+ 	int ret;
+ 
++	if (pp->flags & MVNETA_PORT_F_IF_MUSDK) {
++		if (!pp->use_inband_status)
++			phy_start(dev->phydev);
++		netdev_warn(dev, "skipping ndo_open as this port is User Space port\n");
++		return 0;
++	}
++
+ 	pp->pkt_size = MVNETA_RX_PKT_SIZE(pp->dev->mtu);
+ 	pp->frag_size = SKB_DATA_ALIGN(MVNETA_RX_BUF_SIZE(pp->pkt_size)) +
+ 	                SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+@@ -3832,8 +3841,8 @@ static int mvneta_open(struct net_device *dev)
+ 	netif_carrier_off(pp->dev);
+ 
+ 	if (!pp->use_inband_status) {
+-		err = mvneta_mdio_probe(pp);
+-		if (err < 0) {
++		ret = mvneta_mdio_probe(pp);
++		if (ret < 0) {
+ 			netdev_err(dev, "cannot probe MDIO bus\n");
+ 			goto err_free_dead_hp;
+ 		}
+@@ -3903,6 +3912,23 @@ static int mvneta_stop(struct net_device *dev)
+ 	return 0;
+ }
+ 
++int mvneta_dummy_stop(struct net_device *dev)
++{
++	netdev_warn(dev, "ndo_stop not supported\n");
++	return 0;
++}
++
++static int mvneta_dummy_tx(struct sk_buff *skb, struct net_device *dev)
++{
++	return NETDEV_TX_OK;
++}
++
++static int mvneta_dummy_change_mtu(struct net_device *dev, int mtu)
++{
++	netdev_warn(dev, "ndo_change_mtu not supported\n");
++	return 0;
++}
++
+ static int mvneta_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ {
+ 	if (!dev->phydev)
+@@ -3915,17 +3941,17 @@ static int mvneta_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 
+ /* Check speed and duplex when set auto-nego with ethtool */
+ static int mvneta_spd_dplx_valid(struct mvneta_port *pp,
+-				 struct ethtool_cmd *cmd)
++				 const struct ethtool_link_ksettings *cmd)
+ {
+ 	int ret = 0;
+-	u32 speed = ethtool_cmd_speed(cmd);
++	u32 speed = cmd->base.speed;
+ 
+-	if ((speed + cmd->duplex) == (SPEED_1000 + DUPLEX_HALF)) {
++	if ((speed + cmd->base.duplex) == (SPEED_1000 + DUPLEX_HALF)) {
+ 		/* When auto-nego disabled, 1000Base-Half is illegal.
+ 		 * When auto-nego enabled, 1000Base-Half is invalid,
+ 		 * but no error return for this, ethtool will show results.
+ 		 */
+-		if (cmd->autoneg == AUTONEG_DISABLE) {
++		if (cmd->base.autoneg == AUTONEG_DISABLE) {
+ 			netdev_err(pp->dev, "Unsupported Speed/Duplex configuration\n");
+ 			ret = -EINVAL;
+ 		}
+@@ -3945,7 +3971,7 @@ static int mvneta_spd_dplx_valid(struct mvneta_port *pp,
+ 
+ 	if (phydev) {
+ 		/* Fixed link not allowed to update speed/duplex */
+-		if (phy_is_pseudo_fixed_link(pp->phy_dev))
++		if (phy_is_pseudo_fixed_link(ndev->phydev))
+ 			return -EINVAL;
+ 		if (mvneta_spd_dplx_valid(pp, cmd))
+ 			return -EINVAL;
+@@ -4472,6 +4498,20 @@ static void mvneta_ethtool_diag_test(struct net_device *dev,
+ 	msleep_interruptible(4 * 1000);
+ }
+ 
++static int mvneta_ethtool_nway_reset(struct net_device *dev)
++{
++	if (!netif_running(dev))
++		return -EAGAIN;
++
++	if (!dev->phydev)
++		return -EOPNOTSUPP;
++	
++	if (dev->phydev->autoneg == AUTONEG_DISABLE)
++		return -EINVAL;
++
++	return phy_start_aneg(dev->phydev);
++}
++
+ static const struct net_device_ops mvneta_netdev_ops = {
+ 	.ndo_open            = mvneta_open,
+ 	.ndo_stop            = mvneta_stop,
+@@ -4508,6 +4548,35 @@ static void mvneta_ethtool_diag_test(struct net_device *dev,
+ 	.self_test	= mvneta_ethtool_diag_test,
+ };
+ 
++static const struct net_device_ops mvneta_non_kernel_netdev_ops = {
++	.ndo_open            = mvneta_open,
++	.ndo_stop            = mvneta_dummy_stop,
++	.ndo_start_xmit      = mvneta_dummy_tx,
++	.ndo_set_rx_mode     = mvneta_set_rx_mode,
++	.ndo_set_mac_address = mvneta_set_mac_addr,
++	.ndo_change_mtu      = mvneta_dummy_change_mtu,
++	.ndo_fix_features    = mvneta_fix_features,
++	.ndo_get_stats64     = mvneta_get_stats64,
++	.ndo_do_ioctl        = mvneta_ioctl,
++};
++
++const struct ethtool_ops mvneta_non_kernel_eth_tool_ops = {
++	.get_link       = ethtool_op_get_link,
++	.get_link_ksettings = phy_ethtool_get_link_ksettings,
++	.get_drvinfo    = mvneta_ethtool_get_drvinfo,
++	.get_strings	= mvneta_ethtool_get_strings,
++	.get_ethtool_stats = mvneta_ethtool_get_stats,
++	.get_sset_count	= mvneta_ethtool_get_sset_count,
++	.get_rxfh_indir_size = mvneta_ethtool_get_rxfh_indir_size,
++	.get_rxnfc	= mvneta_ethtool_get_rxnfc,
++	.get_rxfh	= mvneta_ethtool_get_rxfh,
++	.set_rxfh	= mvneta_ethtool_set_rxfh,
++	.get_regs_len	= mvneta_ethtool_get_regs_len,
++	.get_regs	= mvneta_ethtool_get_regs,
++	.nway_reset	= mvneta_ethtool_nway_reset,
++	.self_test	= mvneta_ethtool_diag_test,
++};
++
+ /* Initialize hw */
+ static int mvneta_init(struct device *dev, struct mvneta_port *pp)
+ {
+@@ -4664,6 +4733,8 @@ static int mvneta_probe(struct platform_device *pdev)
+ 	int phy_mode;
+ 	int err;
+ 	int cpu;
++	const char *musdk_status;
++	int statlen;
+ 
+ 	dev = alloc_etherdev_mqs(sizeof(struct mvneta_port), txq_number, rxq_number);
+ 	if (!dev)
+@@ -4767,6 +4838,17 @@ static int mvneta_probe(struct platform_device *pdev)
+ 		goto err_clk;
+ 	}
+ 
++	/* check MUSDK port status */
++	musdk_status = of_get_property(dn, "musdk-status", &statlen);
++
++	/* Set musdk_flag, only if status is "private" */
++	if (musdk_status && !strcmp(musdk_status, "private")) {
++		pp->flags |= MVNETA_PORT_F_IF_MUSDK;
++		/* overwrite mvneta_netdev_ops and mvneta_eth_tool_ops */
++		dev->netdev_ops = &mvneta_non_kernel_netdev_ops;
++		dev->ethtool_ops = &mvneta_non_kernel_eth_tool_ops;
++	}
++
+ 	/* Alloc per-cpu port structure */
+ 	pp->ports = alloc_percpu(struct mvneta_pcpu_port);
+ 	if (!pp->ports) {
+@@ -4830,7 +4912,7 @@ static int mvneta_probe(struct platform_device *pdev)
+ 
+ 	/* Obtain access to BM resources if enabled and already initialized */
+ 	bm_node = of_parse_phandle(dn, "buffer-manager", 0);
+-	if (bm_node && bm_node->data) {
++	if (bm_node && bm_node->data && !(pp->flags & MVNETA_PORT_F_IF_MUSDK)) {
+ 		pp->bm_priv = bm_node->data;
+ 		err = mvneta_bm_port_init(pdev, pp);
+ 		if (err < 0) {
+@@ -4853,16 +4935,18 @@ static int mvneta_probe(struct platform_device *pdev)
+ 	/* Armada3700 network controller does not support per-cpu
+ 	 * operation, so only single NAPI should be initialized.
+ 	 */
+-	if (pp->neta_armada3700) {
+-		netif_napi_add(dev, &pp->napi, mvneta_poll, NAPI_POLL_WEIGHT);
+-	} else {
+-		for_each_present_cpu(cpu) {
+-			struct mvneta_pcpu_port *port =
+-				per_cpu_ptr(pp->ports, cpu);
++	if (!(pp->flags & MVNETA_PORT_F_IF_MUSDK)) {
++		if (pp->neta_armada3700) {
++			netif_napi_add(dev, &pp->napi, mvneta_poll, NAPI_POLL_WEIGHT);
++		} else {
++			for_each_present_cpu(cpu) {
++				struct mvneta_pcpu_port *port =
++							    per_cpu_ptr(pp->ports, cpu);
+ 
+-			netif_napi_add(dev, &port->napi, mvneta_poll,
+-				       NAPI_POLL_WEIGHT);
+-			port->pp = pp;
++				netif_napi_add(dev, &port->napi, mvneta_poll,
++					       NAPI_POLL_WEIGHT);
++				port->pp = pp;
++			}
+ 		}
+ 	}
+ 
+@@ -4896,10 +4980,14 @@ static int mvneta_probe(struct platform_device *pdev)
+ 		put_device(&phy->mdio.dev);
+ 	}
+ 
+-	/* Initialize cleanup */
+-	init_timer(&pp->cleanup_timer);
+-	pp->cleanup_timer.function = mvneta_cleanup_timer_callback;
+-	pp->cleanup_timer.data = (unsigned long)pp;
++
++	if (!(pp->flags & MVNETA_PORT_F_IF_MUSDK)) {
++		/* Initialize cleanup */
++		init_timer(&pp->cleanup_timer);
++		pp->cleanup_timer.function = mvneta_cleanup_timer_callback;
++		pp->cleanup_timer.data = (unsigned long)pp;
++	} else
++		netdev_info(dev, "Port belong to User Space (MUSDK)\n");
+ 
+ 	return 0;
+ 
+@@ -5001,8 +5089,8 @@ static int mvneta_resume(struct device *device)
+ 	}
+ 
+ 	if (pp->bm_priv) {
+-		ret = mvneta_bm_port_init(pdev, pp);
+-		if (ret < 0) {
++		err = mvneta_bm_port_init(pdev, pp);
++		if (err < 0) {
+ 			netdev_err(dev, "Cannot resume HW BM, use SW buffer management\n");
+ 			pp->bm_priv = NULL;
+ 		}
+-- 
+1.7.9.5
+

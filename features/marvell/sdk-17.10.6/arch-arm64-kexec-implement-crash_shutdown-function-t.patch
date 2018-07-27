@@ -1,0 +1,221 @@
+From 739f23f7881e8a7f41cced74656f7ae5583b608e Mon Sep 17 00:00:00 2001
+From: MengLi <meng.li@windriver.com>
+Date: Sat, 21 Jul 2018 17:16:42 +0800
+Subject: [PATCH 1343/1345] arch: arm64: kexec: implement crash_shutdown
+ function to release BM pool resource during run
+ kdump
+
+On arm64 platform, implement below functions:
+int crash_shutdown_register(crash_shutdown_t handler, void *data)
+int crash_shutdown_unregister(crash_shutdown_t handler, void *data)
+static void crash_shutdown_execute(void)
+crash_shutdown_register() is used to register a callback function that
+will be executed when machine_crash_shutdown() function is invoked.
+In this way, BM pool resource is released and make sure that the
+second kernel boots up normally.
+
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm64/include/asm/kexec.h                     |   22 ++++++
+ arch/arm64/kernel/machine_kexec.c                  |   79 ++++++++++++++++++++
+ drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c |   40 ++++++++++
+ 3 files changed, 141 insertions(+)
+
+diff --git a/arch/arm64/include/asm/kexec.h b/arch/arm64/include/asm/kexec.h
+index e17f052..8e55727 100644
+--- a/arch/arm64/include/asm/kexec.h
++++ b/arch/arm64/include/asm/kexec.h
+@@ -30,6 +30,28 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++typedef void (*crash_shutdown_t)(void *data);
++
++struct crash_shutdown {
++	void (*crash_shutdown_fcun)(void *data);
++	void *data;
++};
++
++#ifdef CONFIG_KEXEC
++extern int crash_shutdown_register(crash_shutdown_t handler, void *data);
++extern int crash_shutdown_unregister(crash_shutdown_t handler, void *data);
++#else /* !CONFIG_KEXEC */
++static inline int crash_shutdown_register(crash_shutdown_t handler, void *data)
++{
++	return 0;
++}
++
++static inline int crash_shutdown_unregister(crash_shutdown_t handler, void *data)
++{
++	return 0;
++}
++#endif
++
+ /**
+  * crash_setup_regs() - save registers for the panic kernel
+  *
+diff --git a/arch/arm64/kernel/machine_kexec.c b/arch/arm64/kernel/machine_kexec.c
+index 481f54a..54f7a6a 100644
+--- a/arch/arm64/kernel/machine_kexec.c
++++ b/arch/arm64/kernel/machine_kexec.c
+@@ -29,6 +29,83 @@
+ extern const unsigned char arm64_relocate_new_kernel[];
+ extern const unsigned long arm64_relocate_new_kernel_size;
+ 
++#define CRASH_HANDLER_MAX 3
++/* List of shutdown handles */
++static struct crash_shutdown crash_shutdown_handles[CRASH_HANDLER_MAX];
++static DEFINE_SPINLOCK(crash_handlers_lock);
++
++/*
++ * Register a function to be called on shutdown.  Only use this if you
++ * can't reset your device in the second kernel.
++ */
++int crash_shutdown_register(crash_shutdown_t handler, void *data)
++{
++	unsigned int i, rc;
++
++	spin_lock(&crash_handlers_lock);
++	for (i = 0 ; i < CRASH_HANDLER_MAX; i++)
++		if (!crash_shutdown_handles[i].crash_shutdown_fcun) {
++			/* Insert handle at first empty entry */
++			crash_shutdown_handles[i].crash_shutdown_fcun = handler;
++			crash_shutdown_handles[i].data = data;
++			rc = 0;
++			break;
++		}
++
++	if (i == CRASH_HANDLER_MAX) {
++		printk(KERN_ERR "Crash shutdown handles full, "
++		       "not registered.\n");
++		rc = 1;
++	}
++
++	spin_unlock(&crash_handlers_lock);
++	return rc;
++}
++EXPORT_SYMBOL(crash_shutdown_register);
++
++int crash_shutdown_unregister(crash_shutdown_t handler, void *data)
++{
++	unsigned int i, rc;
++
++	spin_lock(&crash_handlers_lock);
++	for (i = 0 ; i < CRASH_HANDLER_MAX; i++)
++		if (crash_shutdown_handles[i].crash_shutdown_fcun == handler)
++			break;
++
++	if (i == CRASH_HANDLER_MAX) {
++		printk(KERN_ERR "Crash shutdown handle not found\n");
++		rc = 1;
++	} else {
++		/* Shift handles down */
++		for (; i < (CRASH_HANDLER_MAX - 1); i++) {
++			crash_shutdown_handles[i].crash_shutdown_fcun =
++					crash_shutdown_handles[i+1].crash_shutdown_fcun;
++			crash_shutdown_handles[i].data =
++					crash_shutdown_handles[i+1].data;
++		}
++		/*
++		 * Reset last entry to NULL now that it has been shifted down,
++		 * this will allow new handles to be added here.
++		 */
++		crash_shutdown_handles[i].crash_shutdown_fcun = NULL;
++		crash_shutdown_handles[i].data = NULL;
++		rc = 0;
++	}
++
++	spin_unlock(&crash_handlers_lock);
++	return rc;
++}
++EXPORT_SYMBOL(crash_shutdown_unregister);
++
++static void crash_shutdown_execute(void)
++{
++	int i;
++
++	for (i = 0; i < CRASH_HANDLER_MAX && crash_shutdown_handles[i].crash_shutdown_fcun; i++) {
++		crash_shutdown_handles[i].crash_shutdown_fcun(crash_shutdown_handles[i].data);
++	}
++}
++
+ /**
+  * kexec_image_info - For debugging output.
+  */
+@@ -258,6 +335,8 @@ void machine_crash_shutdown(struct pt_regs *regs)
+ 	crash_save_cpu(regs, smp_processor_id());
+ 	machine_kexec_mask_interrupts();
+ 
++	crash_shutdown_execute();
++
+ 	pr_info("Starting crashdump kernel...\n");
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c
+index 05f1510..87e4172 100644
+--- a/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2x/mv_pp2x_main.c
+@@ -50,6 +50,9 @@
+ #include <asm/cacheflush.h>
+ #include <linux/dma-mapping.h>
+ #include <dt-bindings/phy/phy-comphy-mvebu.h>
++#ifdef CONFIG_KEXEC
++#include <linux/kexec.h>
++#endif
+ 
+ #include "mv_pp2x.h"
+ #include "mv_pp2x_hw.h"
+@@ -540,6 +543,38 @@ static int mv_pp2x_bm_pools_init(struct platform_device *pdev,
+ 	return err;
+ }
+ 
++void mv_pp2x_bm_crash_shutdown(void *data)
++{
++	struct platform_device *pdev = data;
++	struct mv_pp2x *priv = platform_get_drvdata(pdev);
++	u32 val;
++	int buf_num, i;
++
++	for (i = 0; i < MVPP2_BM_SWF_NUM_POOLS; i++) {
++		struct mv_pp2x_bm_pool *bm_pool = &priv->bm_pools[i];
++
++		buf_num = mv_pp2x_check_hw_buf_num(priv, bm_pool);
++		mv_pp2x_bm_bufs_free(&pdev->dev, priv, bm_pool, buf_num);
++
++		/* Check buffer counters after free */
++		buf_num = mv_pp2x_check_hw_buf_num(priv, bm_pool);
++		if (buf_num) {
++			WARN(1, "cannot free all buffers in pool %d, buf_num left %d\n",
++				 bm_pool->id,
++				 bm_pool->buf_num);
++			return;
++		}
++
++		val = mv_pp2x_read(&priv->hw, MVPP2_BM_POOL_CTRL_REG(bm_pool->id));
++		val |= MVPP2_BM_STOP_MASK;
++		mv_pp2x_write(&priv->hw, MVPP2_BM_POOL_CTRL_REG(bm_pool->id), val);
++
++		mv_pp2x_bm_pool_bufsize_set(&priv->hw, bm_pool, 0);
++	}
++
++	return;
++}
++
+ static int mv_pp2x_bm_init(struct platform_device *pdev, struct mv_pp2x *priv)
+ {
+ 	int i, err, cpu;
+@@ -574,6 +609,11 @@ static int mv_pp2x_bm_init(struct platform_device *pdev, struct mv_pp2x *priv)
+ 	err = mv_pp2x_bm_pools_init(pdev, priv, first_pool, num_pools);
+ 	if (err < 0)
+ 		return err;
++
++#ifdef CONFIG_KEXEC
++	crash_shutdown_register(&mv_pp2x_bm_crash_shutdown, pdev);
++#endif
++
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

@@ -1,0 +1,129 @@
+From 4a76b0e1bccfc655e2148586ff68436851494466 Mon Sep 17 00:00:00 2001
+From: Ken Ma <make@marvell.com>
+Date: Sat, 11 Mar 2017 00:51:43 +0800
+Subject: [PATCH 0882/1345] xhci-plat: mvebu: bind main hcd and shared hcd
+ with their own generic phys
+
+commit  964e523f4949af5f3b231fe91030af5e57243f3d from
+https://github.com/MarvellEmbeddedProcessors/linux-marvell.git
+
+- Mvebu usb32 host controllers use a dedicated utmi phy for USB 2 and
+  use a comphy for USB 3, this patch introduces a fdt property
+  "separated-phys-for-usb2-usb3" which is set to indicate that usb3
+  host controller uses separated PHYs for USB 2 and USB 3 - a dedicated
+  utmi phy for USB 2 and another phy for USB 3;
+- When "separated-phys-for-usb2-usb3" is set, bind the USB 2 phy with
+  name of "usb2" to the main hcd and bind the USB 3 phy with name of
+  "usb3" to the shared hcd;
+- This patch only does the binding with phy name updates for usb3 host
+  mode but not otg mode; currently in otg mode the phy initialization
+  depends on u-boot, otg adds hcds in the "a3700_otg_phy" driver, the
+  updates of phy name binding to hcd for otg should be done in future.
+
+Change-Id: If3d023a23ba3891ce118273acb60a75cf7bbaf7a
+Signed-off-by: Ken Ma <make@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/37391
+Reviewed-by: Victor Gu <xigu@marvell.com>
+Tested-by: Victor Gu <xigu@marvell.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ Documentation/devicetree/bindings/usb/usb-xhci.txt |   23 +++++++++-
+ drivers/usb/host/xhci-plat.c                       |   44 +++++++++++++++-----
+ 2 files changed, 56 insertions(+), 11 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/usb/usb-xhci.txt b/Documentation/devicetree/bindings/usb/usb-xhci.txt
+index 2d80b60..03f0afd 100644
+--- a/Documentation/devicetree/bindings/usb/usb-xhci.txt
++++ b/Documentation/devicetree/bindings/usb/usb-xhci.txt
+@@ -28,10 +28,31 @@ Optional properties:
+   - clocks: reference to a clock
+   - usb3-lpm-capable: determines if platform is USB3 LPM capable
+   - quirk-broken-port-ped: set if the controller has broken port disable mechanism
++  - separated-phys-for-usb2-usb3: it is set when usb3 host controller
++    uses separated PHYs for USB 2 and USB 3 - a dedicated utmi phy
++    for USB 2 and another phy for USB 3, for example, Armada 3700
++    usb3 controller uses a dedicated utmi phy for USB 2 and a comphy
++    for USB 3
++  - phys: phandle + phy specifier pair, reference to the USB PHYs
++  - phy-names: can be "usb2", "usb3" when "separated-phys-for-usb2-usb3" is
++    set or "usb" when "separated-phys-for-usb2-usb3" is not set.
+ 
+-Example:
++Examples:
+ 	usb@f0931000 {
+ 		compatible = "generic-xhci";
+ 		reg = <0xf0931000 0x8c8>;
+ 		interrupts = <0x0 0x4e 0x0>;
+ 	};
++
++	For Armada 3700 which uses separated PHYs for USB 2 and USB 3:
++	usb3@58000 {
++		compatible = "generic-xhci";
++		reg = <0x58000 0x4000>;
++		interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&sgateclk 17>;
++		usb-phy = <&usb3_phy>;
++		phys = <&utmi_usb32>, /* utmi usb32 dedicated phy */
++		       <&a3700_comphy 1 COMPHY_USB3>; /* usb3 comphy */
++		phy-names = "usb2", "usb3";
++		separated-phys-for-usb2-usb3;
++	};
+\ No newline at end of file
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index ca9545a..932dd3b 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -312,16 +312,40 @@ static int xhci_plat_probe(struct platform_device *pdev)
+ 			goto disable_usb_phy;
+ 		}
+ 	} else {
+-		ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+-		if (ret)
+-			goto disable_usb_phy;
+-
+-		if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
+-			xhci->shared_hcd->can_do_streams = 1;
+-
+-		ret = usb_add_hcd(xhci->shared_hcd, irq, IRQF_SHARED);
+-		if (ret)
+-			goto dealloc_usb2_hcd;
++		/*
++		 * When "separated-phys-for-usb2-usb3" is set, it indicates that usb3 host controller
++		 * uses a dedicated utmi phy for USB 2 and another phy for USB 3, for example,
++		 * armada 3700 usb3 host controller uses a dedicated utmi phy for USB 2 and a
++		 * common phy for USB 3;
++		 * usb hcd should be added with phy name as below:
++		 *        - main hcd is added with "usb2"
++		 *        - shared hcd is added with "usb3"
++		 * When "separated-phys-for-usb2-usb3" is not set, USB 2 and USB 3 shares a same phy,
++		 * main hcd and shared hcd are both added with the default phy name of "usb"
++		 */
++		if (of_property_read_bool(pdev->dev.of_node, "separated-phys-for-usb2-usb3")) {
++			ret = usb_add_hcd_with_phy_name(hcd, irq, IRQF_SHARED, "usb2");
++			if (ret)
++				goto disable_usb_phy;
++
++			if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
++				xhci->shared_hcd->can_do_streams = 1;
++
++			ret = usb_add_hcd_with_phy_name(xhci->shared_hcd, irq, IRQF_SHARED, "usb3");
++			if (ret)
++				goto dealloc_usb2_hcd;
++		} else {
++			ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
++			if (ret)
++				goto disable_usb_phy;
++
++			if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
++				xhci->shared_hcd->can_do_streams = 1;
++
++			ret = usb_add_hcd(xhci->shared_hcd, irq, IRQF_SHARED);
++			if (ret)
++				goto dealloc_usb2_hcd;
++		}
+ 	}
+ 
+ 	device_enable_async_suspend(&pdev->dev);
+-- 
+1.7.9.5
+

@@ -1,0 +1,117 @@
+From a9aa46e05e0a8d9241604cf2644dca46de6ed973 Mon Sep 17 00:00:00 2001
+From: Evan Wang <xswang@marvell.com>
+Date: Mon, 13 Nov 2017 11:56:25 +0800
+Subject: [PATCH 1315/1345] ata: ahci: mvebu: override ahci_stop_engine for
+ mvebu AHCI
+
+commit  2eb4571e1a65410283b5dc4755faf8770cfe6bed from
+https://github.com/MarvellEmbeddedProcessors/linux-marvell.git
+
+There is an issue(Errata Ref#226) that the SATA can not be
+detected via SATA Port-MultiPlayer(PMP) with following
+error log:
+  ata1.15: PMP product ID mismatch
+  ata1.15: SATA link up 6.0 Gbps (SStatus 133 SControl 300)
+  ata1.15: Port Multiplier vendor mismatch '0x1b4b'!='0x0'
+  ata1.15: PMP revalidation failed (errno=-19)
+
+The issue is  that the value Port-x FIS-based Switching
+Control(PxFBS@0x40) become wrong.
+According to design, the bits[11:8, 0] of register PxFBS
+are cleared when Port Command and Status (0x18) bit[0]
+changes its value from 1 to 0, i.e. falling edge of Port
+Command and Status bit[0] sends PULSE that resets PxFBS
+bits[11:8; 0].
+Need to implement workaround to save the port PxFBS
+register before PxCMD ST write and restore it afterwards.
+
+This patch implements the WA in a separate function of
+ahci_mvebu_stop_engine to override ahci_stop_gngine.
+
+Change-Id: I5e744552df7a43e5cf753b9b25bf3c47f425ce13
+Signed-off-by: Evan Wang <xswang@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/52128
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+Reviewed-by: Hanna Hawa <hannah@marvell.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/ata/ahci_mvebu.c |   56 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/drivers/ata/ahci_mvebu.c b/drivers/ata/ahci_mvebu.c
+index fee5831..8129a18 100644
+--- a/drivers/ata/ahci_mvebu.c
++++ b/drivers/ata/ahci_mvebu.c
+@@ -218,6 +218,60 @@ static int ahci_mvebu_pll_power_up(struct platform_device *pdev,
+ 	return err;
+ }
+ 
++/**
++ * ahci_mvebu_stop_engine
++ *
++ * @ap:	Target ata port
++ *
++ * Errata Ref#226 - SATA Disk HOT swap issue when connected through
++ * Port Multiplier in FIS-based Switching mode.
++ *
++ * To avoid the issue, according to design, the bits[11:8, 0] of
++ * register PxFBS are cleared when Port Command and Status (0x18) bit[0]
++ * changes its value from 1 to 0, i.e. falling edge of Port
++ * Command and Status bit[0] sends PULSE that resets PxFBS
++ * bits[11:8; 0].
++ *
++ * This function is used to override function of "ahci_stop_engine"
++ * from libahci.c by adding the mvebu work around(WA) to save PxFBS
++ * value before the PxCMD ST write of 0, then restore PxFBS value.
++ *
++ * Return: 0 on success; Error code otherwise.
++ */
++int ahci_mvebu_stop_engine(struct ata_port *ap)
++{
++	void __iomem *port_mmio = ahci_port_base(ap);
++	u32 tmp, port_fbs;
++
++	tmp = readl(port_mmio + PORT_CMD);
++
++	/* check if the HBA is idle */
++	if ((tmp & (PORT_CMD_START | PORT_CMD_LIST_ON)) == 0)
++		return 0;
++
++	/* save the port PxFBS register for later restore */
++	port_fbs = readl(port_mmio + PORT_FBS);
++
++	/* setting HBA to idle */
++	tmp &= ~PORT_CMD_START;
++	writel(tmp, port_mmio + PORT_CMD);
++
++	/*
++	 * bit #15 PxCMD signal doesn't clear PxFBS,
++	 * restore the PxFBS register right after clearing the PxCMD ST,
++	 * no need to wait for the PxCMD bit #15.
++	 */
++	writel(port_fbs, port_mmio + PORT_FBS);
++
++	/* wait for engine to stop. This could be as long as 500 msec */
++	tmp = ata_wait_register(ap, port_mmio + PORT_CMD,
++				PORT_CMD_LIST_ON, PORT_CMD_LIST_ON, 1, 500);
++	if (tmp & PORT_CMD_LIST_ON)
++		return -EIO;
++
++	return 0;
++}
++
+ #ifdef CONFIG_PM_SLEEP
+ static int ahci_mvebu_suspend(struct platform_device *pdev, pm_message_t state)
+ {
+@@ -296,6 +350,8 @@ static int ahci_mvebu_probe(struct platform_device *pdev)
+ 	if (rc)
+ 		return rc;
+ 
++	hpriv->stop_engine = ahci_mvebu_stop_engine;
++
+ 	if (of_device_is_compatible(pdev->dev.of_node,
+ 				    "marvell,armada-380-ahci")) {
+ 		dram = mv_mbus_dram_info();
+-- 
+1.7.9.5
+
