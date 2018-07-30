@@ -1,0 +1,121 @@
+From d8dc86b636a4935ea8daa7e58e42113b3711a491 Mon Sep 17 00:00:00 2001
+From: Alexander Kappner <agk@godking.net>
+Date: Thu, 21 Dec 2017 15:06:14 +0200
+Subject: [PATCH 47/56] xhci: Fix use-after-free in xhci debugfs
+
+commit dde634057da71a3505d7a6c0b77bb24ded6728c8 upstream.
+
+Trying to read from debugfs after the system has resumed from
+hibernate causes a use-after-free and thus a protection fault.
+
+Steps to reproduce:
+Hibernate system, resume from hibernate, then run
+$ cat /sys/kernel/debug/usb/xhci/*/command-ring/enqueue
+
+[ 3902.765086] general protection fault: 0000 [#1] PREEMPT SMP
+...
+[ 3902.765136] RIP: 0010:xhci_trb_virt_to_dma.part.50+0x5/0x30
+...
+[ 3902.765178] Call Trace:
+[ 3902.765188]  xhci_ring_enqueue_show+0x1e/0x40
+[ 3902.765197]  seq_read+0xdb/0x3a0
+[ 3902.765204]  ? __handle_mm_fault+0x5fb/0x1210
+[ 3902.765211]  full_proxy_read+0x4a/0x70
+[ 3902.765219]  __vfs_read+0x23/0x120
+[ 3902.765228]  vfs_read+0x8e/0x130
+[ 3902.765235]  SyS_read+0x42/0x90
+[ 3902.765242]  do_syscall_64+0x6b/0x290
+[ 3902.765251]  entry_SYSCALL64_slow_path+0x25/0x25
+
+The issue is caused by the xhci ring structures being reallocated
+when the system is resumed, but pointers to the old structures
+being retained in the debugfs files "private" field:
+
+The proposed patch fixes this issue by storing a pointer to the xhci_ring
+field in the xhci device structure in debugfs rather than directly
+storing a pointer to the xhci_ring.
+
+Fixes: 02b6fdc2a153 ("usb: xhci: Add debugfs interface for xHCI driver")
+Signed-off-by: Alexander Kappner <agk@godking.net>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/usb/host/xhci-debugfs.c |   16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-debugfs.c b/drivers/usb/host/xhci-debugfs.c
+index 6772ee9..c05a2b73 100644
+--- a/drivers/usb/host/xhci-debugfs.c
++++ b/drivers/usb/host/xhci-debugfs.c
+@@ -165,7 +165,7 @@ static void xhci_debugfs_extcap_regset(struct xhci_hcd *xhci, int cap_id,
+ static int xhci_ring_enqueue_show(struct seq_file *s, void *unused)
+ {
+ 	dma_addr_t		dma;
+-	struct xhci_ring	*ring = s->private;
++	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
+ 
+ 	dma = xhci_trb_virt_to_dma(ring->enq_seg, ring->enqueue);
+ 	seq_printf(s, "%pad\n", &dma);
+@@ -176,7 +176,7 @@ static int xhci_ring_enqueue_show(struct seq_file *s, void *unused)
+ static int xhci_ring_dequeue_show(struct seq_file *s, void *unused)
+ {
+ 	dma_addr_t		dma;
+-	struct xhci_ring	*ring = s->private;
++	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
+ 
+ 	dma = xhci_trb_virt_to_dma(ring->deq_seg, ring->dequeue);
+ 	seq_printf(s, "%pad\n", &dma);
+@@ -186,7 +186,7 @@ static int xhci_ring_dequeue_show(struct seq_file *s, void *unused)
+ 
+ static int xhci_ring_cycle_show(struct seq_file *s, void *unused)
+ {
+-	struct xhci_ring	*ring = s->private;
++	struct xhci_ring	*ring = *(struct xhci_ring **)s->private;
+ 
+ 	seq_printf(s, "%d\n", ring->cycle_state);
+ 
+@@ -349,7 +349,7 @@ static void xhci_debugfs_create_files(struct xhci_hcd *xhci,
+ }
+ 
+ static struct dentry *xhci_debugfs_create_ring_dir(struct xhci_hcd *xhci,
+-						   struct xhci_ring *ring,
++						   struct xhci_ring **ring,
+ 						   const char *name,
+ 						   struct dentry *parent)
+ {
+@@ -390,7 +390,7 @@ void xhci_debugfs_create_endpoint(struct xhci_hcd *xhci,
+ 
+ 	snprintf(epriv->name, sizeof(epriv->name), "ep%02d", ep_index);
+ 	epriv->root = xhci_debugfs_create_ring_dir(xhci,
+-						   dev->eps[ep_index].new_ring,
++						   &dev->eps[ep_index].new_ring,
+ 						   epriv->name,
+ 						   spriv->root);
+ 	spriv->eps[ep_index] = epriv;
+@@ -426,7 +426,7 @@ void xhci_debugfs_create_slot(struct xhci_hcd *xhci, int slot_id)
+ 	priv->dev = dev;
+ 	dev->debugfs_private = priv;
+ 
+-	xhci_debugfs_create_ring_dir(xhci, dev->eps[0].ring,
++	xhci_debugfs_create_ring_dir(xhci, &dev->eps[0].ring,
+ 				     "ep00", priv->root);
+ 
+ 	xhci_debugfs_create_context_files(xhci, priv->root, slot_id);
+@@ -491,11 +491,11 @@ void xhci_debugfs_init(struct xhci_hcd *xhci)
+ 				   ARRAY_SIZE(xhci_extcap_dbc),
+ 				   "reg-ext-dbc");
+ 
+-	xhci_debugfs_create_ring_dir(xhci, xhci->cmd_ring,
++	xhci_debugfs_create_ring_dir(xhci, &xhci->cmd_ring,
+ 				     "command-ring",
+ 				     xhci->debugfs_root);
+ 
+-	xhci_debugfs_create_ring_dir(xhci, xhci->event_ring,
++	xhci_debugfs_create_ring_dir(xhci, &xhci->event_ring,
+ 				     "event-ring",
+ 				     xhci->debugfs_root);
+ 
+-- 
+1.7.9.5
+

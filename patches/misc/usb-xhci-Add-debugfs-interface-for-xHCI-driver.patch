@@ -1,0 +1,938 @@
+From 37807b3db0a516195bfd117e810a6c5e2270f362 Mon Sep 17 00:00:00 2001
+From: Lu Baolu <baolu.lu@linux.intel.com>
+Date: Thu, 5 Oct 2017 11:21:39 +0300
+Subject: [PATCH 42/56] usb: xhci: Add debugfs interface for xHCI driver
+
+commit 02b6fdc2a153e61b957937772a562fb6357dc861 upstream.
+
+This adds debugfs consumer for xHCI driver. The debugfs entries
+read all host registers, device/endpoint contexts, command ring,
+event ring and various endpoint rings. With these entries, users
+can check the registers and memory spaces used by a host during
+run time, or save all the information with a simple 'cp -r' for
+post-mortem programs.
+
+The file hierarchy looks like this.
+
+[root of debugfs]
+|__usb
+|____[e,u,o]hci                 <---------[root for other HCIs]
+|____xhci                       <---------------[root for xHCI]
+|______0000:00:14.0             <--------------[xHCI host name]
+|________reg-cap                <--------[capability registers]
+|________reg-op                 <-------[operational registers]
+|________reg-runtime            <-----------[runtime registers]
+|________reg-ext-#cap_name      <----[extended capability regs]
+|________command-ring           <-------[root for command ring]
+|__________cycle                <------------------[ring cycle]
+|__________dequeue              <--------[ring dequeue pointer]
+|__________enqueue              <--------[ring enqueue pointer]
+|__________trbs                 <-------------------[ring trbs]
+|________event-ring             <---------[root for event ring]
+|__________cycle                <------------------[ring cycle]
+|__________dequeue              <--------[ring dequeue pointer]
+|__________enqueue              <--------[ring enqueue pointer]
+|__________trbs                 <-------------------[ring trbs]
+|________devices                <------------[root for devices]
+|__________#slot_id             <-----------[root for a device]
+|____________name               <-----------------[device name]
+|____________slot-context       <----------------[slot context]
+|____________ep-context         <-----------[endpoint contexts]
+|____________ep#ep_index        <--------[root for an endpoint]
+|______________cycle            <------------------[ring cycle]
+|______________dequeue          <--------[ring dequeue pointer]
+|______________enqueue          <--------[ring enqueue pointer]
+|______________trbs             <-------------------[ring trbs]
+
+Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/usb/host/Makefile       |    4 +
+ drivers/usb/host/xhci-debugfs.c |  526 +++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-debugfs.h |  137 ++++++++++
+ drivers/usb/host/xhci-mem.c     |    5 +-
+ drivers/usb/host/xhci.c         |   23 +-
+ drivers/usb/host/xhci.h         |    9 +
+ 6 files changed, 700 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/usb/host/xhci-debugfs.c
+ create mode 100644 drivers/usb/host/xhci-debugfs.h
+
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index c405770..dd5c628 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -30,6 +30,10 @@ ifneq ($(CONFIG_USB_XHCI_RCAR), )
+ 	xhci-plat-hcd-y		+= xhci-rcar.o
+ endif
+ 
++ifneq ($(CONFIG_DEBUG_FS),)
++	xhci-hcd-y		+= xhci-debugfs.o
++endif
++
+ obj-$(CONFIG_USB_WHCI_HCD)	+= whci/
+ 
+ obj-$(CONFIG_USB_PCI)	+= pci-quirks.o
+diff --git a/drivers/usb/host/xhci-debugfs.c b/drivers/usb/host/xhci-debugfs.c
+new file mode 100644
+index 0000000..6772ee9
+--- /dev/null
++++ b/drivers/usb/host/xhci-debugfs.c
+@@ -0,0 +1,526 @@
++/*
++ * xhci-debugfs.c - xHCI debugfs interface
++ *
++ * Copyright (C) 2017 Intel Corporation
++ *
++ * Author: Lu Baolu <baolu.lu@linux.intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/slab.h>
++
++#include "xhci.h"
++#include "xhci-debugfs.h"
++
++static const struct debugfs_reg32 xhci_cap_regs[] = {
++	dump_register(CAPLENGTH),
++	dump_register(HCSPARAMS1),
++	dump_register(HCSPARAMS2),
++	dump_register(HCSPARAMS3),
++	dump_register(HCCPARAMS1),
++	dump_register(DOORBELLOFF),
++	dump_register(RUNTIMEOFF),
++	dump_register(HCCPARAMS2),
++};
++
++static const struct debugfs_reg32 xhci_op_regs[] = {
++	dump_register(USBCMD),
++	dump_register(USBSTS),
++	dump_register(PAGESIZE),
++	dump_register(DNCTRL),
++	dump_register(CRCR),
++	dump_register(DCBAAP_LOW),
++	dump_register(DCBAAP_HIGH),
++	dump_register(CONFIG),
++};
++
++static const struct debugfs_reg32 xhci_runtime_regs[] = {
++	dump_register(MFINDEX),
++	dump_register(IR0_IMAN),
++	dump_register(IR0_IMOD),
++	dump_register(IR0_ERSTSZ),
++	dump_register(IR0_ERSTBA_LOW),
++	dump_register(IR0_ERSTBA_HIGH),
++	dump_register(IR0_ERDP_LOW),
++	dump_register(IR0_ERDP_HIGH),
++};
++
++static const struct debugfs_reg32 xhci_extcap_legsup[] = {
++	dump_register(EXTCAP_USBLEGSUP),
++	dump_register(EXTCAP_USBLEGCTLSTS),
++};
++
++static const struct debugfs_reg32 xhci_extcap_protocol[] = {
++	dump_register(EXTCAP_REVISION),
++	dump_register(EXTCAP_NAME),
++	dump_register(EXTCAP_PORTINFO),
++	dump_register(EXTCAP_PORTTYPE),
++	dump_register(EXTCAP_MANTISSA1),
++	dump_register(EXTCAP_MANTISSA2),
++	dump_register(EXTCAP_MANTISSA3),
++	dump_register(EXTCAP_MANTISSA4),
++	dump_register(EXTCAP_MANTISSA5),
++	dump_register(EXTCAP_MANTISSA6),
++};
++
++static const struct debugfs_reg32 xhci_extcap_dbc[] = {
++	dump_register(EXTCAP_DBC_CAPABILITY),
++	dump_register(EXTCAP_DBC_DOORBELL),
++	dump_register(EXTCAP_DBC_ERSTSIZE),
++	dump_register(EXTCAP_DBC_ERST_LOW),
++	dump_register(EXTCAP_DBC_ERST_HIGH),
++	dump_register(EXTCAP_DBC_ERDP_LOW),
++	dump_register(EXTCAP_DBC_ERDP_HIGH),
++	dump_register(EXTCAP_DBC_CONTROL),
++	dump_register(EXTCAP_DBC_STATUS),
++	dump_register(EXTCAP_DBC_PORTSC),
++	dump_register(EXTCAP_DBC_CONT_LOW),
++	dump_register(EXTCAP_DBC_CONT_HIGH),
++	dump_register(EXTCAP_DBC_DEVINFO1),
++	dump_register(EXTCAP_DBC_DEVINFO2),
++};
++
++static struct dentry *xhci_debugfs_root;
++
++static struct xhci_regset *xhci_debugfs_alloc_regset(struct xhci_hcd *xhci)
++{
++	struct xhci_regset	*regset;
++
++	regset = kzalloc(sizeof(*regset), GFP_KERNEL);
++	if (!regset)
++		return NULL;
++
++	/*
++	 * The allocation and free of regset are executed in order.
++	 * We needn't a lock here.
++	 */
++	INIT_LIST_HEAD(&regset->list);
++	list_add_tail(&regset->list, &xhci->regset_list);
++
++	return regset;
++}
++
++static void xhci_debugfs_free_regset(struct xhci_regset *regset)
++{
++	if (!regset)
++		return;
++
++	list_del(&regset->list);
++	kfree(regset);
++}
++
++static void xhci_debugfs_regset(struct xhci_hcd *xhci, u32 base,
++				const struct debugfs_reg32 *regs,
++				size_t nregs, struct dentry *parent,
++				const char *fmt, ...)
++{
++	struct xhci_regset	*rgs;
++	va_list			args;
++	struct debugfs_regset32	*regset;
++	struct usb_hcd		*hcd = xhci_to_hcd(xhci);
++
++	rgs = xhci_debugfs_alloc_regset(xhci);
++	if (!rgs)
++		return;
++
++	va_start(args, fmt);
++	vsnprintf(rgs->name, sizeof(rgs->name), fmt, args);
++	va_end(args);
++
++	regset = &rgs->regset;
++	regset->regs = regs;
++	regset->nregs = nregs;
++	regset->base = hcd->regs + base;
++
++	debugfs_create_regset32((const char *)rgs->name, 0444, parent, regset);
++}
++
++static void xhci_debugfs_extcap_regset(struct xhci_hcd *xhci, int cap_id,
++				       const struct debugfs_reg32 *regs,
++				       size_t n, const char *cap_name)
++{
++	u32			offset;
++	int			index = 0;
++	size_t			psic, nregs = n;
++	void __iomem		*base = &xhci->cap_regs->hc_capbase;
++
++	offset = xhci_find_next_ext_cap(base, 0, cap_id);
++	while (offset) {
++		if (cap_id == XHCI_EXT_CAPS_PROTOCOL) {
++			psic = XHCI_EXT_PORT_PSIC(readl(base + offset + 8));
++			nregs = min(4 + psic, n);
++		}
++
++		xhci_debugfs_regset(xhci, offset, regs, nregs,
++				    xhci->debugfs_root, "%s:%02d",
++				    cap_name, index);
++		offset = xhci_find_next_ext_cap(base, offset, cap_id);
++		index++;
++	}
++}
++
++static int xhci_ring_enqueue_show(struct seq_file *s, void *unused)
++{
++	dma_addr_t		dma;
++	struct xhci_ring	*ring = s->private;
++
++	dma = xhci_trb_virt_to_dma(ring->enq_seg, ring->enqueue);
++	seq_printf(s, "%pad\n", &dma);
++
++	return 0;
++}
++
++static int xhci_ring_dequeue_show(struct seq_file *s, void *unused)
++{
++	dma_addr_t		dma;
++	struct xhci_ring	*ring = s->private;
++
++	dma = xhci_trb_virt_to_dma(ring->deq_seg, ring->dequeue);
++	seq_printf(s, "%pad\n", &dma);
++
++	return 0;
++}
++
++static int xhci_ring_cycle_show(struct seq_file *s, void *unused)
++{
++	struct xhci_ring	*ring = s->private;
++
++	seq_printf(s, "%d\n", ring->cycle_state);
++
++	return 0;
++}
++
++static void xhci_ring_dump_segment(struct seq_file *s,
++				   struct xhci_segment *seg)
++{
++	int			i;
++	dma_addr_t		dma;
++	union xhci_trb		*trb;
++
++	for (i = 0; i < TRBS_PER_SEGMENT; i++) {
++		trb = &seg->trbs[i];
++		dma = seg->dma + i * sizeof(*trb);
++		seq_printf(s, "%pad: %s\n", &dma,
++			   xhci_decode_trb(trb->generic.field[0],
++					   trb->generic.field[1],
++					   trb->generic.field[2],
++					   trb->generic.field[3]));
++	}
++}
++
++static int xhci_ring_trb_show(struct seq_file *s, void *unused)
++{
++	int			i;
++	struct xhci_ring	*ring = s->private;
++	struct xhci_segment	*seg = ring->first_seg;
++
++	for (i = 0; i < ring->num_segs; i++) {
++		xhci_ring_dump_segment(s, seg);
++		seg = seg->next;
++	}
++
++	return 0;
++}
++
++static struct xhci_file_map ring_files[] = {
++	{"enqueue",		xhci_ring_enqueue_show, },
++	{"dequeue",		xhci_ring_dequeue_show, },
++	{"cycle",		xhci_ring_cycle_show, },
++	{"trbs",		xhci_ring_trb_show, },
++};
++
++static int xhci_ring_open(struct inode *inode, struct file *file)
++{
++	int			i;
++	struct xhci_file_map	*f_map;
++	const char		*file_name = file_dentry(file)->d_iname;
++
++	for (i = 0; i < ARRAY_SIZE(ring_files); i++) {
++		f_map = &ring_files[i];
++
++		if (strcmp(f_map->name, file_name) == 0)
++			break;
++	}
++
++	return single_open(file, f_map->show, inode->i_private);
++}
++
++static const struct file_operations xhci_ring_fops = {
++	.open			= xhci_ring_open,
++	.read			= seq_read,
++	.llseek			= seq_lseek,
++	.release		= single_release,
++};
++
++static int xhci_slot_context_show(struct seq_file *s, void *unused)
++{
++	struct xhci_hcd		*xhci;
++	struct xhci_slot_ctx	*slot_ctx;
++	struct xhci_slot_priv	*priv = s->private;
++	struct xhci_virt_device	*dev = priv->dev;
++
++	xhci = hcd_to_xhci(bus_to_hcd(dev->udev->bus));
++	slot_ctx = xhci_get_slot_ctx(xhci, dev->out_ctx);
++	seq_printf(s, "%pad: %s\n", &dev->out_ctx->dma,
++		   xhci_decode_slot_context(slot_ctx->dev_info,
++					    slot_ctx->dev_info2,
++					    slot_ctx->tt_info,
++					    slot_ctx->dev_state));
++
++	return 0;
++}
++
++static int xhci_endpoint_context_show(struct seq_file *s, void *unused)
++{
++	int			dci;
++	dma_addr_t		dma;
++	struct xhci_hcd		*xhci;
++	struct xhci_ep_ctx	*ep_ctx;
++	struct xhci_slot_priv	*priv = s->private;
++	struct xhci_virt_device	*dev = priv->dev;
++
++	xhci = hcd_to_xhci(bus_to_hcd(dev->udev->bus));
++
++	for (dci = 1; dci < 32; dci++) {
++		ep_ctx = xhci_get_ep_ctx(xhci, dev->out_ctx, dci);
++		dma = dev->out_ctx->dma + dci * CTX_SIZE(xhci->hcc_params);
++		seq_printf(s, "%pad: %s\n", &dma,
++			   xhci_decode_ep_context(ep_ctx->ep_info,
++						  ep_ctx->ep_info2,
++						  ep_ctx->deq,
++						  ep_ctx->tx_info));
++	}
++
++	return 0;
++}
++
++static int xhci_device_name_show(struct seq_file *s, void *unused)
++{
++	struct xhci_slot_priv	*priv = s->private;
++	struct xhci_virt_device	*dev = priv->dev;
++
++	seq_printf(s, "%s\n", dev_name(&dev->udev->dev));
++
++	return 0;
++}
++
++static struct xhci_file_map context_files[] = {
++	{"name",		xhci_device_name_show, },
++	{"slot-context",	xhci_slot_context_show, },
++	{"ep-context",		xhci_endpoint_context_show, },
++};
++
++static int xhci_context_open(struct inode *inode, struct file *file)
++{
++	int			i;
++	struct xhci_file_map	*f_map;
++	const char		*file_name = file_dentry(file)->d_iname;
++
++	for (i = 0; i < ARRAY_SIZE(context_files); i++) {
++		f_map = &context_files[i];
++
++		if (strcmp(f_map->name, file_name) == 0)
++			break;
++	}
++
++	return single_open(file, f_map->show, inode->i_private);
++}
++
++static const struct file_operations xhci_context_fops = {
++	.open			= xhci_context_open,
++	.read			= seq_read,
++	.llseek			= seq_lseek,
++	.release		= single_release,
++};
++
++static void xhci_debugfs_create_files(struct xhci_hcd *xhci,
++				      struct xhci_file_map *files,
++				      size_t nentries, void *data,
++				      struct dentry *parent,
++				      const struct file_operations *fops)
++{
++	int			i;
++
++	for (i = 0; i < nentries; i++)
++		debugfs_create_file(files[i].name, 0444, parent, data, fops);
++}
++
++static struct dentry *xhci_debugfs_create_ring_dir(struct xhci_hcd *xhci,
++						   struct xhci_ring *ring,
++						   const char *name,
++						   struct dentry *parent)
++{
++	struct dentry		*dir;
++
++	dir = debugfs_create_dir(name, parent);
++	xhci_debugfs_create_files(xhci, ring_files, ARRAY_SIZE(ring_files),
++				  ring, dir, &xhci_ring_fops);
++
++	return dir;
++}
++
++static void xhci_debugfs_create_context_files(struct xhci_hcd *xhci,
++					      struct dentry *parent,
++					      int slot_id)
++{
++	struct xhci_virt_device	*dev = xhci->devs[slot_id];
++
++	xhci_debugfs_create_files(xhci, context_files,
++				  ARRAY_SIZE(context_files),
++				  dev->debugfs_private,
++				  parent, &xhci_context_fops);
++}
++
++void xhci_debugfs_create_endpoint(struct xhci_hcd *xhci,
++				  struct xhci_virt_device *dev,
++				  int ep_index)
++{
++	struct xhci_ep_priv	*epriv;
++	struct xhci_slot_priv	*spriv = dev->debugfs_private;
++
++	if (spriv->eps[ep_index])
++		return;
++
++	epriv = kzalloc(sizeof(*epriv), GFP_KERNEL);
++	if (!epriv)
++		return;
++
++	snprintf(epriv->name, sizeof(epriv->name), "ep%02d", ep_index);
++	epriv->root = xhci_debugfs_create_ring_dir(xhci,
++						   dev->eps[ep_index].new_ring,
++						   epriv->name,
++						   spriv->root);
++	spriv->eps[ep_index] = epriv;
++}
++
++void xhci_debugfs_remove_endpoint(struct xhci_hcd *xhci,
++				  struct xhci_virt_device *dev,
++				  int ep_index)
++{
++	struct xhci_ep_priv	*epriv;
++	struct xhci_slot_priv	*spriv = dev->debugfs_private;
++
++	if (!spriv || !spriv->eps[ep_index])
++		return;
++
++	epriv = spriv->eps[ep_index];
++	debugfs_remove_recursive(epriv->root);
++	spriv->eps[ep_index] = NULL;
++	kfree(epriv);
++}
++
++void xhci_debugfs_create_slot(struct xhci_hcd *xhci, int slot_id)
++{
++	struct xhci_slot_priv	*priv;
++	struct xhci_virt_device	*dev = xhci->devs[slot_id];
++
++	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return;
++
++	snprintf(priv->name, sizeof(priv->name), "%02d", slot_id);
++	priv->root = debugfs_create_dir(priv->name, xhci->debugfs_slots);
++	priv->dev = dev;
++	dev->debugfs_private = priv;
++
++	xhci_debugfs_create_ring_dir(xhci, dev->eps[0].ring,
++				     "ep00", priv->root);
++
++	xhci_debugfs_create_context_files(xhci, priv->root, slot_id);
++}
++
++void xhci_debugfs_remove_slot(struct xhci_hcd *xhci, int slot_id)
++{
++	int			i;
++	struct xhci_slot_priv	*priv;
++	struct xhci_virt_device	*dev = xhci->devs[slot_id];
++
++	if (!dev || !dev->debugfs_private)
++		return;
++
++	priv = dev->debugfs_private;
++
++	debugfs_remove_recursive(priv->root);
++
++	for (i = 0; i < 31; i++)
++		kfree(priv->eps[i]);
++
++	kfree(priv);
++	dev->debugfs_private = NULL;
++}
++
++void xhci_debugfs_init(struct xhci_hcd *xhci)
++{
++	struct device		*dev = xhci_to_hcd(xhci)->self.controller;
++
++	xhci->debugfs_root = debugfs_create_dir(dev_name(dev),
++						xhci_debugfs_root);
++
++	INIT_LIST_HEAD(&xhci->regset_list);
++
++	xhci_debugfs_regset(xhci,
++			    0,
++			    xhci_cap_regs, ARRAY_SIZE(xhci_cap_regs),
++			    xhci->debugfs_root, "reg-cap");
++
++	xhci_debugfs_regset(xhci,
++			    HC_LENGTH(readl(&xhci->cap_regs->hc_capbase)),
++			    xhci_op_regs, ARRAY_SIZE(xhci_op_regs),
++			    xhci->debugfs_root, "reg-op");
++
++	xhci_debugfs_regset(xhci,
++			    readl(&xhci->cap_regs->run_regs_off) & RTSOFF_MASK,
++			    xhci_runtime_regs, ARRAY_SIZE(xhci_runtime_regs),
++			    xhci->debugfs_root, "reg-runtime");
++
++	xhci_debugfs_extcap_regset(xhci, XHCI_EXT_CAPS_LEGACY,
++				   xhci_extcap_legsup,
++				   ARRAY_SIZE(xhci_extcap_legsup),
++				   "reg-ext-legsup");
++
++	xhci_debugfs_extcap_regset(xhci, XHCI_EXT_CAPS_PROTOCOL,
++				   xhci_extcap_protocol,
++				   ARRAY_SIZE(xhci_extcap_protocol),
++				   "reg-ext-protocol");
++
++	xhci_debugfs_extcap_regset(xhci, XHCI_EXT_CAPS_DEBUG,
++				   xhci_extcap_dbc,
++				   ARRAY_SIZE(xhci_extcap_dbc),
++				   "reg-ext-dbc");
++
++	xhci_debugfs_create_ring_dir(xhci, xhci->cmd_ring,
++				     "command-ring",
++				     xhci->debugfs_root);
++
++	xhci_debugfs_create_ring_dir(xhci, xhci->event_ring,
++				     "event-ring",
++				     xhci->debugfs_root);
++
++	xhci->debugfs_slots = debugfs_create_dir("devices", xhci->debugfs_root);
++}
++
++void xhci_debugfs_exit(struct xhci_hcd *xhci)
++{
++	struct xhci_regset	*rgs, *tmp;
++
++	debugfs_remove_recursive(xhci->debugfs_root);
++	xhci->debugfs_root = NULL;
++	xhci->debugfs_slots = NULL;
++
++	list_for_each_entry_safe(rgs, tmp, &xhci->regset_list, list)
++		xhci_debugfs_free_regset(rgs);
++}
++
++void __init xhci_debugfs_create_root(void)
++{
++	xhci_debugfs_root = debugfs_create_dir("xhci", usb_debug_root);
++}
++
++void __exit xhci_debugfs_remove_root(void)
++{
++	debugfs_remove_recursive(xhci_debugfs_root);
++	xhci_debugfs_root = NULL;
++}
+diff --git a/drivers/usb/host/xhci-debugfs.h b/drivers/usb/host/xhci-debugfs.h
+new file mode 100644
+index 0000000..3adc997
+--- /dev/null
++++ b/drivers/usb/host/xhci-debugfs.h
+@@ -0,0 +1,137 @@
++/*
++ * xhci-debugfs.h - xHCI debugfs interface
++ *
++ * Copyright (C) 2017 Intel Corporation
++ *
++ * Author: Lu Baolu <baolu.lu@linux.intel.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __LINUX_XHCI_DEBUGFS_H
++#define __LINUX_XHCI_DEBUGFS_H
++
++#include <linux/debugfs.h>
++
++#define DEBUGFS_NAMELEN 32
++
++#define REG_CAPLENGTH					0x00
++#define REG_HCSPARAMS1					0x04
++#define REG_HCSPARAMS2					0x08
++#define REG_HCSPARAMS3					0x0c
++#define REG_HCCPARAMS1					0x10
++#define REG_DOORBELLOFF					0x14
++#define REG_RUNTIMEOFF					0x18
++#define REG_HCCPARAMS2					0x1c
++
++#define	REG_USBCMD					0x00
++#define REG_USBSTS					0x04
++#define REG_PAGESIZE					0x08
++#define REG_DNCTRL					0x14
++#define REG_CRCR					0x18
++#define REG_DCBAAP_LOW					0x30
++#define REG_DCBAAP_HIGH					0x34
++#define REG_CONFIG					0x38
++
++#define REG_MFINDEX					0x00
++#define REG_IR0_IMAN					0x20
++#define REG_IR0_IMOD					0x24
++#define REG_IR0_ERSTSZ					0x28
++#define REG_IR0_ERSTBA_LOW				0x30
++#define REG_IR0_ERSTBA_HIGH				0x34
++#define REG_IR0_ERDP_LOW				0x38
++#define REG_IR0_ERDP_HIGH				0x3c
++
++#define REG_EXTCAP_USBLEGSUP				0x00
++#define REG_EXTCAP_USBLEGCTLSTS				0x04
++
++#define REG_EXTCAP_REVISION				0x00
++#define REG_EXTCAP_NAME					0x04
++#define REG_EXTCAP_PORTINFO				0x08
++#define REG_EXTCAP_PORTTYPE				0x0c
++#define REG_EXTCAP_MANTISSA1				0x10
++#define REG_EXTCAP_MANTISSA2				0x14
++#define REG_EXTCAP_MANTISSA3				0x18
++#define REG_EXTCAP_MANTISSA4				0x1c
++#define REG_EXTCAP_MANTISSA5				0x20
++#define REG_EXTCAP_MANTISSA6				0x24
++
++#define REG_EXTCAP_DBC_CAPABILITY			0x00
++#define REG_EXTCAP_DBC_DOORBELL				0x04
++#define REG_EXTCAP_DBC_ERSTSIZE				0x08
++#define REG_EXTCAP_DBC_ERST_LOW				0x10
++#define REG_EXTCAP_DBC_ERST_HIGH			0x14
++#define REG_EXTCAP_DBC_ERDP_LOW				0x18
++#define REG_EXTCAP_DBC_ERDP_HIGH			0x1c
++#define REG_EXTCAP_DBC_CONTROL				0x20
++#define REG_EXTCAP_DBC_STATUS				0x24
++#define REG_EXTCAP_DBC_PORTSC				0x28
++#define REG_EXTCAP_DBC_CONT_LOW				0x30
++#define REG_EXTCAP_DBC_CONT_HIGH			0x34
++#define REG_EXTCAP_DBC_DEVINFO1				0x38
++#define REG_EXTCAP_DBC_DEVINFO2				0x3c
++
++#define dump_register(nm)				\
++{							\
++	.name	= __stringify(nm),			\
++	.offset	= REG_ ##nm,				\
++}
++
++struct xhci_regset {
++	char			name[DEBUGFS_NAMELEN];
++	struct debugfs_regset32	regset;
++	size_t			nregs;
++	struct dentry		*parent;
++	struct list_head	list;
++};
++
++struct xhci_file_map {
++	const char		*name;
++	int			(*show)(struct seq_file *s, void *unused);
++};
++
++struct xhci_ep_priv {
++	char			name[DEBUGFS_NAMELEN];
++	struct dentry		*root;
++};
++
++struct xhci_slot_priv {
++	char			name[DEBUGFS_NAMELEN];
++	struct dentry		*root;
++	struct xhci_ep_priv	*eps[31];
++	struct xhci_virt_device	*dev;
++};
++
++#ifdef CONFIG_DEBUG_FS
++void xhci_debugfs_init(struct xhci_hcd *xhci);
++void xhci_debugfs_exit(struct xhci_hcd *xhci);
++void __init xhci_debugfs_create_root(void);
++void __exit xhci_debugfs_remove_root(void);
++void xhci_debugfs_create_slot(struct xhci_hcd *xhci, int slot_id);
++void xhci_debugfs_remove_slot(struct xhci_hcd *xhci, int slot_id);
++void xhci_debugfs_create_endpoint(struct xhci_hcd *xhci,
++				  struct xhci_virt_device *virt_dev,
++				  int ep_index);
++void xhci_debugfs_remove_endpoint(struct xhci_hcd *xhci,
++				  struct xhci_virt_device *virt_dev,
++				  int ep_index);
++#else
++static inline void xhci_debugfs_init(struct xhci_hcd *xhci) { }
++static inline void xhci_debugfs_exit(struct xhci_hcd *xhci) { }
++static inline void __init xhci_debugfs_create_root(void) { }
++static inline void __exit xhci_debugfs_remove_root(void) { }
++static inline void xhci_debugfs_create_slot(struct xhci_hcd *x, int s) { }
++static inline void xhci_debugfs_remove_slot(struct xhci_hcd *x, int s) { }
++static inline void
++xhci_debugfs_create_endpoint(struct xhci_hcd *xhci,
++			     struct xhci_virt_device *virt_dev,
++			     int ep_index) { }
++static inline void
++xhci_debugfs_remove_endpoint(struct xhci_hcd *xhci,
++			     struct xhci_virt_device *virt_dev,
++			     int ep_index) { }
++#endif /* CONFIG_DEBUG_FS */
++
++#endif /* __LINUX_XHCI_DEBUGFS_H */
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index aa28895..a685562 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -28,6 +28,7 @@
+ 
+ #include "xhci.h"
+ #include "xhci-trace.h"
++#include "xhci-debugfs.h"
+ 
+ /*
+  * Allocates a generic ring segment from the ring pool, sets the dma address,
+@@ -512,8 +513,6 @@ int xhci_ring_expansion(struct xhci_hcd *xhci, struct xhci_ring *ring,
+ 	return 0;
+ }
+ 
+-#define CTX_SIZE(_hcc) (HCC_64BYTE_CONTEXT(_hcc) ? 64 : 32)
+-
+ struct xhci_container_ctx *xhci_alloc_container_ctx(struct xhci_hcd *xhci,
+ 						    int type, gfp_t flags)
+ {
+@@ -1021,6 +1020,7 @@ void xhci_free_virt_devices_depth_first(struct xhci_hcd *xhci, int slot_id)
+ 	}
+ out:
+ 	/* we are now at a leaf device */
++	xhci_debugfs_remove_slot(xhci, slot_id);
+ 	xhci_free_virt_device(xhci, slot_id);
+ }
+ 
+@@ -1572,7 +1572,6 @@ int xhci_endpoint_init(struct xhci_hcd *xhci,
+ 	ep_ctx->tx_info = cpu_to_le32(EP_MAX_ESIT_PAYLOAD_LO(max_esit_payload) |
+ 				      EP_AVG_TRB_LENGTH(avg_trb_len));
+ 
+-	/* FIXME Debug endpoint context */
+ 	return 0;
+ }
+ 
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index bb3c550..2ca27a2 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -32,6 +32,7 @@
+ #include "xhci.h"
+ #include "xhci-trace.h"
+ #include "xhci-mtk.h"
++#include "xhci-debugfs.h"
+ #include "xhci-dbgcap.h"
+ 
+ #define DRIVER_AUTHOR "Sarah Sharp"
+@@ -633,8 +634,11 @@ int xhci_run(struct usb_hcd *hcd)
+ 	}
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_init,
+ 			"Finished xhci_run for USB2 roothub");
++
+ 	xhci_dbc_init(xhci);
+ 
++	xhci_debugfs_init(xhci);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(xhci_run);
+@@ -663,6 +667,8 @@ static void xhci_stop(struct usb_hcd *hcd)
+ 		return;
+ 	}
+ 
++	xhci_debugfs_exit(xhci);
++
+ 	xhci_dbc_exit(xhci);
+ 
+ 	spin_lock_irq(&xhci->lock);
+@@ -1609,6 +1615,8 @@ static int xhci_drop_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
+ 	ctrl_ctx->add_flags &= cpu_to_le32(~drop_flag);
+ 	new_add_flags = le32_to_cpu(ctrl_ctx->add_flags);
+ 
++	xhci_debugfs_remove_endpoint(xhci, xhci->devs[udev->slot_id], ep_index);
++
+ 	xhci_endpoint_zero(xhci, xhci->devs[udev->slot_id], ep);
+ 
+ 	if (xhci->quirks & XHCI_MTK_HOST)
+@@ -1732,6 +1740,8 @@ static int xhci_add_endpoint(struct usb_hcd *hcd, struct usb_device *udev,
+ 	/* Store the usb_device pointer for later use */
+ 	ep->hcpriv = udev;
+ 
++	xhci_debugfs_create_endpoint(xhci, virt_dev, ep_index);
++
+ 	xhci_dbg(xhci, "add ep 0x%x, slot id %d, new drop flags = %#x, new add flags = %#x\n",
+ 			(unsigned int) ep->desc.bEndpointAddress,
+ 			udev->slot_id,
+@@ -2782,6 +2792,7 @@ static void xhci_reset_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+ 	/* Free any rings allocated for added endpoints */
+ 	for (i = 0; i < 31; i++) {
+ 		if (virt_dev->eps[i].new_ring) {
++			xhci_debugfs_remove_endpoint(xhci, virt_dev, i);
+ 			xhci_ring_free(xhci, virt_dev->eps[i].new_ring);
+ 			virt_dev->eps[i].new_ring = NULL;
+ 		}
+@@ -3497,6 +3508,7 @@ static int xhci_discover_or_reset_device(struct usb_hcd *hcd,
+ 		}
+ 
+ 		if (ep->ring) {
++			xhci_debugfs_remove_endpoint(xhci, virt_dev, i);
+ 			xhci_free_or_cache_endpoint_ring(xhci, virt_dev, i);
+ 			last_freed_endpoint = i;
+ 		}
+@@ -3531,6 +3543,8 @@ static void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
+ 	int i, ret;
+ 	struct xhci_command *command;
+ 
++	xhci_debugfs_remove_slot(xhci, udev->slot_id);
++
+ 	command = xhci_alloc_command(xhci, false, false, GFP_KERNEL);
+ 	if (!command)
+ 		return;
+@@ -3702,6 +3716,8 @@ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev)
+ 
+ 	udev->slot_id = slot_id;
+ 
++	xhci_debugfs_create_slot(xhci, slot_id);
++
+ #ifndef CONFIG_USB_DEFAULT_PERSIST
+ 	/*
+ 	 * If resetting upon resume, we can't put the controller into runtime
+@@ -5013,6 +5029,8 @@ static int __init xhci_hcd_init(void)
+ 	if (usb_disabled())
+ 		return -ENODEV;
+ 
++	xhci_debugfs_create_root();
++
+ 	return 0;
+ }
+ 
+@@ -5020,7 +5038,10 @@ static int __init xhci_hcd_init(void)
+  * If an init function is provided, an exit function must also be provided
+  * to allow module unload.
+  */
+-static void __exit xhci_hcd_fini(void) { }
++static void __exit xhci_hcd_fini(void)
++{
++	xhci_debugfs_remove_root();
++}
+ 
+ module_init(xhci_hcd_init);
+ module_exit(xhci_hcd_fini);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 634fe83..01305b6 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -131,6 +131,8 @@ struct xhci_cap_regs {
+ /* Extended Capabilities pointer from PCI base - section 5.3.6 */
+ #define HCC_EXT_CAPS(p)		XHCI_HCC_EXT_CAPS(p)
+ 
++#define CTX_SIZE(_hcc)		(HCC_64BYTE_CONTEXT(_hcc) ? 64 : 32)
++
+ /* db_off bitmask - bits 0:1 reserved */
+ #define	DBOFF_MASK	(~0x3)
+ 
+@@ -1006,6 +1008,8 @@ struct xhci_virt_device {
+ 	struct xhci_tt_bw_info		*tt_info;
+ 	/* The current max exit latency for the enabled USB3 link states. */
+ 	u16				current_mel;
++	/* Used for the debugfs interfaces. */
++	void				*debugfs_private;
+ };
+ 
+ /*
+@@ -1852,6 +1856,10 @@ struct xhci_hcd {
+ /* Compliance Mode Timer Triggered every 2 seconds */
+ #define COMP_MODE_RCVRY_MSECS 2000
+ 
++	struct dentry		*debugfs_root;
++	struct dentry		*debugfs_slots;
++	struct list_head	regset_list;
++
+ 	void			*dbc;
+ 	/* platform-specific data -- must come last */
+ 	unsigned long		priv[0] __aligned(sizeof(s64));
+@@ -2115,6 +2123,7 @@ int xhci_find_slot_id_by_port(struct usb_hcd *hcd, struct xhci_hcd *xhci,
+ struct xhci_ring *xhci_triad_to_transfer_ring(struct xhci_hcd *xhci,
+ 		unsigned int slot_id, unsigned int ep_index,
+ 		unsigned int stream_id);
++
+ static inline struct xhci_ring *xhci_urb_to_transfer_ring(struct xhci_hcd *xhci,
+ 								struct urb *urb)
+ {
+-- 
+1.7.9.5
+
