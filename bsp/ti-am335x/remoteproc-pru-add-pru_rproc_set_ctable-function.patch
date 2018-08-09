@@ -1,0 +1,254 @@
+From 24b4792ff9cebc4a4a96ac902a184d92eb32e742 Mon Sep 17 00:00:00 2001
+From: Zumeng Chen <zumeng.chen@windriver.com>
+Date: Thu, 28 Jun 2018 13:22:52 +0800
+Subject: [PATCH 093/205] remoteproc/pru: add pru_rproc_set_ctable() function
+
+This commit comes from:
+  git://git.ti.com/processor-sdk/processor-sdk-linux.git
+
+Some firmware e.g. pru_ethernet expects OS to configure the
+CTABLE entries. In particular C28 and C30 that point to
+Shared RAM and System SRAM (OCMC) areas.
+
+Provide a way for users to do that through a new API,
+pru_rproc_set_ctable(). The API returns 0 on success and
+a negative value on error.
+
+NOTE:
+This probably should be restricted to the PRU firmwares, as
+typically they will be re-programming these when dealing with
+a certain block of memory. For one-time configuration, the
+client driver and firmware can probably use a fixed address
+location in shared memory.
+
+Signed-off-by: Roger Quadros <rogerq@ti.com>
+Signed-off-by: Andrew F. Davis <afd@ti.com>
+[s-anna@ti.com: add the NOTE: on patch description, minor cleanups]
+Signed-off-by: Suman Anna <s-anna@ti.com>
+
+(cherry picked from commit 94e45c697e259410b8401f29d9c6db728bd8ca02)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ .../bindings/remoteproc/ti,pruss-remoteproc.txt    |    4 +
+ drivers/remoteproc/pru_rproc.c                     |   83 ++++++++++++++++++++
+ include/linux/pruss.h                              |   21 +++++
+ 3 files changed, 108 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/remoteproc/ti,pruss-remoteproc.txt b/Documentation/devicetree/bindings/remoteproc/ti,pruss-remoteproc.txt
+index 862f831..28d340c 100644
+--- a/Documentation/devicetree/bindings/remoteproc/ti,pruss-remoteproc.txt
++++ b/Documentation/devicetree/bindings/remoteproc/ti,pruss-remoteproc.txt
+@@ -190,6 +190,10 @@ applicable for 66AK2G SoCs.
+                      number,
+                          "vring" - for PRU to HOST virtqueue signalling
+                          "kick"  - for HOST to PRU virtqueue signalling
++- ti,pruss-gp-mux-sel : integer value of the GP MUX mode needed by an
++                        application to be run on a PRU. Currently to be used
++                        _only_ for PRU Ethernet usecase on AM571x IDK board
++                        and K2G ICE EVM boards.
+ 
+ 
+ MDIO Child Node
+diff --git a/drivers/remoteproc/pru_rproc.c b/drivers/remoteproc/pru_rproc.c
+index 47e817d..68cf473 100644
+--- a/drivers/remoteproc/pru_rproc.c
++++ b/drivers/remoteproc/pru_rproc.c
+@@ -92,6 +92,7 @@ struct pru_match_private_data {
+  * @irq_kick: IRQ number to use to perform virtio kick
+  * @mem_regions: data for each of the PRU memory regions
+  * @intc_config: PRU INTC configuration data
++ * @rmw_lock: lock for read, modify, write operations on registers
+  * @iram_da: device address of Instruction RAM for this PRU
+  * @pdram_da: device address of primary Data RAM for this PRU
+  * @sdram_da: device address of secondary Data RAM for this PRU
+@@ -110,6 +111,7 @@ struct pru_rproc {
+ 	int irq_kick;
+ 	struct pruss_mem_region mem_regions[PRU_MEM_MAX];
+ 	struct pruss_intc_config intc_config;
++	spinlock_t rmw_lock; /* register access lock */
+ 	u32 iram_da;
+ 	u32 pdram_da;
+ 	u32 sdram_da;
+@@ -130,6 +132,54 @@ void pru_control_write_reg(struct pru_rproc *pru, unsigned int reg, u32 val)
+ 	writel_relaxed(val, pru->mem_regions[PRU_MEM_CTRL].va + reg);
+ }
+ 
++static inline
++void pru_control_set_reg(struct pru_rproc *pru, unsigned int reg,
++			 u32 mask, u32 set)
++{
++	u32 val;
++	unsigned long flags;
++
++	spin_lock_irqsave(&pru->rmw_lock, flags);
++
++	val = pru_control_read_reg(pru, reg);
++	val &= ~mask;
++	val |= (set & mask);
++	pru_control_write_reg(pru, reg, val);
++
++	spin_unlock_irqrestore(&pru->rmw_lock, flags);
++}
++
++/**
++ * pru_rproc_set_ctable() - set the constant table index for the PRU
++ * @rproc: the rproc instance of the PRU
++ * @c: constant table index to set
++ * @addr: physical address to set it to
++ */
++int pru_rproc_set_ctable(struct rproc *rproc, enum pru_ctable_idx c, u32 addr)
++{
++	struct pru_rproc *pru = rproc->priv;
++	unsigned int reg;
++	u32 mask, set;
++	u16 idx;
++	u16 idx_mask;
++
++	/* pointer is 16 bit and index is 8-bit so mask out the rest */
++	idx_mask = (c >= PRU_C28) ? 0xFFFF : 0xFF;
++
++	/* ctable uses bit 8 and upwards only */
++	idx = (addr >> 8) & idx_mask;
++
++	/* configurable ctable (i.e. C24) starts at PRU_CTRL_CTBIR0 */
++	reg = PRU_CTRL_CTBIR0 + 4 * (c >> 1);
++	mask = idx_mask << (16 * (c & 1));
++	set = idx << (16 * (c & 1));
++
++	pru_control_set_reg(pru, reg, mask, set);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(pru_rproc_set_ctable);
++
+ static inline u32 pru_debug_read_reg(struct pru_rproc *pru, unsigned int reg)
+ {
+ 	return readl_relaxed(pru->mem_regions[PRU_MEM_DEBUG].va + reg);
+@@ -642,6 +692,7 @@ static int pru_rproc_probe(struct platform_device *pdev)
+ 	struct resource *res;
+ 	int i, ret;
+ 	const char *mem_names[PRU_MEM_MAX] = { "iram", "control", "debug" };
++	u32 mux_sel;
+ 
+ 	if (!np) {
+ 		dev_err(dev, "Non-DT platform device not supported\n");
+@@ -663,11 +714,21 @@ static int pru_rproc_probe(struct platform_device *pdev)
+ 	/* error recovery is not supported for PRUs */
+ 	rproc->recovery_disabled = true;
+ 
++	/*
++	 * rproc_add will auto-boot the processor normally, but this is
++	 * not desired with PRU client driven boot-flow methodoly. A PRU
++	 * application/client driver will boot the corresponding PRU
++	 * remote-processor as part of its state machine either through
++	 * the remoteproc sysfs interface or through the equivalent kernel API
++	 */
++	rproc->auto_boot = false;
++
+ 	pru = rproc->priv;
+ 	pru->id = pdata->id;
+ 	pru->pruss = platform_get_drvdata(ppdev);
+ 	pru->rproc = rproc;
+ 	pru->fw_name = pdata->fw_name;
++	spin_lock_init(&pru->rmw_lock);
+ 
+ 	/* XXX: get this from match data if different in the future */
+ 	pru->iram_da = 0;
+@@ -735,12 +796,29 @@ static int pru_rproc_probe(struct platform_device *pdev)
+ 		goto put_mbox;
+ 	}
+ 
++	if ((of_machine_is_compatible("ti,am5718-idk") ||
++	     of_machine_is_compatible("ti,k2g-ice")) &&
++	    !of_property_read_u32(np, "ti,pruss-gp-mux-sel", &mux_sel)) {
++		if (mux_sel < PRUSS_GP_MUX_SEL_GP ||
++		    mux_sel >= PRUSS_GP_MUX_MAX) {
++			dev_err(dev, "invalid gp_mux_sel %d\n", mux_sel);
++			ret = -EINVAL;
++			goto del_rproc;
++		}
++
++		ret = pruss_cfg_set_gpmux(pru->pruss, pru->id, mux_sel);
++		if (ret)
++			goto del_rproc;
++	}
++
+ 	pru_rproc_create_debug_entries(rproc);
+ 
+ 	dev_info(dev, "PRU rproc node %s probed successfully\n", np->full_name);
+ 
+ 	return 0;
+ 
++del_rproc:
++	rproc_del(rproc);
+ put_mbox:
+ 	mbox_free_channel(pru->mbox);
+ free_rproc:
+@@ -758,6 +836,10 @@ static int pru_rproc_remove(struct platform_device *pdev)
+ 
+ 	mbox_free_channel(pru->mbox);
+ 
++	if ((of_machine_is_compatible("ti,am5718-idk") ||
++	     of_machine_is_compatible("ti,k2g-ice")))
++		pruss_cfg_set_gpmux(pru->pruss, pru->id, PRUSS_GP_MUX_SEL_GP);
++
+ 	rproc_del(rproc);
+ 	rproc_free(rproc);
+ 
+@@ -937,6 +1019,7 @@ static int pru_rproc_remove(struct platform_device *pdev)
+ 	.driver = {
+ 		.name   = "pru-rproc",
+ 		.of_match_table = pru_rproc_match,
++		.suppress_bind_attrs = true,
+ 	},
+ 	.probe  = pru_rproc_probe,
+ 	.remove = pru_rproc_remove,
+diff --git a/include/linux/pruss.h b/include/linux/pruss.h
+index c173582..8551763 100644
+--- a/include/linux/pruss.h
++++ b/include/linux/pruss.h
+@@ -63,6 +63,20 @@ enum pruss_gpi_mode {
+ 	PRUSS_GPI_MODE_MII,
+ };
+ 
++/**
++ * enum pru_ctable_idx - Configurable Constant table index identifiers
++ */
++enum pru_ctable_idx {
++	PRU_C24 = 0,
++	PRU_C25,
++	PRU_C26,
++	PRU_C27,
++	PRU_C28,
++	PRU_C29,
++	PRU_C30,
++	PRU_C31,
++};
++
+ struct pruss;
+ 
+ #if IS_ENABLED(CONFIG_PRUSS_REMOTEPROC)
+@@ -81,6 +95,7 @@ int pruss_cfg_gpimode(struct pruss *pruss, struct rproc *rproc,
+ 		      enum pruss_gpi_mode mode);
+ void pruss_cfg_miirt_enable(struct pruss *pruss, bool enable);
+ void pruss_cfg_xfr_enable(struct pruss *pruss, bool enable);
++int pru_rproc_set_ctable(struct rproc *rproc, enum pru_ctable_idx c, u32 addr);
+ 
+ #else
+ 
+@@ -127,6 +142,12 @@ static inline void pruss_cfg_miirt_enable(struct pruss *pruss, bool enable) { }
+ 
+ static inline void pruss_cfg_xfr_enable(struct pruss *pruss, bool enable) { }
+ 
++static inline int pru_rproc_set_ctable(struct rproc *rproc,
++				       enum pru_ctable_idx c, u32 addr)
++{
++	return -ENOTSUPP;
++}
++
+ #endif /* CONFIG_PRUSS_REMOTEPROC */
+ 
+ #endif /* __LINUX_PRUSS_H */
+-- 
+1.7.9.5
+

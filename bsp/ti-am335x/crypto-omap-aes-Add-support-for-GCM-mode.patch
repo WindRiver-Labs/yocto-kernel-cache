@@ -1,0 +1,911 @@
+From 0a3aa0cebed12a35b29580665aa4b318a6d096ab Mon Sep 17 00:00:00 2001
+From: Tero Kristo <t-kristo@ti.com>
+Date: Wed, 24 May 2017 10:35:31 +0300
+Subject: [PATCH 138/205] crypto: omap-aes - Add support for GCM mode
+
+OMAP AES hw supports AES-GCM mode. This patch adds support for GCM and
+RFC4106 GCM mode in omap-aes driver. The GCM implementation is mostly
+written into its own source file, which gets built into the same driver
+binary as the existing AES support.
+
+Signed-off-by: Lokesh Vutla <lokeshvutla@ti.com>
+[t-kristo@ti.com: forward port to latest upstream kernel, conversion to use
+ omap-crypto lib and some additional fixes]
+Signed-off-by: Tero Kristo <t-kristo@ti.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+
+(cherry picked from commit ad18cc9d0f911928704cdc37f4d126853daa9e4e)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/crypto/Kconfig        |    1 +
+ drivers/crypto/Makefile       |    3 +-
+ drivers/crypto/omap-aes-gcm.c |  408 +++++++++++++++++++++++++++++++++++++++++
+ drivers/crypto/omap-aes.c     |  159 +++++++++++++++-
+ drivers/crypto/omap-aes.h     |   54 +++++-
+ 5 files changed, 612 insertions(+), 13 deletions(-)
+ create mode 100644 drivers/crypto/omap-aes-gcm.c
+
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+index 5a18806..6dcc210 100644
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -344,6 +344,7 @@ config CRYPTO_DEV_OMAP_AES
+ 	select CRYPTO_CBC
+ 	select CRYPTO_ECB
+ 	select CRYPTO_CTR
++	select CRYPTO_AEAD
+ 	help
+ 	  OMAP processors have AES module accelerator. Select this if you
+ 	  want to use the OMAP module for AES algorithms.
+diff --git a/drivers/crypto/Makefile b/drivers/crypto/Makefile
+index 8fd1151..8177388 100644
+--- a/drivers/crypto/Makefile
++++ b/drivers/crypto/Makefile
+@@ -21,7 +21,8 @@ obj-$(CONFIG_CRYPTO_DEV_NIAGARA2) += n2_crypto.o
+ n2_crypto-y := n2_core.o n2_asm.o
+ obj-$(CONFIG_CRYPTO_DEV_NX) += nx/
+ obj-$(CONFIG_CRYPTO_DEV_OMAP) += omap-crypto.o
+-obj-$(CONFIG_CRYPTO_DEV_OMAP_AES) += omap-aes.o
++obj-$(CONFIG_CRYPTO_DEV_OMAP_AES) += omap-aes-driver.o
++omap-aes-driver-objs := omap-aes.o omap-aes-gcm.o
+ obj-$(CONFIG_CRYPTO_DEV_OMAP_DES) += omap-des.o
+ obj-$(CONFIG_CRYPTO_DEV_OMAP_SHAM) += omap-sham.o
+ obj-$(CONFIG_CRYPTO_DEV_PADLOCK_AES) += padlock-aes.o
+diff --git a/drivers/crypto/omap-aes-gcm.c b/drivers/crypto/omap-aes-gcm.c
+new file mode 100644
+index 0000000..521a310
+--- /dev/null
++++ b/drivers/crypto/omap-aes-gcm.c
+@@ -0,0 +1,408 @@
++/*
++ * Cryptographic API.
++ *
++ * Support for OMAP AES GCM HW acceleration.
++ *
++ * Copyright (c) 2016 Texas Instruments Incorporated
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ *
++ */
++
++#include <linux/errno.h>
++#include <linux/scatterlist.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/omap-dma.h>
++#include <linux/interrupt.h>
++#include <crypto/aes.h>
++#include <crypto/scatterwalk.h>
++#include <crypto/skcipher.h>
++#include <crypto/internal/aead.h>
++
++#include "omap-crypto.h"
++#include "omap-aes.h"
++
++static int omap_aes_gcm_handle_queue(struct omap_aes_dev *dd,
++				     struct aead_request *req);
++
++static void omap_aes_gcm_finish_req(struct omap_aes_dev *dd, int ret)
++{
++	struct aead_request *req = dd->aead_req;
++
++	dd->flags &= ~FLAGS_BUSY;
++	dd->in_sg = NULL;
++	dd->out_sg = NULL;
++
++	req->base.complete(&req->base, ret);
++}
++
++static void omap_aes_gcm_done_task(struct omap_aes_dev *dd)
++{
++	u8 *tag;
++	int alen, clen, i, ret = 0, nsg;
++	struct omap_aes_reqctx *rctx;
++
++	alen = ALIGN(dd->assoc_len, AES_BLOCK_SIZE);
++	clen = ALIGN(dd->total, AES_BLOCK_SIZE);
++	rctx = aead_request_ctx(dd->aead_req);
++
++	nsg = !!(dd->assoc_len && dd->total);
++
++	dma_sync_sg_for_device(dd->dev, dd->out_sg, dd->out_sg_len,
++			       DMA_FROM_DEVICE);
++	dma_unmap_sg(dd->dev, dd->in_sg, dd->in_sg_len, DMA_TO_DEVICE);
++	dma_unmap_sg(dd->dev, dd->out_sg, dd->out_sg_len, DMA_FROM_DEVICE);
++	omap_aes_crypt_dma_stop(dd);
++
++	omap_crypto_cleanup(dd->out_sg, dd->orig_out,
++			    dd->aead_req->assoclen, dd->total,
++			    FLAGS_OUT_DATA_ST_SHIFT, dd->flags);
++
++	if (dd->flags & FLAGS_ENCRYPT)
++		scatterwalk_map_and_copy(rctx->auth_tag,
++					 dd->aead_req->dst,
++					 dd->total + dd->aead_req->assoclen,
++					 dd->authsize, 1);
++
++	omap_crypto_cleanup(&dd->in_sgl[0], NULL, 0, alen,
++			    FLAGS_ASSOC_DATA_ST_SHIFT, dd->flags);
++
++	omap_crypto_cleanup(&dd->in_sgl[nsg], NULL, 0, clen,
++			    FLAGS_IN_DATA_ST_SHIFT, dd->flags);
++
++	if (!(dd->flags & FLAGS_ENCRYPT)) {
++		tag = (u8 *)rctx->auth_tag;
++		for (i = 0; i < dd->authsize; i++) {
++			if (tag[i]) {
++				dev_err(dd->dev, "GCM decryption: Tag Message is wrong\n");
++				ret = -EBADMSG;
++			}
++		}
++	}
++
++	omap_aes_gcm_finish_req(dd, ret);
++	omap_aes_gcm_handle_queue(dd, NULL);
++}
++
++static int omap_aes_gcm_copy_buffers(struct omap_aes_dev *dd,
++				     struct aead_request *req)
++{
++	int alen, clen, cryptlen, assoclen, ret;
++	struct crypto_aead *aead = crypto_aead_reqtfm(req);
++	unsigned int authlen = crypto_aead_authsize(aead);
++	struct scatterlist *tmp, sg_arr[2];
++	int nsg;
++	u16 flags;
++
++	assoclen = req->assoclen;
++	cryptlen = req->cryptlen;
++
++	if (dd->flags & FLAGS_RFC4106_GCM)
++		assoclen -= 8;
++
++	if (!(dd->flags & FLAGS_ENCRYPT))
++		cryptlen -= authlen;
++
++	alen = ALIGN(assoclen, AES_BLOCK_SIZE);
++	clen = ALIGN(cryptlen, AES_BLOCK_SIZE);
++
++	nsg = !!(assoclen && cryptlen);
++
++	omap_aes_clear_copy_flags(dd);
++
++	sg_init_table(dd->in_sgl, nsg + 1);
++	if (assoclen) {
++		tmp = req->src;
++		ret = omap_crypto_align_sg(&tmp, assoclen,
++					   AES_BLOCK_SIZE, dd->in_sgl,
++					   OMAP_CRYPTO_COPY_DATA |
++					   OMAP_CRYPTO_ZERO_BUF |
++					   OMAP_CRYPTO_FORCE_SINGLE_ENTRY,
++					   FLAGS_ASSOC_DATA_ST_SHIFT,
++					   &dd->flags);
++	}
++
++	if (cryptlen) {
++		tmp = scatterwalk_ffwd(sg_arr, req->src, req->assoclen);
++
++		ret = omap_crypto_align_sg(&tmp, cryptlen,
++					   AES_BLOCK_SIZE, &dd->in_sgl[nsg],
++					   OMAP_CRYPTO_COPY_DATA |
++					   OMAP_CRYPTO_ZERO_BUF |
++					   OMAP_CRYPTO_FORCE_SINGLE_ENTRY,
++					   FLAGS_IN_DATA_ST_SHIFT,
++					   &dd->flags);
++	}
++
++	dd->in_sg = dd->in_sgl;
++	dd->total = cryptlen;
++	dd->assoc_len = assoclen;
++	dd->authsize = authlen;
++
++	dd->out_sg = req->dst;
++	dd->orig_out = req->dst;
++
++	dd->out_sg = scatterwalk_ffwd(sg_arr, req->dst, assoclen);
++
++	flags = 0;
++	if (req->src == req->dst || dd->out_sg == sg_arr)
++		flags |= OMAP_CRYPTO_FORCE_COPY;
++
++	ret = omap_crypto_align_sg(&dd->out_sg, cryptlen,
++				   AES_BLOCK_SIZE, &dd->out_sgl,
++				   flags,
++				   FLAGS_OUT_DATA_ST_SHIFT, &dd->flags);
++	if (ret)
++		return ret;
++
++	dd->in_sg_len = sg_nents_for_len(dd->in_sg, alen + clen);
++	dd->out_sg_len = sg_nents_for_len(dd->out_sg, clen);
++
++	return 0;
++}
++
++static void omap_aes_gcm_complete(struct crypto_async_request *req, int err)
++{
++	struct omap_aes_gcm_result *res = req->data;
++
++	if (err == -EINPROGRESS)
++		return;
++
++	res->err = err;
++	complete(&res->completion);
++}
++
++static int do_encrypt_iv(struct aead_request *req, u32 *tag, u32 *iv)
++{
++	struct scatterlist iv_sg, tag_sg;
++	struct skcipher_request *sk_req;
++	struct omap_aes_gcm_result result;
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
++	int ret = 0;
++
++	sk_req = skcipher_request_alloc(ctx->ctr, GFP_KERNEL);
++	if (!sk_req) {
++		pr_err("skcipher: Failed to allocate request\n");
++		return -1;
++	}
++
++	init_completion(&result.completion);
++
++	sg_init_one(&iv_sg, iv, AES_BLOCK_SIZE);
++	sg_init_one(&tag_sg, tag, AES_BLOCK_SIZE);
++	skcipher_request_set_callback(sk_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++				      omap_aes_gcm_complete, &result);
++	ret = crypto_skcipher_setkey(ctx->ctr, (u8 *)ctx->key, ctx->keylen);
++	skcipher_request_set_crypt(sk_req, &iv_sg, &tag_sg, AES_BLOCK_SIZE,
++				   NULL);
++	ret = crypto_skcipher_encrypt(sk_req);
++	switch (ret) {
++	case 0:
++		break;
++	case -EINPROGRESS:
++	case -EBUSY:
++		ret = wait_for_completion_interruptible(&result.completion);
++		if (!ret) {
++			ret = result.err;
++			if (!ret) {
++				reinit_completion(&result.completion);
++				break;
++			}
++		}
++		/* fall through */
++	default:
++		pr_err("Encryptio of IV failed for GCM mode");
++		break;
++	}
++
++	skcipher_request_free(sk_req);
++	return ret;
++}
++
++void omap_aes_gcm_dma_out_callback(void *data)
++{
++	struct omap_aes_dev *dd = data;
++	struct omap_aes_reqctx *rctx;
++	int i, val;
++	u32 *auth_tag, tag[4];
++
++	if (!(dd->flags & FLAGS_ENCRYPT))
++		scatterwalk_map_and_copy(tag, dd->aead_req->src,
++					 dd->total + dd->aead_req->assoclen,
++					 dd->authsize, 0);
++
++	rctx = aead_request_ctx(dd->aead_req);
++	auth_tag = (u32 *)rctx->auth_tag;
++	for (i = 0; i < 4; i++) {
++		val = omap_aes_read(dd, AES_REG_TAG_N(dd, i));
++		auth_tag[i] = val ^ auth_tag[i];
++		if (!(dd->flags & FLAGS_ENCRYPT))
++			auth_tag[i] = auth_tag[i] ^ tag[i];
++	}
++
++	omap_aes_gcm_done_task(dd);
++}
++
++static int omap_aes_gcm_handle_queue(struct omap_aes_dev *dd,
++				     struct aead_request *req)
++{
++	struct omap_aes_ctx *ctx;
++	struct aead_request *backlog;
++	struct omap_aes_reqctx *rctx;
++	unsigned long flags;
++	int err, ret = 0;
++
++	spin_lock_irqsave(&dd->lock, flags);
++	if (req)
++		ret = aead_enqueue_request(&dd->aead_queue, req);
++	if (dd->flags & FLAGS_BUSY) {
++		spin_unlock_irqrestore(&dd->lock, flags);
++		return ret;
++	}
++
++	backlog = aead_get_backlog(&dd->aead_queue);
++	req = aead_dequeue_request(&dd->aead_queue);
++	if (req)
++		dd->flags |= FLAGS_BUSY;
++	spin_unlock_irqrestore(&dd->lock, flags);
++
++	if (!req)
++		return ret;
++
++	if (backlog)
++		backlog->base.complete(&backlog->base, -EINPROGRESS);
++
++	ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
++	rctx = aead_request_ctx(req);
++
++	dd->ctx = ctx;
++	rctx->dd = dd;
++	dd->aead_req = req;
++
++	rctx->mode &= FLAGS_MODE_MASK;
++	dd->flags = (dd->flags & ~FLAGS_MODE_MASK) | rctx->mode;
++
++	err = omap_aes_gcm_copy_buffers(dd, req);
++	if (err)
++		return err;
++
++	err = omap_aes_write_ctrl(dd);
++	if (!err)
++		err = omap_aes_crypt_dma_start(dd);
++
++	if (err) {
++		omap_aes_gcm_finish_req(dd, err);
++		omap_aes_gcm_handle_queue(dd, NULL);
++	}
++
++	return ret;
++}
++
++static int omap_aes_gcm_crypt(struct aead_request *req, unsigned long mode)
++{
++	struct omap_aes_reqctx *rctx = aead_request_ctx(req);
++	struct crypto_aead *aead = crypto_aead_reqtfm(req);
++	unsigned int authlen = crypto_aead_authsize(aead);
++	struct omap_aes_dev *dd;
++	__be32 counter = cpu_to_be32(1);
++	int err, assoclen;
++
++	memset(rctx->auth_tag, 0, sizeof(rctx->auth_tag));
++	memcpy(rctx->iv + 12, &counter, 4);
++
++	err = do_encrypt_iv(req, (u32 *)rctx->auth_tag, (u32 *)rctx->iv);
++	if (err)
++		return err;
++
++	if (mode & FLAGS_RFC4106_GCM)
++		assoclen = req->assoclen - 8;
++	else
++		assoclen = req->assoclen;
++	if (assoclen + req->cryptlen == 0) {
++		scatterwalk_map_and_copy(rctx->auth_tag, req->dst, 0, authlen,
++					 1);
++		return 0;
++	}
++
++	dd = omap_aes_find_dev(rctx);
++	if (!dd)
++		return -ENODEV;
++	rctx->mode = mode;
++
++	return omap_aes_gcm_handle_queue(dd, req);
++}
++
++int omap_aes_gcm_encrypt(struct aead_request *req)
++{
++	struct omap_aes_reqctx *rctx = aead_request_ctx(req);
++
++	memcpy(rctx->iv, req->iv, 12);
++	return omap_aes_gcm_crypt(req, FLAGS_ENCRYPT | FLAGS_GCM);
++}
++
++int omap_aes_gcm_decrypt(struct aead_request *req)
++{
++	struct omap_aes_reqctx *rctx = aead_request_ctx(req);
++
++	memcpy(rctx->iv, req->iv, 12);
++	return omap_aes_gcm_crypt(req, FLAGS_GCM);
++}
++
++int omap_aes_4106gcm_encrypt(struct aead_request *req)
++{
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
++	struct omap_aes_reqctx *rctx = aead_request_ctx(req);
++
++	memcpy(rctx->iv, ctx->nonce, 4);
++	memcpy(rctx->iv + 4, req->iv, 8);
++	return omap_aes_gcm_crypt(req, FLAGS_ENCRYPT | FLAGS_GCM |
++				  FLAGS_RFC4106_GCM);
++}
++
++int omap_aes_4106gcm_decrypt(struct aead_request *req)
++{
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(crypto_aead_reqtfm(req));
++	struct omap_aes_reqctx *rctx = aead_request_ctx(req);
++
++	memcpy(rctx->iv, ctx->nonce, 4);
++	memcpy(rctx->iv + 4, req->iv, 8);
++	return omap_aes_gcm_crypt(req, FLAGS_GCM | FLAGS_RFC4106_GCM);
++}
++
++int omap_aes_gcm_setkey(struct crypto_aead *tfm, const u8 *key,
++			unsigned int keylen)
++{
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(tfm);
++
++	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
++	    keylen != AES_KEYSIZE_256)
++		return -EINVAL;
++
++	memcpy(ctx->key, key, keylen);
++	ctx->keylen = keylen;
++
++	return 0;
++}
++
++int omap_aes_4106gcm_setkey(struct crypto_aead *tfm, const u8 *key,
++			    unsigned int keylen)
++{
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(tfm);
++
++	if (keylen < 4)
++		return -EINVAL;
++
++	keylen -= 4;
++	if (keylen != AES_KEYSIZE_128 && keylen != AES_KEYSIZE_192 &&
++	    keylen != AES_KEYSIZE_256)
++		return -EINVAL;
++
++	memcpy(ctx->key, key, keylen);
++	memcpy(ctx->nonce, key + keylen, 4);
++	ctx->keylen = keylen;
++
++	return 0;
++}
+diff --git a/drivers/crypto/omap-aes.c b/drivers/crypto/omap-aes.c
+index bf3b27d..5120a17 100644
+--- a/drivers/crypto/omap-aes.c
++++ b/drivers/crypto/omap-aes.c
+@@ -37,6 +37,7 @@
+ #include <crypto/aes.h>
+ #include <crypto/engine.h>
+ #include <crypto/internal/skcipher.h>
++#include <crypto/internal/aead.h>
+ 
+ #include "omap-crypto.h"
+ #include "omap-aes.h"
+@@ -112,8 +113,16 @@ static int omap_aes_hw_init(struct omap_aes_dev *dd)
+ 	return 0;
+ }
+ 
++void omap_aes_clear_copy_flags(struct omap_aes_dev *dd)
++{
++	dd->flags &= ~(OMAP_CRYPTO_COPY_MASK << FLAGS_IN_DATA_ST_SHIFT);
++	dd->flags &= ~(OMAP_CRYPTO_COPY_MASK << FLAGS_OUT_DATA_ST_SHIFT);
++	dd->flags &= ~(OMAP_CRYPTO_COPY_MASK << FLAGS_ASSOC_DATA_ST_SHIFT);
++}
++
+ int omap_aes_write_ctrl(struct omap_aes_dev *dd)
+ {
++	struct omap_aes_reqctx *rctx;
+ 	unsigned int key32;
+ 	int i, err;
+ 	u32 val;
+@@ -124,7 +133,11 @@ int omap_aes_write_ctrl(struct omap_aes_dev *dd)
+ 
+ 	key32 = dd->ctx->keylen / sizeof(u32);
+ 
+-	/* it seems a key should always be set even if it has not changed */
++	/* RESET the key as previous HASH keys should not get affected*/
++	if (dd->flags & FLAGS_GCM)
++		for (i = 0; i < 0x40; i = i + 4)
++			omap_aes_write(dd, i, 0x0);
++
+ 	for (i = 0; i < key32; i++) {
+ 		omap_aes_write(dd, AES_REG_KEY(dd, i),
+ 			__le32_to_cpu(dd->ctx->key[i]));
+@@ -133,12 +146,21 @@ int omap_aes_write_ctrl(struct omap_aes_dev *dd)
+ 	if ((dd->flags & (FLAGS_CBC | FLAGS_CTR)) && dd->req->info)
+ 		omap_aes_write_n(dd, AES_REG_IV(dd, 0), dd->req->info, 4);
+ 
++	if ((dd->flags & (FLAGS_GCM)) && dd->aead_req->iv) {
++		rctx = aead_request_ctx(dd->aead_req);
++		omap_aes_write_n(dd, AES_REG_IV(dd, 0), (u32 *)rctx->iv, 4);
++	}
++
+ 	val = FLD_VAL(((dd->ctx->keylen >> 3) - 1), 4, 3);
+ 	if (dd->flags & FLAGS_CBC)
+ 		val |= AES_REG_CTRL_CBC;
+-	if (dd->flags & FLAGS_CTR)
++
++	if (dd->flags & (FLAGS_CTR | FLAGS_GCM))
+ 		val |= AES_REG_CTRL_CTR | AES_REG_CTRL_CTR_WIDTH_128;
+ 
++	if (dd->flags & FLAGS_GCM)
++		val |= AES_REG_CTRL_GCM;
++
+ 	if (dd->flags & FLAGS_ENCRYPT)
+ 		val |= AES_REG_CTRL_DIRECTION;
+ 
+@@ -169,6 +191,8 @@ static void omap_aes_dma_trigger_omap4(struct omap_aes_dev *dd, int length)
+ {
+ 	omap_aes_write(dd, AES_REG_LENGTH_N(0), length);
+ 	omap_aes_write(dd, AES_REG_LENGTH_N(1), 0);
++	if (dd->flags & FLAGS_GCM)
++		omap_aes_write(dd, AES_REG_A_LEN, dd->assoc_len);
+ 
+ 	omap_aes_dma_trigger_omap2(dd, length);
+ }
+@@ -306,7 +330,10 @@ static int omap_aes_crypt_dma(struct omap_aes_dev *dd,
+ 		return -EINVAL;
+ 	}
+ 
+-	tx_out->callback = omap_aes_dma_out_callback;
++	if (dd->flags & FLAGS_GCM)
++		tx_out->callback = omap_aes_gcm_dma_out_callback;
++	else
++		tx_out->callback = omap_aes_dma_out_callback;
+ 	tx_out->callback_param = dd;
+ 
+ 	dmaengine_submit(tx_in);
+@@ -411,7 +438,7 @@ static int omap_aes_prepare_req(struct crypto_engine *engine,
+ 		flags |= OMAP_CRYPTO_FORCE_COPY;
+ 
+ 	ret = omap_crypto_align_sg(&dd->in_sg, dd->total, AES_BLOCK_SIZE,
+-				   &dd->in_sgl, flags,
++				   dd->in_sgl, flags,
+ 				   FLAGS_IN_DATA_ST_SHIFT, &dd->flags);
+ 	if (ret)
+ 		return ret;
+@@ -466,7 +493,7 @@ static void omap_aes_done_task(unsigned long data)
+ 		omap_aes_crypt_dma_stop(dd);
+ 	}
+ 
+-	omap_crypto_cleanup(&dd->in_sgl, NULL, 0, dd->total_save,
++	omap_crypto_cleanup(dd->in_sgl, NULL, 0, dd->total_save,
+ 			    FLAGS_IN_DATA_ST_SHIFT, dd->flags);
+ 
+ 	omap_crypto_cleanup(&dd->out_sgl, dd->orig_out, 0, dd->total_save,
+@@ -591,6 +618,36 @@ static int omap_aes_cra_init(struct crypto_tfm *tfm)
+ 	return 0;
+ }
+ 
++static int omap_aes_gcm_cra_init(struct crypto_aead *tfm)
++{
++	struct omap_aes_dev *dd = NULL;
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(tfm);
++	int err;
++
++	/* Find AES device, currently picks the first device */
++	spin_lock_bh(&list_lock);
++	list_for_each_entry(dd, &dev_list, list) {
++		break;
++	}
++	spin_unlock_bh(&list_lock);
++
++	err = pm_runtime_get_sync(dd->dev);
++	if (err < 0) {
++		dev_err(dd->dev, "%s: failed to get_sync(%d)\n",
++			__func__, err);
++		return err;
++	}
++
++	tfm->reqsize = sizeof(struct omap_aes_reqctx);
++	ctx->ctr = crypto_alloc_skcipher("ecb(aes)", 0, 0);
++	if (IS_ERR(ctx->ctr)) {
++		pr_warn("could not load aes driver for encrypting IV\n");
++		return PTR_ERR(ctx->ctr);
++	}
++
++	return 0;
++}
++
+ static void omap_aes_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct omap_aes_ctx *ctx = crypto_tfm_ctx(tfm);
+@@ -601,6 +658,16 @@ static void omap_aes_cra_exit(struct crypto_tfm *tfm)
+ 	ctx->fallback = NULL;
+ }
+ 
++static void omap_aes_gcm_cra_exit(struct crypto_aead *tfm)
++{
++	struct omap_aes_ctx *ctx = crypto_aead_ctx(tfm);
++
++	omap_aes_cra_exit(crypto_aead_tfm(tfm));
++
++	if (ctx->ctr)
++		crypto_free_skcipher(ctx->ctr);
++}
++
+ /* ********************** ALGS ************************************ */
+ 
+ static struct crypto_alg algs_ecb_cbc[] = {
+@@ -685,6 +752,54 @@ static void omap_aes_cra_exit(struct crypto_tfm *tfm)
+ 	},
+ };
+ 
++static struct aead_alg algs_aead_gcm[] = {
++{
++	.base = {
++		.cra_name		= "gcm(aes)",
++		.cra_driver_name	= "gcm-aes-omap",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_ASYNC |
++					  CRYPTO_ALG_KERN_DRIVER_ONLY,
++		.cra_blocksize		= 1,
++		.cra_ctxsize		= sizeof(struct omap_aes_ctx),
++		.cra_alignmask		= 0xf,
++		.cra_module		= THIS_MODULE,
++	},
++	.init		= omap_aes_gcm_cra_init,
++	.exit		= omap_aes_gcm_cra_exit,
++	.ivsize		= 12,
++	.maxauthsize	= AES_BLOCK_SIZE,
++	.setkey		= omap_aes_gcm_setkey,
++	.encrypt	= omap_aes_gcm_encrypt,
++	.decrypt	= omap_aes_gcm_decrypt,
++},
++{
++	.base = {
++		.cra_name		= "rfc4106(gcm(aes))",
++		.cra_driver_name	= "rfc4106-gcm-aes-omap",
++		.cra_priority		= 300,
++		.cra_flags		= CRYPTO_ALG_ASYNC |
++					  CRYPTO_ALG_KERN_DRIVER_ONLY,
++		.cra_blocksize		= 1,
++		.cra_ctxsize		= sizeof(struct omap_aes_ctx),
++		.cra_alignmask		= 0xf,
++		.cra_module		= THIS_MODULE,
++	},
++	.init		= omap_aes_gcm_cra_init,
++	.exit		= omap_aes_gcm_cra_exit,
++	.maxauthsize	= AES_BLOCK_SIZE,
++	.ivsize		= 8,
++	.setkey		= omap_aes_4106gcm_setkey,
++	.encrypt	= omap_aes_4106gcm_encrypt,
++	.decrypt	= omap_aes_4106gcm_decrypt,
++},
++};
++
++static struct omap_aes_aead_algs omap_aes_aead_info = {
++	.algs_list	=	algs_aead_gcm,
++	.size		=	ARRAY_SIZE(algs_aead_gcm),
++};
++
+ static const struct omap_aes_pdata omap_aes_pdata_omap2 = {
+ 	.algs_info	= omap_aes_algs_info_ecb_cbc,
+ 	.algs_info_size	= ARRAY_SIZE(omap_aes_algs_info_ecb_cbc),
+@@ -738,6 +853,7 @@ static void omap_aes_cra_exit(struct crypto_tfm *tfm)
+ static const struct omap_aes_pdata omap_aes_pdata_omap4 = {
+ 	.algs_info	= omap_aes_algs_info_ecb_cbc_ctr,
+ 	.algs_info_size	= ARRAY_SIZE(omap_aes_algs_info_ecb_cbc_ctr),
++	.aead_algs_info	= &omap_aes_aead_info,
+ 	.trigger	= omap_aes_dma_trigger_omap4,
+ 	.key_ofs	= 0x3c,
+ 	.iv_ofs		= 0x40,
+@@ -920,6 +1036,7 @@ static int omap_aes_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct omap_aes_dev *dd;
+ 	struct crypto_alg *algp;
++	struct aead_alg *aalg;
+ 	struct resource res;
+ 	int err = -ENOMEM, i, j, irq = -1;
+ 	u32 reg;
+@@ -932,6 +1049,8 @@ static int omap_aes_probe(struct platform_device *pdev)
+ 	dd->dev = dev;
+ 	platform_set_drvdata(pdev, dd);
+ 
++	aead_init_queue(&dd->aead_queue, OMAP_AES_QUEUE_LENGTH);
++
+ 	err = (dev->of_node) ? omap_aes_get_res_of(dd, dev, &res) :
+ 			       omap_aes_get_res_pdev(dd, pdev, &res);
+ 	if (err)
+@@ -987,6 +1106,7 @@ static int omap_aes_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	spin_lock_init(&dd->lock);
+ 
+ 	INIT_LIST_HEAD(&dd->list);
+ 	spin_lock(&list_lock);
+@@ -1023,7 +1143,29 @@ static int omap_aes_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (dd->pdata->aead_algs_info &&
++	    !dd->pdata->aead_algs_info->registered) {
++		for (i = 0; i < dd->pdata->aead_algs_info->size; i++) {
++			aalg = &dd->pdata->aead_algs_info->algs_list[i];
++			algp = &aalg->base;
++
++			pr_debug("reg alg: %s\n", algp->cra_name);
++			INIT_LIST_HEAD(&algp->cra_list);
++
++			err = crypto_register_aead(aalg);
++			if (err)
++				goto err_aead_algs;
++
++			dd->pdata->aead_algs_info->registered++;
++		}
++	}
++
+ 	return 0;
++err_aead_algs:
++	for (i = dd->pdata->aead_algs_info->registered - 1; i >= 0; i--) {
++		aalg = &dd->pdata->aead_algs_info->algs_list[i];
++		crypto_unregister_aead(aalg);
++	}
+ err_algs:
+ 	for (i = dd->pdata->algs_info_size - 1; i >= 0; i--)
+ 		for (j = dd->pdata->algs_info[i].registered - 1; j >= 0; j--)
+@@ -1048,6 +1190,7 @@ static int omap_aes_probe(struct platform_device *pdev)
+ static int omap_aes_remove(struct platform_device *pdev)
+ {
+ 	struct omap_aes_dev *dd = platform_get_drvdata(pdev);
++	struct aead_alg *aalg;
+ 	int i, j;
+ 
+ 	if (!dd)
+@@ -1062,7 +1205,13 @@ static int omap_aes_remove(struct platform_device *pdev)
+ 			crypto_unregister_alg(
+ 					&dd->pdata->algs_info[i].algs_list[j]);
+ 
++	for (i = dd->pdata->aead_algs_info->size - 1; i >= 0; i--) {
++		aalg = &dd->pdata->aead_algs_info->algs_list[i];
++		crypto_unregister_aead(aalg);
++	}
++
+ 	crypto_engine_exit(dd->engine);
++
+ 	tasklet_kill(&dd->done_task);
+ 	omap_aes_dma_cleanup(dd);
+ 	pm_runtime_disable(dd->dev);
+diff --git a/drivers/crypto/omap-aes.h b/drivers/crypto/omap-aes.h
+index 11e1784..8906342 100644
+--- a/drivers/crypto/omap-aes.h
++++ b/drivers/crypto/omap-aes.h
+@@ -30,11 +30,13 @@
+ #define AES_REG_IV(dd, x)		((dd)->pdata->iv_ofs + ((x) * 0x04))
+ 
+ #define AES_REG_CTRL(dd)		((dd)->pdata->ctrl_ofs)
++#define AES_REG_CTRL_CONTEXT_READY	BIT(31)
+ #define AES_REG_CTRL_CTR_WIDTH_MASK	GENMASK(8, 7)
+ #define AES_REG_CTRL_CTR_WIDTH_32	0
+ #define AES_REG_CTRL_CTR_WIDTH_64	BIT(7)
+ #define AES_REG_CTRL_CTR_WIDTH_96	BIT(8)
+ #define AES_REG_CTRL_CTR_WIDTH_128	GENMASK(8, 7)
++#define AES_REG_CTRL_GCM		GENMASK(17, 16)
+ #define AES_REG_CTRL_CTR		BIT(6)
+ #define AES_REG_CTRL_CBC		BIT(5)
+ #define AES_REG_CTRL_KEY_SIZE		GENMASK(4, 3)
+@@ -43,7 +45,12 @@
+ #define AES_REG_CTRL_OUTPUT_READY	BIT(0)
+ #define AES_REG_CTRL_MASK		GENMASK(24, 2)
+ 
++#define AES_REG_C_LEN_0			0x54
++#define AES_REG_C_LEN_1			0x58
++#define AES_REG_A_LEN			0x5C
++
+ #define AES_REG_DATA_N(dd, x)		((dd)->pdata->data_ofs + ((x) * 0x04))
++#define AES_REG_TAG_N(dd, x)		(0x70 + ((x) * 0x04))
+ 
+ #define AES_REG_REV(dd)			((dd)->pdata->rev_ofs)
+ 
+@@ -65,30 +72,41 @@
+ 
+ #define DEFAULT_AUTOSUSPEND_DELAY	1000
+ 
+-#define FLAGS_MODE_MASK		0x000f
++#define FLAGS_MODE_MASK		0x001f
+ #define FLAGS_ENCRYPT		BIT(0)
+ #define FLAGS_CBC		BIT(1)
+-#define FLAGS_GIV		BIT(2)
+-#define FLAGS_CTR		BIT(3)
++#define FLAGS_CTR		BIT(2)
++#define FLAGS_GCM		BIT(3)
++#define FLAGS_RFC4106_GCM	BIT(4)
+ 
+-#define FLAGS_INIT		BIT(4)
+-#define FLAGS_FAST		BIT(5)
+-#define FLAGS_BUSY		BIT(6)
++#define FLAGS_INIT		BIT(5)
++#define FLAGS_FAST		BIT(6)
++#define FLAGS_BUSY		BIT(7)
+ 
+ #define FLAGS_IN_DATA_ST_SHIFT	8
+ #define FLAGS_OUT_DATA_ST_SHIFT	10
++#define FLAGS_ASSOC_DATA_ST_SHIFT	12
+ 
+ #define AES_BLOCK_WORDS		(AES_BLOCK_SIZE >> 2)
+ 
++struct omap_aes_gcm_result {
++	struct completion completion;
++	int err;
++};
++
+ struct omap_aes_ctx {
+ 	int		keylen;
+ 	u32		key[AES_KEYSIZE_256 / sizeof(u32)];
++	u8		nonce[4];
+ 	struct crypto_skcipher	*fallback;
++	struct crypto_skcipher	*ctr;
+ };
+ 
+ struct omap_aes_reqctx {
+ 	struct omap_aes_dev *dd;
+ 	unsigned long mode;
++	u8 iv[AES_BLOCK_SIZE];
++	u32 auth_tag[AES_BLOCK_SIZE / sizeof(u32)];
+ };
+ 
+ #define OMAP_AES_QUEUE_LENGTH	1
+@@ -100,9 +118,16 @@ struct omap_aes_algs_info {
+ 	unsigned int		registered;
+ };
+ 
++struct omap_aes_aead_algs {
++	struct aead_alg	*algs_list;
++	unsigned int	size;
++	unsigned int	registered;
++};
++
+ struct omap_aes_pdata {
+ 	struct omap_aes_algs_info	*algs_info;
+ 	unsigned int	algs_info_size;
++	struct omap_aes_aead_algs	*aead_algs_info;
+ 
+ 	void		(*trigger)(struct omap_aes_dev *dd, int length);
+ 
+@@ -135,8 +160,11 @@ struct omap_aes_dev {
+ 	int			err;
+ 
+ 	struct tasklet_struct	done_task;
++	struct aead_queue	aead_queue;
++	spinlock_t		lock;
+ 
+ 	struct ablkcipher_request	*req;
++	struct aead_request		*aead_req;
+ 	struct crypto_engine		*engine;
+ 
+ 	/*
+@@ -145,12 +173,14 @@ struct omap_aes_dev {
+ 	 */
+ 	size_t				total;
+ 	size_t				total_save;
++	size_t				assoc_len;
++	size_t				authsize;
+ 
+ 	struct scatterlist		*in_sg;
+ 	struct scatterlist		*out_sg;
+ 
+ 	/* Buffers for copying for unaligned cases */
+-	struct scatterlist		in_sgl;
++	struct scatterlist		in_sgl[2];
+ 	struct scatterlist		out_sgl;
+ 	struct scatterlist		*orig_out;
+ 
+@@ -167,8 +197,18 @@ struct omap_aes_dev {
+ u32 omap_aes_read(struct omap_aes_dev *dd, u32 offset);
+ void omap_aes_write(struct omap_aes_dev *dd, u32 offset, u32 value);
+ struct omap_aes_dev *omap_aes_find_dev(struct omap_aes_reqctx *rctx);
++int omap_aes_gcm_setkey(struct crypto_aead *tfm, const u8 *key,
++			unsigned int keylen);
++int omap_aes_4106gcm_setkey(struct crypto_aead *tfm, const u8 *key,
++			    unsigned int keylen);
++int omap_aes_gcm_encrypt(struct aead_request *req);
++int omap_aes_gcm_decrypt(struct aead_request *req);
++int omap_aes_4106gcm_encrypt(struct aead_request *req);
++int omap_aes_4106gcm_decrypt(struct aead_request *req);
+ int omap_aes_write_ctrl(struct omap_aes_dev *dd);
+ int omap_aes_crypt_dma_start(struct omap_aes_dev *dd);
+ int omap_aes_crypt_dma_stop(struct omap_aes_dev *dd);
++void omap_aes_gcm_dma_out_callback(void *data);
++void omap_aes_clear_copy_flags(struct omap_aes_dev *dd);
+ 
+ #endif
+-- 
+1.7.9.5
+
