@@ -1,0 +1,107 @@
+From de9a32dfd97438d93b0b362297886e5318af30c2 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 3 Aug 2012 10:30:45 -0700
+Subject: [PATCH 3/3] workqueue: disable irq while manipulating PENDING
+
+commit 8930caba3dbdd8b86dd6934a5920bf61b53a931e upstream
+
+Queueing operations use WORK_STRUCT_PENDING_BIT to synchronize access
+to the target work item.  They first try to claim the bit and proceed
+with queueing only after that succeeds and there's a window between
+PENDING being set and the actual queueing where the task can be
+interrupted or preempted.
+
+There's also a similar window in process_one_work() when clearing
+PENDING.  A work item is dequeued, gcwq->lock is released and then
+PENDING is cleared and the worker might get interrupted or preempted
+between releasing gcwq->lock and clearing PENDING.
+
+cancel[_delayed]_work_sync() tries to claim or steal PENDING.  The
+function assumes that a work item with PENDING is either queued or in
+the process of being [de]queued.  In the latter case, it busy-loops
+until either the work item loses PENDING or is queued.  If canceling
+coincides with the above described interrupts or preemptions, the
+canceling task will busy-loop while the queueing or executing task is
+preempted.
+
+This patch keeps irq disabled across claiming PENDING and actual
+queueing and moves PENDING clearing in process_one_work() inside
+gcwq->lock so that busy looping from PENDING && !queued doesn't wait
+for interrupted/preempted tasks.  Note that, in process_one_work(),
+setting last CPU and clearing PENDING got merged into single
+operation.
+
+This removes possible long busy-loops and will allow using
+try_to_grab_pending() from bh and irq contexts.
+
+v2: __queue_work() was testing preempt_count() to ensure that the
+    caller has disabled preemption.  This triggers spuriously if
+    !CONFIG_PREEMPT_COUNT.  Use preemptible() instead.  Reported by
+    Fengguang Wu.
+
+v3: Disable irq instead of preemption.  IRQ will be disabled while
+    grabbing gcwq->lock later anyway and this allows using
+    try_to_grab_pending() from bh and irq contexts.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Fengguang Wu <fengguang.wu@intel.com>
+Signed-off-by: Rui Wang <rui.wang@windriver.com>
+---
+ kernel/workqueue.c |   12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index b8cc3a2..4790ff0 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -1513,14 +1513,14 @@ bool queue_work_on(int cpu, struct workqueue_struct *wq,
+ 	bool ret = false;
+ 	unsigned long flags;
+ 
+-	local_lock_irqsave(pendingb_lock,flags);
++	local_irq_save(flags);
+ 
+ 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+ 		__queue_work(cpu, wq, work);
+ 		ret = true;
+ 	}
+ 
+-	local_unlock_irqrestore(pendingb_lock, flags);
++	local_irq_restore(flags);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(queue_work_on);
+@@ -1589,14 +1589,14 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
+ 	unsigned long flags;
+ 
+ 	/* read the comment in __queue_work() */
+-	local_lock_irqsave(pendingb_lock, flags);
++	local_irq_save(flags);
+ 
+ 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+ 		__queue_delayed_work(cpu, wq, dwork, delay);
+ 		ret = true;
+ 	}
+ 
+-	local_unlock_irqrestore(pendingb_lock, flags);
++	local_irq_restore(flags);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(queue_delayed_work_on);
+@@ -3015,10 +3015,10 @@ bool cancel_work_sync(struct work_struct *work)
+  */
+ bool flush_delayed_work(struct delayed_work *dwork)
+ {
+-	local_lock_irq(pendingb_lock);
++	local_irq_disable();
+ 	if (del_timer_sync(&dwork->timer))
+ 		__queue_work(dwork->cpu, dwork->wq, &dwork->work);
+-	local_unlock_irq(pendingb_lock);
++	local_irq_enable();
+ 	return flush_work(&dwork->work);
+ }
+ EXPORT_SYMBOL(flush_delayed_work);
+-- 
+1.7.9.5
+
