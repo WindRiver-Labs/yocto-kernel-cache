@@ -1,0 +1,498 @@
+From 5e502e7b6e849e9e50003e350cffd98784863118 Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Thu, 22 Mar 2018 20:42:50 +0100
+Subject: [PATCH 124/176] tipc: add 128-bit node identifier
+
+commit d50ccc2d3909fc1b4d40e4af16b026f05dc68707 upstream
+
+We add a 128-bit node identity, as an alternative to the currently used
+32-bit node address.
+
+For the sake of compatibility and to minimize message header changes
+we retain the existing 32-bit address field. When not set explicitly by
+the user, this field will be filled with a hash value generated from the
+much longer node identity, and be used as a shorthand value for the
+latter.
+
+We permit either the address or the identity to be set by configuration,
+but not both, so when the address value is set by a legacy user the
+corresponding 128-bit node identity is generated based on the that value.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ include/uapi/linux/tipc_netlink.h |    2 +
+ net/tipc/addr.c                   |   81 ++++++++++++++++++++++++++++++-------
+ net/tipc/addr.h                   |   28 ++++++++++---
+ net/tipc/core.c                   |    4 +-
+ net/tipc/core.h                   |    6 ++-
+ net/tipc/discover.c               |    4 +-
+ net/tipc/link.c                   |    6 ++-
+ net/tipc/name_distr.c             |    6 +--
+ net/tipc/net.c                    |   51 +++++++++++++++--------
+ net/tipc/net.h                    |    4 +-
+ net/tipc/node.c                   |    8 +---
+ net/tipc/node.h                   |    4 +-
+ 12 files changed, 148 insertions(+), 56 deletions(-)
+
+diff --git a/include/uapi/linux/tipc_netlink.h b/include/uapi/linux/tipc_netlink.h
+index 15f72e3..e31c1e6 100644
+--- a/include/uapi/linux/tipc_netlink.h
++++ b/include/uapi/linux/tipc_netlink.h
+@@ -168,6 +168,8 @@ enum {
+ 	TIPC_NLA_NET_UNSPEC,
+ 	TIPC_NLA_NET_ID,		/* u32 */
+ 	TIPC_NLA_NET_ADDR,		/* u32 */
++	TIPC_NLA_NET_NODEID,            /* u64 */
++	TIPC_NLA_NET_NODEID_W1,         /* u64 */
+ 
+ 	__TIPC_NLA_NET_MAX,
+ 	TIPC_NLA_NET_MAX = __TIPC_NLA_NET_MAX - 1
+diff --git a/net/tipc/addr.c b/net/tipc/addr.c
+index 6e06b4d..4841e98 100644
+--- a/net/tipc/addr.c
++++ b/net/tipc/addr.c
+@@ -1,7 +1,7 @@
+ /*
+  * net/tipc/addr.c: TIPC address utility routines
+  *
+- * Copyright (c) 2000-2006, Ericsson AB
++ * Copyright (c) 2000-2006, 2018, Ericsson AB
+  * Copyright (c) 2004-2005, 2010-2011, Wind River Systems
+  * All rights reserved.
+  *
+@@ -34,18 +34,9 @@
+  * POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
+-#include <linux/kernel.h>
+ #include "addr.h"
+ #include "core.h"
+ 
+-/**
+- * in_own_node - test for node inclusion; <0.0.0> always matches
+- */
+-int in_own_node(struct net *net, u32 addr)
+-{
+-	return addr == tipc_own_addr(net) || !addr;
+-}
+-
+ bool tipc_in_scope(bool legacy_format, u32 domain, u32 addr)
+ {
+ 	if (!domain || (domain == addr))
+@@ -61,9 +52,71 @@ bool tipc_in_scope(bool legacy_format, u32 domain, u32 addr)
+ 	return false;
+ }
+ 
+-char *tipc_addr_string_fill(char *string, u32 addr)
++void tipc_set_node_id(struct net *net, u8 *id)
++{
++	struct tipc_net *tn = tipc_net(net);
++	u32 *tmp = (u32 *)id;
++
++	memcpy(tn->node_id, id, NODE_ID_LEN);
++	tipc_nodeid2string(tn->node_id_string, id);
++	tn->node_addr = tmp[0] ^ tmp[1] ^ tmp[2] ^ tmp[3];
++	pr_info("Own node identity %s, cluster identity %u\n",
++		tipc_own_id_string(net), tn->net_id);
++}
++
++void tipc_set_node_addr(struct net *net, u32 addr)
+ {
+-	snprintf(string, 16, "<%u.%u.%u>",
+-		 tipc_zone(addr), tipc_cluster(addr), tipc_node(addr));
+-	return string;
++	struct tipc_net *tn = tipc_net(net);
++	u8 node_id[NODE_ID_LEN] = {0,};
++
++	tn->node_addr = addr;
++	if (!tipc_own_id(net)) {
++		sprintf(node_id, "%x", addr);
++		tipc_set_node_id(net, node_id);
++	}
++	pr_info("32-bit node address hash set to %x\n", addr);
++}
++
++char *tipc_nodeid2string(char *str, u8 *id)
++{
++	int i;
++	u8 c;
++
++	/* Already a string ? */
++	for (i = 0; i < NODE_ID_LEN; i++) {
++		c = id[i];
++		if (c >= '0' && c <= '9')
++			continue;
++		if (c >= 'A' && c <= 'Z')
++			continue;
++		if (c >= 'a' && c <= 'z')
++			continue;
++		if (c == '.')
++			continue;
++		if (c == ':')
++			continue;
++		if (c == '_')
++			continue;
++		if (c == '-')
++			continue;
++		if (c == '@')
++			continue;
++		if (c != 0)
++			break;
++	}
++	if (i == NODE_ID_LEN) {
++		memcpy(str, id, NODE_ID_LEN);
++		str[NODE_ID_LEN] = 0;
++		return str;
++	}
++
++	/* Translate to hex string */
++	for (i = 0; i < NODE_ID_LEN; i++)
++		sprintf(&str[2 * i], "%02x", id[i]);
++
++	/* Strip off trailing zeroes */
++	for (i = NODE_ID_STR_LEN - 2; str[i] == '0'; i--)
++		str[i] = 0;
++
++	return str;
+ }
+diff --git a/net/tipc/addr.h b/net/tipc/addr.h
+index 6b48f0d..31bee0e 100644
+--- a/net/tipc/addr.h
++++ b/net/tipc/addr.h
+@@ -1,7 +1,7 @@
+ /*
+  * net/tipc/addr.h: Include file for TIPC address utility routines
+  *
+- * Copyright (c) 2000-2006, Ericsson AB
++ * Copyright (c) 2000-2006, 2018, Ericsson AB
+  * Copyright (c) 2004-2005, Wind River Systems
+  * All rights reserved.
+  *
+@@ -45,9 +45,21 @@
+ 
+ static inline u32 tipc_own_addr(struct net *net)
+ {
++	return tipc_net(net)->node_addr;
++}
++
++static inline u8 *tipc_own_id(struct net *net)
++{
+ 	struct tipc_net *tn = tipc_net(net);
+ 
+-	return tn->own_addr;
++	if (!strlen(tn->node_id_string))
++		return NULL;
++	return tn->node_id;
++}
++
++static inline char *tipc_own_id_string(struct net *net)
++{
++	return tipc_net(net)->node_id_string;
+ }
+ 
+ static inline u32 tipc_cluster_mask(u32 addr)
+@@ -65,9 +77,15 @@ static inline int tipc_scope2node(struct net *net, int sc)
+ 	return sc != TIPC_NODE_SCOPE ? 0 : tipc_own_addr(net);
+ }
+ 
+-u32 tipc_own_addr(struct net *net);
+-int in_own_node(struct net *net, u32 addr);
++static inline int in_own_node(struct net *net, u32 addr)
++{
++	return addr == tipc_own_addr(net) || !addr;
++}
++
+ bool tipc_in_scope(bool legacy_format, u32 domain, u32 addr);
+-char *tipc_addr_string_fill(char *string, u32 addr);
++void tipc_set_node_id(struct net *net, u8 *id);
++void tipc_set_node_addr(struct net *net, u32 addr);
++char *tipc_nodeid2string(char *str, u8 *id);
++u32 tipc_node_id2hash(u8 *id128);
+ 
+ #endif
+diff --git a/net/tipc/core.c b/net/tipc/core.c
+index 04fd91b..e92fed4 100644
+--- a/net/tipc/core.c
++++ b/net/tipc/core.c
+@@ -56,7 +56,9 @@ static int __net_init tipc_init_net(struct net *net)
+ 	int err;
+ 
+ 	tn->net_id = 4711;
+-	tn->own_addr = 0;
++	tn->node_addr = 0;
++	memset(tn->node_id, 0, sizeof(tn->node_id));
++	memset(tn->node_id_string, 0, sizeof(tn->node_id_string));
+ 	tn->mon_threshold = TIPC_DEF_MON_THRESHOLD;
+ 	get_random_bytes(&tn->random, sizeof(int));
+ 	INIT_LIST_HEAD(&tn->node_list);
+diff --git a/net/tipc/core.h b/net/tipc/core.h
+index bd2b112..eabad41 100644
+--- a/net/tipc/core.h
++++ b/net/tipc/core.h
+@@ -72,13 +72,17 @@
+ #define NODE_HTABLE_SIZE       512
+ #define MAX_BEARERS	         3
+ #define TIPC_DEF_MON_THRESHOLD  32
++#define NODE_ID_LEN             16
++#define NODE_ID_STR_LEN        (NODE_ID_LEN * 2 + 1)
+ 
+ extern unsigned int tipc_net_id __read_mostly;
+ extern int sysctl_tipc_rmem[3] __read_mostly;
+ extern int sysctl_tipc_named_timeout __read_mostly;
+ 
+ struct tipc_net {
+-	u32 own_addr;
++	u8  node_id[NODE_ID_LEN];
++	u32 node_addr;
++	char node_id_string[NODE_ID_STR_LEN];
+ 	int net_id;
+ 	int random;
+ 	bool legacy_addr_format;
+diff --git a/net/tipc/discover.c b/net/tipc/discover.c
+index 94d5240..b4c4cd1 100644
+--- a/net/tipc/discover.c
++++ b/net/tipc/discover.c
+@@ -118,13 +118,11 @@ static void tipc_disc_msg_xmit(struct net *net, u32 mtyp, u32 dst, u32 src,
+ static void disc_dupl_alert(struct tipc_bearer *b, u32 node_addr,
+ 			    struct tipc_media_addr *media_addr)
+ {
+-	char node_addr_str[16];
+ 	char media_addr_str[64];
+ 
+-	tipc_addr_string_fill(node_addr_str, node_addr);
+ 	tipc_media_addr_printf(media_addr_str, sizeof(media_addr_str),
+ 			       media_addr);
+-	pr_warn("Duplicate %s using %s seen on <%s>\n", node_addr_str,
++	pr_warn("Duplicate %x using %s seen on <%s>\n", node_addr,
+ 		media_addr_str, b->name);
+ }
+ 
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index 4aa56e3..bcd76b1 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -442,6 +442,7 @@ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 		      struct sk_buff_head *namedq,
+ 		      struct tipc_link **link)
+ {
++	char *self_str = tipc_own_id_string(net);
+ 	struct tipc_link *l;
+ 
+ 	l = kzalloc(sizeof(*l), GFP_ATOMIC);
+@@ -451,7 +452,10 @@ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 	l->session = session;
+ 
+ 	/* Note: peer i/f name is completed by reset/activate message */
+-	sprintf(l->name, "%x:%s-%x:unknown", self, if_name, peer);
++	if (strlen(self_str) > 16)
++		sprintf(l->name, "%x:%s-%x:unknown", self, if_name, peer);
++	else
++		sprintf(l->name, "%s:%s-%x:unknown", self_str, if_name, peer);
+ 	strcpy(l->if_name, if_name);
+ 	l->addr = peer;
+ 	l->peer_caps = peer_caps;
+diff --git a/net/tipc/name_distr.c b/net/tipc/name_distr.c
+index 7e571f4..8240a85 100644
+--- a/net/tipc/name_distr.c
++++ b/net/tipc/name_distr.c
+@@ -318,7 +318,6 @@ void tipc_named_process_backlog(struct net *net)
+ {
+ 	struct distr_queue_item *e, *tmp;
+ 	struct tipc_net *tn = net_generic(net, tipc_net_id);
+-	char addr[16];
+ 	unsigned long now = get_jiffies_64();
+ 
+ 	list_for_each_entry_safe(e, tmp, &tn->dist_queue, next) {
+@@ -326,12 +325,11 @@ void tipc_named_process_backlog(struct net *net)
+ 			if (!tipc_update_nametbl(net, &e->i, e->node, e->dtype))
+ 				continue;
+ 		} else {
+-			tipc_addr_string_fill(addr, e->node);
+-			pr_warn_ratelimited("Dropping name table update (%d) of {%u, %u, %u} from %s key=%u\n",
++			pr_warn_ratelimited("Dropping name table update (%d) of {%u, %u, %u} from %x key=%u\n",
+ 					    e->dtype, ntohl(e->i.type),
+ 					    ntohl(e->i.lower),
+ 					    ntohl(e->i.upper),
+-					    addr, ntohl(e->i.key));
++					    e->node, ntohl(e->i.key));
+ 		}
+ 		list_del(&e->next);
+ 		kfree(e);
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index 7f140a5..e786748 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -104,27 +104,31 @@
+  *     - A local spin_lock protecting the queue of subscriber events.
+ */
+ 
+-int tipc_net_start(struct net *net, u32 addr)
++int tipc_net_init(struct net *net, u8 *node_id, u32 addr)
+ {
+-	struct tipc_net *tn = tipc_net(net);
+-	char addr_string[16];
++	if (tipc_own_id(net)) {
++		pr_info("Cannot configure node identity twice\n");
++		return -1;
++	}
++	pr_info("Started in network mode\n");
+ 
+-	tn->own_addr = addr;
++	if (node_id) {
++		tipc_set_node_id(net, node_id);
++		tipc_net_finalize(net, tipc_own_addr(net));
++	}
++	if (addr)
++		tipc_net_finalize(net, addr);
++	return 0;
++}
+ 
+-	/* Ensure that the new address is visible before we reinit. */
++void tipc_net_finalize(struct net *net, u32 addr)
++{
++	tipc_set_node_addr(net, addr);
+ 	smp_mb();
+-
+ 	tipc_named_reinit(net);
+ 	tipc_sk_reinit(net);
+-
+ 	tipc_nametbl_publish(net, TIPC_CFG_SRV, addr, addr,
+ 			     TIPC_CLUSTER_SCOPE, 0, addr);
+-
+-	pr_info("Started in network mode\n");
+-	pr_info("Own node address %s, cluster identity %u\n",
+-		tipc_addr_string_fill(addr_string, addr),
+-		tn->net_id);
+-	return 0;
+ }
+ 
+ void tipc_net_stop(struct net *net)
+@@ -146,8 +150,10 @@ void tipc_net_stop(struct net *net)
+ static int __tipc_nl_add_net(struct net *net, struct tipc_nl_msg *msg)
+ {
+ 	struct tipc_net *tn = net_generic(net, tipc_net_id);
+-	void *hdr;
++	u64 *w0 = (u64 *)&tn->node_id[0];
++	u64 *w1 = (u64 *)&tn->node_id[8];
+ 	struct nlattr *attrs;
++	void *hdr;
+ 
+ 	hdr = genlmsg_put(msg->skb, msg->portid, msg->seq, &tipc_genl_family,
+ 			  NLM_F_MULTI, TIPC_NL_NET_GET);
+@@ -160,7 +166,10 @@ static int __tipc_nl_add_net(struct net *net, struct tipc_nl_msg *msg)
+ 
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_NET_ID, tn->net_id))
+ 		goto attr_msg_full;
+-
++	if (nla_put_u64_64bit(msg->skb, TIPC_NLA_NET_NODEID, *w0, 0))
++		goto attr_msg_full;
++	if (nla_put_u64_64bit(msg->skb, TIPC_NLA_NET_NODEID_W1, *w1, 0))
++		goto attr_msg_full;
+ 	nla_nest_end(msg->skb, attrs);
+ 	genlmsg_end(msg->skb, hdr);
+ 
+@@ -212,6 +221,7 @@ int __tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info)
+ 	err = nla_parse_nested(attrs, TIPC_NLA_NET_MAX,
+ 			       info->attrs[TIPC_NLA_NET], tipc_nl_net_policy,
+ 			       info->extack);
++
+ 	if (err)
+ 		return err;
+ 
+@@ -236,9 +246,18 @@ int __tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info)
+ 		if (!addr)
+ 			return -EINVAL;
+ 		tn->legacy_addr_format = true;
+-		tipc_net_start(net, addr);
++		tipc_net_init(net, NULL, addr);
+ 	}
+ 
++	if (attrs[TIPC_NLA_NET_NODEID]) {
++		u8 node_id[NODE_ID_LEN];
++		u64 *w0 = (u64 *)&node_id[0];
++		u64 *w1 = (u64 *)&node_id[8];
++
++		*w0 = nla_get_u64(attrs[TIPC_NLA_NET_NODEID]);
++		*w1 = nla_get_u64(attrs[TIPC_NLA_NET_NODEID_W1]);
++		tipc_net_init(net, node_id, 0);
++	}
+ 	return 0;
+ }
+ 
+diff --git a/net/tipc/net.h b/net/tipc/net.h
+index c0306aa..08efa60 100644
+--- a/net/tipc/net.h
++++ b/net/tipc/net.h
+@@ -41,10 +41,8 @@
+ 
+ extern const struct nla_policy tipc_nl_net_policy[];
+ 
+-int tipc_net_start(struct net *net, u32 addr);
+-
++void tipc_net_finalize(struct net *net, u32 addr);
+ void tipc_net_stop(struct net *net);
+-
+ int tipc_nl_net_dump(struct sk_buff *skb, struct netlink_callback *cb);
+ int tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info);
+ int __tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info);
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 8a4b049..7b0c993 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -883,11 +883,9 @@ void tipc_node_delete_links(struct net *net, int bearer_id)
+ 
+ static void tipc_node_reset_links(struct tipc_node *n)
+ {
+-	char addr_string[16];
+ 	int i;
+ 
+-	pr_warn("Resetting all links to %s\n",
+-		tipc_addr_string_fill(addr_string, n->addr));
++	pr_warn("Resetting all links to %x\n", n->addr);
+ 
+ 	for (i = 0; i < MAX_BEARERS; i++) {
+ 		tipc_node_link_down(n, i, false);
+@@ -1074,15 +1072,13 @@ static void tipc_node_fsm_evt(struct tipc_node *n, int evt)
+ static void node_lost_contact(struct tipc_node *n,
+ 			      struct sk_buff_head *inputq)
+ {
+-	char addr_string[16];
+ 	struct tipc_sock_conn *conn, *safe;
+ 	struct tipc_link *l;
+ 	struct list_head *conns = &n->conn_sks;
+ 	struct sk_buff *skb;
+ 	uint i;
+ 
+-	pr_debug("Lost contact with %s\n",
+-		 tipc_addr_string_fill(addr_string, n->addr));
++	pr_debug("Lost contact with %x\n", n->addr);
+ 
+ 	/* Clean up broadcast state */
+ 	tipc_bcast_remove_peer(n->net, n->bc_entry.link);
+diff --git a/net/tipc/node.h b/net/tipc/node.h
+index 5fb38cf..e06faf4 100644
+--- a/net/tipc/node.h
++++ b/net/tipc/node.h
+@@ -49,14 +49,14 @@ enum {
+ 	TIPC_BCAST_STATE_NACK = (1 << 2),
+ 	TIPC_BLOCK_FLOWCTL    = (1 << 3),
+ 	TIPC_BCAST_RCAST      = (1 << 4),
+-	TIPC_NODE_ID32        = (1 << 5)
++	TIPC_NODE_ID128       = (1 << 5)
+ };
+ 
+ #define TIPC_NODE_CAPABILITIES (TIPC_BCAST_SYNCH | \
+ 				TIPC_BCAST_STATE_NACK | \
+ 				TIPC_BCAST_RCAST | \
+ 				TIPC_BLOCK_FLOWCTL | \
+-				TIPC_NODE_ID32)
++				TIPC_NODE_ID128)
+ #define INVALID_BEARER_ID -1
+ 
+ void tipc_node_stop(struct net *net);
+-- 
+1.7.9.5
+

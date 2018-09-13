@@ -1,0 +1,161 @@
+From 02e3cfb1c63fb814559ab59c4260e65765fedc5b Mon Sep 17 00:00:00 2001
+From: GhantaKrishnamurthy MohanKrishna
+ <mohan.krishna.ghanta.krishnamurthy@ericsson.com>
+Date: Wed, 21 Mar 2018 14:37:43 +0100
+Subject: [PATCH 116/176] tipc: modify socket iterator for sock_diag
+
+commit dfde331e757fd792e1c9579b72a8370ca665e5ed upstream
+
+The current socket iterator function tipc_nl_sk_dump, handles socket
+locks and calls __tipc_nl_add_sk for each socket.
+To reuse this logic in sock_diag implementation, we do minor
+modifications to make these functions generic as described below.
+
+In this commit, we add a two new functions __tipc_nl_sk_walk,
+__tipc_nl_add_sk_info and modify tipc_nl_sk_dump, __tipc_nl_add_sk
+accordingly.
+
+In __tipc_nl_sk_walk we:
+1. acquire and release socket locks
+2. for each socket, execute the specified callback function
+
+In __tipc_nl_add_sk we:
+- Move the netlink attribute insertion to __tipc_nl_add_sk_info.
+
+tipc_nl_sk_dump calls tipc_nl_sk_walk with __tipc_nl_add_sk as argument.
+
+sock_diag will use these generic functions in a later commit.
+
+There is no functional change in this commit.
+Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: GhantaKrishnamurthy MohanKrishna <mohan.krishna.ghanta.krishnamurthy@ericsson.com>
+Signed-off-by: Parthasarathy Bhuvaragan <parthasarathy.bhuvaragan@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/socket.c |   65 +++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/net/tipc/socket.c b/net/tipc/socket.c
+index 953cf20..28feae2 100644
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -3161,16 +3161,33 @@ static int __tipc_nl_add_sk_con(struct sk_buff *skb, struct tipc_sock *tsk)
+ 	return -EMSGSIZE;
+ }
+ 
++static int __tipc_nl_add_sk_info(struct sk_buff *skb, struct tipc_sock
++			  *tsk)
++{
++	struct net *net = sock_net(skb->sk);
++	struct tipc_net *tn = tipc_net(net);
++	struct sock *sk = &tsk->sk;
++
++	if (nla_put_u32(skb, TIPC_NLA_SOCK_REF, tsk->portid) ||
++	    nla_put_u32(skb, TIPC_NLA_SOCK_ADDR, tn->own_addr))
++		return -EMSGSIZE;
++
++	if (tipc_sk_connected(sk)) {
++		if (__tipc_nl_add_sk_con(skb, tsk))
++			return -EMSGSIZE;
++	} else if (!list_empty(&tsk->publications)) {
++		if (nla_put_flag(skb, TIPC_NLA_SOCK_HAS_PUBL))
++			return -EMSGSIZE;
++	}
++	return 0;
++}
++
+ /* Caller should hold socket lock for the passed tipc socket. */
+ static int __tipc_nl_add_sk(struct sk_buff *skb, struct netlink_callback *cb,
+ 			    struct tipc_sock *tsk)
+ {
+-	int err;
+-	void *hdr;
+ 	struct nlattr *attrs;
+-	struct net *net = sock_net(skb->sk);
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
+-	struct sock *sk = &tsk->sk;
++	void *hdr;
+ 
+ 	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
+ 			  &tipc_genl_family, NLM_F_MULTI, TIPC_NL_SOCK_GET);
+@@ -3180,19 +3197,10 @@ static int __tipc_nl_add_sk(struct sk_buff *skb, struct netlink_callback *cb,
+ 	attrs = nla_nest_start(skb, TIPC_NLA_SOCK);
+ 	if (!attrs)
+ 		goto genlmsg_cancel;
+-	if (nla_put_u32(skb, TIPC_NLA_SOCK_REF, tsk->portid))
+-		goto attr_msg_cancel;
+-	if (nla_put_u32(skb, TIPC_NLA_SOCK_ADDR, tn->own_addr))
++
++	if (__tipc_nl_add_sk_info(skb, tsk))
+ 		goto attr_msg_cancel;
+ 
+-	if (tipc_sk_connected(sk)) {
+-		err = __tipc_nl_add_sk_con(skb, tsk);
+-		if (err)
+-			goto attr_msg_cancel;
+-	} else if (!list_empty(&tsk->publications)) {
+-		if (nla_put_flag(skb, TIPC_NLA_SOCK_HAS_PUBL))
+-			goto attr_msg_cancel;
+-	}
+ 	nla_nest_end(skb, attrs);
+ 	genlmsg_end(skb, hdr);
+ 
+@@ -3206,16 +3214,19 @@ static int __tipc_nl_add_sk(struct sk_buff *skb, struct netlink_callback *cb,
+ 	return -EMSGSIZE;
+ }
+ 
+-int tipc_nl_sk_dump(struct sk_buff *skb, struct netlink_callback *cb)
++static int __tipc_nl_sk_walk(struct sk_buff *skb, struct netlink_callback *cb,
++			     int (*skb_handler)(struct sk_buff *skb,
++						struct netlink_callback *cb,
++						struct tipc_sock *tsk))
+ {
+-	int err;
+-	struct tipc_sock *tsk;
+-	const struct bucket_table *tbl;
+-	struct rhash_head *pos;
+ 	struct net *net = sock_net(skb->sk);
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
+-	u32 tbl_id = cb->args[0];
++	struct tipc_net *tn = tipc_net(net);
++	const struct bucket_table *tbl;
+ 	u32 prev_portid = cb->args[1];
++	u32 tbl_id = cb->args[0];
++	struct rhash_head *pos;
++	struct tipc_sock *tsk;
++	int err;
+ 
+ 	rcu_read_lock();
+ 	tbl = rht_dereference_rcu((&tn->sk_rht)->tbl, &tn->sk_rht);
+@@ -3227,12 +3238,13 @@ int tipc_nl_sk_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 				continue;
+ 			}
+ 
+-			err = __tipc_nl_add_sk(skb, cb, tsk);
++			err = skb_handler(skb, cb, tsk);
+ 			if (err) {
+ 				prev_portid = tsk->portid;
+ 				spin_unlock_bh(&tsk->sk.sk_lock.slock);
+ 				goto out;
+ 			}
++
+ 			prev_portid = 0;
+ 			spin_unlock_bh(&tsk->sk.sk_lock.slock);
+ 		}
+@@ -3245,6 +3257,11 @@ int tipc_nl_sk_dump(struct sk_buff *skb, struct netlink_callback *cb)
+ 	return skb->len;
+ }
+ 
++int tipc_nl_sk_dump(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	return __tipc_nl_sk_walk(skb, cb, __tipc_nl_add_sk);
++}
++
+ /* Caller should hold socket lock for the passed tipc socket. */
+ static int __tipc_nl_add_sk_publ(struct sk_buff *skb,
+ 				 struct netlink_callback *cb,
+-- 
+1.7.9.5
+

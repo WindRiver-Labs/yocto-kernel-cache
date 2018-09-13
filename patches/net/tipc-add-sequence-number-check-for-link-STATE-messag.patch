@@ -1,0 +1,153 @@
+From bfcfaebc488126ed0c79da2d3f1d4eccced5a27a Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Tue, 10 Jul 2018 01:07:35 +0200
+Subject: [PATCH 165/176] tipc: add sequence number check for link STATE
+ messages
+
+commit 9012de5089560136b849b920ad038b96160ed8f6 upstream
+
+Some switch infrastructures produce huge amounts of packet duplicates.
+This becomes a problem if those messages are STATE/NACK protocol
+messages, causing unnecessary retransmissions of already accepted
+packets.
+
+We now introduce a unique sequence number per STATE protocol message
+so that duplicates can be identified and ignored. This will also be
+useful when tracing such cases, and to avert replay attacks when TIPC
+is encrypted.
+
+For compatibility reasons we have to introduce a new capability flag
+TIPC_LINK_PROTO_SEQNO to handle this new feature.
+
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/link.c |   16 ++++++++++++++++
+ net/tipc/link.h |    1 +
+ net/tipc/node.c |    7 +++++++
+ net/tipc/node.h |   14 ++++++++------
+ 4 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index ec4d283..065e9e6 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -130,6 +130,8 @@ struct tipc_link {
+ 	/* Management and link supervision data */
+ 	u32 peer_session;
+ 	u32 session;
++	u16 snd_nxt_state;
++	u16 rcv_nxt_state;
+ 	u32 peer_bearer_id;
+ 	u32 bearer_id;
+ 	u32 tolerance;
+@@ -339,6 +341,11 @@ char tipc_link_plane(struct tipc_link *l)
+ 	return l->net_plane;
+ }
+ 
++void tipc_link_update_caps(struct tipc_link *l, u16 capabilities)
++{
++	l->peer_caps = capabilities;
++}
++
+ void tipc_link_add_bc_peer(struct tipc_link *snd_l,
+ 			   struct tipc_link *uc_l,
+ 			   struct sk_buff_head *xmitq)
+@@ -859,6 +866,8 @@ void tipc_link_reset(struct tipc_link *l)
+ 	l->rcv_unacked = 0;
+ 	l->snd_nxt = 1;
+ 	l->rcv_nxt = 1;
++	l->snd_nxt_state = 1;
++	l->rcv_nxt_state = 1;
+ 	l->acked = 0;
+ 	l->silent_intv_cnt = 0;
+ 	l->rst_cnt = 0;
+@@ -1353,6 +1362,8 @@ static void tipc_link_build_proto_msg(struct tipc_link *l, int mtyp, bool probe,
+ 	msg_set_seqno(hdr, l->snd_nxt + U16_MAX / 2);
+ 
+ 	if (mtyp == STATE_MSG) {
++		if (l->peer_caps & TIPC_LINK_PROTO_SEQNO)
++			msg_set_seqno(hdr, l->snd_nxt_state++);
+ 		msg_set_seq_gap(hdr, rcvgap);
+ 		msg_set_bc_gap(hdr, link_bc_rcv_gap(bcl));
+ 		msg_set_probe(hdr, probe);
+@@ -1522,6 +1533,11 @@ static int tipc_link_proto_rcv(struct tipc_link *l, struct sk_buff *skb,
+ 
+ 	case STATE_MSG:
+ 
++		if (l->peer_caps & TIPC_LINK_PROTO_SEQNO &&
++		    less(msg_seqno(hdr), l->rcv_nxt_state))
++			break;
++		l->rcv_nxt_state = msg_seqno(hdr) + 1;
++
+ 		/* Update own tolerance if peer indicates a non-zero value */
+ 		if (in_range(peers_tol, TIPC_MIN_LINK_TOL, TIPC_MAX_LINK_TOL))
+ 			l->tolerance = peers_tol;
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index ec59348..d56f9c9 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -110,6 +110,7 @@ int tipc_link_xmit(struct tipc_link *link, struct sk_buff_head *list,
+ char tipc_link_plane(struct tipc_link *l);
+ int tipc_link_prio(struct tipc_link *l);
+ int tipc_link_window(struct tipc_link *l);
++void tipc_link_update_caps(struct tipc_link *l, u16 capabilities);
+ unsigned long tipc_link_tolerance(struct tipc_link *l);
+ void tipc_link_set_tolerance(struct tipc_link *l, u32 tol,
+ 			     struct sk_buff_head *xmitq);
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 7d03126..a9c714a 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -363,6 +363,8 @@ static struct tipc_node *tipc_node_create(struct net *net, u32 addr,
+ {
+ 	struct tipc_net *tn = net_generic(net, tipc_net_id);
+ 	struct tipc_node *n, *temp_node;
++	struct tipc_link *l;
++	int bearer_id;
+ 	int i;
+ 
+ 	spin_lock_bh(&tn->node_list_lock);
+@@ -370,6 +372,11 @@ static struct tipc_node *tipc_node_create(struct net *net, u32 addr,
+ 	if (n) {
+ 		/* Same node may come back with new capabilities */
+ 		n->capabilities = capabilities;
++		for (bearer_id = 0; bearer_id < MAX_BEARERS; bearer_id++) {
++			l = n->links[bearer_id].link;
++			if (l)
++				tipc_link_update_caps(l, capabilities);
++		}
+ 		goto exit;
+ 	}
+ 	n = kzalloc(sizeof(*n), GFP_ATOMIC);
+diff --git a/net/tipc/node.h b/net/tipc/node.h
+index 846c8f2..48b3298 100644
+--- a/net/tipc/node.h
++++ b/net/tipc/node.h
+@@ -49,14 +49,16 @@ enum {
+ 	TIPC_BCAST_STATE_NACK = (1 << 2),
+ 	TIPC_BLOCK_FLOWCTL    = (1 << 3),
+ 	TIPC_BCAST_RCAST      = (1 << 4),
+-	TIPC_NODE_ID128       = (1 << 5)
++	TIPC_NODE_ID128       = (1 << 5),
++	TIPC_LINK_PROTO_SEQNO = (1 << 6)
+ };
+ 
+-#define TIPC_NODE_CAPABILITIES (TIPC_BCAST_SYNCH | \
+-				TIPC_BCAST_STATE_NACK | \
+-				TIPC_BCAST_RCAST | \
+-				TIPC_BLOCK_FLOWCTL | \
+-				TIPC_NODE_ID128)
++#define TIPC_NODE_CAPABILITIES (TIPC_BCAST_SYNCH       |  \
++				TIPC_BCAST_STATE_NACK  |  \
++				TIPC_BCAST_RCAST       |  \
++				TIPC_BLOCK_FLOWCTL     |  \
++				TIPC_NODE_ID128        |  \
++				TIPC_LINK_PROTO_SEQNO)
+ #define INVALID_BEARER_ID -1
+ 
+ void tipc_node_stop(struct net *net);
+-- 
+1.7.9.5
+

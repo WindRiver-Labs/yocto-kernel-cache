@@ -1,0 +1,413 @@
+From 58e5ea62f21bda2f5e39557ca16843aea19458bf Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Thu, 29 Mar 2018 23:20:43 +0200
+Subject: [PATCH 133/176] tipc: permit overlapping service ranges in name
+ table
+
+commit 37922ea4a3105176357c8d565a9d982c4a08714a upstream
+
+With the new RB tree structure for service ranges it becomes possible to
+solve an old problem; - we can now allow overlapping service ranges in
+the table.
+
+When inserting a new service range to the tree, we use 'lower' as primary
+key, and when necessary 'upper' as secondary key.
+
+Since there may now be multiple service ranges matching an indicated
+'lower' value, we must also add the 'upper' value to the functions
+used for removing publications, so that the correct, corresponding
+range item can be found.
+
+These changes guarantee that a well-formed publication/withdrawal item
+from a peer node never will be rejected, and make it possible to
+eliminate the problematic backlog functionality we currently have for
+handling such cases.
+
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/name_distr.c |   90 ++++++++++++-------------------------------------
+ net/tipc/name_distr.h |    1 -
+ net/tipc/name_table.c |   64 +++++++++++++++++------------------
+ net/tipc/name_table.h |    8 ++---
+ net/tipc/net.c        |    2 +-
+ net/tipc/node.c       |    2 +-
+ net/tipc/socket.c     |    4 +--
+ 7 files changed, 60 insertions(+), 111 deletions(-)
+
+diff --git a/net/tipc/name_distr.c b/net/tipc/name_distr.c
+index 8240a85..51b4b96 100644
+--- a/net/tipc/name_distr.c
++++ b/net/tipc/name_distr.c
+@@ -204,12 +204,12 @@ void tipc_named_node_up(struct net *net, u32 dnode)
+  */
+ static void tipc_publ_purge(struct net *net, struct publication *publ, u32 addr)
+ {
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
++	struct tipc_net *tn = tipc_net(net);
+ 	struct publication *p;
+ 
+ 	spin_lock_bh(&tn->nametbl_lock);
+-	p = tipc_nametbl_remove_publ(net, publ->type, publ->lower,
+-				     publ->node, publ->port, publ->key);
++	p = tipc_nametbl_remove_publ(net, publ->type, publ->lower, publ->upper,
++				     publ->node, publ->key);
+ 	if (p)
+ 		tipc_node_unsubscribe(net, &p->binding_node, addr);
+ 	spin_unlock_bh(&tn->nametbl_lock);
+@@ -261,28 +261,31 @@ void tipc_publ_notify(struct net *net, struct list_head *nsub_list, u32 addr)
+ static bool tipc_update_nametbl(struct net *net, struct distr_item *i,
+ 				u32 node, u32 dtype)
+ {
+-	struct publication *publ = NULL;
++	struct publication *p = NULL;
++	u32 lower = ntohl(i->lower);
++	u32 upper = ntohl(i->upper);
++	u32 type = ntohl(i->type);
++	u32 port = ntohl(i->port);
++	u32 key = ntohl(i->key);
+ 
+ 	if (dtype == PUBLICATION) {
+-		publ = tipc_nametbl_insert_publ(net, ntohl(i->type),
+-						ntohl(i->lower),
+-						ntohl(i->upper),
+-						TIPC_CLUSTER_SCOPE, node,
+-						ntohl(i->port), ntohl(i->key));
+-		if (publ) {
+-			tipc_node_subscribe(net, &publ->binding_node, node);
++		p = tipc_nametbl_insert_publ(net, type, lower, upper,
++					     TIPC_CLUSTER_SCOPE, node,
++					     port, key);
++		if (p) {
++			tipc_node_subscribe(net, &p->binding_node, node);
+ 			return true;
+ 		}
+ 	} else if (dtype == WITHDRAWAL) {
+-		publ = tipc_nametbl_remove_publ(net, ntohl(i->type),
+-						ntohl(i->lower),
+-						node, ntohl(i->port),
+-						ntohl(i->key));
+-		if (publ) {
+-			tipc_node_unsubscribe(net, &publ->binding_node, node);
+-			kfree_rcu(publ, rcu);
++		p = tipc_nametbl_remove_publ(net, type, lower,
++					     upper, node, key);
++		if (p) {
++			tipc_node_unsubscribe(net, &p->binding_node, node);
++			kfree_rcu(p, rcu);
+ 			return true;
+ 		}
++		pr_warn_ratelimited("Failed to remove binding %u,%u from %x\n",
++				    type, lower, node);
+ 	} else {
+ 		pr_warn("Unrecognized name table message received\n");
+ 	}
+@@ -290,53 +293,6 @@ static bool tipc_update_nametbl(struct net *net, struct distr_item *i,
+ }
+ 
+ /**
+- * tipc_named_add_backlog - add a failed name table update to the backlog
+- *
+- */
+-static void tipc_named_add_backlog(struct net *net, struct distr_item *i,
+-				   u32 type, u32 node)
+-{
+-	struct distr_queue_item *e;
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
+-	unsigned long now = get_jiffies_64();
+-
+-	e = kzalloc(sizeof(*e), GFP_ATOMIC);
+-	if (!e)
+-		return;
+-	e->dtype = type;
+-	e->node = node;
+-	e->expires = now + msecs_to_jiffies(sysctl_tipc_named_timeout);
+-	memcpy(e, i, sizeof(*i));
+-	list_add_tail(&e->next, &tn->dist_queue);
+-}
+-
+-/**
+- * tipc_named_process_backlog - try to process any pending name table updates
+- * from the network.
+- */
+-void tipc_named_process_backlog(struct net *net)
+-{
+-	struct distr_queue_item *e, *tmp;
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
+-	unsigned long now = get_jiffies_64();
+-
+-	list_for_each_entry_safe(e, tmp, &tn->dist_queue, next) {
+-		if (time_after(e->expires, now)) {
+-			if (!tipc_update_nametbl(net, &e->i, e->node, e->dtype))
+-				continue;
+-		} else {
+-			pr_warn_ratelimited("Dropping name table update (%d) of {%u, %u, %u} from %x key=%u\n",
+-					    e->dtype, ntohl(e->i.type),
+-					    ntohl(e->i.lower),
+-					    ntohl(e->i.upper),
+-					    e->node, ntohl(e->i.key));
+-		}
+-		list_del(&e->next);
+-		kfree(e);
+-	}
+-}
+-
+-/**
+  * tipc_named_rcv - process name table update messages sent by another node
+  */
+ void tipc_named_rcv(struct net *net, struct sk_buff_head *inputq)
+@@ -358,12 +314,10 @@ void tipc_named_rcv(struct net *net, struct sk_buff_head *inputq)
+ 		count = msg_data_sz(msg) / ITEM_SIZE;
+ 		node = msg_orignode(msg);
+ 		while (count--) {
+-			if (!tipc_update_nametbl(net, item, node, mtype))
+-				tipc_named_add_backlog(net, item, mtype, node);
++			tipc_update_nametbl(net, item, node, mtype);
+ 			item++;
+ 		}
+ 		kfree_skb(skb);
+-		tipc_named_process_backlog(net);
+ 	}
+ 	spin_unlock_bh(&tn->nametbl_lock);
+ }
+diff --git a/net/tipc/name_distr.h b/net/tipc/name_distr.h
+index 4753e62..63fc73e 100644
+--- a/net/tipc/name_distr.h
++++ b/net/tipc/name_distr.h
+@@ -72,7 +72,6 @@ struct distr_item {
+ void tipc_named_node_up(struct net *net, u32 dnode);
+ void tipc_named_rcv(struct net *net, struct sk_buff_head *msg_queue);
+ void tipc_named_reinit(struct net *net);
+-void tipc_named_process_backlog(struct net *net);
+ void tipc_publ_notify(struct net *net, struct list_head *nsub_list, u32 addr);
+ 
+ #endif
+diff --git a/net/tipc/name_table.c b/net/tipc/name_table.c
+index 4bdc580..b1fe209 100644
+--- a/net/tipc/name_table.c
++++ b/net/tipc/name_table.c
+@@ -171,10 +171,14 @@ static struct service_range *tipc_service_create_range(struct tipc_service *sc,
+ 		tmp = container_of(parent, struct service_range, tree_node);
+ 		if (lower < tmp->lower)
+ 			n = &(*n)->rb_left;
++		else if (lower > tmp->lower)
++			n = &(*n)->rb_right;
++		else if (upper < tmp->upper)
++			n = &(*n)->rb_left;
+ 		else if (upper > tmp->upper)
+ 			n = &(*n)->rb_right;
+ 		else
+-			return NULL;
++			return tmp;
+ 	}
+ 	sr = kzalloc(sizeof(*sr), GFP_ATOMIC);
+ 	if (!sr)
+@@ -200,17 +204,11 @@ static struct publication *tipc_service_insert_publ(struct net *net,
+ 	struct publication *p;
+ 	bool first = false;
+ 
+-	sr = tipc_service_find_range(sc, lower);
+-	if (!sr) {
+-		sr = tipc_service_create_range(sc, lower, upper);
+-		if (!sr)
+-			goto  err;
+-		first = true;
+-	}
++	sr = tipc_service_create_range(sc, lower, upper);
++	if (!sr)
++		goto  err;
+ 
+-	/* Lower end overlaps existing entry, but we need an exact match */
+-	if (sr->lower != lower || sr->upper != upper)
+-		return NULL;
++	first = list_empty(&sr->all_publ);
+ 
+ 	/* Return if the publication already exists */
+ 	list_for_each_entry(p, &sr->all_publ, all_publ) {
+@@ -239,30 +237,32 @@ static struct publication *tipc_service_insert_publ(struct net *net,
+ 
+ /**
+  * tipc_service_remove_publ - remove a publication from a service
+- *
+- * NOTE: There may be cases where TIPC is asked to remove a publication
+- * that is not in the name table.  For example, if another node issues a
+- * publication for a name range that overlaps an existing name range
+- * the publication will not be recorded, which means the publication won't
+- * be found when the name range is later withdrawn by that node.
+- * A failed withdraw request simply returns a failure indication and lets the
+- * caller issue any error or warning messages associated with such a problem.
+  */
+ static struct publication *tipc_service_remove_publ(struct net *net,
+ 						    struct tipc_service *sc,
+-						    u32 inst, u32 node,
+-						    u32 port, u32 key)
++						    u32 lower, u32 upper,
++						    u32 node, u32 key)
+ {
+ 	struct tipc_subscription *sub, *tmp;
+ 	struct service_range *sr;
+ 	struct publication *p;
+ 	bool found = false;
+ 	bool last = false;
++	struct rb_node *n;
+ 
+-	sr = tipc_service_find_range(sc, inst);
++	sr = tipc_service_find_range(sc, lower);
+ 	if (!sr)
+ 		return NULL;
+ 
++	/* Find exact matching service range */
++	for (n = &sr->tree_node; n; n = rb_next(n)) {
++		sr = container_of(n, struct service_range, tree_node);
++		if (sr->upper == upper)
++			break;
++	}
++	if (!n || sr->lower != lower || sr->upper != upper)
++		return NULL;
++
+ 	/* Find publication, if it exists */
+ 	list_for_each_entry(p, &sr->all_publ, all_publ) {
+ 		if (p->key != key || (node && node != p->node))
+@@ -375,8 +375,8 @@ struct publication *tipc_nametbl_insert_publ(struct net *net, u32 type,
+ }
+ 
+ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+-						 u32 lower, u32 node, u32 port,
+-						 u32 key)
++					     u32 lower, u32 upper,
++					     u32 node, u32 key)
+ {
+ 	struct tipc_service *sc = tipc_service_find(net, type);
+ 	struct publication *p = NULL;
+@@ -385,7 +385,7 @@ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+ 		return NULL;
+ 
+ 	spin_lock_bh(&sc->lock);
+-	p = tipc_service_remove_publ(net, sc, lower, node, port, key);
++	p = tipc_service_remove_publ(net, sc, lower, upper, node, key);
+ 
+ 	/* Delete service item if this no more publications and subscriptions */
+ 	if (RB_EMPTY_ROOT(&sc->ranges) && list_empty(&sc->subscriptions)) {
+@@ -620,8 +620,6 @@ struct publication *tipc_nametbl_publish(struct net *net, u32 type, u32 lower,
+ 	if (p) {
+ 		nt->local_publ_count++;
+ 		skb = tipc_named_publish(net, p);
+-		/* Any pending external events? */
+-		tipc_named_process_backlog(net);
+ 	}
+ exit:
+ 	spin_unlock_bh(&tn->nametbl_lock);
+@@ -635,7 +633,7 @@ struct publication *tipc_nametbl_publish(struct net *net, u32 type, u32 lower,
+  * tipc_nametbl_withdraw - withdraw a service binding
+  */
+ int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower,
+-			  u32 port, u32 key)
++			  u32 upper, u32 key)
+ {
+ 	struct name_table *nt = tipc_name_table(net);
+ 	struct tipc_net *tn = tipc_net(net);
+@@ -645,17 +643,15 @@ int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower,
+ 
+ 	spin_lock_bh(&tn->nametbl_lock);
+ 
+-	p = tipc_nametbl_remove_publ(net, type, lower, self, port, key);
++	p = tipc_nametbl_remove_publ(net, type, lower, upper, self, key);
+ 	if (p) {
+ 		nt->local_publ_count--;
+ 		skb = tipc_named_withdraw(net, p);
+-		/* Any pending external events? */
+-		tipc_named_process_backlog(net);
+ 		list_del_init(&p->binding_sock);
+ 		kfree_rcu(p, rcu);
+ 	} else {
+ 		pr_err("Failed to remove local publication {%u,%u,%u}/%u\n",
+-		       type, lower, port, key);
++		       type, lower, upper, key);
+ 	}
+ 	spin_unlock_bh(&tn->nametbl_lock);
+ 
+@@ -754,8 +750,8 @@ static void tipc_service_delete(struct net *net, struct tipc_service *sc)
+ 	rbtree_postorder_for_each_entry_safe(sr, tmpr, &sc->ranges, tree_node) {
+ 		list_for_each_entry_safe(p, tmpb,
+ 					 &sr->all_publ, all_publ) {
+-			tipc_service_remove_publ(net, sc, p->lower, p->node,
+-						 p->port, p->key);
++			tipc_service_remove_publ(net, sc, p->lower, p->upper,
++						 p->node, p->key);
+ 			kfree_rcu(p, rcu);
+ 		}
+ 	}
+diff --git a/net/tipc/name_table.h b/net/tipc/name_table.h
+index 1b03b87..4b14fc2 100644
+--- a/net/tipc/name_table.h
++++ b/net/tipc/name_table.h
+@@ -116,16 +116,16 @@ bool tipc_nametbl_lookup(struct net *net, u32 type, u32 instance, u32 domain,
+ 			 struct list_head *dsts, int *dstcnt, u32 exclude,
+ 			 bool all);
+ struct publication *tipc_nametbl_publish(struct net *net, u32 type, u32 lower,
+-					 u32 upper, u32 scope, u32 port_ref,
++					 u32 upper, u32 scope, u32 port,
+ 					 u32 key);
+-int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower, u32 ref,
++int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower, u32 upper,
+ 			  u32 key);
+ struct publication *tipc_nametbl_insert_publ(struct net *net, u32 type,
+ 					     u32 lower, u32 upper, u32 scope,
+ 					     u32 node, u32 ref, u32 key);
+ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+-					     u32 lower, u32 node, u32 ref,
+-					     u32 key);
++					     u32 lower, u32 upper,
++					     u32 node, u32 key);
+ void tipc_nametbl_subscribe(struct tipc_subscription *s);
+ void tipc_nametbl_unsubscribe(struct tipc_subscription *s);
+ int tipc_nametbl_init(struct net *net);
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index 29538dc..856f9e9 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -136,7 +136,7 @@ void tipc_net_stop(struct net *net)
+ 	if (!self)
+ 		return;
+ 
+-	tipc_nametbl_withdraw(net, TIPC_CFG_SRV, self, 0, self);
++	tipc_nametbl_withdraw(net, TIPC_CFG_SRV, self, self, self);
+ 	rtnl_lock();
+ 	tipc_bearer_stop(net);
+ 	tipc_node_stop(net);
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 85e777e..c77dd2f 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -329,7 +329,7 @@ static void tipc_node_write_unlock(struct tipc_node *n)
+ 	if (flags & TIPC_NOTIFY_LINK_DOWN) {
+ 		tipc_mon_peer_down(net, addr, bearer_id);
+ 		tipc_nametbl_withdraw(net, TIPC_LINK_STATE, addr,
+-				      link_id, link_id);
++				      addr, link_id);
+ 	}
+ }
+ 
+diff --git a/net/tipc/socket.c b/net/tipc/socket.c
+index 1585563..4b20078 100644
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -2635,12 +2635,12 @@ static int tipc_sk_withdraw(struct tipc_sock *tsk, uint scope,
+ 			if (publ->upper != seq->upper)
+ 				break;
+ 			tipc_nametbl_withdraw(net, publ->type, publ->lower,
+-					      publ->port, publ->key);
++					      publ->upper, publ->key);
+ 			rc = 0;
+ 			break;
+ 		}
+ 		tipc_nametbl_withdraw(net, publ->type, publ->lower,
+-				      publ->port, publ->key);
++				      publ->upper, publ->key);
+ 		rc = 0;
+ 	}
+ 	if (list_empty(&tsk->publications))
+-- 
+1.7.9.5
+

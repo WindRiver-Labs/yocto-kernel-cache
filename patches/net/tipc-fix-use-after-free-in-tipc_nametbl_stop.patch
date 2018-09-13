@@ -1,0 +1,114 @@
+From 81b45b3863e0ddc6b2446335bab46c172bb531df Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Tue, 17 Apr 2018 21:25:42 +0200
+Subject: [PATCH 142/176] tipc: fix use-after-free in tipc_nametbl_stop
+
+commit be47e41d77fba5bc17e9fb5f1c99217bb6691989 upstream
+
+When we delete a service item in tipc_nametbl_stop() we loop over
+all service ranges in the service's RB tree, and for each service
+range we loop over its pertaining publications while calling
+tipc_service_remove_publ() for each of them.
+
+However, tipc_service_remove_publ() has the side effect that it also
+removes the comprising service range item when there are no publications
+left. This leads to a "use-after-free" access when the inner loop
+continues to the next iteration, since the range item holding the list
+we are looping no longer exists.
+
+We fix this by moving the delete of the service range item outside
+the said function. Instead, we now let the two functions calling it
+test if the list is empty and perform the removal when that is the
+case.
+
+Reported-by: syzbot+d64b64afc55660106556@syzkaller.appspotmail.com
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/name_table.c |   29 +++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/net/tipc/name_table.c b/net/tipc/name_table.c
+index 4068eaa..dd1c4fa 100644
+--- a/net/tipc/name_table.c
++++ b/net/tipc/name_table.c
+@@ -241,7 +241,8 @@ static struct publication *tipc_service_insert_publ(struct net *net,
+ static struct publication *tipc_service_remove_publ(struct net *net,
+ 						    struct tipc_service *sc,
+ 						    u32 lower, u32 upper,
+-						    u32 node, u32 key)
++						    u32 node, u32 key,
++						    struct service_range **rng)
+ {
+ 	struct tipc_subscription *sub, *tmp;
+ 	struct service_range *sr;
+@@ -275,19 +276,15 @@ static struct publication *tipc_service_remove_publ(struct net *net,
+ 
+ 	list_del(&p->all_publ);
+ 	list_del(&p->local_publ);
+-
+-	/* Remove service range item if this was its last publication */
+-	if (list_empty(&sr->all_publ)) {
++	if (list_empty(&sr->all_publ))
+ 		last = true;
+-		rb_erase(&sr->tree_node, &sc->ranges);
+-		kfree(sr);
+-	}
+ 
+ 	/* Notify any waiting subscriptions */
+ 	list_for_each_entry_safe(sub, tmp, &sc->subscriptions, service_list) {
+ 		tipc_sub_report_overlap(sub, p->lower, p->upper, TIPC_WITHDRAWN,
+ 					p->port, p->node, p->scope, last);
+ 	}
++	*rng = sr;
+ 	return p;
+ }
+ 
+@@ -379,13 +376,20 @@ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+ 					     u32 node, u32 key)
+ {
+ 	struct tipc_service *sc = tipc_service_find(net, type);
++	struct service_range *sr = NULL;
+ 	struct publication *p = NULL;
+ 
+ 	if (!sc)
+ 		return NULL;
+ 
+ 	spin_lock_bh(&sc->lock);
+-	p = tipc_service_remove_publ(net, sc, lower, upper, node, key);
++	p = tipc_service_remove_publ(net, sc, lower, upper, node, key, &sr);
++
++	/* Remove service range item if this was its last publication */
++	if (sr && list_empty(&sr->all_publ)) {
++		rb_erase(&sr->tree_node, &sc->ranges);
++		kfree(sr);
++	}
+ 
+ 	/* Delete service item if this no more publications and subscriptions */
+ 	if (RB_EMPTY_ROOT(&sc->ranges) && list_empty(&sc->subscriptions)) {
+@@ -747,16 +751,17 @@ int tipc_nametbl_init(struct net *net)
+ static void tipc_service_delete(struct net *net, struct tipc_service *sc)
+ {
+ 	struct service_range *sr, *tmpr;
+-	struct publication *p, *tmpb;
++	struct publication *p, *tmp;
+ 
+ 	spin_lock_bh(&sc->lock);
+ 	rbtree_postorder_for_each_entry_safe(sr, tmpr, &sc->ranges, tree_node) {
+-		list_for_each_entry_safe(p, tmpb,
+-					 &sr->all_publ, all_publ) {
++		list_for_each_entry_safe(p, tmp, &sr->all_publ, all_publ) {
+ 			tipc_service_remove_publ(net, sc, p->lower, p->upper,
+-						 p->node, p->key);
++						 p->node, p->key, &sr);
+ 			kfree_rcu(p, rcu);
+ 		}
++		rb_erase(&sr->tree_node, &sc->ranges);
++		kfree(sr);
+ 	}
+ 	hlist_del_init_rcu(&sc->service_list);
+ 	spin_unlock_bh(&sc->lock);
+-- 
+1.7.9.5
+

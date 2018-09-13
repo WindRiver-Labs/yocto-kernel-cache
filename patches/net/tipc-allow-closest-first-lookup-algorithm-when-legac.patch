@@ -1,0 +1,184 @@
+From 94a5445b33c30bb2abd0713149ef09ebbbc2bf45 Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Thu, 22 Mar 2018 20:42:48 +0100
+Subject: [PATCH 122/176] tipc: allow closest-first lookup algorithm when
+ legacy address is configured
+
+commit b89afb116ca2830cc982624f93e888860868a84b upstream
+
+The removal of an internal structure of the node address has an unwanted
+side effect.
+- Currently, if a user is sending an anycast message with destination
+  domain 0, the tipc_namebl_translate() function will use the 'closest-
+  first' algorithm to first look for a node local destination, and only
+  when no such is found, will it resort to the cluster global 'round-
+  robin' lookup algorithm.
+- Current users can get around this, and enforce unconditional use of
+  global round-robin by indicating a destination as Z.0.0 or Z.C.0.
+- This option disappears when we make the node address flat, since the
+  lookup algorithm has no way of recognizing this case. So, as long as
+  there are node local destinations, the algorithm will always select
+  one of those, and there is nothing the sender can do to change this.
+
+We solve this by eliminating the 'closest-first' option, which was never
+a good idea anyway, for non-legacy users, but only for those. To
+distinguish between legacy users and non-legacy users we introduce a new
+flag 'legacy_addr_format' in struct tipc_core, to be set when the user
+configures a legacy-style Z.C.N node address. Hence, when a legacy user
+indicates a zero lookup domain 'closest-first' is selected, and in all
+other cases we use 'round-robin'.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/addr.c       |   12 +++++++-----
+ net/tipc/addr.h       |    2 +-
+ net/tipc/core.h       |    3 ++-
+ net/tipc/discover.c   |   13 ++++++-------
+ net/tipc/name_table.c |    8 +++++---
+ net/tipc/net.c        |    2 +-
+ 6 files changed, 22 insertions(+), 18 deletions(-)
+
+diff --git a/net/tipc/addr.c b/net/tipc/addr.c
+index dfc31a7..1998799 100644
+--- a/net/tipc/addr.c
++++ b/net/tipc/addr.c
+@@ -48,15 +48,17 @@ int in_own_node(struct net *net, u32 addr)
+ 	return (addr == tn->own_addr) || !addr;
+ }
+ 
+-int tipc_in_scope(u32 domain, u32 addr)
++bool tipc_in_scope(bool legacy_format, u32 domain, u32 addr)
+ {
+ 	if (!domain || (domain == addr))
+-		return 1;
++		return true;
++	if (!legacy_format)
++		return false;
+ 	if (domain == tipc_cluster_mask(addr)) /* domain <Z.C.0> */
+-		return 1;
++		return true;
+ 	if (domain == (addr & TIPC_ZONE_MASK)) /* domain <Z.0.0> */
+-		return 1;
+-	return 0;
++		return true;
++	return false;
+ }
+ 
+ char *tipc_addr_string_fill(char *string, u32 addr)
+diff --git a/net/tipc/addr.h b/net/tipc/addr.h
+index 5ffde51..97bdc0e 100644
+--- a/net/tipc/addr.h
++++ b/net/tipc/addr.h
+@@ -67,7 +67,7 @@ static inline int tipc_scope2node(struct net *net, int sc)
+ 
+ u32 tipc_own_addr(struct net *net);
+ int in_own_node(struct net *net, u32 addr);
+-int tipc_in_scope(u32 domain, u32 addr);
++bool tipc_in_scope(bool legacy_format, u32 domain, u32 addr);
+ char *tipc_addr_string_fill(char *string, u32 addr);
+ 
+ #endif
+diff --git a/net/tipc/core.h b/net/tipc/core.h
+index 347f850..bd2b112 100644
+--- a/net/tipc/core.h
++++ b/net/tipc/core.h
+@@ -1,7 +1,7 @@
+ /*
+  * net/tipc/core.h: Include file for TIPC global declarations
+  *
+- * Copyright (c) 2005-2006, 2013 Ericsson AB
++ * Copyright (c) 2005-2006, 2013-2018 Ericsson AB
+  * Copyright (c) 2005-2007, 2010-2013, Wind River Systems
+  * All rights reserved.
+  *
+@@ -81,6 +81,7 @@ struct tipc_net {
+ 	u32 own_addr;
+ 	int net_id;
+ 	int random;
++	bool legacy_addr_format;
+ 
+ 	/* Node table and node list */
+ 	spinlock_t node_list_lock;
+diff --git a/net/tipc/discover.c b/net/tipc/discover.c
+index 669af12..82556e1 100644
+--- a/net/tipc/discover.c
++++ b/net/tipc/discover.c
+@@ -139,6 +139,7 @@ void tipc_disc_rcv(struct net *net, struct sk_buff *skb,
+ 	struct tipc_net *tn = tipc_net(net);
+ 	struct tipc_msg *hdr = buf_msg(skb);
+ 	u16 caps = msg_node_capabilities(hdr);
++	bool legacy = tn->legacy_addr_format;
+ 	u32 signature = msg_node_sig(hdr);
+ 	u32 dst = msg_dest_domain(hdr);
+ 	u32 net_id = msg_bc_netid(hdr);
+@@ -165,13 +166,11 @@ void tipc_disc_rcv(struct net *net, struct sk_buff *skb,
+ 		disc_dupl_alert(b, self, &maddr);
+ 		return;
+ 	}
+-	/* Domain filter only works if both peers use legacy address format */
+-	if (b->domain) {
+-		if (!tipc_in_scope(dst, self))
+-			return;
+-		if (!tipc_in_scope(b->domain, src))
+-			return;
+-	}
++	if (!tipc_in_scope(legacy, dst, self))
++		return;
++	if (!tipc_in_scope(legacy, b->domain, src))
++		return;
++
+ 	tipc_node_check_dest(net, src, b, caps, signature,
+ 			     &maddr, &respond, &dupl_addr);
+ 	if (dupl_addr)
+diff --git a/net/tipc/name_table.c b/net/tipc/name_table.c
+index bbbfc07..7478acb 100644
+--- a/net/tipc/name_table.c
++++ b/net/tipc/name_table.c
+@@ -499,7 +499,9 @@ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+ u32 tipc_nametbl_translate(struct net *net, u32 type, u32 instance,
+ 			   u32 *destnode)
+ {
+-	struct tipc_net *tn = net_generic(net, tipc_net_id);
++	struct tipc_net *tn = tipc_net(net);
++	bool legacy = tn->legacy_addr_format;
++	u32 self = tipc_own_addr(net);
+ 	struct sub_seq *sseq;
+ 	struct name_info *info;
+ 	struct publication *publ;
+@@ -507,7 +509,7 @@ u32 tipc_nametbl_translate(struct net *net, u32 type, u32 instance,
+ 	u32 port = 0;
+ 	u32 node = 0;
+ 
+-	if (!tipc_in_scope(*destnode, tn->own_addr))
++	if (!tipc_in_scope(legacy, *destnode, self))
+ 		return 0;
+ 
+ 	rcu_read_lock();
+@@ -521,7 +523,7 @@ u32 tipc_nametbl_translate(struct net *net, u32 type, u32 instance,
+ 	info = sseq->info;
+ 
+ 	/* Closest-First Algorithm */
+-	if (likely(!*destnode)) {
++	if (legacy && !*destnode) {
+ 		if (!list_empty(&info->local_publ)) {
+ 			publ = list_first_entry(&info->local_publ,
+ 						struct publication,
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index a074f28..eb0d7a3 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -240,7 +240,7 @@ int __tipc_nl_net_set(struct sk_buff *skb, struct genl_info *info)
+ 		addr = nla_get_u32(attrs[TIPC_NLA_NET_ADDR]);
+ 		if (!addr)
+ 			return -EINVAL;
+-
++		tn->legacy_addr_format = true;
+ 		tipc_net_start(net, addr);
+ 	}
+ 
+-- 
+1.7.9.5
+

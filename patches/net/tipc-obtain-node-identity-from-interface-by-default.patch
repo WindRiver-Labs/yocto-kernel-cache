@@ -1,0 +1,138 @@
+From 52e7095ee703aa7efac6e7bd29f9cebb67a1a8f2 Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Thu, 22 Mar 2018 20:42:52 +0100
+Subject: [PATCH 126/176] tipc: obtain node identity from interface by default
+
+commit 52dfae5c85a4c1078e9f1d5e8947d4a25f73dd81 upstream
+
+Selecting and explicitly configuring a TIPC node identity may be
+unwanted in some cases.
+
+In this commit we introduce a default setting if the identity has not
+been set at the moment the first bearer is enabled. We do this by
+using a raw copy of a unique identifier from the used interface: MAC
+address in the case of an L2 bearer, IPv4/IPv6 address in the case
+of a UDP bearer.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/bearer.c    |   24 +++++++++++++++---------
+ net/tipc/net.h       |    1 +
+ net/tipc/udp_media.c |   13 +++++++++++++
+ 3 files changed, 29 insertions(+), 9 deletions(-)
+
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index ae5b44c..f7d47c8 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -243,12 +243,6 @@ static int tipc_enable_bearer(struct net *net, const char *name,
+ 	int res = -EINVAL;
+ 	char *errstr = "";
+ 
+-	if (!tipc_own_id(net)) {
+-		errstr = "not supported in standalone mode";
+-		res = -ENOPROTOOPT;
+-		goto rejected;
+-	}
+-
+ 	if (!bearer_name_validate(name, &b_names)) {
+ 		errstr = "illegal name";
+ 		goto rejected;
+@@ -381,11 +375,13 @@ static void bearer_disable(struct net *net, struct tipc_bearer *b)
+ int tipc_enable_l2_media(struct net *net, struct tipc_bearer *b,
+ 			 struct nlattr *attr[])
+ {
++	char *dev_name = strchr((const char *)b->name, ':') + 1;
++	int hwaddr_len = b->media->hwaddr_len;
++	u8 node_id[NODE_ID_LEN] = {0,};
+ 	struct net_device *dev;
+-	char *driver_name = strchr((const char *)b->name, ':') + 1;
+ 
+ 	/* Find device with specified name */
+-	dev = dev_get_by_name(net, driver_name);
++	dev = dev_get_by_name(net, dev_name);
+ 	if (!dev)
+ 		return -ENODEV;
+ 	if (tipc_mtu_bad(dev, 0)) {
+@@ -393,6 +389,16 @@ int tipc_enable_l2_media(struct net *net, struct tipc_bearer *b,
+ 		return -EINVAL;
+ 	}
+ 
++	/* Autoconfigure own node identity if needed */
++	if (!tipc_own_id(net) && hwaddr_len <= NODE_ID_LEN) {
++		memcpy(node_id, dev->dev_addr, hwaddr_len);
++		tipc_net_init(net, node_id, 0);
++	}
++	if (!tipc_own_id(net)) {
++		pr_warn("Failed to obtain node identity\n");
++		return -EINVAL;
++	}
++
+ 	/* Associate TIPC bearer with L2 bearer */
+ 	rcu_assign_pointer(b->media_ptr, dev);
+ 	b->pt.dev = dev;
+@@ -400,7 +406,7 @@ int tipc_enable_l2_media(struct net *net, struct tipc_bearer *b,
+ 	b->pt.func = tipc_l2_rcv_msg;
+ 	dev_add_pack(&b->pt);
+ 	memset(&b->bcast_addr, 0, sizeof(b->bcast_addr));
+-	memcpy(b->bcast_addr.value, dev->broadcast, b->media->hwaddr_len);
++	memcpy(b->bcast_addr.value, dev->broadcast, hwaddr_len);
+ 	b->bcast_addr.media_id = b->media->type_id;
+ 	b->bcast_addr.broadcast = TIPC_BROADCAST_SUPPORT;
+ 	b->mtu = dev->mtu;
+diff --git a/net/tipc/net.h b/net/tipc/net.h
+index 08efa60..09ad02b 100644
+--- a/net/tipc/net.h
++++ b/net/tipc/net.h
+@@ -41,6 +41,7 @@
+ 
+ extern const struct nla_policy tipc_nl_net_policy[];
+ 
++int tipc_net_init(struct net *net, u8 *node_id, u32 addr);
+ void tipc_net_finalize(struct net *net, u32 addr);
+ void tipc_net_stop(struct net *net);
+ int tipc_nl_net_dump(struct sk_buff *skb, struct netlink_callback *cb);
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index 3deabca..2c13b18 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -47,6 +47,8 @@
+ #include <net/addrconf.h>
+ #include <linux/tipc_netlink.h>
+ #include "core.h"
++#include "addr.h"
++#include "net.h"
+ #include "bearer.h"
+ #include "netlink.h"
+ #include "msg.h"
+@@ -647,6 +649,7 @@ static int tipc_udp_enable(struct net *net, struct tipc_bearer *b,
+ 	struct udp_port_cfg udp_conf = {0};
+ 	struct udp_tunnel_sock_cfg tuncfg = {NULL};
+ 	struct nlattr *opts[TIPC_NLA_UDP_MAX + 1];
++	u8 node_id[NODE_ID_LEN] = {0,};
+ 
+ 	ub = kzalloc(sizeof(*ub), GFP_ATOMIC);
+ 	if (!ub)
+@@ -677,6 +680,16 @@ static int tipc_udp_enable(struct net *net, struct tipc_bearer *b,
+ 	if (err)
+ 		goto err;
+ 
++	/* Autoconfigure own node identity if needed */
++	if (!tipc_own_id(net)) {
++		memcpy(node_id, local.ipv6.in6_u.u6_addr8, 16);
++		tipc_net_init(net, node_id, 0);
++	}
++	if (!tipc_own_id(net)) {
++		pr_warn("Failed to set node id, please configure manually\n");
++		return -EINVAL;
++	}
++
+ 	b->bcast_addr.media_id = TIPC_MEDIA_TYPE_UDP;
+ 	b->bcast_addr.broadcast = TIPC_BROADCAST_SUPPORT;
+ 	rcu_assign_pointer(b->media_ptr, ub);
+-- 
+1.7.9.5
+

@@ -1,0 +1,103 @@
+From 3e64d2e728f81332d6489d085cf6940a1f38ea32 Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Wed, 11 Apr 2018 22:52:09 +0200
+Subject: [PATCH 138/176] tipc: fix unbalanced reference counter
+
+commit c3317f4db831b7564ff8d1670326456a7fbbbcb3 upstream
+
+When a topology subscription is created, we may encounter (or KASAN
+may provoke) a failure to create a corresponding service instance in
+the binding table. Instead of letting the tipc_nametbl_subscribe()
+report the failure back to the caller, the function just makes a warning
+printout and returns, without incrementing the subscription reference
+counter as expected by the caller.
+
+This makes the caller believe that the subscription was successful, so
+it will at a later moment try to unsubscribe the item. This involves
+a sub_put() call. Since the reference counter never was incremented
+in the first place, we get a premature delete of the subscription item,
+followed by a "use-after-free" warning.
+
+We fix this by adding a return value to tipc_nametbl_subscribe() and
+make the caller aware of the failure to subscribe.
+
+This bug seems to always have been around, but this fix only applies
+back to the commit shown below. Given the low risk of this happening
+we believe this to be sufficient.
+
+Fixes: commit 218527fe27ad ("tipc: replace name table service range
+array with rb tree")
+Reported-by: syzbot+aa245f26d42b8305d157@syzkaller.appspotmail.com
+
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/name_table.c |    5 ++++-
+ net/tipc/name_table.h |    2 +-
+ net/tipc/subscr.c     |    5 ++++-
+ 3 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/net/tipc/name_table.c b/net/tipc/name_table.c
+index b1fe209..4068eaa 100644
+--- a/net/tipc/name_table.c
++++ b/net/tipc/name_table.c
+@@ -665,13 +665,14 @@ int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower,
+ /**
+  * tipc_nametbl_subscribe - add a subscription object to the name table
+  */
+-void tipc_nametbl_subscribe(struct tipc_subscription *sub)
++bool tipc_nametbl_subscribe(struct tipc_subscription *sub)
+ {
+ 	struct name_table *nt = tipc_name_table(sub->net);
+ 	struct tipc_net *tn = tipc_net(sub->net);
+ 	struct tipc_subscr *s = &sub->evt.s;
+ 	u32 type = tipc_sub_read(s, seq.type);
+ 	struct tipc_service *sc;
++	bool res = true;
+ 
+ 	spin_lock_bh(&tn->nametbl_lock);
+ 	sc = tipc_service_find(sub->net, type);
+@@ -685,8 +686,10 @@ void tipc_nametbl_subscribe(struct tipc_subscription *sub)
+ 		pr_warn("Failed to subscribe for {%u,%u,%u}\n", type,
+ 			tipc_sub_read(s, seq.lower),
+ 			tipc_sub_read(s, seq.upper));
++		res = false;
+ 	}
+ 	spin_unlock_bh(&tn->nametbl_lock);
++	return res;
+ }
+ 
+ /**
+diff --git a/net/tipc/name_table.h b/net/tipc/name_table.h
+index 4b14fc2..0febba4 100644
+--- a/net/tipc/name_table.h
++++ b/net/tipc/name_table.h
+@@ -126,7 +126,7 @@ struct publication *tipc_nametbl_insert_publ(struct net *net, u32 type,
+ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+ 					     u32 lower, u32 upper,
+ 					     u32 node, u32 key);
+-void tipc_nametbl_subscribe(struct tipc_subscription *s);
++bool tipc_nametbl_subscribe(struct tipc_subscription *s);
+ void tipc_nametbl_unsubscribe(struct tipc_subscription *s);
+ int tipc_nametbl_init(struct net *net);
+ void tipc_nametbl_stop(struct net *net);
+diff --git a/net/tipc/subscr.c b/net/tipc/subscr.c
+index b7d80bc..f340e53 100644
+--- a/net/tipc/subscr.c
++++ b/net/tipc/subscr.c
+@@ -153,7 +153,10 @@ struct tipc_subscription *tipc_sub_subscribe(struct net *net,
+ 	memcpy(&sub->evt.s, s, sizeof(*s));
+ 	spin_lock_init(&sub->lock);
+ 	kref_init(&sub->kref);
+-	tipc_nametbl_subscribe(sub);
++	if (!tipc_nametbl_subscribe(sub)) {
++		kfree(sub);
++		return NULL;
++	}
+ 	timer_setup(&sub->timer, tipc_sub_timeout, 0);
+ 	timeout = tipc_sub_read(&sub->evt.s, timeout);
+ 	if (timeout != TIPC_WAIT_FOREVER)
+-- 
+1.7.9.5
+

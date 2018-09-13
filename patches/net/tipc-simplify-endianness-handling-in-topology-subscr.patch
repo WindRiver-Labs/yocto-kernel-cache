@@ -1,0 +1,423 @@
+From fba7f281961d78add63841462273649a84e52295 Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Thu, 15 Feb 2018 10:40:46 +0100
+Subject: [PATCH 100/176] tipc: simplify endianness handling in topology
+ subscriber
+
+commit 8985ecc7c1e07c42acc1e44ac56fa224f8a5c62f upstream
+
+Because of the requirement for total distribution transparency, users
+send subscriptions and receive topology events in their own host format.
+It is up to the topology server to determine this format and do the
+correct conversions to and from its own host format when needed.
+
+Until now, this has been handled in a rather non-transparent way inside
+the topology server and subscriber code, leading to unnecessary
+complexity when creating subscriptions and issuing events.
+
+We now improve this situation by adding two new macros, tipc_sub_read()
+and tipc_evt_write(). Both those functions calculate the need for
+conversion internally before performing their respective operations.
+Hence, all handling of such conversions become transparent to the rest
+of the code.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/name_table.c |   42 +++++++++++++++----------
+ net/tipc/name_table.h |    2 +-
+ net/tipc/server.c     |   25 ++-------------
+ net/tipc/subscr.c     |   83 ++++++++++++++++++-------------------------------
+ net/tipc/subscr.h     |   36 +++++++++++++++------
+ 5 files changed, 86 insertions(+), 102 deletions(-)
+
+diff --git a/net/tipc/name_table.c b/net/tipc/name_table.c
+index c0ca7be..2fbd0a2 100644
+--- a/net/tipc/name_table.c
++++ b/net/tipc/name_table.c
+@@ -412,18 +412,22 @@ static struct publication *tipc_nameseq_remove_publ(struct net *net,
+  * sequence overlapping with the requested sequence
+  */
+ static void tipc_nameseq_subscribe(struct name_seq *nseq,
+-				   struct tipc_subscription *s,
+-				   bool status)
++				   struct tipc_subscription *sub)
+ {
+ 	struct sub_seq *sseq = nseq->sseqs;
+ 	struct tipc_name_seq ns;
++	struct tipc_subscr *s = &sub->evt.s;
++	bool no_status;
+ 
+-	tipc_subscrp_convert_seq(&s->evt.s.seq, s->swap, &ns);
++	ns.type = tipc_sub_read(s, seq.type);
++	ns.lower = tipc_sub_read(s, seq.lower);
++	ns.upper = tipc_sub_read(s, seq.upper);
++	no_status = tipc_sub_read(s, filter) & TIPC_SUB_NO_STATUS;
+ 
+-	tipc_subscrp_get(s);
+-	list_add(&s->nameseq_list, &nseq->subscriptions);
++	tipc_subscrp_get(sub);
++	list_add(&sub->nameseq_list, &nseq->subscriptions);
+ 
+-	if (!status || !sseq)
++	if (no_status || !sseq)
+ 		return;
+ 
+ 	while (sseq != &nseq->sseqs[nseq->first_free]) {
+@@ -433,7 +437,7 @@ static void tipc_nameseq_subscribe(struct name_seq *nseq,
+ 			int must_report = 1;
+ 
+ 			list_for_each_entry(crs, &info->zone_list, zone_list) {
+-				tipc_subscrp_report_overlap(s, sseq->lower,
++				tipc_subscrp_report_overlap(sub, sseq->lower,
+ 							    sseq->upper,
+ 							    TIPC_PUBLISHED,
+ 							    crs->ref, crs->node,
+@@ -808,11 +812,12 @@ int tipc_nametbl_withdraw(struct net *net, u32 type, u32 lower, u32 ref,
+ /**
+  * tipc_nametbl_subscribe - add a subscription object to the name table
+  */
+-void tipc_nametbl_subscribe(struct tipc_subscription *s, bool status)
++void tipc_nametbl_subscribe(struct tipc_subscription *sub)
+ {
+-	struct tipc_server *srv = s->server;
++	struct tipc_server *srv = sub->server;
+ 	struct tipc_net *tn = tipc_net(srv->net);
+-	u32 type = tipc_subscrp_convert_seq_type(s->evt.s.seq.type, s->swap);
++	struct tipc_subscr *s = &sub->evt.s;
++	u32 type = tipc_sub_read(s, seq.type);
+ 	int index = hash(type);
+ 	struct name_seq *seq;
+ 	struct tipc_name_seq ns;
+@@ -823,10 +828,12 @@ void tipc_nametbl_subscribe(struct tipc_subscription *s, bool status)
+ 		seq = tipc_nameseq_create(type, &tn->nametbl->seq_hlist[index]);
+ 	if (seq) {
+ 		spin_lock_bh(&seq->lock);
+-		tipc_nameseq_subscribe(seq, s, status);
++		tipc_nameseq_subscribe(seq, sub);
+ 		spin_unlock_bh(&seq->lock);
+ 	} else {
+-		tipc_subscrp_convert_seq(&s->evt.s.seq, s->swap, &ns);
++		ns.type = tipc_sub_read(s, seq.type);
++		ns.lower = tipc_sub_read(s, seq.lower);
++		ns.upper = tipc_sub_read(s, seq.upper);
+ 		pr_warn("Failed to create subscription for {%u,%u,%u}\n",
+ 			ns.type, ns.lower, ns.upper);
+ 	}
+@@ -836,19 +843,20 @@ void tipc_nametbl_subscribe(struct tipc_subscription *s, bool status)
+ /**
+  * tipc_nametbl_unsubscribe - remove a subscription object from name table
+  */
+-void tipc_nametbl_unsubscribe(struct tipc_subscription *s)
++void tipc_nametbl_unsubscribe(struct tipc_subscription *sub)
+ {
+-	struct tipc_server *srv = s->server;
++	struct tipc_server *srv = sub->server;
++	struct tipc_subscr *s = &sub->evt.s;
+ 	struct tipc_net *tn = tipc_net(srv->net);
+ 	struct name_seq *seq;
+-	u32 type = tipc_subscrp_convert_seq_type(s->evt.s.seq.type, s->swap);
++	u32 type = tipc_sub_read(s, seq.type);
+ 
+ 	spin_lock_bh(&tn->nametbl_lock);
+ 	seq = nametbl_find_seq(srv->net, type);
+ 	if (seq != NULL) {
+ 		spin_lock_bh(&seq->lock);
+-		list_del_init(&s->nameseq_list);
+-		tipc_subscrp_put(s);
++		list_del_init(&sub->nameseq_list);
++		tipc_subscrp_put(sub);
+ 		if (!seq->first_free && list_empty(&seq->subscriptions)) {
+ 			hlist_del_init_rcu(&seq->ns_list);
+ 			kfree(seq->sseqs);
+diff --git a/net/tipc/name_table.h b/net/tipc/name_table.h
+index f56e7cb..1765260 100644
+--- a/net/tipc/name_table.h
++++ b/net/tipc/name_table.h
+@@ -120,7 +120,7 @@ struct publication *tipc_nametbl_insert_publ(struct net *net, u32 type,
+ struct publication *tipc_nametbl_remove_publ(struct net *net, u32 type,
+ 					     u32 lower, u32 node, u32 ref,
+ 					     u32 key);
+-void tipc_nametbl_subscribe(struct tipc_subscription *s, bool status);
++void tipc_nametbl_subscribe(struct tipc_subscription *s);
+ void tipc_nametbl_unsubscribe(struct tipc_subscription *s);
+ int tipc_nametbl_init(struct net *net);
+ void tipc_nametbl_stop(struct net *net);
+diff --git a/net/tipc/server.c b/net/tipc/server.c
+index 7933fb9..5d231fa 100644
+--- a/net/tipc/server.c
++++ b/net/tipc/server.c
+@@ -98,18 +98,6 @@ static bool connected(struct tipc_conn *con)
+ 	return con && test_bit(CF_CONNECTED, &con->flags);
+ }
+ 
+-/**
+- * htohl - convert value to endianness used by destination
+- * @in: value to convert
+- * @swap: non-zero if endianness must be reversed
+- *
+- * Returns converted value
+- */
+-static u32 htohl(u32 in, int swap)
+-{
+-	return swap ? swab32(in) : in;
+-}
+-
+ static void tipc_conn_kref_release(struct kref *kref)
+ {
+ 	struct tipc_conn *con = container_of(kref, struct tipc_conn, kref);
+@@ -285,21 +273,12 @@ static int tipc_con_rcv_sub(struct tipc_server *srv,
+ 			    struct tipc_subscr *s)
+ {
+ 	struct tipc_subscription *sub;
+-	bool status;
+-	int swap;
+-
+-	/* Determine subscriber's endianness */
+-	swap = !(s->filter & (TIPC_SUB_PORTS | TIPC_SUB_SERVICE |
+-			      TIPC_SUB_CANCEL));
+ 
+-	/* Detect & process a subscription cancellation request */
+-	if (s->filter & htohl(TIPC_SUB_CANCEL, swap)) {
+-		s->filter &= ~htohl(TIPC_SUB_CANCEL, swap);
++	if (tipc_sub_read(s, filter) & TIPC_SUB_CANCEL) {
+ 		tipc_con_delete_sub(con, s);
+ 		return 0;
+ 	}
+-	status = !(s->filter & htohl(TIPC_SUB_NO_STATUS, swap));
+-	sub = tipc_subscrp_subscribe(srv, s, con->conid, swap, status);
++	sub = tipc_subscrp_subscribe(srv, s, con->conid);
+ 	if (!sub)
+ 		return -1;
+ 
+diff --git a/net/tipc/subscr.c b/net/tipc/subscr.c
+index c3e0b924..406b09f 100644
+--- a/net/tipc/subscr.c
++++ b/net/tipc/subscr.c
+@@ -38,32 +38,19 @@
+ #include "name_table.h"
+ #include "subscr.h"
+ 
+-/**
+- * htohl - convert value to endianness used by destination
+- * @in: value to convert
+- * @swap: non-zero if endianness must be reversed
+- *
+- * Returns converted value
+- */
+-static u32 htohl(u32 in, int swap)
+-{
+-	return swap ? swab32(in) : in;
+-}
+-
+ static void tipc_subscrp_send_event(struct tipc_subscription *sub,
+ 				    u32 found_lower, u32 found_upper,
+ 				    u32 event, u32 port, u32 node)
+ {
+ 	struct tipc_event *evt = &sub->evt;
+-	bool swap = sub->swap;
+ 
+ 	if (sub->inactive)
+ 		return;
+-	evt->event = htohl(event, swap);
+-	evt->found_lower = htohl(found_lower, swap);
+-	evt->found_upper = htohl(found_upper, swap);
+-	evt->port.ref = htohl(port, swap);
+-	evt->port.node = htohl(node, swap);
++	tipc_evt_write(evt, event, event);
++	tipc_evt_write(evt, found_lower, found_lower);
++	tipc_evt_write(evt, found_upper, found_upper);
++	tipc_evt_write(evt, port.ref, port);
++	tipc_evt_write(evt, port.node, node);
+ 	tipc_conn_queue_evt(sub->server, sub->conid, event, evt);
+ }
+ 
+@@ -85,29 +72,22 @@ int tipc_subscrp_check_overlap(struct tipc_name_seq *seq, u32 found_lower,
+ 	return 1;
+ }
+ 
+-u32 tipc_subscrp_convert_seq_type(u32 type, int swap)
++void tipc_subscrp_report_overlap(struct tipc_subscription *sub,
++				 u32 found_lower, u32 found_upper,
++				 u32 event, u32 port, u32 node,
++				 u32 scope, int must)
+ {
+-	return htohl(type, swap);
+-}
+-
+-void tipc_subscrp_convert_seq(struct tipc_name_seq *in, int swap,
+-			      struct tipc_name_seq *out)
+-{
+-	out->type = htohl(in->type, swap);
+-	out->lower = htohl(in->lower, swap);
+-	out->upper = htohl(in->upper, swap);
+-}
+-
+-void tipc_subscrp_report_overlap(struct tipc_subscription *sub, u32 found_lower,
+-				 u32 found_upper, u32 event, u32 port_ref,
+-				 u32 node, u32 scope, int must)
+-{
+-	u32 filter = htohl(sub->evt.s.filter, sub->swap);
+ 	struct tipc_name_seq seq;
++	struct tipc_subscr *s = &sub->evt.s;
++	u32 filter = tipc_sub_read(s, filter);
++
++	seq.type = tipc_sub_read(s, seq.type);
++	seq.lower = tipc_sub_read(s, seq.lower);
++	seq.upper = tipc_sub_read(s, seq.upper);
+ 
+-	tipc_subscrp_convert_seq(&sub->evt.s.seq, sub->swap, &seq);
+ 	if (!tipc_subscrp_check_overlap(&seq, found_lower, found_upper))
+ 		return;
++
+ 	if (!must && !(filter & TIPC_SUB_PORTS))
+ 		return;
+ 	if (filter & TIPC_SUB_CLUSTER_SCOPE && scope == TIPC_NODE_SCOPE)
+@@ -116,7 +96,7 @@ void tipc_subscrp_report_overlap(struct tipc_subscription *sub, u32 found_lower,
+ 		return;
+ 	spin_lock(&sub->lock);
+ 	tipc_subscrp_send_event(sub, found_lower, found_upper,
+-				event, port_ref, node);
++				event, port, node);
+ 	spin_unlock(&sub->lock);
+ }
+ 
+@@ -156,11 +136,11 @@ void tipc_subscrp_get(struct tipc_subscription *subscription)
+ 
+ static struct tipc_subscription *tipc_subscrp_create(struct tipc_server *srv,
+ 						     struct tipc_subscr *s,
+-						     int conid, bool swap)
++						     int conid)
+ {
+ 	struct tipc_net *tn = tipc_net(srv->net);
+ 	struct tipc_subscription *sub;
+-	u32 filter = htohl(s->filter, swap);
++	u32 filter = tipc_sub_read(s, filter);
+ 
+ 	/* Refuse subscription if global limit exceeded */
+ 	if (atomic_read(&tn->subscription_count) >= TIPC_MAX_SUBSCRIPTIONS) {
+@@ -177,39 +157,38 @@ static struct tipc_subscription *tipc_subscrp_create(struct tipc_server *srv,
+ 	}
+ 
+ 	/* Initialize subscription object */
++	if (filter & TIPC_SUB_PORTS && filter & TIPC_SUB_SERVICE)
++		goto err;
++	if (tipc_sub_read(s, seq.lower) > tipc_sub_read(s, seq.upper))
++		goto err;
+ 	sub->server = srv;
+ 	sub->conid = conid;
+ 	sub->inactive = false;
+-	if (((filter & TIPC_SUB_PORTS) && (filter & TIPC_SUB_SERVICE)) ||
+-	    (htohl(s->seq.lower, swap) > htohl(s->seq.upper, swap))) {
+-		pr_warn("Subscription rejected, illegal request\n");
+-		kfree(sub);
+-		return NULL;
+-	}
+-
+-	sub->swap = swap;
+ 	memcpy(&sub->evt.s, s, sizeof(*s));
+ 	spin_lock_init(&sub->lock);
+ 	atomic_inc(&tn->subscription_count);
+ 	kref_init(&sub->kref);
+ 	return sub;
++err:
++	pr_warn("Subscription rejected, illegal request\n");
++	kfree(sub);
++	return NULL;
+ }
+ 
+ struct tipc_subscription *tipc_subscrp_subscribe(struct tipc_server *srv,
+ 						 struct tipc_subscr *s,
+-						 int conid, bool swap,
+-						 bool status)
++						 int conid)
+ {
+ 	struct tipc_subscription *sub = NULL;
+ 	u32 timeout;
+ 
+-	sub = tipc_subscrp_create(srv, s, conid, swap);
++	sub = tipc_subscrp_create(srv, s, conid);
+ 	if (!sub)
+ 		return NULL;
+ 
+-	tipc_nametbl_subscribe(sub, status);
++	tipc_nametbl_subscribe(sub);
+ 	timer_setup(&sub->timer, tipc_subscrp_timeout, 0);
+-	timeout = htohl(sub->evt.s.timeout, swap);
++	timeout = tipc_sub_read(&sub->evt.s, timeout);
+ 	if (timeout != TIPC_WAIT_FOREVER)
+ 		mod_timer(&sub->timer, jiffies + msecs_to_jiffies(timeout));
+ 	return sub;
+diff --git a/net/tipc/subscr.h b/net/tipc/subscr.h
+index 64ffd32..db80e41 100644
+--- a/net/tipc/subscr.h
++++ b/net/tipc/subscr.h
+@@ -52,7 +52,6 @@
+  * @timer: timer governing subscription duration (optional)
+  * @nameseq_list: adjacent subscriptions in name sequence's subscription list
+  * @subscrp_list: adjacent subscriptions in subscriber's subscription list
+- * @swap: indicates if subscriber uses opposite endianness in its messages
+  * @evt: template for events generated by subscription
+  */
+ struct tipc_subscription {
+@@ -63,28 +62,47 @@ struct tipc_subscription {
+ 	struct list_head subscrp_list;
+ 	struct tipc_event evt;
+ 	int conid;
+-	bool swap;
+ 	bool inactive;
+ 	spinlock_t lock; /* serialize up/down and timer events */
+ };
+ 
+ struct tipc_subscription *tipc_subscrp_subscribe(struct tipc_server *srv,
+ 						 struct tipc_subscr *s,
+-						 int conid, bool swap,
+-						 bool status);
++						 int conid);
+ void tipc_sub_delete(struct tipc_subscription *sub);
++
+ int tipc_subscrp_check_overlap(struct tipc_name_seq *seq, u32 found_lower,
+ 			       u32 found_upper);
+ void tipc_subscrp_report_overlap(struct tipc_subscription *sub,
+-				 u32 found_lower, u32 found_upper, u32 event,
+-				 u32 port_ref, u32 node, u32 scope, int must);
+-void tipc_subscrp_convert_seq(struct tipc_name_seq *in, int swap,
+-			      struct tipc_name_seq *out);
+-u32 tipc_subscrp_convert_seq_type(u32 type, int swap);
++				 u32 found_lower, u32 found_upper,
++				 u32 event, u32 port, u32 node,
++				 u32 scope, int must);
+ int tipc_topsrv_start(struct net *net);
+ void tipc_topsrv_stop(struct net *net);
+ 
+ void tipc_subscrp_put(struct tipc_subscription *subscription);
+ void tipc_subscrp_get(struct tipc_subscription *subscription);
+ 
++#define TIPC_FILTER_MASK (TIPC_SUB_PORTS | TIPC_SUB_SERVICE | TIPC_SUB_CANCEL)
++
++/* tipc_sub_read - return field_ of struct sub_ in host endian format
++ */
++#define tipc_sub_read(sub_, field_)					\
++	({								\
++		struct tipc_subscr *sub__ = sub_;			\
++		u32 val__ = (sub__)->field_;				\
++		int swap_ = !((sub__)->filter & TIPC_FILTER_MASK);	\
++		(swap_ ? swab32(val__) : val__);			\
++	})
++
++/* tipc_evt_write - write val_ to field_ of struct evt_ in user endian format
++ */
++#define tipc_evt_write(evt_, field_, val_)				\
++	({								\
++		struct tipc_event *evt__ = evt_;			\
++		u32 val__ = val_;					\
++		int swap_ = !((evt__)->s.filter & (TIPC_FILTER_MASK));	\
++		(evt__)->field_ = swap_ ? swab32(val__) : val__;	\
++	})
++
+ #endif
+-- 
+1.7.9.5
+

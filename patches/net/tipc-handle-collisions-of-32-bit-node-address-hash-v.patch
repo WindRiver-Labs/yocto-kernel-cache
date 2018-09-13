@@ -1,0 +1,684 @@
+From 507e5e13d8d499a8dcf60b6bc78db559c194ca7b Mon Sep 17 00:00:00 2001
+From: Jon Maloy <jon.maloy@ericsson.com>
+Date: Thu, 22 Mar 2018 20:42:51 +0100
+Subject: [PATCH 125/176] tipc: handle collisions of 32-bit node address hash
+ values
+
+commit 52dfae5c85a4c1078e9f1d5e8947d4a25f73dd81 upstream
+
+When a 32-bit node address is generated from a 128-bit identifier,
+there is a risk of collisions which must be discovered and handled.
+
+We do this as follows:
+- We don't apply the generated address immediately to the node, but do
+  instead initiate a 1 sec trial period to allow other cluster members
+  to discover and handle such collisions.
+
+- During the trial period the node periodically sends out a new type
+  of message, DSC_TRIAL_MSG, using broadcast or emulated broadcast,
+  to all the other nodes in the cluster.
+
+- When a node is receiving such a message, it must check that the
+  presented 32-bit identifier either is unused, or was used by the very
+  same peer in a previous session. In both cases it accepts the request
+  by not responding to it.
+
+- If it finds that the same node has been up before using a different
+  address, it responds with a DSC_TRIAL_FAIL_MSG containing that
+  address.
+
+- If it finds that the address has already been taken by some other
+  node, it generates a new, unused address and returns it to the
+  requester.
+
+- During the trial period the requesting node must always be prepared
+  to accept a failure message, i.e., a message where a peer suggests a
+  different (or equal)  address to the one tried. In those cases it
+  must apply the suggested value as trial address and restart the trial
+  period.
+
+This algorithm ensures that in the vast majority of cases a node will
+have the same address before and after a reboot. If a legacy user
+configures the address explicitly, there will be no trial period and
+messages, so this protocol addition is completely backwards compatible.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/addr.c     |    3 +-
+ net/tipc/bearer.c   |    3 +-
+ net/tipc/core.c     |    2 +
+ net/tipc/core.h     |    2 +
+ net/tipc/discover.c |  126 +++++++++++++++++++++++++++++++++++++++++++--------
+ net/tipc/link.c     |   26 +++++++----
+ net/tipc/link.h     |    4 +-
+ net/tipc/msg.h      |   23 +++++++++-
+ net/tipc/net.c      |    4 +-
+ net/tipc/node.c     |   85 +++++++++++++++++++++++++++++++---
+ net/tipc/node.h     |    3 +-
+ 11 files changed, 236 insertions(+), 45 deletions(-)
+
+diff --git a/net/tipc/addr.c b/net/tipc/addr.c
+index 4841e98..b88d48d 100644
+--- a/net/tipc/addr.c
++++ b/net/tipc/addr.c
+@@ -59,7 +59,7 @@ void tipc_set_node_id(struct net *net, u8 *id)
+ 
+ 	memcpy(tn->node_id, id, NODE_ID_LEN);
+ 	tipc_nodeid2string(tn->node_id_string, id);
+-	tn->node_addr = tmp[0] ^ tmp[1] ^ tmp[2] ^ tmp[3];
++	tn->trial_addr = tmp[0] ^ tmp[1] ^ tmp[2] ^ tmp[3];
+ 	pr_info("Own node identity %s, cluster identity %u\n",
+ 		tipc_own_id_string(net), tn->net_id);
+ }
+@@ -74,6 +74,7 @@ void tipc_set_node_addr(struct net *net, u32 addr)
+ 		sprintf(node_id, "%x", addr);
+ 		tipc_set_node_id(net, node_id);
+ 	}
++	tn->trial_addr = addr;
+ 	pr_info("32-bit node address hash set to %x\n", addr);
+ }
+ 
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index a71f318..ae5b44c 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -235,7 +235,6 @@ static int tipc_enable_bearer(struct net *net, const char *name,
+ {
+ 	struct tipc_net *tn = tipc_net(net);
+ 	struct tipc_bearer_names b_names;
+-	u32 self = tipc_own_addr(net);
+ 	int with_this_prio = 1;
+ 	struct tipc_bearer *b;
+ 	struct tipc_media *m;
+@@ -244,7 +243,7 @@ static int tipc_enable_bearer(struct net *net, const char *name,
+ 	int res = -EINVAL;
+ 	char *errstr = "";
+ 
+-	if (!self) {
++	if (!tipc_own_id(net)) {
+ 		errstr = "not supported in standalone mode";
+ 		res = -ENOPROTOOPT;
+ 		goto rejected;
+diff --git a/net/tipc/core.c b/net/tipc/core.c
+index e92fed4..52dfc51 100644
+--- a/net/tipc/core.c
++++ b/net/tipc/core.c
+@@ -57,6 +57,8 @@ static int __net_init tipc_init_net(struct net *net)
+ 
+ 	tn->net_id = 4711;
+ 	tn->node_addr = 0;
++	tn->trial_addr = 0;
++	tn->addr_trial_end = 0;
+ 	memset(tn->node_id, 0, sizeof(tn->node_id));
+ 	memset(tn->node_id_string, 0, sizeof(tn->node_id_string));
+ 	tn->mon_threshold = TIPC_DEF_MON_THRESHOLD;
+diff --git a/net/tipc/core.h b/net/tipc/core.h
+index eabad41..d0f64ca 100644
+--- a/net/tipc/core.h
++++ b/net/tipc/core.h
+@@ -82,6 +82,8 @@
+ struct tipc_net {
+ 	u8  node_id[NODE_ID_LEN];
+ 	u32 node_addr;
++	u32 trial_addr;
++	unsigned long addr_trial_end;
+ 	char node_id_string[NODE_ID_STR_LEN];
+ 	int net_id;
+ 	int random;
+diff --git a/net/tipc/discover.c b/net/tipc/discover.c
+index b4c4cd1..e765573 100644
+--- a/net/tipc/discover.c
++++ b/net/tipc/discover.c
+@@ -1,7 +1,7 @@
+ /*
+  * net/tipc/discover.c
+  *
+- * Copyright (c) 2003-2006, 2014-2015, Ericsson AB
++ * Copyright (c) 2003-2006, 2014-2018, Ericsson AB
+  * Copyright (c) 2005-2006, 2010-2011, Wind River Systems
+  * All rights reserved.
+  *
+@@ -78,34 +78,40 @@ struct tipc_discoverer {
+  * @b: ptr to bearer issuing message
+  */
+ static void tipc_disc_init_msg(struct net *net, struct sk_buff *skb,
+-			       u32 mtyp, struct tipc_bearer *b)
++			       u32 mtyp,  struct tipc_bearer *b)
+ {
+ 	struct tipc_net *tn = tipc_net(net);
+-	u32 self = tipc_own_addr(net);
+ 	u32 dest_domain = b->domain;
+ 	struct tipc_msg *hdr;
+ 
+ 	hdr = buf_msg(skb);
+-	tipc_msg_init(self, hdr, LINK_CONFIG, mtyp,
++	tipc_msg_init(tn->trial_addr, hdr, LINK_CONFIG, mtyp,
+ 		      MAX_H_SIZE, dest_domain);
++	msg_set_size(hdr, MAX_H_SIZE + NODE_ID_LEN);
+ 	msg_set_non_seq(hdr, 1);
+ 	msg_set_node_sig(hdr, tn->random);
+ 	msg_set_node_capabilities(hdr, TIPC_NODE_CAPABILITIES);
+ 	msg_set_dest_domain(hdr, dest_domain);
+ 	msg_set_bc_netid(hdr, tn->net_id);
+ 	b->media->addr2msg(msg_media_addr(hdr), &b->addr);
++	msg_set_node_id(hdr, tipc_own_id(net));
+ }
+ 
+-static void tipc_disc_msg_xmit(struct net *net, u32 mtyp, u32 dst, u32 src,
++static void tipc_disc_msg_xmit(struct net *net, u32 mtyp, u32 dst,
++			       u32 src, u32 sugg_addr,
+ 			       struct tipc_media_addr *maddr,
+ 			       struct tipc_bearer *b)
+ {
++	struct tipc_msg *hdr;
+ 	struct sk_buff *skb;
+ 
+-	skb = tipc_buf_acquire(MAX_H_SIZE, GFP_ATOMIC);
++	skb = tipc_buf_acquire(MAX_H_SIZE + NODE_ID_LEN, GFP_ATOMIC);
+ 	if (!skb)
+ 		return;
++	hdr = buf_msg(skb);
+ 	tipc_disc_init_msg(net, skb, mtyp, b);
++	msg_set_sugg_node_addr(hdr, sugg_addr);
++	msg_set_dest_domain(hdr, dst);
+ 	tipc_bearer_xmit_skb(net, b->identity, skb, maddr);
+ }
+ 
+@@ -126,6 +132,52 @@ static void disc_dupl_alert(struct tipc_bearer *b, u32 node_addr,
+ 		media_addr_str, b->name);
+ }
+ 
++/* tipc_disc_addr_trial(): - handle an address uniqueness trial from peer
++ */
++bool tipc_disc_addr_trial_msg(struct tipc_discoverer *d,
++			      struct tipc_media_addr *maddr,
++			      struct tipc_bearer *b,
++			      u32 dst, u32 src,
++			      u32 sugg_addr,
++			      u8 *peer_id,
++			      int mtyp)
++{
++	struct net *net = d->net;
++	struct tipc_net *tn = tipc_net(net);
++	bool trial = time_before(jiffies, tn->addr_trial_end);
++	u32 self = tipc_own_addr(net);
++
++	if (mtyp == DSC_TRIAL_FAIL_MSG) {
++		if (!trial)
++			return true;
++
++		/* Ignore if somebody else already gave new suggestion */
++		if (dst != tn->trial_addr)
++			return true;
++
++		/* Otherwise update trial address and restart trial period */
++		tn->trial_addr = sugg_addr;
++		msg_set_prevnode(buf_msg(d->skb), sugg_addr);
++		tn->addr_trial_end = jiffies + msecs_to_jiffies(1000);
++		return true;
++	}
++
++	/* Apply trial address if we just left trial period */
++	if (!trial && !self) {
++		tipc_net_finalize(net, tn->trial_addr);
++		msg_set_type(buf_msg(d->skb), DSC_REQ_MSG);
++	}
++
++	if (mtyp != DSC_TRIAL_MSG)
++		return false;
++
++	sugg_addr = tipc_node_try_addr(net, peer_id, src);
++	if (sugg_addr)
++		tipc_disc_msg_xmit(net, DSC_TRIAL_FAIL_MSG, src,
++				   self, sugg_addr, maddr, b);
++	return true;
++}
++
+ /**
+  * tipc_disc_rcv - handle incoming discovery message (request or response)
+  * @net: applicable net namespace
+@@ -139,17 +191,27 @@ void tipc_disc_rcv(struct net *net, struct sk_buff *skb,
+ 	struct tipc_msg *hdr = buf_msg(skb);
+ 	u16 caps = msg_node_capabilities(hdr);
+ 	bool legacy = tn->legacy_addr_format;
++	u32 sugg = msg_sugg_node_addr(hdr);
+ 	u32 signature = msg_node_sig(hdr);
++	u8 peer_id[NODE_ID_LEN] = {0,};
+ 	u32 dst = msg_dest_domain(hdr);
+ 	u32 net_id = msg_bc_netid(hdr);
+-	u32 self = tipc_own_addr(net);
+ 	struct tipc_media_addr maddr;
+ 	u32 src = msg_prevnode(hdr);
+ 	u32 mtyp = msg_type(hdr);
+ 	bool dupl_addr = false;
+ 	bool respond = false;
++	u32 self;
+ 	int err;
+ 
++	skb_linearize(skb);
++	hdr = buf_msg(skb);
++
++	if (caps & TIPC_NODE_ID128)
++		memcpy(peer_id, msg_node_id(hdr), NODE_ID_LEN);
++	else
++		sprintf(peer_id, "%x", src);
++
+ 	err = b->media->msg2addr(b, &maddr, msg_media_addr(hdr));
+ 	kfree_skb(skb);
+ 	if (err || maddr.broadcast) {
+@@ -161,6 +223,12 @@ void tipc_disc_rcv(struct net *net, struct sk_buff *skb,
+ 		return;
+ 	if (net_id != tn->net_id)
+ 		return;
++	if (tipc_disc_addr_trial_msg(b->disc, &maddr, b, dst,
++				     src, sugg, peer_id, mtyp))
++		return;
++	self = tipc_own_addr(net);
++
++	/* Message from somebody using this node's address */
+ 	if (in_own_node(net, src)) {
+ 		disc_dupl_alert(b, self, &maddr);
+ 		return;
+@@ -169,8 +237,7 @@ void tipc_disc_rcv(struct net *net, struct sk_buff *skb,
+ 		return;
+ 	if (!tipc_in_scope(legacy, b->domain, src))
+ 		return;
+-
+-	tipc_node_check_dest(net, src, b, caps, signature,
++	tipc_node_check_dest(net, src, peer_id, b, caps, signature,
+ 			     &maddr, &respond, &dupl_addr);
+ 	if (dupl_addr)
+ 		disc_dupl_alert(b, src, &maddr);
+@@ -178,7 +245,7 @@ void tipc_disc_rcv(struct net *net, struct sk_buff *skb,
+ 		return;
+ 	if (mtyp != DSC_REQ_MSG)
+ 		return;
+-	tipc_disc_msg_xmit(net, DSC_RESP_MSG, src, self, &maddr, b);
++	tipc_disc_msg_xmit(net, DSC_RESP_MSG, src, self, 0, &maddr, b);
+ }
+ 
+ /* tipc_disc_add_dest - increment set of discovered nodes
+@@ -216,9 +283,11 @@ void tipc_disc_remove_dest(struct tipc_discoverer *d)
+ static void tipc_disc_timeout(struct timer_list *t)
+ {
+ 	struct tipc_discoverer *d = from_timer(d, t, timer);
++	struct tipc_net *tn = tipc_net(d->net);
++	u32 self = tipc_own_addr(d->net);
+ 	struct tipc_media_addr maddr;
+ 	struct sk_buff *skb = NULL;
+-	struct net *net;
++	struct net *net = d->net;
+ 	u32 bearer_id;
+ 
+ 	spin_lock_bh(&d->lock);
+@@ -228,16 +297,29 @@ static void tipc_disc_timeout(struct timer_list *t)
+ 		d->timer_intv = TIPC_DISC_INACTIVE;
+ 		goto exit;
+ 	}
++
++	/* Did we just leave the address trial period ? */
++	if (!self && !time_before(jiffies, tn->addr_trial_end)) {
++		self = tn->trial_addr;
++		tipc_net_finalize(net, self);
++		msg_set_prevnode(buf_msg(d->skb), self);
++		msg_set_type(buf_msg(d->skb), DSC_REQ_MSG);
++	}
++
+ 	/* Adjust timeout interval according to discovery phase */
+-	d->timer_intv *= 2;
+-	if (d->num_nodes && d->timer_intv > TIPC_DISC_SLOW)
+-		d->timer_intv = TIPC_DISC_SLOW;
+-	else if (!d->num_nodes && d->timer_intv > TIPC_DISC_FAST)
+-		d->timer_intv = TIPC_DISC_FAST;
++	if (time_before(jiffies, tn->addr_trial_end)) {
++		d->timer_intv = TIPC_DISC_INIT;
++	} else {
++		d->timer_intv *= 2;
++		if (d->num_nodes && d->timer_intv > TIPC_DISC_SLOW)
++			d->timer_intv = TIPC_DISC_SLOW;
++		else if (!d->num_nodes && d->timer_intv > TIPC_DISC_FAST)
++			d->timer_intv = TIPC_DISC_FAST;
++	}
++
+ 	mod_timer(&d->timer, jiffies + d->timer_intv);
+ 	memcpy(&maddr, &d->dest, sizeof(maddr));
+ 	skb = skb_clone(d->skb, GFP_ATOMIC);
+-	net = d->net;
+ 	bearer_id = d->bearer_id;
+ exit:
+ 	spin_unlock_bh(&d->lock);
+@@ -257,18 +339,24 @@ static void tipc_disc_timeout(struct timer_list *t)
+ int tipc_disc_create(struct net *net, struct tipc_bearer *b,
+ 		     struct tipc_media_addr *dest, struct sk_buff **skb)
+ {
++	struct tipc_net *tn = tipc_net(net);
+ 	struct tipc_discoverer *d;
+ 
+ 	d = kmalloc(sizeof(*d), GFP_ATOMIC);
+ 	if (!d)
+ 		return -ENOMEM;
+-	d->skb = tipc_buf_acquire(MAX_H_SIZE, GFP_ATOMIC);
++	d->skb = tipc_buf_acquire(MAX_H_SIZE + NODE_ID_LEN, GFP_ATOMIC);
+ 	if (!d->skb) {
+ 		kfree(d);
+ 		return -ENOMEM;
+ 	}
+-
+ 	tipc_disc_init_msg(net, d->skb, DSC_REQ_MSG, b);
++
++	/* Do we need an address trial period first ? */
++	if (!tipc_own_addr(net)) {
++		tn->addr_trial_end = jiffies + msecs_to_jiffies(1000);
++		msg_set_type(buf_msg(d->skb), DSC_TRIAL_MSG);
++	}
+ 	memcpy(&d->dest, dest, sizeof(*dest));
+ 	d->net = net;
+ 	d->bearer_id = b->identity;
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index bcd76b1..1289b4b 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -434,15 +434,16 @@ char *tipc_link_name(struct tipc_link *l)
+  */
+ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 		      int tolerance, char net_plane, u32 mtu, int priority,
+-		      int window, u32 session, u32 self, u32 peer,
+-		      u16 peer_caps,
++		      int window, u32 session, u32 self,
++		      u32 peer, u8 *peer_id, u16 peer_caps,
+ 		      struct tipc_link *bc_sndlink,
+ 		      struct tipc_link *bc_rcvlink,
+ 		      struct sk_buff_head *inputq,
+ 		      struct sk_buff_head *namedq,
+ 		      struct tipc_link **link)
+ {
+-	char *self_str = tipc_own_id_string(net);
++	char peer_str[NODE_ID_STR_LEN] = {0,};
++	char self_str[NODE_ID_STR_LEN] = {0,};
+ 	struct tipc_link *l;
+ 
+ 	l = kzalloc(sizeof(*l), GFP_ATOMIC);
+@@ -451,11 +452,18 @@ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 	*link = l;
+ 	l->session = session;
+ 
+-	/* Note: peer i/f name is completed by reset/activate message */
+-	if (strlen(self_str) > 16)
+-		sprintf(l->name, "%x:%s-%x:unknown", self, if_name, peer);
+-	else
+-		sprintf(l->name, "%s:%s-%x:unknown", self_str, if_name, peer);
++	/* Set link name for unicast links only */
++	if (peer_id) {
++		tipc_nodeid2string(self_str, tipc_own_id(net));
++		if (strlen(self_str) > 16)
++			sprintf(self_str, "%x", self);
++		tipc_nodeid2string(peer_str, peer_id);
++		if (strlen(peer_str) > 16)
++			sprintf(peer_str, "%x", peer);
++	}
++	/* Peer i/f name will be completed by reset/activate message */
++	sprintf(l->name, "%s:%s-%s:unknown", self_str, if_name, peer_str);
++
+ 	strcpy(l->if_name, if_name);
+ 	l->addr = peer;
+ 	l->peer_caps = peer_caps;
+@@ -503,7 +511,7 @@ bool tipc_link_bc_create(struct net *net, u32 ownnode, u32 peer,
+ 	struct tipc_link *l;
+ 
+ 	if (!tipc_link_create(net, "", MAX_BEARERS, 0, 'Z', mtu, 0, window,
+-			      0, ownnode, peer, peer_caps, bc_sndlink,
++			      0, ownnode, peer, NULL, peer_caps, bc_sndlink,
+ 			      NULL, inputq, namedq, link))
+ 		return false;
+ 
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index d1bd178..ec59348 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -73,8 +73,8 @@ enum {
+ 
+ bool tipc_link_create(struct net *net, char *if_name, int bearer_id,
+ 		      int tolerance, char net_plane, u32 mtu, int priority,
+-		      int window, u32 session, u32 ownnode, u32 peer,
+-		      u16 peer_caps,
++		      int window, u32 session, u32 ownnode,
++		      u32 peer, u8 *peer_id, u16 peer_caps,
+ 		      struct tipc_link *bc_sndlink,
+ 		      struct tipc_link *bc_rcvlink,
+ 		      struct sk_buff_head *inputq,
+diff --git a/net/tipc/msg.h b/net/tipc/msg.h
+index b4ba1b4..a4e944d 100644
+--- a/net/tipc/msg.h
++++ b/net/tipc/msg.h
+@@ -550,6 +550,8 @@ static inline void msg_set_nameupper(struct tipc_msg *m, u32 n)
+  */
+ #define DSC_REQ_MSG		0
+ #define DSC_RESP_MSG		1
++#define DSC_TRIAL_MSG		2
++#define DSC_TRIAL_FAIL_MSG	3
+ 
+ /*
+  * Group protocol message types
+@@ -627,7 +629,6 @@ static inline void msg_set_bcgap_to(struct tipc_msg *m, u32 n)
+ 	msg_set_bits(m, 2, 0, 0xffff, n);
+ }
+ 
+-
+ /*
+  * Word 4
+  */
+@@ -925,6 +926,26 @@ static inline bool msg_is_reset(struct tipc_msg *hdr)
+ 	return (msg_user(hdr) == LINK_PROTOCOL) && (msg_type(hdr) == RESET_MSG);
+ }
+ 
++static inline u32 msg_sugg_node_addr(struct tipc_msg *m)
++{
++	return msg_word(m, 14);
++}
++
++static inline void msg_set_sugg_node_addr(struct tipc_msg *m, u32 n)
++{
++	msg_set_word(m, 14, n);
++}
++
++static inline void msg_set_node_id(struct tipc_msg *hdr, u8 *id)
++{
++	memcpy(msg_data(hdr), id, 16);
++}
++
++static inline u8 *msg_node_id(struct tipc_msg *hdr)
++{
++	return (u8 *)msg_data(hdr);
++}
++
+ struct sk_buff *tipc_buf_acquire(u32 size, gfp_t gfp);
+ bool tipc_msg_validate(struct sk_buff **_skb);
+ bool tipc_msg_reverse(u32 own_addr, struct sk_buff **skb, int err);
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index e786748..29538dc 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -112,10 +112,8 @@ int tipc_net_init(struct net *net, u8 *node_id, u32 addr)
+ 	}
+ 	pr_info("Started in network mode\n");
+ 
+-	if (node_id) {
++	if (node_id)
+ 		tipc_set_node_id(net, node_id);
+-		tipc_net_finalize(net, tipc_own_addr(net));
+-	}
+ 	if (addr)
+ 		tipc_net_finalize(net, addr);
+ 	return 0;
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 7b0c993..4a95c8c 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -115,6 +115,7 @@ struct tipc_node {
+ 	u16 capabilities;
+ 	u32 signature;
+ 	u32 link_id;
++	u8 peer_id[16];
+ 	struct list_head publ_list;
+ 	struct list_head conn_sks;
+ 	unsigned long keepalive_intv;
+@@ -156,6 +157,7 @@ static void tipc_node_link_down(struct tipc_node *n, int bearer_id,
+ static void tipc_node_timeout(struct timer_list *t);
+ static void tipc_node_fsm_evt(struct tipc_node *n, int evt);
+ static struct tipc_node *tipc_node_find(struct net *net, u32 addr);
++static struct tipc_node *tipc_node_find_by_id(struct net *net, u8 *id);
+ static void tipc_node_put(struct tipc_node *node);
+ static bool node_is_up(struct tipc_node *n);
+ 
+@@ -245,6 +247,30 @@ static struct tipc_node *tipc_node_find(struct net *net, u32 addr)
+ 	return node;
+ }
+ 
++/* tipc_node_find_by_id - locate specified node object by its 128-bit id
++ * Note: this function is called only when a discovery request failed
++ * to find the node by its 32-bit id, and is not time critical
++ */
++static struct tipc_node *tipc_node_find_by_id(struct net *net, u8 *id)
++{
++	struct tipc_net *tn = tipc_net(net);
++	struct tipc_node *n;
++	bool found = false;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(n, &tn->node_list, list) {
++		read_lock_bh(&n->lock);
++		if (!memcmp(id, n->peer_id, 16) &&
++		    kref_get_unless_zero(&n->kref))
++			found = true;
++		read_unlock_bh(&n->lock);
++		if (found)
++			break;
++	}
++	rcu_read_unlock();
++	return found ? n : NULL;
++}
++
+ static void tipc_node_read_lock(struct tipc_node *n)
+ {
+ 	read_lock_bh(&n->lock);
+@@ -307,7 +333,8 @@ static void tipc_node_write_unlock(struct tipc_node *n)
+ 	}
+ }
+ 
+-struct tipc_node *tipc_node_create(struct net *net, u32 addr, u16 capabilities)
++struct tipc_node *tipc_node_create(struct net *net, u32 addr,
++				   u8 *peer_id, u16 capabilities)
+ {
+ 	struct tipc_net *tn = net_generic(net, tipc_net_id);
+ 	struct tipc_node *n, *temp_node;
+@@ -326,6 +353,7 @@ struct tipc_node *tipc_node_create(struct net *net, u32 addr, u16 capabilities)
+ 		goto exit;
+ 	}
+ 	n->addr = addr;
++	memcpy(&n->peer_id, peer_id, 16);
+ 	n->net = net;
+ 	n->capabilities = capabilities;
+ 	kref_init(&n->kref);
+@@ -344,8 +372,8 @@ struct tipc_node *tipc_node_create(struct net *net, u32 addr, u16 capabilities)
+ 	n->signature = INVALID_NODE_SIG;
+ 	n->active_links[0] = INVALID_BEARER_ID;
+ 	n->active_links[1] = INVALID_BEARER_ID;
+-	if (!tipc_link_bc_create(net, tipc_own_addr(net), n->addr,
+-				 U16_MAX,
++	if (!tipc_link_bc_create(net, tipc_own_addr(net),
++				 addr, U16_MAX,
+ 				 tipc_link_window(tipc_bc_sndlink(net)),
+ 				 n->capabilities,
+ 				 &n->bc_entry.inputq1,
+@@ -735,8 +763,51 @@ bool tipc_node_is_up(struct net *net, u32 addr)
+ 	return retval;
+ }
+ 
+-void tipc_node_check_dest(struct net *net, u32 onode,
+-			  struct tipc_bearer *b,
++static u32 tipc_node_suggest_addr(struct net *net, u32 addr)
++{
++	struct tipc_node *n;
++
++	addr ^= tipc_net(net)->random;
++	while ((n = tipc_node_find(net, addr))) {
++		tipc_node_put(n);
++		addr++;
++	}
++	return addr;
++}
++
++/* tipc_node_try_addr(): Check if addr can be used by peer, suggest other if not
++ */
++u32 tipc_node_try_addr(struct net *net, u8 *id, u32 addr)
++{
++	struct tipc_net *tn = tipc_net(net);
++	struct tipc_node *n;
++
++	/* Suggest new address if some other peer is using this one */
++	n = tipc_node_find(net, addr);
++	if (n) {
++		if (!memcmp(n->peer_id, id, NODE_ID_LEN))
++			addr = 0;
++		tipc_node_put(n);
++		if (!addr)
++			return 0;
++		return tipc_node_suggest_addr(net, addr);
++	}
++
++	/* Suggest previously used address if peer is known */
++	n = tipc_node_find_by_id(net, id);
++	if (n) {
++		addr = n->addr;
++		tipc_node_put(n);
++	}
++	/* Even this node may be in trial phase */
++	if (tn->trial_addr == addr)
++		return tipc_node_suggest_addr(net, addr);
++
++	return addr;
++}
++
++void tipc_node_check_dest(struct net *net, u32 addr,
++			  u8 *peer_id, struct tipc_bearer *b,
+ 			  u16 capabilities, u32 signature,
+ 			  struct tipc_media_addr *maddr,
+ 			  bool *respond, bool *dupl_addr)
+@@ -755,7 +826,7 @@ void tipc_node_check_dest(struct net *net, u32 onode,
+ 	*dupl_addr = false;
+ 	*respond = false;
+ 
+-	n = tipc_node_create(net, onode, capabilities);
++	n = tipc_node_create(net, addr, peer_id, capabilities);
+ 	if (!n)
+ 		return;
+ 
+@@ -840,7 +911,7 @@ void tipc_node_check_dest(struct net *net, u32 onode,
+ 		if (!tipc_link_create(net, if_name, b->identity, b->tolerance,
+ 				      b->net_plane, b->mtu, b->priority,
+ 				      b->window, mod(tipc_net(net)->random),
+-				      tipc_own_addr(net), onode,
++				      tipc_own_addr(net), addr, peer_id,
+ 				      n->capabilities,
+ 				      tipc_bc_sndlink(n->net), n->bc_entry.link,
+ 				      &le->inputq,
+diff --git a/net/tipc/node.h b/net/tipc/node.h
+index e06faf4..f24b835 100644
+--- a/net/tipc/node.h
++++ b/net/tipc/node.h
+@@ -60,7 +60,8 @@ enum {
+ #define INVALID_BEARER_ID -1
+ 
+ void tipc_node_stop(struct net *net);
+-void tipc_node_check_dest(struct net *net, u32 onode,
++u32 tipc_node_try_addr(struct net *net, u8 *id, u32 addr);
++void tipc_node_check_dest(struct net *net, u32 onode, u8 *peer_id128,
+ 			  struct tipc_bearer *bearer,
+ 			  u16 capabilities, u32 signature,
+ 			  struct tipc_media_addr *maddr,
+-- 
+1.7.9.5
+

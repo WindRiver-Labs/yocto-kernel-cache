@@ -1,0 +1,103 @@
+From f4c5e0befea312899cbbdca24928a4c9ea2c76b6 Mon Sep 17 00:00:00 2001
+From: Tung Nguyen <tung.q.nguyen@dektech.com.au>
+Date: Thu, 28 Jun 2018 22:25:04 +0200
+Subject: [PATCH 155/176] tipc: eliminate buffer cloning in function
+ tipc_msg_extract()
+
+commit ef9be755697f1b841c2a219a05df1a72ccd6f471 upstream
+
+The function tipc_msg_extract() is using skb_clone() to clone inner
+messages from a message bundle buffer. Although this method is safe,
+it has an undesired effect that each buffer clone inherits the
+true-size of the bundling buffer. As a result, the buffer clone
+almost always ends up with being copied anyway by the message
+validation function. This makes the cloning into a sub-optimization.
+
+In this commit we take the consequence of this realization, and copy
+each inner message to a separately allocated buffer up front in the
+extraction function.
+
+As a bonus we can now eliminate the two cases where we had to copy
+re-routed packets that may potentially go out on the wire again.
+
+Signed-off-by: Tung Nguyen <tung.q.nguyen@dektech.com.au>
+Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Zhenbo Gao <zhenbo.gao@windriver.com>
+---
+ net/tipc/msg.c |   35 +++++++++++++++--------------------
+ 1 file changed, 15 insertions(+), 20 deletions(-)
+
+diff --git a/net/tipc/msg.c b/net/tipc/msg.c
+index b6c45dc..b618910 100644
+--- a/net/tipc/msg.c
++++ b/net/tipc/msg.c
+@@ -416,26 +416,31 @@ bool tipc_msg_bundle(struct sk_buff *skb, struct tipc_msg *msg, u32 mtu)
+  */
+ bool tipc_msg_extract(struct sk_buff *skb, struct sk_buff **iskb, int *pos)
+ {
+-	struct tipc_msg *msg;
+-	int imsz, offset;
++	struct tipc_msg *hdr, *ihdr;
++	int imsz;
+ 
+ 	*iskb = NULL;
+ 	if (unlikely(skb_linearize(skb)))
+ 		goto none;
+ 
+-	msg = buf_msg(skb);
+-	offset = msg_hdr_sz(msg) + *pos;
+-	if (unlikely(offset > (msg_size(msg) - MIN_H_SIZE)))
++	hdr = buf_msg(skb);
++	if (unlikely(*pos > (msg_data_sz(hdr) - MIN_H_SIZE)))
+ 		goto none;
+ 
+-	*iskb = skb_clone(skb, GFP_ATOMIC);
+-	if (unlikely(!*iskb))
++	ihdr = (struct tipc_msg *)(msg_data(hdr) + *pos);
++	imsz = msg_size(ihdr);
++
++	if ((*pos + imsz) > msg_data_sz(hdr))
+ 		goto none;
+-	skb_pull(*iskb, offset);
+-	imsz = msg_size(buf_msg(*iskb));
+-	skb_trim(*iskb, imsz);
++
++	*iskb = tipc_buf_acquire(imsz, GFP_ATOMIC);
++	if (!*iskb)
++		goto none;
++
++	skb_copy_to_linear_data(*iskb, ihdr, imsz);
+ 	if (unlikely(!tipc_msg_validate(iskb)))
+ 		goto none;
++
+ 	*pos += align(imsz);
+ 	return true;
+ none:
+@@ -531,12 +536,6 @@ bool tipc_msg_reverse(u32 own_node,  struct sk_buff **skb, int err)
+ 		msg_set_hdr_sz(hdr, BASIC_H_SIZE);
+ 	}
+ 
+-	if (skb_cloned(_skb) &&
+-	    pskb_expand_head(_skb, BUF_HEADROOM, BUF_TAILROOM, GFP_ATOMIC))
+-		goto exit;
+-
+-	/* reassign after skb header modifications */
+-	hdr = buf_msg(_skb);
+ 	/* Now reverse the concerned fields */
+ 	msg_set_errcode(hdr, err);
+ 	msg_set_non_seq(hdr, 0);
+@@ -595,10 +594,6 @@ bool tipc_msg_lookup_dest(struct net *net, struct sk_buff *skb, int *err)
+ 	if (!skb_cloned(skb))
+ 		return true;
+ 
+-	/* Unclone buffer in case it was bundled */
+-	if (pskb_expand_head(skb, BUF_HEADROOM, BUF_TAILROOM, GFP_ATOMIC))
+-		return false;
+-
+ 	return true;
+ }
+ 
+-- 
+1.7.9.5
+
