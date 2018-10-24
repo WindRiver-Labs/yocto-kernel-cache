@@ -1,0 +1,122 @@
+From ffe991bd5522feb7319a08e7c9ab4f82e0ab44a6 Mon Sep 17 00:00:00 2001
+From: James Morse <james.morse@arm.com>
+Date: Thu, 2 Nov 2017 12:12:37 +0000
+Subject: [PATCH 4/9] arm64: Mask all exceptions during kernel_exit
+
+commit 8d66772e869e79ffb94eed7492ca3d2267e150e8 from upstream
+
+To take RAS Exceptions as quickly as possible we need to keep SError
+unmasked as much as possible. We need to mask it during kernel_exit
+as taking an error from this code will overwrite the exception-registers.
+
+Adding a naked 'disable_daif' to kernel_exit causes a performance problem
+for micro-benchmarks that do no real work, (e.g. calling getpid() in a
+loop). This is because the ret_to_user loop has already masked IRQs so
+that the TIF_WORK_MASK thread flags can't change underneath it, adding
+disable_daif is an additional self-synchronising operation.
+
+In the future, the RAS APEI code may need to modify the TIF_WORK_MASK
+flags from an SError, in which case the ret_to_user loop must mask SError
+while it examines the flags.
+
+Disable all exceptions for return to EL1. For return to EL0 get the
+ret_to_user loop to leave all exceptions masked once it has done its
+work, this avoids an extra pstate-write.
+
+Signed-off-by: James Morse <james.morse@arm.com>
+Reviewed-by: Julien Thierry <julien.thierry@arm.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm64/kernel/entry.S  |   10 +++++-----
+ arch/arm64/kernel/signal.c |    8 ++++++--
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index c1ffa95..167345b 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -269,6 +269,8 @@ alternative_else_nop_endif
+ 
+ 	.macro	kernel_exit, el
+ 	.if	\el != 0
++	disable_daif
++
+ 	/* Restore the task's original addr_limit. */
+ 	ldr	x20, [sp, #S_ORIG_ADDR_LIMIT]
+ 	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
+@@ -584,8 +586,6 @@ el1_da:
+ 	mov	x2, sp				// struct pt_regs
+ 	bl	do_mem_abort
+ 
+-	// disable interrupts before pulling preserved data off the stack
+-	disable_irq
+ 	kernel_exit 1
+ el1_sp_pc:
+ 	/*
+@@ -869,7 +869,7 @@ ENDPROC(el0_irq)
+  * and this includes saving x0 back into the kernel stack.
+  */
+ ret_fast_syscall:
+-	disable_irq				// disable interrupts
++	disable_daif
+ 	str	x0, [sp, #S_X0]			// returned x0
+ 	ldr	x1, [tsk, #TSK_TI_FLAGS]	// re-check for syscall tracing
+ 	and	x2, x1, #_TIF_SYSCALL_WORK
+@@ -879,7 +879,7 @@ ret_fast_syscall:
+ 	enable_step_tsk x1, x2
+ 	kernel_exit 0
+ ret_fast_syscall_trace:
+-	enable_irq				// enable interrupts
++	enable_daif
+ 	b	__sys_trace_return_skipped	// we already saved x0
+ 
+ /*
+@@ -897,7 +897,7 @@ work_pending:
+  * "slow" syscall return path.
+  */
+ ret_to_user:
+-	disable_irq				// disable interrupts
++	disable_daif
+ 	ldr	x1, [tsk, #TSK_TI_FLAGS]
+ 	and	x2, x1, #_TIF_WORK_MASK
+ 	cbnz	x2, work_pending
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index 3d04da4..5124011 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -27,6 +27,7 @@
+ #include <linux/ratelimit.h>
+ #include <linux/syscalls.h>
+ 
++#include <asm/daifflags.h>
+ #include <asm/debug-monitors.h>
+ #include <asm/elf.h>
+ #include <asm/cacheflush.h>
+@@ -415,9 +416,12 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 		addr_limit_user_check();
+ 
+ 		if (thread_flags & _TIF_NEED_RESCHED) {
++			/* Unmask Debug and SError for the next task */
++			local_daif_restore(DAIF_PROCCTX_NOIRQ);
++
+ 			schedule();
+ 		} else {
+-			local_irq_enable();
++			local_daif_restore(DAIF_PROCCTX);
+ 
+ 			if (thread_flags & _TIF_UPROBE)
+ 				uprobe_notify_resume(regs);
+@@ -434,7 +438,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 				fpsimd_restore_current_state();
+ 		}
+ 
+-		local_irq_disable();
++		local_daif_mask();
+ 		thread_flags = READ_ONCE(current_thread_info()->flags);
+ 	} while (thread_flags & _TIF_WORK_MASK);
+ }
+-- 
+1.7.9.5
+
