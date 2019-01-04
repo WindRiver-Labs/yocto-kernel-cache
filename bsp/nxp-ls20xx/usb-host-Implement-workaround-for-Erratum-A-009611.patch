@@ -1,0 +1,155 @@
+From 906cd7d32f8918e7ff042da4db8fd8ae387ad4c8 Mon Sep 17 00:00:00 2001
+From: "yinbo.zhu" <yinbo.zhu@nxp.com>
+Date: Thu, 7 Sep 2017 11:40:45 +0800
+Subject: [PATCH 360/767] usb: host: Implement workaround for Erratum A-009611
+
+This is a occasional problem where the software issues an End
+Transfer command while a USB transfer is in progress,
+resulting in the TxFIFO  being flushed when the lower layer is
+waiting for data, causing the super speed (ss) transmit to get
+blocked. If the End Transfer command is issued on an IN
+endpoint to flush out the pending transfers when the same IN
+endpoint is doing transfers on the USB, then depending upon
+the timing of the End Transfer (and the resulting internal
+flush),the lower layer (U3PTL/U3MAC) could get stuck waiting
+for data indefinitely. This blocks the transmission path on
+the SS, and no DP/ACK/ERDY/DEVNOTIF packets can be sent from
+the device. Impact: If this issue happens and the transmission
+gets blocked, then the USB host aborts and
+resets/re-enumerates the device. This unblocks the transmitt
+engine and the device functions normally.
+
+Workaround: Software must wait for all existing TRBs to
+complete before issuing End transfer command.
+
+Configs Affected:
+LS1088-48A-R1.0, LS2081A-R1.1, LS2088-48A-R1.0,
+LS2088-48A-R1.1, LX2160-2120-2080A-R1.
+
+Signed-off-by: yinbo zhu <yinbo.zhu@nxp.com>
+[Xulin: Original patch taken from NXP LSDK-18.09.]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/usb/dwc3/core.c      |  2 ++
+ drivers/usb/dwc3/core.h      |  3 +++
+ drivers/usb/dwc3/host.c      |  3 +++
+ drivers/usb/host/xhci-plat.c |  4 ++++
+ drivers/usb/host/xhci.c      | 25 +++++++++++++++++++------
+ drivers/usb/host/xhci.h      |  1 +
+ 6 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 086be9b012bd..c4fc9f2c36c2 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -1249,6 +1249,8 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 
+ 	dwc->quirk_reverse_in_out = device_property_read_bool(dev,
+ 				"snps,quirk_reverse_in_out");
++	dwc->quirk_stop_transfer_in_block = device_property_read_bool(dev,
++				"snps,quirk_stop_transfer_in_block");
+ 	dwc->tx_de_emphasis_quirk = device_property_read_bool(dev,
+ 				"snps,tx_de_emphasis_quirk");
+ 	dwc->disable_devinit_u1u2_quirk = device_property_read_bool(dev,
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 164b586ceb45..0b6d45a7b9b5 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1019,6 +1019,8 @@ struct dwc3_scratchpad_array {
+  * @dis_metastability_quirk: set to disable metastability quirk.
+  * @disable_devinit_u1u2_quirk: disable device-initiated U1/U2 request.
+  * @quirk_reverse_in_out: prevent tx fifo reverse the data direction
++ * @quirk_stop_transfer_in_block: prevent block transmission from being
++ *				interrupted
+  * @imod_interval: set the interrupt moderation interval in 250ns
+  *                 increments or 0 to disable.
+  */
+@@ -1197,6 +1199,7 @@ struct dwc3 {
+ 	unsigned		tx_de_emphasis:2;
+ 	unsigned		disable_devinit_u1u2_quirk:1;
+ 	unsigned                quirk_reverse_in_out:1;
++	unsigned                quirk_stop_transfer_in_block:1;
+ 
+ 	unsigned		dis_metastability_quirk:1;
+ 
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index c84ca1228a29..20210b534a8e 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -102,6 +102,9 @@ int dwc3_host_init(struct dwc3 *dwc)
+ 	if (dwc->quirk_reverse_in_out)
+ 		props[prop_idx++].name = "quirk-reverse-in-out";
+ 
++	if (dwc->quirk_stop_transfer_in_block)
++		props[prop_idx++].name = "quirk-stop-transfer-in-block";
++
+ 	if (dwc->usb3_lpm_capable)
+ 		props[prop_idx++].name = "usb3-lpm-capable";
+ 
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index 2100196fdcd1..25a7eb8414e8 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -287,6 +287,10 @@ static int xhci_plat_probe(struct platform_device *pdev)
+ 		if (device_property_read_bool(&pdev->dev, "quirk-reverse-in-out"))
+ 			xhci->quirks |= XHCI_REVERSE_IN_OUT;
+ 
++		if (device_property_read_bool(&pdev->dev,
++				"quirk-stop-transfer-in-block"))
++			xhci->quirks |= XHCI_STOP_TRANSFER_IN_BLOCK;
++
+ 		if (device_property_read_bool(tmpdev, "quirk-broken-port-ped"))
+ 			xhci->quirks |= XHCI_BROKEN_PORT_PED;
+ 
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index c2220a7fc758..06f8a1f48e53 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -1641,13 +1641,26 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 			ret = -ENOMEM;
+ 			goto done;
+ 		}
+-		ep->ep_state |= EP_STOP_CMD_PENDING;
+-		ep->stop_cmd_timer.expires = jiffies +
++		/*
++		 *erratum A-009611: Issuing an End Transfer command on an IN
++		 *endpoint. when a transfer is in progress on USB blocks the
++		 *transmission.
++		 *Workaround: Software must wait for all existing TRBs to
++		 *complete before issuing End transfer command.
++		 */
++		if ((ep_ring->enqueue == ep_ring->dequeue &&
++				(xhci->quirks & XHCI_STOP_TRANSFER_IN_BLOCK)) ||
++				!(xhci->quirks & XHCI_STOP_TRANSFER_IN_BLOCK)) {
++			ep->ep_state |= EP_STOP_CMD_PENDING;
++			ep->stop_cmd_timer.expires = jiffies +
+ 			XHCI_STOP_EP_CMD_TIMEOUT * HZ;
+-		add_timer(&ep->stop_cmd_timer);
+-		xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
+-					 ep_index, 0);
+-		xhci_ring_cmd_db(xhci);
++			add_timer(&ep->stop_cmd_timer);
++			xhci_queue_stop_endpoint(xhci, command,
++					urb->dev->slot_id,
++					ep_index, 0);
++			xhci_ring_cmd_db(xhci);
++		}
++
+ 	}
+ done:
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index b9570ed18e3c..95c904740968 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1838,6 +1838,7 @@ struct xhci_hcd {
+ #define XHCI_NO_64BIT_SUPPORT	BIT_ULL(23)
+ #define XHCI_MISSING_CAS	BIT_ULL(24)
+ #define XHCI_REVERSE_IN_OUT     BIT(32)
++#define XHCI_STOP_TRANSFER_IN_BLOCK   BIT(33)
+ /* For controller with a broken Port Disable implementation */
+ #define XHCI_BROKEN_PORT_PED	BIT_ULL(25)
+ #define XHCI_LIMIT_ENDPOINT_INTERVAL_7	BIT_ULL(26)
+-- 
+2.17.0
+

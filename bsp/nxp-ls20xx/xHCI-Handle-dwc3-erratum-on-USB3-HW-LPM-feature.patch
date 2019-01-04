@@ -1,0 +1,118 @@
+From 9db3426d64b92e87260b6fbdb511a77e60f2acf9 Mon Sep 17 00:00:00 2001
+From: Ran Wang <ran.wang_1@nxp.com>
+Date: Fri, 5 Jan 2018 15:40:40 +0800
+Subject: [PATCH 362/767] xHCI: Handle dwc3 erratum on USB3 HW LPM feature.
+
+Synopsys STARS ticket: 90000969472(A-010131)
+
+Description: This erratum is applicable for the USB 3.0 Super
+Speed host mode operation. When the U2 timer expires while in
+U1 mode, the USB 3.0 controller completes a U1->U2 entry operation
+lasting three mac3_clk (24 ns). If the xHCI driver issues a
+U3 request during this operation, thecontroller drops this request.
+
+Impact: The controller ignores the request when the xHCI driver
+programs the U3 entry (PORTSC.PLS = U3).
+
+Workaround:
+1. Before initiating U3 entry, save PORTPMSC.
+2. Disable U2 entry by programming PORTPMSC[U2 Timeout] = h'FF.
+3. After U3 entry, re-enable the U2 timer by programming PORTPMSC
+with the value saved in Step 1.
+
+Signed-off-by: Ran Wang <ran.wang_1@nxp.com>
+[Xulin: Original patch taken from NXP LSDK-18.09.]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/usb/host/xhci-hub.c  | 22 ++++++++++++++++++++++
+ drivers/usb/host/xhci-plat.c |  6 +++++-
+ drivers/usb/host/xhci-ring.c |  3 +--
+ drivers/usb/host/xhci.h      |  1 +
+ 4 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 1f7eeee2ebca..be394d4c9e44 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -666,12 +666,34 @@ void xhci_set_link_state(struct xhci_hcd *xhci, struct xhci_port *port,
+ 			 u32 link_state)
+ {
+ 	u32 temp;
++	u32 portpmsc_u2_backup = 0;
++
++	/* Backup U2 timeout info before initiating U3 entry erratum A-010131 */
++	if (xhci->shared_hcd->speed >= HCD_USB3 &&
++			link_state == USB_SS_PORT_LS_U3 &&
++			(xhci->quirks & XHCI_DIS_U1U2_WHEN_U3)) {
++		portpmsc_u2_backup = readl(port->addr + PORTPMSC);
++		portpmsc_u2_backup &= PORT_U2_TIMEOUT_MASK;
++		temp = readl(port->addr + PORTPMSC);
++		temp |= PORT_U2_TIMEOUT_MASK;
++		writel(temp, port->addr + PORTPMSC);
++	}
+ 
+ 	temp = readl(port->addr);
+ 	temp = xhci_port_state_to_neutral(temp);
+ 	temp &= ~PORT_PLS_MASK;
+ 	temp |= PORT_LINK_STROBE | link_state;
+ 	writel(temp, port->addr);
++
++	/* Restore U2 timeout info after U3 entry complete */
++	if (xhci->shared_hcd->speed >= HCD_USB3 &&
++			link_state == USB_SS_PORT_LS_U3 &&
++			(xhci->quirks & XHCI_DIS_U1U2_WHEN_U3)) {
++		temp = readl(port->addr + PORTPMSC);
++		temp &= ~PORT_U2_TIMEOUT_MASK;
++		temp |= portpmsc_u2_backup;
++		writel(temp, port->addr + PORTPMSC);
++	}
+ }
+ 
+ static void xhci_set_remote_wake_mask(struct xhci_hcd *xhci,
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index bd0899300762..d8df28795ebb 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -281,8 +281,12 @@ static int xhci_plat_probe(struct platform_device *pdev)
+ 		if (device_property_read_bool(tmpdev, "usb2-lpm-disable"))
+ 			xhci->quirks |= XHCI_HW_LPM_DISABLE;
+ 
+-		if (device_property_read_bool(tmpdev, "usb3-lpm-capable"))
++		if (device_property_read_bool(sysdev, "usb3-lpm-capable")) {
+ 			xhci->quirks |= XHCI_LPM_SUPPORT;
++			if (device_property_read_bool(sysdev,
++					"snps,dis-u1u2-when-u3-quirk"))
++				xhci->quirks |= XHCI_DIS_U1U2_WHEN_U3;
++		}
+ 
+ 		if (device_property_read_bool(&pdev->dev, "quirk-reverse-in-out"))
+ 			xhci->quirks |= XHCI_REVERSE_IN_OUT;
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 5d2ff22301d7..0f62cba36cd3 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1900,8 +1900,7 @@ static int finish_td(struct xhci_hcd *xhci, struct xhci_td *td,
+ 			 * The class driver clears the device side halt later.
+ 			 */
+ 			xhci_cleanup_halted_endpoint(xhci, slot_id, ep_index,
+-					ep_ring->stream_id, td, ep_trb,
+-					EP_HARD_RESET);
++					ep_ring->stream_id, td, EP_HARD_RESET);
+ 		}
+ 	} else {
+ 		/* Update ring dequeue pointer */
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index d212fa1c9cf5..9862b123acf8 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1845,6 +1845,7 @@ struct xhci_hcd {
+ #define XHCI_LIMIT_ENDPOINT_INTERVAL_7	BIT_ULL(26)
+ #define XHCI_U2_DISABLE_WAKE	BIT_ULL(27)
+ #define XHCI_ASMEDIA_MODIFY_FLOWCONTROL	BIT_ULL(28)
++#define XHCI_DIS_U1U2_WHEN_U3 (1 << 30)
+ #define XHCI_HW_LPM_DISABLE	BIT_ULL(29)
+ #define XHCI_SUSPEND_DELAY	BIT_ULL(30)
+ #define XHCI_INTEL_USB_ROLE_SW	BIT_ULL(31)
+-- 
+2.17.0
+

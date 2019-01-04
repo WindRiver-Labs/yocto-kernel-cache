@@ -1,0 +1,307 @@
+From 613eaed9f6d99fc3b34df8d56d576524b79fe647 Mon Sep 17 00:00:00 2001
+From: Roy Pledge <roy.pledge@nxp.com>
+Date: Wed, 4 Oct 2017 15:36:06 -0400
+Subject: [PATCH 464/767] staging/fsl-mc/bus/dpio: Add Support for Order
+ Restoration
+
+Add DPIO support for HW assisted order restoration
+
+Signed-off-by: Roy Pledge <roy.pledge@nxp.com>
+[Xulin: Original patch taken from NXP LSDK-18.09.]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ .../staging/fsl-mc/bus/dpio/dpio-service.c    | 163 ++++++++++++++++++
+ .../staging/fsl-mc/bus/dpio/qbman-portal.c    |  37 ++++
+ .../staging/fsl-mc/bus/dpio/qbman-portal.h    |   3 +
+ drivers/staging/fsl-mc/include/dpaa2-io.h     |  18 ++
+ 4 files changed, 221 insertions(+)
+
+diff --git a/drivers/staging/fsl-mc/bus/dpio/dpio-service.c b/drivers/staging/fsl-mc/bus/dpio/dpio-service.c
+index 4e705ed02abd..dfd9db993c58 100644
+--- a/drivers/staging/fsl-mc/bus/dpio/dpio-service.c
++++ b/drivers/staging/fsl-mc/bus/dpio/dpio-service.c
+@@ -313,6 +313,37 @@ int dpaa2_io_service_rearm(struct dpaa2_io *d,
+ }
+ EXPORT_SYMBOL_GPL(dpaa2_io_service_rearm);
+ 
++/**
++ * dpaa2_io_service_pull_fq() - pull dequeue functions from a fq.
++ * @d: the given DPIO service.
++ * @fqid: the given frame queue id.
++ * @s: the dpaa2_io_store object for the result.
++ *
++ * Return 0 for success, or error code for failure.
++ */
++int dpaa2_io_service_pull_fq(struct dpaa2_io *d, u32 fqid,
++			     struct dpaa2_io_store *s)
++{
++	struct qbman_pull_desc pd;
++	int err;
++
++	qbman_pull_desc_clear(&pd);
++	qbman_pull_desc_set_storage(&pd, s->vaddr, s->paddr, 1);
++	qbman_pull_desc_set_numframes(&pd, (u8)s->max);
++	qbman_pull_desc_set_fq(&pd, fqid);
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++	s->swp = d->swp;
++	err = qbman_swp_pull(d->swp, &pd);
++	if (err)
++		s->swp = NULL;
++
++	return err;
++}
++EXPORT_SYMBOL(dpaa2_io_service_pull_fq);
++
+ /**
+  * dpaa2_io_service_pull_channel() - pull dequeue functions from a channel.
+  * @d: the given DPIO service.
+@@ -345,6 +376,33 @@ int dpaa2_io_service_pull_channel(struct dpaa2_io *d, u32 channelid,
+ }
+ EXPORT_SYMBOL_GPL(dpaa2_io_service_pull_channel);
+ 
++/**
++ * dpaa2_io_service_enqueue_fq() - Enqueue a frame to a frame queue.
++ * @d: the given DPIO service.
++ * @fqid: the given frame queue id.
++ * @fd: the frame descriptor which is enqueued.
++ *
++ * Return 0 for successful enqueue, -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_enqueue_fq(struct dpaa2_io *d,
++				u32 fqid,
++				const struct dpaa2_fd *fd)
++{
++	struct qbman_eq_desc ed;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_no_orp(&ed, 0);
++	qbman_eq_desc_set_fq(&ed, fqid);
++
++	return qbman_swp_enqueue(d->swp, &ed, fd);
++}
++EXPORT_SYMBOL(dpaa2_io_service_enqueue_fq);
++
+ /**
+  * dpaa2_io_service_enqueue_qd() - Enqueue a frame to a QD.
+  * @d: the given DPIO service.
+@@ -615,3 +673,108 @@ int dpaa2_io_query_bp_count(struct dpaa2_io *d, u32 bpid, u32 *num)
+ 	return 0;
+ }
+ EXPORT_SYMBOL(dpaa2_io_query_bp_count);
++
++/**
++ * dpaa2_io_service_enqueue_orp_fq() - Enqueue a frame to a frame queue with
++ * order restoration
++ * @d: the given DPIO service.
++ * @fqid: the given frame queue id.
++ * @fd: the frame descriptor which is enqueued.
++ * @orpid: the order restoration point ID
++ * @seqnum: the order sequence number
++ * @last: must be set for the final frame if seqnum is shared (spilt frame)
++ *
++ * Performs an enqueue to a frame queue using the specified order restoration
++ * point. The QMan device will ensure the order of frames placed on the
++ * queue will be ordered as per the sequence number.
++ *
++ * In the case a frame is split it is possible to enqueue using the same
++ * sequence number more than once. The final frame in a shared sequence number
++ * most be indicated by setting last = 1. For non shared sequence numbers
++ * last = 1 must always be set.
++ *
++ * Return 0 for successful enqueue, or -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_enqueue_orp_fq(struct dpaa2_io *d, u32 fqid,
++				    const struct dpaa2_fd *fd, u16 orpid,
++				    u16 seqnum, int last)
++{
++	struct qbman_eq_desc ed;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_orp(&ed, 0, orpid, seqnum, !last);
++	qbman_eq_desc_set_fq(&ed, fqid);
++	return qbman_swp_enqueue(d->swp, &ed, fd);
++}
++EXPORT_SYMBOL(dpaa2_io_service_enqueue_orp_fq);
++
++/**
++ * dpaa2_io_service_enqueue_orp_qd() - Enqueue a frame to a queueing destination
++ * with order restoration
++ * @d: the given DPIO service.
++ * @qdid: the given queuing destination id.
++ * @fd: the frame descriptor which is enqueued.
++ * @orpid: the order restoration point ID
++ * @seqnum: the order sequence number
++ * @last: must be set for the final frame if seqnum is shared (spilt frame)
++ *
++ * Performs an enqueue to a frame queue using the specified order restoration
++ * point. The QMan device will ensure the order of frames placed on the
++ * queue will be ordered as per the sequence number.
++ *
++ * In the case a frame is split it is possible to enqueue using the same
++ * sequence number more than once. The final frame in a shared sequence number
++ * most be indicated by setting last = 1. For non shared sequence numbers
++ * last = 1 must always be set.
++ *
++ * Return 0 for successful enqueue, or -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_enqueue_orp_qd(struct dpaa2_io *d, u32 qdid, u8 prio,
++				    u16 qdbin, const struct dpaa2_fd *fd,
++				    u16 orpid, u16 seqnum, int last)
++{
++	struct qbman_eq_desc ed;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_orp(&ed, 0, orpid, seqnum, !last);
++	qbman_eq_desc_set_qd(&ed, qdid, qdbin, prio);
++	return qbman_swp_enqueue(d->swp, &ed, fd);
++}
++EXPORT_SYMBOL_GPL(dpaa2_io_service_enqueue_orp_qd);
++
++/**
++ * dpaa2_io_service_orp_seqnum_drop() - Remove a sequence number from
++ * an order restoration list
++ * @d: the given DPIO service.
++ * @orpid: Order restoration point to remove a sequence number from
++ * @seqnum: Sequence number to remove
++ *
++ * Removes a frames sequence number from an order restoration point without
++ * enqueing the frame. Used to indicate that the order restoration hardware
++ * should not expect to see this sequence number. Typically used to indicate
++ * a frame was terminated or dropped from a flow.
++ *
++ * Return 0 for successful enqueue, or -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_orp_seqnum_drop(struct dpaa2_io *d, u16 orpid, u16 seqnum)
++{
++	struct qbman_eq_desc ed;
++	struct dpaa2_fd fd;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_orp_hole(&ed, orpid, seqnum);
++	return qbman_swp_enqueue(d->swp, &ed, &fd);
++}
++EXPORT_SYMBOL_GPL(dpaa2_io_service_orp_seqnum_drop);
+diff --git a/drivers/staging/fsl-mc/bus/dpio/qbman-portal.c b/drivers/staging/fsl-mc/bus/dpio/qbman-portal.c
+index 2bcfcac8efdf..b4d0a5272649 100644
+--- a/drivers/staging/fsl-mc/bus/dpio/qbman-portal.c
++++ b/drivers/staging/fsl-mc/bus/dpio/qbman-portal.c
+@@ -355,6 +355,43 @@ void qbman_eq_desc_set_no_orp(struct qbman_eq_desc *d, int respond_success)
+ 		d->verb |= enqueue_rejects_to_fq;
+ }
+ 
++/**
++ * qbman_eq_desc_set_orp() - Set order-restoration in the enqueue descriptor
++ * @d: the enqueue descriptor.
++ * @response_success: 1 = enqueue with response always; 0 = enqueue with
++ * rejections returned on a FQ.
++ * @oprid: the order point record id.
++ * @seqnum: the order restoration sequence number.
++ * @incomplete: indicates whether this is the last fragments using the same
++ * sequence number.
++ */
++void qbman_eq_desc_set_orp(struct qbman_eq_desc *d, int respond_success,
++			   u16 oprid, u16 seqnum, int incomplete)
++{
++	d->verb |= (1 << QB_ENQUEUE_CMD_ORP_ENABLE_SHIFT);
++	if (respond_success)
++		d->verb |= enqueue_response_always;
++	else
++		d->verb |= enqueue_rejects_to_fq;
++	d->orpid = cpu_to_le16(oprid);
++	d->seqnum = cpu_to_le16((!!incomplete << 14) | seqnum);
++}
++
++/**
++ * qbman_eq_desc_set_orp_hole() - fill a hole in the order-restoration sequence
++ * without any enqueue
++ * @d: the enqueue descriptor.
++ * @oprid: the order point record id.
++ * @seqnum: the order restoration sequence number.
++ */
++void qbman_eq_desc_set_orp_hole(struct qbman_eq_desc *d, u16 oprid,
++				u16 seqnum)
++{
++	d->verb |= (1 << QB_ENQUEUE_CMD_ORP_ENABLE_SHIFT) | enqueue_empty;
++	d->orpid = cpu_to_le16(oprid);
++	d->seqnum = cpu_to_le16(seqnum);
++}
++
+ /*
+  * Exactly one of the following descriptor "targets" should be set. (Calling any
+  * one of these will replace the effect of any prior call to one of these.)
+diff --git a/drivers/staging/fsl-mc/bus/dpio/qbman-portal.h b/drivers/staging/fsl-mc/bus/dpio/qbman-portal.h
+index 12cb3b5cb9df..2fb9b673e04f 100644
+--- a/drivers/staging/fsl-mc/bus/dpio/qbman-portal.h
++++ b/drivers/staging/fsl-mc/bus/dpio/qbman-portal.h
+@@ -162,6 +162,9 @@ int qbman_result_has_new_result(struct qbman_swp *p, const struct dpaa2_dq *dq);
+ 
+ void qbman_eq_desc_clear(struct qbman_eq_desc *d);
+ void qbman_eq_desc_set_no_orp(struct qbman_eq_desc *d, int respond_success);
++void qbman_eq_desc_set_orp(struct qbman_eq_desc *d, int respond_success,
++			   u16 oprid, u16 seqnum, int incomplete);
++void qbman_eq_desc_set_orp_hole(struct qbman_eq_desc *d, u16 oprid, u16 seqnum);
+ void qbman_eq_desc_set_token(struct qbman_eq_desc *d, u8 token);
+ void qbman_eq_desc_set_fq(struct qbman_eq_desc *d, u32 fqid);
+ void qbman_eq_desc_set_qd(struct qbman_eq_desc *d, u32 qdid,
+diff --git a/drivers/staging/fsl-mc/include/dpaa2-io.h b/drivers/staging/fsl-mc/include/dpaa2-io.h
+index 7997a05c2933..698f54742a20 100644
+--- a/drivers/staging/fsl-mc/include/dpaa2-io.h
++++ b/drivers/staging/fsl-mc/include/dpaa2-io.h
+@@ -97,9 +97,15 @@ void dpaa2_io_service_deregister(struct dpaa2_io *service,
+ int dpaa2_io_service_rearm(struct dpaa2_io *service,
+ 			   struct dpaa2_io_notification_ctx *ctx);
+ 
++int dpaa2_io_service_pull_fq(struct dpaa2_io *d, u32 fqid,
++			     struct dpaa2_io_store *s);
++
+ int dpaa2_io_service_pull_channel(struct dpaa2_io *d, u32 channelid,
+ 				  struct dpaa2_io_store *s);
+ 
++int dpaa2_io_service_enqueue_fq(struct dpaa2_io *d, u32 fqid,
++				const struct dpaa2_fd *fd);
++
+ int dpaa2_io_service_enqueue_qd(struct dpaa2_io *d, u32 qdid, u8 prio,
+ 				u16 qdbin, const struct dpaa2_fd *fd);
+ int dpaa2_io_service_release(struct dpaa2_io *d, u32 bpid,
+@@ -112,6 +118,18 @@ struct dpaa2_io_store *dpaa2_io_store_create(unsigned int max_frames,
+ void dpaa2_io_store_destroy(struct dpaa2_io_store *s);
+ struct dpaa2_dq *dpaa2_io_store_next(struct dpaa2_io_store *s, int *is_last);
+ 
++/* Order Restoration Support */
++int dpaa2_io_service_enqueue_orp_fq(struct dpaa2_io *d, u32 fqid,
++				    const struct dpaa2_fd *fd, u16 orpid,
++				    u16 seqnum, int last);
++
++int dpaa2_io_service_enqueue_orp_qd(struct dpaa2_io *d, u32 qdid, u8 prio,
++				    u16 qdbin, const struct dpaa2_fd *fd,
++				    u16 orpid, u16 seqnum, int last);
++
++int dpaa2_io_service_orp_seqnum_drop(struct dpaa2_io *d, u16 orpid,
++				     u16 seqnum);
++
+ /***************/
+ /* CSCN        */
+ /***************/
+-- 
+2.17.0
+
