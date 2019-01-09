@@ -1,0 +1,106 @@
+From b33a14ab4b80c43dc8b7df43f29a2bd6d52463a8 Mon Sep 17 00:00:00 2001
+From: Chintan Pandya <cpandya@codeaurora.org>
+Date: Wed, 6 Jun 2018 12:31:21 +0530
+Subject: [PATCH 7/8] arm64: Implement page table free interfaces
+
+commit ec28bb9c9b0826d7bd36f44cccfa5295c291cadd upstream
+
+arm64 requires break-before-make. Originally, before
+setting up new pmd/pud entry for huge mapping, in few
+cases, the modifying pmd/pud entry was still valid
+and pointing to next level page table as we only
+clear off leaf PTE in unmap leg.
+
+ a) This was resulting into stale entry in TLBs (as few
+    TLBs also cache intermediate mapping for performance
+    reasons)
+ b) Also, modifying pmd/pud was the only reference to
+    next level page table and it was getting lost without
+    freeing it. So, page leaks were happening.
+
+Implement pud_free_pmd_page() and pmd_free_pte_page() to
+enforce BBM and also free the leaking page tables.
+
+Implementation requires,
+ 1) Clearing off the current pud/pmd entry
+ 2) Invalidation of TLB
+ 3) Freeing of the un-used next level page tables
+
+Reviewed-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Chintan Pandya <cpandya@codeaurora.org>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+---
+ arch/arm64/mm/mmu.c |   48 ++++++++++++++++++++++++++++++++++++++++++++----
+ 1 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index a5385ba..8304ca1 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -44,6 +44,7 @@
+ #include <asm/memblock.h>
+ #include <asm/mmu_context.h>
+ #include <asm/ptdump.h>
++#include <asm/tlbflush.h>
+ 
+ #define NO_BLOCK_MAPPINGS	BIT(0)
+ #define NO_CONT_MAPPINGS	BIT(1)
+@@ -933,12 +934,51 @@ int pmd_clear_huge(pmd_t *pmd)
+ 	return 1;
+ }
+ 
+-int pud_free_pmd_page(pud_t *pud, unsigned long addr)
++int pmd_free_pte_page(pmd_t *pmdp, unsigned long addr)
+ {
+-	return pud_none(*pud);
++	pte_t *table;
++	pmd_t pmd;
++
++	pmd = READ_ONCE(*pmdp);
++
++	/* No-op for empty entry and WARN_ON for valid entry */
++	if (!pmd_present(pmd) || !pmd_table(pmd)) {
++		VM_WARN_ON(!pmd_table(pmd));
++		return 1;
++	}
++
++	table = pte_offset_kernel(pmdp, addr);
++	pmd_clear(pmdp);
++	__flush_tlb_kernel_pgtable(addr);
++	pte_free_kernel(NULL, table);
++	return 1;
+ }
+ 
+-int pmd_free_pte_page(pmd_t *pmd, unsigned long addr)
++int pud_free_pmd_page(pud_t *pudp, unsigned long addr)
+ {
+-	return pmd_none(*pmd);
++	pmd_t *table;
++	pmd_t *pmdp;
++	pud_t pud;
++	unsigned long next, end;
++
++	pud = READ_ONCE(*pudp);
++
++	/* No-op for empty entry and WARN_ON for valid entry */
++	if (!pud_present(pud) || !pud_table(pud)) {
++		VM_WARN_ON(!pud_table(pud));
++		return 1;
++	}
++
++	table = pmd_offset(pudp, addr);
++	pmdp = table;
++	next = addr;
++	end = addr + PUD_SIZE;
++	do {
++		pmd_free_pte_page(pmdp, next);
++	} while (pmdp++, next += PMD_SIZE, next != end);
++
++	pud_clear(pudp);
++	__flush_tlb_kernel_pgtable(addr);
++	pmd_free(NULL, table);
++	return 1;
+ }
+-- 
+1.7.5.4
+
