@@ -1,0 +1,105 @@
+From 3f9f319fb87e234a4b2679cbe8b6c80f8c904b03 Mon Sep 17 00:00:00 2001
+From: Yongxin Liu <yongxin.liu@windriver.com>
+Date: Tue, 5 Mar 2019 08:55:06 +0000
+Subject: [PATCH] nvdimm: make lane acquirement RT aware
+
+Currently, nvdimm driver isn't RT compatible.
+nd_region_acquire_lane() disables preemption with get_cpu() which
+causes "scheduling while atomic" spews on RT, when using fio to test
+pmem as block device.
+
+In this change, we replace get_cpu/put_cpu with local_lock_cpu/
+local_unlock_cpu, and introduce per CPU variable "ndl_local_lock".
+Due to preemption on RT, this lock can avoid race condition for the
+same lane on the same CPU. When CPU number is greater than the lane
+number, lane can be shared among CPUs. "ndl_lock->lock" is used to
+protect the lane in this situation.
+
+This patch is derived from Dan Williams and Pankaj Gupta's proposal from
+https://www.mail-archive.com/linux-nvdimm@lists.01.org/msg13359.html
+and https://www.spinics.net/lists/linux-rt-users/msg20280.html.
+Many thanks to them.
+
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Pankaj Gupta <pagupta@redhat.com>
+Cc: linux-rt-users <linux-rt-users@vger.kernel.org>
+Cc: linux-nvdimm <linux-nvdimm@lists.01.org>
+Acked-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/nvdimm/region_devs.c |   40 +++++++++++++++++++---------------------
+ 1 file changed, 19 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/nvdimm/region_devs.c b/drivers/nvdimm/region_devs.c
+index 63cb01e..71d824d 100644
+--- a/drivers/nvdimm/region_devs.c
++++ b/drivers/nvdimm/region_devs.c
+@@ -18,9 +18,13 @@
+ #include <linux/sort.h>
+ #include <linux/io.h>
+ #include <linux/nd.h>
++#include <linux/locallock.h>
+ #include "nd-core.h"
+ #include "nd.h"
+ 
++/* lock for tasks on the same CPU to sequence the access to the lane */
++static DEFINE_LOCAL_IRQ_LOCK(ndl_local_lock);
++
+ /*
+  * For readq() and writeq() on 32-bit builds, the hi-lo, lo-hi order is
+  * irrelevant.
+@@ -926,18 +930,15 @@ int nd_blk_region_init(struct nd_region *nd_region)
+ unsigned int nd_region_acquire_lane(struct nd_region *nd_region)
+ {
+ 	unsigned int cpu, lane;
++	struct nd_percpu_lane *ndl_lock, *ndl_count;
+ 
+-	cpu = get_cpu();
+-	if (nd_region->num_lanes < nr_cpu_ids) {
+-		struct nd_percpu_lane *ndl_lock, *ndl_count;
++	cpu = local_lock_cpu(ndl_local_lock);
+ 
+-		lane = cpu % nd_region->num_lanes;
+-		ndl_count = per_cpu_ptr(nd_region->lane, cpu);
+-		ndl_lock = per_cpu_ptr(nd_region->lane, lane);
+-		if (ndl_count->count++ == 0)
+-			spin_lock(&ndl_lock->lock);
+-	} else
+-		lane = cpu;
++	lane = cpu % nd_region->num_lanes;
++	ndl_count = per_cpu_ptr(nd_region->lane, cpu);
++	ndl_lock = per_cpu_ptr(nd_region->lane, lane);
++	if (ndl_count->count++ == 0)
++		spin_lock(&ndl_lock->lock);
+ 
+ 	return lane;
+ }
+@@ -945,17 +946,14 @@ unsigned int nd_region_acquire_lane(struct nd_region *nd_region)
+ 
+ void nd_region_release_lane(struct nd_region *nd_region, unsigned int lane)
+ {
+-	if (nd_region->num_lanes < nr_cpu_ids) {
+-		unsigned int cpu = get_cpu();
+-		struct nd_percpu_lane *ndl_lock, *ndl_count;
+-
+-		ndl_count = per_cpu_ptr(nd_region->lane, cpu);
+-		ndl_lock = per_cpu_ptr(nd_region->lane, lane);
+-		if (--ndl_count->count == 0)
+-			spin_unlock(&ndl_lock->lock);
+-		put_cpu();
+-	}
+-	put_cpu();
++	struct nd_percpu_lane *ndl_lock, *ndl_count;
++	unsigned int cpu = smp_processor_id();
++
++	ndl_count = per_cpu_ptr(nd_region->lane, cpu);
++	ndl_lock = per_cpu_ptr(nd_region->lane, lane);
++	if (--ndl_count->count == 0)
++		spin_unlock(&ndl_lock->lock);
++	local_unlock_cpu(ndl_local_lock);
+ }
+ EXPORT_SYMBOL(nd_region_release_lane);
+ 
+-- 
+1.7.9.5
+
