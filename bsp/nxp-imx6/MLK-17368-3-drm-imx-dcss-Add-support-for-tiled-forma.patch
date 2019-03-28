@@ -1,0 +1,562 @@
+From d549ca5284514e65eb665e1cf82f6d183cf72a2c Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Fri, 12 Jan 2018 15:18:51 +0200
+Subject: [PATCH 3201/5242] MLK-17368-3: drm: imx: dcss: Add support for tiled
+ formats
+
+commit  4d6b0cdf1df22dbbc2e08deda79d3952e1890d2b from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch effectively enables DTRC module in DCSS to decode tiled
+formats from VPU:
+ * uncompressed G1;
+ * uncompressed G2;
+ * compressed G2;
+
+Compressed G2 formats need to pass on the decompression table offsets,
+by using the 'dtrc_dec_ofs' property. This is a 64 bit value like below:
+
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+64--------48----------32---------16---------0
+|<- chroma table ofs ->|<- luma table ofs ->|
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-crtc.c  |   18 +++
+ drivers/gpu/drm/imx/dcss/dcss-plane.c |   11 +-
+ drivers/gpu/drm/imx/dcss/dcss-plane.h |    3 +
+ drivers/gpu/imx/dcss/dcss-ctxld.c     |    8 +-
+ drivers/gpu/imx/dcss/dcss-dpr.c       |   10 +-
+ drivers/gpu/imx/dcss/dcss-dtrc.c      |  239 ++++++++++++++++++++++++++++-----
+ drivers/gpu/imx/dcss/dcss-prv.h       |    2 +
+ include/video/imx-dcss.h              |    5 +-
+ 8 files changed, 254 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.c b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+index fd758f7..c8e0cf6 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-crtc.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+@@ -36,6 +36,7 @@ struct dcss_crtc {
+ 
+ 	struct drm_property *alpha;
+ 	struct drm_property *use_global;
++	struct drm_property *dtrc_table_ofs;
+ 
+ 	struct completion disable_completion;
+ };
+@@ -268,6 +269,14 @@ static int dcss_crtc_init(struct dcss_crtc *crtc,
+ 		return -ENOMEM;
+ 	}
+ 
++	crtc->dtrc_table_ofs = drm_property_create_range(drm, 0,
++							 "dtrc_table_ofs", 0,
++							 ULLONG_MAX);
++	if (!crtc->dtrc_table_ofs) {
++		dev_err(crtc->dev, "cannot create dtrc_table_ofs property\n");
++		return -ENOMEM;
++	}
++
+ 	/* attach alpha property to channel 0 */
+ 	drm_object_attach_property(&crtc->plane[0]->base.base,
+ 				   crtc->alpha, 255);
+@@ -277,6 +286,15 @@ static int dcss_crtc_init(struct dcss_crtc *crtc,
+ 				   crtc->use_global, 0);
+ 	crtc->plane[0]->use_global_prop = crtc->use_global;
+ 
++	/* attach DTRC table offsets property to overlay planes */
++	drm_object_attach_property(&crtc->plane[1]->base.base,
++				   crtc->dtrc_table_ofs, 0);
++	crtc->plane[1]->dtrc_table_ofs_prop = crtc->dtrc_table_ofs;
++
++	drm_object_attach_property(&crtc->plane[2]->base.base,
++				   crtc->dtrc_table_ofs, 0);
++	crtc->plane[2]->dtrc_table_ofs_prop = crtc->dtrc_table_ofs;
++
+ 	crtc->irq = dcss_vblank_irq_get(dcss);
+ 	if (crtc->irq < 0) {
+ 		dev_err(crtc->dev, "unable to get vblank interrupt\n");
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.c b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+index 45c19f0..91cbc62 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+@@ -82,6 +82,8 @@ static int dcss_plane_atomic_set_property(struct drm_plane *plane,
+ 		dcss_plane->alpha_val = val;
+ 	else if (property == dcss_plane->use_global_prop)
+ 		dcss_plane->use_global_val = val;
++	else if (property == dcss_plane->dtrc_table_ofs_prop)
++		dcss_plane->dtrc_table_ofs_val = val;
+ 	else
+ 		return -EINVAL;
+ 
+@@ -99,6 +101,8 @@ static int dcss_plane_atomic_get_property(struct drm_plane *plane,
+ 		*val = dcss_plane->alpha_val;
+ 	else if (property == dcss_plane->use_global_prop)
+ 		*val = dcss_plane->use_global_val;
++	else if (property == dcss_plane->dtrc_table_ofs_prop)
++		*val = dcss_plane->dtrc_table_ofs_val;
+ 	else
+ 		return -EINVAL;
+ 
+@@ -185,7 +189,10 @@ static void dcss_plane_atomic_set_base(struct dcss_plane *dcss_plane)
+ 		return;
+ 	}
+ 
+-	dcss_dtrc_addr_set(dcss_plane->dcss, dcss_plane->ch_num, p1_ba, p2_ba);
++	dcss_dtrc_set_format_mod(dcss_plane->dcss, dcss_plane->ch_num,
++				 fb->modifier);
++	dcss_dtrc_addr_set(dcss_plane->dcss, dcss_plane->ch_num,
++			   p1_ba, p2_ba, dcss_plane->dtrc_table_ofs_val);
+ }
+ 
+ static bool dcss_plane_needs_setup(struct drm_plane_state *state,
+@@ -250,6 +257,7 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 				 pixel_format, dcss_plane->alpha_val,
+ 				 dcss_plane->use_global_val);
+ 
++	dcss_dtrc_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+ 	dcss_dpr_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+ 	dcss_scaler_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+ 	dcss_dtg_ch_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+@@ -260,6 +268,7 @@ static void dcss_plane_atomic_disable(struct drm_plane *plane,
+ {
+ 	struct dcss_plane *dcss_plane = to_dcss_plane(plane);
+ 
++	dcss_dtrc_enable(dcss_plane->dcss, dcss_plane->ch_num, false);
+ 	dcss_dpr_enable(dcss_plane->dcss, dcss_plane->ch_num, false);
+ 	dcss_scaler_enable(dcss_plane->dcss, dcss_plane->ch_num, false);
+ 	dcss_dtg_plane_pos_set(dcss_plane->dcss, dcss_plane->ch_num,
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.h b/drivers/gpu/drm/imx/dcss/dcss-plane.h
+index 3f04385..c607551 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.h
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.h
+@@ -13,6 +13,9 @@ struct dcss_plane {
+ 	int use_global_val;
+ 	struct drm_property *use_global_prop;
+ 
++	uint64_t dtrc_table_ofs_val;
++	struct drm_property *dtrc_table_ofs_prop;
++
+ 	int ch_num;
+ };
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-ctxld.c b/drivers/gpu/imx/dcss/dcss-ctxld.c
+index 01c05c3..0444656 100644
+--- a/drivers/gpu/imx/dcss/dcss-ctxld.c
++++ b/drivers/gpu/imx/dcss/dcss-ctxld.c
+@@ -143,8 +143,8 @@ static irqreturn_t dcss_ctxld_irq_handler_thread(int irq, void *data)
+ 		ctxld->in_use = false;
+ 
+ 		if (ctxld->run_again) {
+-			__dcss_ctxld_enable(ctxld);
+ 			ctxld->run_again = false;
++			__dcss_ctxld_enable(ctxld);
+ 			goto exit;
+ 		}
+ 
+@@ -315,6 +315,12 @@ static int __dcss_ctxld_enable(struct dcss_ctxld_priv *ctxld)
+ 	u32 db_base, sb_base, sb_count;
+ 	u32 sb_hp_cnt, sb_lp_cnt, db_cnt;
+ 
++	if (dcss_dtrc_is_running(ctxld->dcss, 1) ||
++	    dcss_dtrc_is_running(ctxld->dcss, 2)) {
++		dcss_dtrc_switch_banks(ctxld->dcss);
++		ctxld->run_again = true;
++	}
++
+ 	sb_hp_cnt = ctxld->ctx_size[curr_ctx][CTX_SB_HP];
+ 	sb_lp_cnt = ctxld->ctx_size[curr_ctx][CTX_SB_LP];
+ 	db_cnt = ctxld->ctx_size[curr_ctx][CTX_DB];
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index 04ef932..f822bc7 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -286,11 +286,13 @@ void dcss_dpr_addr_set(struct dcss_soc *dcss, int ch_num, u32 luma_base_addr,
+ {
+ 	struct dcss_dpr_ch *ch = &dcss->dpr_priv->ch[ch_num];
+ 
+-	dcss_dpr_write(dcss->dpr_priv, ch_num, luma_base_addr,
+-		       DCSS_DPR_FRAME_1P_BASE_ADDR);
++	if (!dcss_dtrc_is_running(dcss, ch_num)) {
++		dcss_dpr_write(dcss->dpr_priv, ch_num, luma_base_addr,
++			       DCSS_DPR_FRAME_1P_BASE_ADDR);
+ 
+-	dcss_dpr_write(dcss->dpr_priv, ch_num, chroma_base_addr,
+-		       DCSS_DPR_FRAME_2P_BASE_ADDR);
++		dcss_dpr_write(dcss->dpr_priv, ch_num, chroma_base_addr,
++			       DCSS_DPR_FRAME_2P_BASE_ADDR);
++	}
+ 
+ 	ch->frame_ctrl &= ~PITCH_MASK;
+ 	ch->frame_ctrl |= ((pitch << PITCH_POS) & PITCH_MASK);
+diff --git a/drivers/gpu/imx/dcss/dcss-dtrc.c b/drivers/gpu/imx/dcss/dcss-dtrc.c
+index 8f9a117..a31057f 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtrc.c
++++ b/drivers/gpu/imx/dcss/dcss-dtrc.c
+@@ -15,7 +15,10 @@
+ #include <linux/device.h>
+ #include <linux/bitops.h>
+ #include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/interrupt.h>
+ #include <drm/drm_fourcc.h>
++#include <linux/delay.h>
+ 
+ #include <video/imx-dcss.h>
+ #include "dcss-prv.h"
+@@ -41,6 +44,10 @@
+ #define DCSS_DTRC_CROPORIG			0x24
+ #define DCSS_DTRC_CROPSIZE			0x28
+ #define DCSS_DTRC_DCTL				0x2C
++#define   CROPPING_EN				BIT(18)
++#define   COMPRESSION_DIS			BIT(17)
++#define   PIX_DEPTH_8BIT_EN			BIT(1)
++#define   CONFIG_READY				BIT(0)
+ #define DCSS_DTRC_DYDSADDR_EXT			0x30
+ #define DCSS_DTRC_DCDSADDR_EXT			0x34
+ #define DCSS_DTRC_DYTSADDR_EXT			0x38
+@@ -54,7 +61,23 @@
+ #define DCSS_DTRC_FDINTR			0xC4
+ #define DCSS_DTRC_DTCTRL			0xC8
+ #define   CURRENT_FRAME				BIT(31)
++#define   ADDRESS_ID_ENABLE			BIT(30)
++#define   ENDIANNESS_10BIT			BIT(29)
++#define   MERGE_ARID_ENABLE			BIT(28)
++#define   NON_G1_2_SWAP_MODE_POS		24
++#define   NON_G1_2_SWAP_MODE_MASK		GENMASK(27, 24)
++#define   TABLE_DATA_SWAP_POS			20
++#define   TABLE_DATA_SWAP_MASK			GENMASK(23, 20)
++#define   TILED_SWAP_POS			16
++#define   TILED_SWAP_MASK			GENMASK(19, 16)
++#define   RASTER_SWAP_POS			12
++#define   RASTER_SWAP_MASK			GENMASK(15, 12)
++#define   BURST_LENGTH_POS			4
++#define   BURST_LENGTH_MASK			GENMASK(11, 4)
++#define   G1_TILED_DATA_EN			BIT(3)
+ #define   HOT_RESET				BIT(2)
++#define   ARIDR_MODE_DETILE			0
++#define   ARIDR_MODE_BYPASS			2
+ #define DCSS_DTRC_ARIDR				0xCC
+ #define DCSS_DTRC_DTID2DDR			0xD0
+ #define DCSS_DTRC_CONFIG			0xD4
+@@ -70,10 +93,18 @@ struct dcss_dtrc_ch {
+ 	u32 xres;
+ 	u32 yres;
+ 	u32 pix_format;
++	u64 format_modifier;
++	u32 y_dec_ofs;
++	u32 uv_dec_ofs;
++
++	int curr_frame;
++
++	u32 dctl;
+ 
+ 	u32 ctx_id;
+ 
+ 	bool bypass;
++	bool running;
+ };
+ 
+ struct dcss_dtrc_priv {
+@@ -174,6 +205,10 @@ static int dcss_dtrc_ch_init_all(struct dcss_soc *dcss, unsigned long dtrc_base)
+ 			dev_err(dcss->dev, "dtrc: unable to remap ch base\n");
+ 			return -ENOMEM;
+ 		}
++
++#if defined(USE_CTXLD)
++		ch->ctx_id = CTX_SB_HP;
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -190,6 +225,17 @@ static void dcss_dtrc_write(struct dcss_dtrc_priv *dtrc, int ch_num,
+ #endif
+ }
+ 
++static void dcss_dtrc_write_irqsafe(struct dcss_dtrc_priv *dtrc, int ch_num,
++				    u32 val, u32 ofs)
++{
++#if !defined(USE_CTXLD)
++	dcss_writel(val, dtrc->ch[ch_num].base_reg + ofs);
++#else
++	dcss_ctxld_write_irqsafe(dtrc->dcss, dtrc->ch[ch_num].ctx_id,
++				 val, dtrc->ch[ch_num].base_ofs + ofs);
++#endif
++}
++
+ int dcss_dtrc_init(struct dcss_soc *dcss, unsigned long dtrc_base)
+ {
+ 	struct dcss_dtrc_priv *dtrc;
+@@ -224,7 +270,7 @@ void dcss_dtrc_bypass(struct dcss_soc *dcss, int ch_num)
+ 	if (dtrc->ch[ch_num].bypass)
+ 		return;
+ 
+-	dcss_dtrc_write(dtrc, ch_num, 2, DCSS_DTRC_DTCTRL);
++	dcss_dtrc_write(dtrc, ch_num, ARIDR_MODE_BYPASS, DCSS_DTRC_DTCTRL);
+ 	dcss_dtrc_write(dtrc, ch_num, 0, DCSS_DTRC_DYTSADDR);
+ 	dcss_dtrc_write(dtrc, ch_num, 0, DCSS_DTRC_DCTSADDR);
+ 	dcss_dtrc_write(dtrc, ch_num, 0x0f0e0100, DCSS_DTRC_ARIDR);
+@@ -234,19 +280,18 @@ void dcss_dtrc_bypass(struct dcss_soc *dcss, int ch_num)
+ }
+ EXPORT_SYMBOL(dcss_dtrc_bypass);
+ 
+-void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba)
++void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba,
++			uint64_t dec_table_ofs)
+ {
+ 	struct dcss_dtrc_priv *dtrc = dcss->dtrc_priv;
+-	struct dcss_dtrc_ch *ch = &dtrc->ch[ch_num];
+-	int curr_frame;
++	struct dcss_dtrc_ch *ch;
+ 
+ 	if (ch_num == 0)
+ 		return;
+ 
+ 	ch_num -= 1;
+ 
+-	curr_frame = dcss_readl(dtrc->ch[ch_num].base_reg + DCSS_DTRC_DTCTRL);
+-	curr_frame = (curr_frame & CURRENT_FRAME) >> 31;
++	ch = &dtrc->ch[ch_num];
+ 
+ 	dcss_dtrc_write(dtrc, ch_num, p1_ba, DCSS_DTRC_DYDSADDR);
+ 	dcss_dtrc_write(dtrc, ch_num, p2_ba, DCSS_DTRC_DCDSADDR);
+@@ -254,34 +299,37 @@ void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba)
+ 	dcss_dtrc_write(dtrc, ch_num, p1_ba, DTRC_F1_OFS + DCSS_DTRC_DYDSADDR);
+ 	dcss_dtrc_write(dtrc, ch_num, p2_ba, DTRC_F1_OFS + DCSS_DTRC_DCDSADDR);
+ 
+-	dcss_dtrc_write(dtrc, ch_num, p1_ba, DCSS_DTRC_SYSSA);
+-	dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->xres * ch->yres,
+-			DCSS_DTRC_SYSEA);
++	if (!ch->running) {
++		dcss_dtrc_write(dtrc, ch_num, p1_ba, DCSS_DTRC_SYSSA);
++		dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->xres * ch->yres,
++				DCSS_DTRC_SYSEA);
+ 
+-	dcss_dtrc_write(dtrc, ch_num, p1_ba, DTRC_F1_OFS + DCSS_DTRC_SYSSA);
+-	dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->xres * ch->yres,
+-			DTRC_F1_OFS + DCSS_DTRC_SYSEA);
++		dcss_dtrc_write(dtrc, ch_num, p2_ba, DCSS_DTRC_SUVSSA);
++		dcss_dtrc_write(dtrc, ch_num, p2_ba + ch->xres * ch->yres / 2,
++				DCSS_DTRC_SUVSEA);
+ 
+-	dcss_dtrc_write(dtrc, ch_num, p2_ba, DCSS_DTRC_SUVSSA);
+-	dcss_dtrc_write(dtrc, ch_num, p2_ba + ch->xres * ch->yres / 4,
+-			DCSS_DTRC_SUVSEA);
++		dcss_dtrc_write(dtrc, ch_num, p1_ba,
++				DTRC_F1_OFS + DCSS_DTRC_SYSSA);
++		dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->xres * ch->yres,
++				DTRC_F1_OFS + DCSS_DTRC_SYSEA);
+ 
+-	dcss_dtrc_write(dtrc, ch_num, p2_ba, DTRC_F1_OFS + DCSS_DTRC_SUVSSA);
+-	dcss_dtrc_write(dtrc, ch_num, p2_ba + ch->xres * ch->yres / 4,
+-			DTRC_F1_OFS + DCSS_DTRC_SUVSEA);
++		dcss_dtrc_write(dtrc, ch_num, p2_ba,
++				DTRC_F1_OFS + DCSS_DTRC_SUVSSA);
++		dcss_dtrc_write(dtrc, ch_num, p2_ba + ch->xres * ch->yres / 2,
++				DTRC_F1_OFS + DCSS_DTRC_SUVSEA);
+ 
+-	dcss_dtrc_write(dcss->dtrc_priv, ch_num - 1, 0x0f0e0100,
+-			DCSS_DTRC_ARIDR);
+-	dcss_dtrc_write(dcss->dtrc_priv, ch_num - 1, 0x0f0e,
+-			DCSS_DTRC_DTID2DDR);
++		ch->y_dec_ofs = dec_table_ofs & 0xFFFFFFFF;
++		ch->uv_dec_ofs = dec_table_ofs >> 32;
++	}
+ 
+-	dcss_dtrc_write(dtrc, ch_num, 0x50f00108, DCSS_DTRC_DTCTRL);
+-
+-	/* TODO: hardcoded this for testing purposes. */
+-	dcss_dtrc_write(dtrc, ch_num, 0x20002,
+-			(curr_frame ^ 1) * DTRC_F1_OFS + DCSS_DTRC_DCTL);
+-	dcss_dtrc_write(dtrc, ch_num, 0x20003,
+-			curr_frame * DTRC_F1_OFS + DCSS_DTRC_DCTL);
++	dcss_dtrc_write(dtrc, ch_num,
++		p1_ba + ch->y_dec_ofs, DCSS_DTRC_DYTSADDR);
++	dcss_dtrc_write(dtrc, ch_num,
++		p1_ba + ch->uv_dec_ofs, DCSS_DTRC_DCTSADDR);
++	dcss_dtrc_write(dtrc, ch_num,
++		p1_ba + ch->y_dec_ofs, DTRC_F1_OFS + DCSS_DTRC_DYTSADDR);
++	dcss_dtrc_write(dtrc, ch_num,
++		p1_ba + ch->uv_dec_ofs, DTRC_F1_OFS + DCSS_DTRC_DCTSADDR);
+ 
+ 	dtrc->ch[ch_num].bypass = false;
+ }
+@@ -290,20 +338,141 @@ void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba)
+ void dcss_dtrc_set_res(struct dcss_soc *dcss, int ch_num, u32 xres, u32 yres)
+ {
+ 	struct dcss_dtrc_priv *dtrc = dcss->dtrc_priv;
++	struct dcss_dtrc_ch *ch;
+ 	u32 frame_height, frame_width;
++	int bank;
+ 
+ 	if (ch_num == 0)
+ 		return;
+ 
+-	dtrc->ch[ch_num].xres = xres;
+-	dtrc->ch[ch_num].yres = yres;
++	ch_num -= 1;
++
++	ch = &dtrc->ch[ch_num];
++	bank = dcss_readl(ch->base_reg + DCSS_DTRC_DTCTRL) >> 31;
++
++	ch->xres = xres;
++	ch->yres = yres;
+ 
+ 	frame_height = ((yres >> 3) << FRAME_HEIGHT_POS) & FRAME_HEIGHT_MASK;
+ 	frame_width = ((xres >> 3) << FRAME_WIDTH_POS) & FRAME_WIDTH_MASK;
+ 
+-	dcss_dtrc_write(dcss->dtrc_priv, ch_num - 1, frame_height | frame_width,
+-			DTRC_F0_OFS + DCSS_DTRC_SIZE);
+-	dcss_dtrc_write(dcss->dtrc_priv, ch_num - 1, frame_height | frame_width,
+-			DTRC_F1_OFS + DCSS_DTRC_SIZE);
++	dcss_dtrc_write(dcss->dtrc_priv, ch_num, frame_height | frame_width,
++			DTRC_F1_OFS * bank + DCSS_DTRC_SIZE);
++
++	dcss_dtrc_write(dcss->dtrc_priv, ch_num, frame_height | frame_width,
++			DTRC_F1_OFS * (bank ^ 1) + DCSS_DTRC_SIZE);
+ }
+ EXPORT_SYMBOL(dcss_dtrc_set_res);
++
++void dcss_dtrc_enable(struct dcss_soc *dcss, int ch_num, bool enable)
++{
++	struct dcss_dtrc_priv *dtrc = dcss->dtrc_priv;
++	struct dcss_dtrc_ch *ch;
++	int curr_frame;
++	u32 fdctl, dtctrl;
++
++	if (ch_num == 0)
++		return;
++
++	ch_num -= 1;
++
++	ch = &dtrc->ch[ch_num];
++
++	if (ch->bypass)
++		return;
++
++	if (!enable) {
++		ch->running = false;
++		return;
++	}
++
++	if (ch->running)
++		return;
++
++	dcss_update(HOT_RESET, HOT_RESET, ch->base_reg + DCSS_DTRC_DTCTRL);
++	while (dcss_readl(ch->base_reg + DCSS_DTRC_DTCTRL) & HOT_RESET)
++		usleep_range(100, 200);
++
++	dcss_dtrc_write(dcss->dtrc_priv, ch_num, 0x0f0e0100,
++			DCSS_DTRC_ARIDR);
++	dcss_dtrc_write(dcss->dtrc_priv, ch_num, 0x0f0e,
++			DCSS_DTRC_DTID2DDR);
++
++	dtctrl = ADDRESS_ID_ENABLE | MERGE_ARID_ENABLE |
++		 ((0xF << TABLE_DATA_SWAP_POS) & TABLE_DATA_SWAP_MASK) |
++		 ((0x10 << BURST_LENGTH_POS) & BURST_LENGTH_MASK);
++
++	if (ch->format_modifier == DRM_FORMAT_MOD_VSI_G1_TILED)
++		dtctrl |= G1_TILED_DATA_EN;
++
++	dcss_dtrc_write(dtrc, ch_num, dtctrl, DCSS_DTRC_DTCTRL);
++
++	curr_frame = dcss_readl(ch->base_reg + DCSS_DTRC_DTCTRL) >> 31;
++
++	fdctl = PIX_DEPTH_8BIT_EN;
++
++	if (ch->format_modifier != DRM_FORMAT_MOD_VSI_G2_TILED_COMPRESSED)
++		fdctl |= COMPRESSION_DIS;
++
++	dcss_dtrc_write(dtrc, ch_num, fdctl,
++			(curr_frame ^ 1) * DTRC_F1_OFS + DCSS_DTRC_DCTL);
++	dcss_dtrc_write(dtrc, ch_num, fdctl | (enable ? CONFIG_READY : 0),
++			curr_frame * DTRC_F1_OFS + DCSS_DTRC_DCTL);
++
++	ch->curr_frame = curr_frame;
++	ch->dctl = fdctl;
++	ch->running = true;
++}
++EXPORT_SYMBOL(dcss_dtrc_enable);
++
++bool dcss_dtrc_is_running(struct dcss_soc *dcss, int ch_num)
++{
++	struct dcss_dtrc_priv *dtrc = dcss->dtrc_priv;
++	struct dcss_dtrc_ch *ch;
++
++	if (!ch_num)
++		return false;
++
++	ch_num -= 1;
++
++	ch = &dtrc->ch[ch_num];
++
++	return ch->running;
++}
++
++void dcss_dtrc_set_format_mod(struct dcss_soc *dcss, int ch_num, u64 modifier)
++{
++	struct dcss_dtrc_priv *dtrc = dcss->dtrc_priv;
++	struct dcss_dtrc_ch *ch;
++
++	if (!ch_num)
++		return;
++
++	ch_num -= 1;
++
++	ch = &dtrc->ch[ch_num];
++
++	ch->format_modifier = modifier;
++}
++EXPORT_SYMBOL(dcss_dtrc_set_format_mod);
++
++static void dcss_dtrc_ch_switch_banks(struct dcss_dtrc_priv *dtrc, int dtrc_ch)
++{
++	struct dcss_dtrc_ch *ch = &dtrc->ch[dtrc_ch];
++
++	if (!ch->running)
++		return;
++
++	ch->curr_frame ^= 1;
++
++	dcss_dtrc_write_irqsafe(dtrc, dtrc_ch, ch->dctl | CONFIG_READY,
++				ch->curr_frame * DTRC_F1_OFS + DCSS_DTRC_DCTL);
++}
++
++void dcss_dtrc_switch_banks(struct dcss_soc *dcss)
++{
++	struct dcss_dtrc_priv *dtrc = dcss->dtrc_priv;
++
++	dcss_dtrc_ch_switch_banks(dtrc, 0);
++	dcss_dtrc_ch_switch_banks(dtrc, 1);
++}
+diff --git a/drivers/gpu/imx/dcss/dcss-prv.h b/drivers/gpu/imx/dcss/dcss-prv.h
+index 399a135..8c349bf 100644
+--- a/drivers/gpu/imx/dcss/dcss-prv.h
++++ b/drivers/gpu/imx/dcss/dcss-prv.h
+@@ -106,6 +106,8 @@ void dcss_ctxld_write_irqsafe(struct dcss_soc *dcss, u32 ctx_id, u32 val,
+ /* DTRC */
+ int dcss_dtrc_init(struct dcss_soc *dcss, unsigned long dtrc_base);
+ void dcss_dtrc_exit(struct dcss_soc *dcss);
++void dcss_dtrc_switch_banks(struct dcss_soc *dcss);
++bool dcss_dtrc_is_running(struct dcss_soc *dcss, int ch_num);
+ 
+ /* DEC400d */
+ int dcss_dec400d_init(struct dcss_soc *dcss, unsigned long dec400d_base);
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index c166eb0..0354bf9 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -93,7 +93,10 @@ void dcss_hdr10_pipe_csc_setup(struct dcss_soc *dcss, int ch_num,
+ /* DTRC */
+ void dcss_dtrc_bypass(struct dcss_soc *dcss, int ch_num);
+ void dcss_dtrc_set_res(struct dcss_soc *dcss, int ch_num, u32 xres, u32 yres);
+-void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba);
++void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba,
++			uint64_t dec_table_ofs);
++void dcss_dtrc_enable(struct dcss_soc *dcss, int ch_num, bool enable);
++void dcss_dtrc_set_format_mod(struct dcss_soc *dcss, int ch_num, u64 modifier);
+ 
+ enum dcss_color_space {
+ 	DCSS_COLORSPACE_RGB,
+-- 
+1.7.9.5
+

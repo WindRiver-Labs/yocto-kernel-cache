@@ -1,0 +1,335 @@
+From 35fce4ede3365986d3b50bd3a319d8b43a0041d7 Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Mon, 12 Jun 2017 13:34:26 +0800
+Subject: [PATCH 1924/5242] MLK-15001-23 drm/imx: ldb: Add i.MX8qxp LDB
+ support
+
+commit  3f50948c65a8ad6821e3613f7e011734185206a4 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch adds i.MX8qxp LDB support.
+Logics are added to make i.MX8qxp LDB cope with Mixel LVDS combo PHY.
+Also, logics are added to handle pixel link quirks for i.MX8qxp LDB.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../devicetree/bindings/display/imx/ldb.txt        |   22 +--
+ drivers/gpu/drm/imx/imx-ldb.c                      |  140 +++++++++++++++++++-
+ 2 files changed, 148 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/display/imx/ldb.txt b/Documentation/devicetree/bindings/display/imx/ldb.txt
+index 2c3a5ac..d425efb 100644
+--- a/Documentation/devicetree/bindings/display/imx/ldb.txt
++++ b/Documentation/devicetree/bindings/display/imx/ldb.txt
+@@ -10,13 +10,15 @@ Required properties:
+  - #address-cells : should be <1>
+  - #size-cells : should be <0>
+  - compatible : should be "fsl,imx53-ldb" or "fsl,imx6q-ldb" or
+-                "fsl,imx8qm-ldb".
++                "fsl,imx8qm-ldb" or "fsl,imx8qxp-ldb".
+                 All LDB versions are similar.
+                 i.MX6q/dl has an additional multiplexer in the front to select
+                 any of the two or four IPU display interfaces as input for each
+                 LVDS channel.
+                 i.MX8qm LDB supports 10bit RGB input and needs an additional
+                 phy.
++                i.MX8qxp LDB only supports one LVDS encoder channel(either
++                channel0 or channel1).
+  - gpr : should be <&gpr> on i.MX53 and i.MX6q.
+          The phandle points to the iomuxc-gpr region containing the LVDS
+          control register.
+@@ -39,15 +41,18 @@ Required properties:
+         The needed clock numbers for each are documented in
+         Documentation/devicetree/bindings/clock/imx5-clock.txt, and in
+         Documentation/devicetree/bindings/clock/imx6q-clock.txt.
+-- power-domains : phandle pointing to power domain, only required by i.MX8qm.
++- power-domains : phandle pointing to power domain, only required by i.MX8qm and
++                  i.MX8qxp.
+ 
+ Optional properties:
+- - pinctrl-names : should be "default" on i.MX53, not used on i.MX6q and i.MX8qm
++ - pinctrl-names : should be "default" on i.MX53, not used on i.MX6q, i.MX8qm
++                   and i.MX8qxp
+  - pinctrl-0 : a phandle pointing to LVDS pin settings on i.MX53,
+-               not used on i.MX6q and i.MX8qm
++               not used on i.MX6q, i.MX8qm and i.MX8qxp
+  - fsl,dual-channel : boolean. if it exists, only LVDS channel 0 should
+    be configured - one input will be distributed on both outputs in dual
+    channel mode
++   Currently, i.MX8qxp doesn't support dual channel mode.
+ 
+ LVDS Channel
+ ============
+@@ -66,12 +71,13 @@ Required properties:
+    On i.MX6, there should be four input ports (port@[0-3]) that correspond
+    to the four LVDS multiplexer inputs.
+    On i.MX8qm, the two channels of LDB connect to one display interface of DPU.
+-   A single output port (port@2 on i.MX5, port@4 on i.MX6, port@1 on i.MX8qm)
+-   must be connected to a panel input port or a bridge input port.
++   A single output port (port@2 on i.MX5, port@4 on i.MX6, port@1 on i.MX8qm
++   and i.MX8qxp) must be connected to a panel input port or a bridge input port.
+    Optionally, the output port can be left out if display-timings are used
+    instead.
+- - phys: the phandle for the LVDS PHY device. Valid only on i.MX8qm.
+- - phy-names: should be "ldb_phy". Valid only on i.MX8qm.
++ - phys: the phandle for the LVDS PHY device. Valid only on i.MX8qm and
++         i.MX8qxp.
++ - phy-names: should be "ldb_phy". Valid only on i.MX8qm and i.MX8qxp.
+ 
+ Optional properties (required if display-timings are used):
+  - ddc-i2c-bus: phandle of an I2C controller used for DDC EDID probing
+diff --git a/drivers/gpu/drm/imx/imx-ldb.c b/drivers/gpu/drm/imx/imx-ldb.c
+index db880ca..69093ff 100644
+--- a/drivers/gpu/drm/imx/imx-ldb.c
++++ b/drivers/gpu/drm/imx/imx-ldb.c
+@@ -31,8 +31,10 @@
+ #include <video/of_videomode.h>
+ #include <linux/phy/phy.h>
+ #include <linux/phy/phy-mixel-lvds.h>
++#include <linux/phy/phy-mixel-lvds-combo.h>
+ #include <linux/regmap.h>
+ #include <linux/videodev2.h>
++#include <soc/imx8/sc/sci.h>
+ 
+ #include "imx-drm.h"
+ 
+@@ -58,6 +60,7 @@
+ #define LDB_CH1_DATA_WIDTH_24BIT	(1 << 26)
+ #define LDB_CH0_DATA_WIDTH_30BIT	(2 << 24)
+ #define LDB_CH1_DATA_WIDTH_30BIT	(2 << 26)
++#define LDB_CH_SEL			(1 << 28)
+ 
+ struct imx_ldb;
+ 
+@@ -106,9 +109,12 @@ struct devtype {
+ 	bool capable_10bit;
+ 	bool visible_phy;
+ 	bool has_mux;
++	bool has_ch_sel;
+ 	bool is_imx8;
+ 	bool use_mixel_phy;
++	bool use_mixel_combo_phy;
+ 	bool padding_quirks;
++	bool pixel_link_quirks;
+ 
+ 	/* pixel rate in KHz */
+ 	unsigned int max_prate_single_mode;
+@@ -131,13 +137,18 @@ struct imx_ldb {
+ 	bool capable_10bit;
+ 	bool visible_phy;
+ 	bool has_mux;
++	bool has_ch_sel;
+ 	bool is_imx8;
+ 	bool use_mixel_phy;
++	bool use_mixel_combo_phy;
+ 	bool padding_quirks;
++	bool pixel_link_quirks;
+ 
+ 	/* pixel rate in KHz */
+ 	unsigned int max_prate_single_mode;
+ 	unsigned int max_prate_dual_mode;
++
++	int id;
+ };
+ 
+ static void imx_ldb_ch_set_bus_format(struct imx_ldb_channel *imx_ldb_ch,
+@@ -372,6 +383,9 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 						     di_clk / 2);
+ 			mixel_phy_lvds_set_phy_speed(ldb->channel[1].phy,
+ 						     di_clk / 2);
++		} else if (ldb->use_mixel_combo_phy) {
++			mixel_phy_combo_lvds_set_phy_speed(ldb->channel[0].phy,
++						     di_clk / 2);
+ 		}
+ 	} else {
+ 		serial_clk = 7000UL * mode->clock;
+@@ -380,6 +394,16 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 
+ 		if (ldb->use_mixel_phy)
+ 			mixel_phy_lvds_set_phy_speed(imx_ldb_ch->phy, di_clk);
++		else if (ldb->use_mixel_combo_phy)
++			mixel_phy_combo_lvds_set_phy_speed(imx_ldb_ch->phy,
++							   di_clk);
++	}
++
++	if (ldb->has_ch_sel) {
++		if (imx_ldb_ch == &ldb->channel[0])
++			ldb->ldb_ctrl &= ~LDB_CH_SEL;
++		if (imx_ldb_ch == &ldb->channel[1])
++			ldb->ldb_ctrl |= LDB_CH_SEL;
+ 	}
+ 
+ 	/* FIXME - assumes straight connections DI0 --> CH0, DI1 --> CH1 */
+@@ -422,6 +446,21 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 				mixel_phy_lvds_set_hsync_pol(
+ 					ldb->channel[1].phy, true);
+ 			}
++		} else if (ldb->use_mixel_combo_phy) {
++			/* VSYNC */
++			if (mode->flags & DRM_MODE_FLAG_NVSYNC)
++				mixel_phy_combo_lvds_set_vsync_pol(
++					ldb->channel[0].phy, false);
++			else if (mode->flags & DRM_MODE_FLAG_PVSYNC)
++				mixel_phy_combo_lvds_set_vsync_pol(
++					ldb->channel[0].phy, true);
++			/* HSYNC */
++			if (mode->flags & DRM_MODE_FLAG_NHSYNC)
++				mixel_phy_combo_lvds_set_hsync_pol(
++					ldb->channel[0].phy, false);
++			else if (mode->flags & DRM_MODE_FLAG_PHSYNC)
++				mixel_phy_combo_lvds_set_hsync_pol(
++					ldb->channel[0].phy, true);
+ 		}
+ 	} else {
+ 		if (ldb->use_mixel_phy) {
+@@ -439,6 +478,25 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 			else if (mode->flags & DRM_MODE_FLAG_PHSYNC)
+ 				mixel_phy_lvds_set_hsync_pol(imx_ldb_ch->phy,
+ 								true);
++		} else if (ldb->use_mixel_combo_phy) {
++			/* VSYNC */
++			if (mode->flags & DRM_MODE_FLAG_NVSYNC)
++				mixel_phy_combo_lvds_set_vsync_pol(
++								imx_ldb_ch->phy,
++								false);
++			else if (mode->flags & DRM_MODE_FLAG_PVSYNC)
++				mixel_phy_combo_lvds_set_vsync_pol(
++								imx_ldb_ch->phy,
++								true);
++			/* HSYNC */
++			if (mode->flags & DRM_MODE_FLAG_NHSYNC)
++				mixel_phy_combo_lvds_set_hsync_pol(
++								imx_ldb_ch->phy,
++								false);
++			else if (mode->flags & DRM_MODE_FLAG_PHSYNC)
++				mixel_phy_combo_lvds_set_hsync_pol(
++								imx_ldb_ch->phy,
++								true);
+ 		}
+ 	}
+ 
+@@ -760,14 +818,28 @@ static u32 of_get_bus_format(struct device *dev, struct imx_ldb *ldb,
+ 	.max_prate_dual_mode = 300000,
+ };
+ 
++static struct devtype imx8qxp_ldb_devtype = {
++	.ctrl_reg = 0x10e0,
++	.bus_mux = NULL,
++	.visible_phy = true,
++	.has_ch_sel = true,
++	.is_imx8 = true,
++	.use_mixel_combo_phy = true,
++	.padding_quirks = true,
++	.pixel_link_quirks = true,
++	.max_prate_single_mode = 150000,
++	.max_prate_dual_mode = 300000,
++};
++
+ /*
+- * For a device declaring compatible = "fsl,imx8qm-ldb", "fsl,imx6q-ldb",
+- * "fsl,imx53-ldb", of_match_device will walk through this list and take the
+- * first entry matching any of its compatible values.
+- * Therefore, the more generic entries (in this case fsl,imx53-ldb) need
+- * to be ordered last.
++ * For a device declaring compatible = "fsl,imx8qxp-ldb", "fsl,imx8qm-ldb",
++ * "fsl,imx6q-ldb",  "fsl,imx53-ldb", of_match_device will walk through this
++ * list and take the first entry matching any of its compatible values.
++ * Therefore, the more generic entries (in this case fsl,imx53-ldb) need to be
++ * ordered last.
+  */
+ static const struct of_device_id imx_ldb_dt_ids[] = {
++	{ .compatible = "fsl,imx8qxp-ldb", .data = &imx8qxp_ldb_devtype, },
+ 	{ .compatible = "fsl,imx8qm-ldb", .data = &imx8qm_ldb_devtype, },
+ 	{ .compatible = "fsl,imx6q-ldb", .data = &imx6q_ldb_devtype, },
+ 	{ .compatible = "fsl,imx53-ldb", .data = &imx53_ldb_devtype, },
+@@ -815,6 +887,49 @@ static int imx_ldb_panel_ddc(struct device *dev,
+ 	return 0;
+ }
+ 
++static void ldb_pixel_link_config(int id)
++{
++	sc_err_t sciErr;
++	sc_ipc_t ipcHndl = 0;
++	u32 mu_id;
++
++	sciErr = sc_ipc_getMuID(&mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("Cannot obtain MU ID\n");
++		return;
++	}
++
++	sciErr = sc_ipc_open(&ipcHndl, mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("sc_ipc_open failed! (sciError = %d)\n", sciErr);
++		return;
++	}
++
++	if (id == 0) {
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_MODE, 1);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_MIPI_%d MODE failed %d!\n", id, sciErr);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_DUAL_MODE, 0);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_MIPI_%d DUAL_MODE failed %d!\n", id, sciErr);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_PXL_LINK_SEL, 0);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_MIPI_%d PXL_LINK_SEL failed %d!\n", id, sciErr);
++	} else {
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_MODE, 1);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_MIPI_%d MODE failed %d!\n", id, sciErr);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_DUAL_MODE, 0);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_MIPI_%d DUAL_MODE failed %d!\n", id, sciErr);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_PXL_LINK_SEL, 0);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_MIPI_%d PXL_LINK_SEL failed %d!\n", id, sciErr);
++	}
++
++	sc_ipc_close(mu_id);
++}
++
+ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct drm_device *drm = data;
+@@ -844,15 +959,23 @@ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ 	imx_ldb->capable_10bit = devtype->capable_10bit;
+ 	imx_ldb->visible_phy = devtype->visible_phy;
+ 	imx_ldb->has_mux = devtype->has_mux;
++	imx_ldb->has_ch_sel = devtype->has_ch_sel;
+ 	imx_ldb->is_imx8 = devtype->is_imx8;
+ 	imx_ldb->use_mixel_phy = devtype->use_mixel_phy;
++	imx_ldb->use_mixel_combo_phy = devtype->use_mixel_combo_phy;
+ 	imx_ldb->padding_quirks = devtype->padding_quirks;
++	imx_ldb->pixel_link_quirks = devtype->pixel_link_quirks;
+ 	imx_ldb->max_prate_single_mode = devtype->max_prate_single_mode;
+ 	imx_ldb->max_prate_dual_mode = devtype->max_prate_dual_mode;
+ 
+ 	dual = of_property_read_bool(np, "fsl,dual-channel");
+-	if (dual)
++	if (dual) {
++		if (imx_ldb->has_ch_sel) {
++			dev_info(dev, "do not suppurt dual channel mode\n");
++			return -EINVAL;
++		}
+ 		imx_ldb->ldb_ctrl |= LDB_SPLIT_MODE_EN;
++	}
+ 
+ 	if (imx_ldb->is_imx8) {
+ 		imx_ldb->clk_pixel = devm_clk_get(imx_ldb->dev, "pixel");
+@@ -994,6 +1117,11 @@ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ 
+ 	dev_set_drvdata(dev, imx_ldb);
+ 
++	if (imx_ldb->pixel_link_quirks) {
++		imx_ldb->id = of_alias_get_id(np, "ldb");
++		ldb_pixel_link_config(imx_ldb->id);
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

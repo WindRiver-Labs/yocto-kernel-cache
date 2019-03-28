@@ -1,0 +1,352 @@
+From 9ca74bcbd4617109f897f3147e04409178de9f01 Mon Sep 17 00:00:00 2001
+From: Shengjiu Wang <shengjiu.wang@nxp.com>
+Date: Wed, 25 Jul 2018 13:42:50 +0800
+Subject: [PATCH 4391/5242] MLK-19042-1: ASoC: fsl_rpmsg_i2s: support low
+ power audio
+
+commit  3fef6fb095d15d12e3f6b8d54310632995e28490 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add two new message command I2S_TX_POINTER and I2S_RX_POINTER,
+which are used to get the hw pointer in m4 side. For in low
+power audio mode, m4 won't send notification every period, the
+notification only be sent when hw pointer reach end of buffer,
+so we need these command to get the position of hw pointer,
+user can use it to calculate the timestamp.
+
+Restructure send message and recv message together for i2s_rpmsg,
+that every send message has a recv message. so the
+i2s_send_message can store the recv message indepedently. one
+reason is that the receive message is async withe send message.
+
+The low power audio is disabled in default, user need to enabled
+it by add "fsl,enable-lpa" in dts.
+
+Signed-off-by: Shengjiu Wang <shengjiu.wang@nxp.com>
+Reviewed-by: Viorel Suman <viorel.suman@nxp.com>
+(cherry picked from commit 753e7b819609ad4791e32069a124d4411c720947)
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../devicetree/bindings/sound/fsl,rpmsg-i2s.txt    |    1 +
+ sound/soc/fsl/fsl_rpmsg_i2s.c                      |  115 ++++++++++++++------
+ sound/soc/fsl/fsl_rpmsg_i2s.h                      |   49 ++++++---
+ 3 files changed, 116 insertions(+), 49 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt b/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt
+index f38cf9d..fd62b0d 100644
+--- a/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt
++++ b/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt
+@@ -7,6 +7,7 @@ serial interfaces with frame synchronization such as I2S.
+ Required properties:
+ 
+   - compatible		: Compatible list, contains "fsl,imx7ulp-rpmsg-i2s".
++				"fsl,imx8mq-rpmsg-i2s"
+ 
+   - fsl,audioindex      : This is an index indicating the audio device index in
+ 			  the M4 side.
+diff --git a/sound/soc/fsl/fsl_rpmsg_i2s.c b/sound/soc/fsl/fsl_rpmsg_i2s.c
+index ec3560d..4d004a3 100644
+--- a/sound/soc/fsl/fsl_rpmsg_i2s.c
++++ b/sound/soc/fsl/fsl_rpmsg_i2s.c
+@@ -30,10 +30,10 @@
+ 				SNDRV_PCM_RATE_48000)
+ #define FSL_RPMSG_I2S_FORMATS	SNDRV_PCM_FMTBIT_S16_LE
+ 
+-static int i2s_send_message(struct i2s_rpmsg_s *msg,
++static int i2s_send_message(struct i2s_rpmsg *msg,
+ 			       struct i2s_info *info)
+ {
+-	int err;
++	int err = 0;
+ 
+ 	mutex_lock(&info->tx_lock);
+ 	if (!info->rpdev) {
+@@ -42,10 +42,12 @@ static int i2s_send_message(struct i2s_rpmsg_s *msg,
+ 		return -EINVAL;
+ 	}
+ 
+-	dev_dbg(&info->rpdev->dev, "send cmd %d\n", msg->header.cmd);
++	dev_dbg(&info->rpdev->dev, "send cmd %d\n", msg->send_msg.header.cmd);
+ 
+-	reinit_completion(&info->cmd_complete);
+-	err = rpmsg_send(info->rpdev->ept, (void *)msg,
++	if (!(msg->send_msg.header.type == I2S_TYPE_C))
++		reinit_completion(&info->cmd_complete);
++
++	err = rpmsg_send(info->rpdev->ept, (void *)&msg->send_msg,
+ 			 sizeof(struct i2s_rpmsg_s));
+ 	if (err) {
+ 		dev_err(&info->rpdev->dev, "rpmsg_send failed: %d\n", err);
+@@ -53,20 +55,25 @@ static int i2s_send_message(struct i2s_rpmsg_s *msg,
+ 		return err;
+ 	}
+ 
+-	/* wait response from rpmsg */
+-	err = wait_for_completion_timeout(&info->cmd_complete,
++	if (!(msg->send_msg.header.type == I2S_TYPE_C)) {
++		/* wait response from rpmsg */
++		err = wait_for_completion_timeout(&info->cmd_complete,
+ 					  msecs_to_jiffies(RPMSG_TIMEOUT));
+-	if (!err) {
+-		dev_err(&info->rpdev->dev, "rpmsg_send cmd %d timeout!\n",
+-							msg->header.cmd);
+-		mutex_unlock(&info->tx_lock);
+-		return -ETIMEDOUT;
++		if (!err) {
++			dev_err(&info->rpdev->dev,
++					"rpmsg_send cmd %d timeout!\n",
++					msg->send_msg.header.cmd);
++			mutex_unlock(&info->tx_lock);
++			return -ETIMEDOUT;
++		}
++		memcpy(&msg->recv_msg, &info->recv_msg,
++					sizeof(struct i2s_rpmsg_r));
++		memcpy(&info->rpmsg[msg->recv_msg.header.cmd].recv_msg,
++			&msg->recv_msg, sizeof(struct i2s_rpmsg_r));
+ 	}
+ 
+-	if (msg->header.cmd == GET_CODEC_VALUE)
+-		msg->param.buffer_size = info->recv_msg.param.reg_data;
+-
+-	dev_dbg(&info->rpdev->dev, "cmd:%d, resp %d\n", msg->header.cmd,
++	dev_dbg(&info->rpdev->dev, "cmd:%d, resp %d\n",
++						msg->send_msg.header.cmd,
+ 						info->recv_msg.param.resp);
+ 	mutex_unlock(&info->tx_lock);
+ 
+@@ -99,6 +106,7 @@ static int i2s_send_message(struct i2s_rpmsg_s *msg,
+ 
+ static const struct of_device_id fsl_rpmsg_i2s_ids[] = {
+ 	{ .compatible = "fsl,imx7ulp-rpmsg-i2s"},
++	{ .compatible = "fsl,imx8mq-rpmsg-i2s"},
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, fsl_rpmsg_i2s_ids);
+@@ -149,17 +157,56 @@ static int fsl_rpmsg_i2s_probe(struct platform_device *pdev)
+ 		i2s_info->work_list[i].i2s_info = i2s_info;
+ 	}
+ 
+-	for (i = 0; i < RPMSG_AUDIO_NUM; i++) {
+-		i2s_info->send_msg[i].header.cate  = IMX_RPMSG_AUDIO;
+-		i2s_info->send_msg[i].header.major = IMX_RMPSG_MAJOR;
+-		i2s_info->send_msg[i].header.minor = IMX_RMPSG_MINOR;
+-		i2s_info->send_msg[i].header.type  = I2S_TYPE_A;
+-		i2s_info->send_msg[i].param.audioindex = audioindex;
++	for (i = 0; i < I2S_CMD_MAX_NUM ; i++) {
++		i2s_info->rpmsg[i].send_msg.header.cate  = IMX_RPMSG_AUDIO;
++		i2s_info->rpmsg[i].send_msg.header.major = IMX_RMPSG_MAJOR;
++		i2s_info->rpmsg[i].send_msg.header.minor = IMX_RMPSG_MINOR;
++		i2s_info->rpmsg[i].send_msg.header.type  = I2S_TYPE_A;
++		i2s_info->rpmsg[i].send_msg.param.audioindex = audioindex;
+ 	}
+ 
+ 	mutex_init(&i2s_info->tx_lock);
+ 	mutex_init(&i2s_info->i2c_lock);
+ 
++	if (of_device_is_compatible(pdev->dev.of_node,
++				    "fsl,imx7ulp-rpmsg-i2s")) {
++		rpmsg_i2s->codec = 1;
++		rpmsg_i2s->version = 1;
++		rpmsg_i2s->rates = SNDRV_PCM_RATE_8000 |
++				SNDRV_PCM_RATE_16000 |
++				SNDRV_PCM_RATE_48000;
++		rpmsg_i2s->formats =  SNDRV_PCM_FMTBIT_S16_LE;
++		fsl_rpmsg_i2s_dai.playback.rates = rpmsg_i2s->rates;
++		fsl_rpmsg_i2s_dai.playback.formats = rpmsg_i2s->formats;
++		fsl_rpmsg_i2s_dai.capture.rates = rpmsg_i2s->rates;
++		fsl_rpmsg_i2s_dai.capture.formats = rpmsg_i2s->formats;
++	}
++
++	if (of_device_is_compatible(pdev->dev.of_node,
++				    "fsl,imx8mq-rpmsg-i2s")) {
++		rpmsg_i2s->codec = 0;
++		rpmsg_i2s->version = 2;
++		rpmsg_i2s->rates = SNDRV_PCM_RATE_32000 |
++				SNDRV_PCM_RATE_48000 |
++				SNDRV_PCM_RATE_96000 |
++				SNDRV_PCM_RATE_192000;
++		rpmsg_i2s->formats = SNDRV_PCM_FMTBIT_S16_LE |
++					SNDRV_PCM_FMTBIT_S24_LE |
++					SNDRV_PCM_FMTBIT_S32_LE |
++					SNDRV_PCM_FMTBIT_S24_3LE;
++		fsl_rpmsg_i2s_dai.playback.rates = rpmsg_i2s->rates;
++		fsl_rpmsg_i2s_dai.playback.formats = rpmsg_i2s->formats;
++		fsl_rpmsg_i2s_dai.capture.rates = rpmsg_i2s->rates;
++		fsl_rpmsg_i2s_dai.capture.formats = rpmsg_i2s->formats;
++	}
++
++	if (of_property_read_bool(pdev->dev.of_node, "fsl,enable-lpa"))
++		rpmsg_i2s->enable_lpa = 1;
++
++	if (of_property_read_u32(np, "fsl,dma-buffer-size",
++					&i2s_info->prealloc_buffer_size))
++		i2s_info->prealloc_buffer_size = IMX_DEFAULT_DMABUF_SIZE;
++
+ 	platform_set_drvdata(pdev, rpmsg_i2s);
+ 	pm_runtime_enable(&pdev->dev);
+ 
+@@ -205,17 +252,17 @@ static int fsl_rpmsg_i2s_suspend(struct device *dev)
+ {
+ 	struct fsl_rpmsg_i2s *rpmsg_i2s = dev_get_drvdata(dev);
+ 	struct i2s_info  *i2s_info =  &rpmsg_i2s->i2s_info;
+-	struct i2s_rpmsg_s *rpmsg_tx;
+-	struct i2s_rpmsg_s *rpmsg_rx;
++	struct i2s_rpmsg *rpmsg_tx;
++	struct i2s_rpmsg *rpmsg_rx;
+ 
+ 	flush_workqueue(i2s_info->rpmsg_wq);
+-	rpmsg_tx = &i2s_info->send_msg[SNDRV_PCM_STREAM_PLAYBACK];
+-	rpmsg_rx = &i2s_info->send_msg[SNDRV_PCM_STREAM_CAPTURE];
++	rpmsg_tx = &i2s_info->rpmsg[I2S_TX_SUSPEND];
++	rpmsg_rx = &i2s_info->rpmsg[I2S_RX_SUSPEND];
+ 
+-	rpmsg_tx->header.cmd = I2S_TX_SUSPEND;
++	rpmsg_tx->send_msg.header.cmd = I2S_TX_SUSPEND;
+ 	i2s_send_message(rpmsg_tx, i2s_info);
+ 
+-	rpmsg_rx->header.cmd = I2S_RX_SUSPEND;
++	rpmsg_rx->send_msg.header.cmd = I2S_RX_SUSPEND;
+ 	i2s_send_message(rpmsg_rx, i2s_info);
+ 
+ 	return 0;
+@@ -225,16 +272,16 @@ static int fsl_rpmsg_i2s_resume(struct device *dev)
+ {
+ 	struct fsl_rpmsg_i2s *rpmsg_i2s = dev_get_drvdata(dev);
+ 	struct i2s_info  *i2s_info =  &rpmsg_i2s->i2s_info;
+-	struct i2s_rpmsg_s *rpmsg_tx;
+-	struct i2s_rpmsg_s *rpmsg_rx;
++	struct i2s_rpmsg *rpmsg_tx;
++	struct i2s_rpmsg *rpmsg_rx;
+ 
+-	rpmsg_tx = &i2s_info->send_msg[SNDRV_PCM_STREAM_PLAYBACK];
+-	rpmsg_rx = &i2s_info->send_msg[SNDRV_PCM_STREAM_CAPTURE];
++	rpmsg_tx = &i2s_info->rpmsg[I2S_TX_RESUME];
++	rpmsg_rx = &i2s_info->rpmsg[I2S_RX_RESUME];
+ 
+-	rpmsg_tx->header.cmd = I2S_TX_RESUME;
++	rpmsg_tx->send_msg.header.cmd = I2S_TX_RESUME;
+ 	i2s_send_message(rpmsg_tx, i2s_info);
+ 
+-	rpmsg_rx->header.cmd = I2S_RX_RESUME;
++	rpmsg_rx->send_msg.header.cmd = I2S_RX_RESUME;
+ 	i2s_send_message(rpmsg_rx, i2s_info);
+ 
+ 	return 0;
+diff --git a/sound/soc/fsl/fsl_rpmsg_i2s.h b/sound/soc/fsl/fsl_rpmsg_i2s.h
+index cbb984e..9c5105c 100644
+--- a/sound/soc/fsl/fsl_rpmsg_i2s.h
++++ b/sound/soc/fsl/fsl_rpmsg_i2s.h
+@@ -304,11 +304,20 @@
+ #define		I2S_RX_RESUME		0x13
+ #define         SET_CODEC_VALUE         0x14
+ #define         GET_CODEC_VALUE         0x15
+-#define         WORK_MAX_NUM		0x16
++#define		I2S_TX_POINTER		0x16
++#define		I2S_RX_POINTER		0x17
++
++#define         I2S_TYPE_A_NUM          0x18
++
++#define         WORK_MAX_NUM		0x18
+ 
+ #define		I2S_TX_PERIOD_DONE	0x0
+ #define		I2S_RX_PERIOD_DONE	0x1
+ 
++#define         I2S_TYPE_C_NUM          0x2
++
++#define         I2S_CMD_MAX_NUM	        (I2S_TYPE_A_NUM + I2S_TYPE_C_NUM)
++
+ #define         I2S_TYPE_A		0x0
+ #define         I2S_TYPE_B		0x1
+ #define         I2S_TYPE_C		0x2
+@@ -320,6 +329,7 @@
+ 
+ #define		RPMSG_S16_LE		0x0
+ #define		RPMSG_S24_LE		0x1
++#define		RPMSG_S32_LE		0x2
+ 
+ #define		RPMSG_CH_LEFT		0x0
+ #define		RPMSG_CH_RIGHT		0x1
+@@ -339,10 +349,12 @@ struct i2s_param_s {
+ struct i2s_param_r {
+ 	unsigned char audioindex;
+ 	unsigned char resp;
+-	unsigned char reserved1[5];
++	unsigned char reserved1[1];
++	unsigned int  buffer_offset;	/* the consumed offset of buffer*/
+ 	unsigned int  reg_addr;
+ 	unsigned int  reg_data;
+-	unsigned char reserved2[8];
++	unsigned char reserved2[4];
++	unsigned int  buffer_tail;
+ } __packed;
+ 
+ /* struct of send message */
+@@ -357,46 +369,53 @@ struct i2s_rpmsg_r {
+ 	struct i2s_param_r    param;
+ };
+ 
++struct i2s_rpmsg {
++	struct i2s_rpmsg_s       send_msg;
++	struct i2s_rpmsg_r       recv_msg;
++};
++
+ struct work_of_rpmsg {
+ 	struct i2s_info		*i2s_info;
+ 	/* sent msg for each work */
+-	struct i2s_rpmsg_s       msg;
++	struct i2s_rpmsg         msg;
+ 	struct work_struct       work;
+ };
+ 
+-enum {
+-	RPMSG_AUDIO_TX = 0,
+-	RPMSG_AUDIO_RX = 1,
+-	RPMSG_AUDIO_I2C = 2,
+-	RPMSG_AUDIO_NUM = 3,
+-};
+-
+ typedef void (*dma_callback)(void *arg);
+ struct i2s_info {
+ 	struct rpmsg_device     *rpdev;
+ 	struct device            *dev;
+ 	struct completion        cmd_complete;
+-	/* received msg */
++
++	/* received msg (global) */
+ 	struct i2s_rpmsg_r       recv_msg;
+-	/* backup sent msg */
+-	struct i2s_rpmsg_s       send_msg[RPMSG_AUDIO_NUM];
++
++	struct i2s_rpmsg         rpmsg[I2S_CMD_MAX_NUM];
+ 
+ 	struct workqueue_struct  *rpmsg_wq;
+ 	struct work_of_rpmsg	 work_list[WORK_MAX_NUM];
+ 	int                      work_index;
+ 	int                      num_period[2];
+ 	void                     *callback_param[2];
+-	int (*send_message)(struct i2s_rpmsg_s *msg, struct i2s_info *info);
++	int (*send_message)(struct i2s_rpmsg *msg, struct i2s_info *info);
+ 	dma_callback             callback[2];
+ 	spinlock_t               lock[2];
+ 	struct mutex             tx_lock;
+ 	struct mutex             i2c_lock;
++	struct timer_list        stream_timer[2];
++	int                      prealloc_buffer_size;
+ };
+ 
+ struct fsl_rpmsg_i2s {
+ 	struct platform_device *pdev;
+ 	struct i2s_info        i2s_info;
+ 	struct pm_qos_request pm_qos_req;
++	int codec;
++	int force_lpa;
++	int version;
++	int rates;
++	u64 formats;
++	int enable_lpa;
+ };
+ 
+ #define RPMSG_CODEC_DRV_NAME "rpmsg-audio-codec"
+-- 
+1.7.9.5
+

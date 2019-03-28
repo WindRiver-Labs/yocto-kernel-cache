@@ -1,0 +1,116 @@
+From a0507ad9a242333be70fe3e433b0955f16bd9656 Mon Sep 17 00:00:00 2001
+From: Octavian Purdila <octavian.purdila@nxp.com>
+Date: Thu, 13 Apr 2017 14:22:38 +0300
+Subject: [PATCH 1677/5242] MLK-14609 ASoC: fsl_asrc: use
+ snd_pcm_stream_lock_irqsave/restore
+
+commit  634af7f9601e01f5e30ed5b52354dd78dc7498f2 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+fsl_asrc_reset can be called from interrupt context with interrupts
+disabled via sdma_int_handler -> imx_pcm_dma_complete. In this case we
+need to make sure we don't reenable interrupts.
+
+However, start_unlock_stream uses the _irq version of
+snd_pcm_stream_unlock which means that interrupts will be enabled at
+the end of that function.
+
+This patch switches to the _irqsave/_irqrestore version of
+snd_cpm_stream_lock/unlock to avoid the above issue and fix the
+following warning:
+
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 0 at kernel/irq/handle.c:151 __handle_irq_event_percpu+0x150/0x154
+irq 61 handler sdma_int_handler+0x0/0x34c enabled interrupts
+Modules linked in:
+CPU: 0 PID: 0 Comm: swapper/0 Not tainted 4.9.11-02052-g4c94f9e-dirty #684
+Hardware name: Freescale i.MX6 Quad/DualLite (Device Tree)
+[<8010ed08>] (unwind_backtrace) from [<8010b350>] (show_stack+0x10/0x14)
+[<8010b350>] (show_stack) from [<803bae4c>] (dump_stack+0x88/0x9c)
+[<803bae4c>] (dump_stack) from [<8012d82c>] (__warn+0xe8/0x100)
+[<8012d82c>] (__warn) from [<8012d87c>] (warn_slowpath_fmt+0x38/0x48)
+[<8012d87c>] (warn_slowpath_fmt) from [<80170a48>] (__handle_irq_event_percpu+0x150/0x154)
+[<80170a48>] (__handle_irq_event_percpu) from [<80170a68>] (handle_irq_event_percpu+0x1c/0x58)
+[<80170a68>] (handle_irq_event_percpu) from [<80170adc>] (handle_irq_event+0x38/0x5c)
+[<80170adc>] (handle_irq_event) from [<80173e3c>] (handle_fasteoi_irq+0xd0/0x1a8)
+[<80173e3c>] (handle_fasteoi_irq) from [<8016fc78>] (generic_handle_irq+0x24/0x34)
+[<8016fc78>] (generic_handle_irq) from [<80170194>] (__handle_domain_irq+0x7c/0xec)
+[<80170194>] (__handle_domain_irq) from [<801014c4>] (gic_handle_irq+0x48/0x8c)
+[<801014c4>] (gic_handle_irq) from [<8010be8c>] (__irq_svc+0x6c/0xa8)
+Exception stack(0x80f01f20 to 0x80f01f68)
+1f20: 00000000 00000002 00000001 f4a00600 00000001 daf1ce68 4f334151 00000014
+1f40: 4ef44986 00000014 00000004 80f03144 8010e30c 80f01f70 80999fb8 806c8808
+1f60: 200f0013 ffffffff
+[<8010be8c>] (__irq_svc) from [<806c8808>] (cpuidle_enter_state+0xec/0x264)
+[<806c8808>] (cpuidle_enter_state) from [<80166e4c>] (cpu_startup_entry+0x148/0x21c)
+[<80166e4c>] (cpu_startup_entry) from [<80e00c58>] (start_kernel+0x37c/0x388)
+---[ end trace c7e4dec8204cf86b ]---
+
+Signed-off-by: Octavian Purdila <octavian.purdila@nxp.com>
+Reviewed-by: Daniel Baluta <daniel.baluta@nxp.com>
+---
+ sound/soc/fsl/fsl_asrc.c |   19 +++++++++++--------
+ 1 file changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_asrc.c b/sound/soc/fsl/fsl_asrc.c
+index 24d9c79..c567b82 100644
+--- a/sound/soc/fsl/fsl_asrc.c
++++ b/sound/soc/fsl/fsl_asrc.c
+@@ -847,22 +847,24 @@ static bool fsl_asrc_check_xrun(struct snd_pcm_substream *substream)
+ 	return ret;
+ }
+ 
+-static int stop_lock_stream(struct snd_pcm_substream *substream)
++static int stop_lock_stream(struct snd_pcm_substream *substream,
++			    unsigned long *flags)
+ {
+ 	if (substream) {
+-		snd_pcm_stream_lock_irq(substream);
++		snd_pcm_stream_lock_irqsave(substream, *flags);
+ 		if (substream->runtime->status->state == SNDRV_PCM_STATE_RUNNING)
+ 			substream->ops->trigger(substream, SNDRV_PCM_TRIGGER_STOP);
+ 	}
+ 	return 0;
+ }
+ 
+-static int start_unlock_stream(struct snd_pcm_substream *substream)
++static int start_unlock_stream(struct snd_pcm_substream *substream,
++			       unsigned long *flags)
+ {
+ 	if (substream) {
+ 		if (substream->runtime->status->state == SNDRV_PCM_STATE_RUNNING)
+ 			substream->ops->trigger(substream, SNDRV_PCM_TRIGGER_START);
+-		snd_pcm_stream_unlock_irq(substream);
++		snd_pcm_stream_unlock_irqrestore(substream, *flags);
+ 	}
+ 	return 0;
+ }
+@@ -875,10 +877,11 @@ static void fsl_asrc_reset(struct snd_pcm_substream *substream, bool stop)
+ 	struct snd_dmaengine_dai_dma_data *dma_params_be = NULL;
+ 	struct snd_soc_dpcm *dpcm;
+ 	struct snd_pcm_substream *be_substream;
++	unsigned long flags0, flags1;
+ 
+ 	if (stop) {
+-		stop_lock_stream(asrc_priv->substream[0]);
+-		stop_lock_stream(asrc_priv->substream[1]);
++		stop_lock_stream(asrc_priv->substream[0], &flags0);
++		stop_lock_stream(asrc_priv->substream[1], &flags1);
+ 	}
+ 
+ 	/* find the be for this fe stream */
+@@ -896,8 +899,8 @@ static void fsl_asrc_reset(struct snd_pcm_substream *substream, bool stop)
+ 	}
+ 
+ 	if (stop) {
+-		start_unlock_stream(asrc_priv->substream[1]);
+-		start_unlock_stream(asrc_priv->substream[0]);
++		start_unlock_stream(asrc_priv->substream[1], &flags1);
++		start_unlock_stream(asrc_priv->substream[0], &flags0);
+ 	}
+ }
+ 
+-- 
+1.7.9.5
+

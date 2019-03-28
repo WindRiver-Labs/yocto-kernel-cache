@@ -1,0 +1,111 @@
+From 1ec971c67e937372c281cb40d258e87120156d34 Mon Sep 17 00:00:00 2001
+From: Radu Solea <radu.solea@nxp.com>
+Date: Fri, 16 Jun 2017 14:02:50 +0300
+Subject: [PATCH 1970/5242] MLK-14765: Fix DCP Aes timeout issues when used
+ with CTS
+
+commit  4766623be90df38cdf3ab07f2ea045cc09c03b78 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The DCP driver does not obey cryptlen, when doing CTS this results in
+passing to hardware input stream lengths which are not multiple of
+block size. This causes the hw to misbehave. Also not honoring
+cryptlen makes CTS fail. A check was introduced to prevent future
+erroneous stream lengths from reaching the hardware. Code which is
+splitting the input stream in internal DCP pages was changed to obey
+cryptlen.
+
+Signed-off-by: Radu Solea <radu.solea@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/crypto/mxs-dcp.c |   27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/mxs-dcp.c b/drivers/crypto/mxs-dcp.c
+index a534971..c713a51 100644
+--- a/drivers/crypto/mxs-dcp.c
++++ b/drivers/crypto/mxs-dcp.c
+@@ -236,6 +236,12 @@ static int mxs_dcp_run_aes(struct dcp_async_ctx *actx,
+ 	dma_addr_t dst_phys = dma_map_single(sdcp->dev, sdcp->coh->aes_out_buf,
+ 					     DCP_BUF_SZ, DMA_FROM_DEVICE);
+ 
++	if (actx->fill % AES_BLOCK_SIZE) {
++		dev_err(sdcp->dev, "Invalid block size!\n");
++		ret = -EINVAL;
++		goto aes_done_run;
++	}
++
+ 	/* Fill in the DMA descriptor. */
+ 	desc->control0 = MXS_DCP_CONTROL0_DECR_SEMAPHORE |
+ 		    MXS_DCP_CONTROL0_INTERRUPT |
+@@ -265,6 +271,7 @@ static int mxs_dcp_run_aes(struct dcp_async_ctx *actx,
+ 
+ 	ret = mxs_dcp_start_dma(actx);
+ 
++aes_done_run:
+ 	dma_unmap_single(sdcp->dev, key_phys, 2 * AES_KEYSIZE_128,
+ 			 DMA_TO_DEVICE);
+ 	dma_unmap_single(sdcp->dev, src_phys, DCP_BUF_SZ, DMA_TO_DEVICE);
+@@ -291,13 +298,15 @@ static int mxs_dcp_aes_block_crypt(struct crypto_async_request *arq)
+ 
+ 	uint8_t *out_tmp, *src_buf, *dst_buf = NULL;
+ 	uint32_t dst_off = 0;
++	uint32_t last_out_len = 0;
+ 
+ 	uint8_t *key = sdcp->coh->aes_key;
+ 
+ 	int ret = 0;
+ 	int split = 0;
+-	unsigned int i, len, clen, rem = 0;
++	unsigned int i, len, clen, rem = 0, tlen = 0;
+ 	int init = 0;
++	bool limit_hit = false;
+ 
+ 	actx->fill = 0;
+ 
+@@ -316,6 +325,11 @@ static int mxs_dcp_aes_block_crypt(struct crypto_async_request *arq)
+ 	for_each_sg(req->src, src, nents, i) {
+ 		src_buf = sg_virt(src);
+ 		len = sg_dma_len(src);
++		tlen += len;
++		limit_hit = tlen > req->nbytes;
++
++		if (limit_hit)
++			len = req->nbytes - (tlen - len);
+ 
+ 		do {
+ 			if (actx->fill + len > out_off)
+@@ -332,13 +346,15 @@ static int mxs_dcp_aes_block_crypt(struct crypto_async_request *arq)
+ 			 * If we filled the buffer or this is the last SG,
+ 			 * submit the buffer.
+ 			 */
+-			if (actx->fill == out_off || sg_is_last(src)) {
++			if (actx->fill == out_off || sg_is_last(src) ||
++				limit_hit) {
+ 				ret = mxs_dcp_run_aes(actx, req, init);
+ 				if (ret)
+ 					return ret;
+ 				init = 0;
+ 
+ 				out_tmp = out_buf;
++				last_out_len = actx->fill;
+ 				while (dst && actx->fill) {
+ 					if (!split) {
+ 						dst_buf = sg_virt(dst);
+@@ -361,6 +377,13 @@ static int mxs_dcp_aes_block_crypt(struct crypto_async_request *arq)
+ 				}
+ 			}
+ 		} while (len);
++
++		if (limit_hit)
++			break;
++	}
++	if (last_out_len >= AES_BLOCK_SIZE) {
++		memcpy(req->info, out_buf+(last_out_len-AES_BLOCK_SIZE),
++		       AES_BLOCK_SIZE);
+ 	}
+ 
+ 	return ret;
+-- 
+1.7.9.5
+

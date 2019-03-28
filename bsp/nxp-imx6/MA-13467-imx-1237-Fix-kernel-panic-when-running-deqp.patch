@@ -1,0 +1,230 @@
+From 1993a8eb2fc83560346df685a4e22201886d304a Mon Sep 17 00:00:00 2001
+From: "Ivan.liu" <xiaowen.liu@nxp.com>
+Date: Tue, 20 Nov 2018 13:20:38 +0800
+Subject: [PATCH 5159/5242] MA-13467 [#imx-1237] Fix kernel panic when running
+ deqp module.
+
+commit  6f27d64b1fee81a5af9361f20c703a988eed34a3 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Unable to handle kernel paging request at virtual address 1000100
+[<ffff000008274ed8>] prefetch_freepointer.isra.37+0x8/0x14
+[<ffff0000087bd3b0>] sync_file_create+0x28/0xc0
+[<ffff000008b7c7e4>] gckOS_CreateNativeFence+0x74/0x110
+[<ffff000008b89a78>] gckKERNEL_Dispatch+0xa54/0x15b0
+[<ffff000008b8a8b8>] gckDEVICE_Dispatch+0x2e4/0x2f8
+[<ffff000008b81160>] drv_ioctl+0x110/0x21c
+[<ffff0000082b4478>] do_vfs_ioctl+0xb8/0x8b0
+[<ffff0000082b4cf4>] SyS_ioctl+0x84/0x98
+
+The reference count should be increased in one spin lock cycle.
+Move spin lock out of _QueryIntegerId function.
+Move signal reference count to gckOS_CreateNativeFence.
+
+Change-Id: I1bf89b4de6055e5d0009baf7287f600696c4a529
+Signed-off-by: Ivan.liu <xiaowen.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c |   72 ++++++++++++++------
+ .../hal/os/linux/kernel/gc_hal_kernel_sync.c       |   11 +--
+ 2 files changed, 54 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c
+index bfd4f2f..bd3ea86 100644
+--- a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c
++++ b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c
+@@ -346,14 +346,8 @@
+     )
+ {
+     gctPOINTER pointer;
+-    unsigned long flags;
+-
+-    spin_lock_irqsave(&Database->lock, flags);
+ 
+     pointer = idr_find(&Database->idr, Id);
+-
+-    spin_unlock_irqrestore(&Database->lock, flags);
+-
+     if (pointer)
+     {
+         *KernelPointer = pointer;
+@@ -5587,9 +5581,14 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     gcmkVERIFY_OBJECT(Os, gcvOBJ_OS);
+     gcmkVERIFY_ARGUMENT(Signal != gcvNULL);
+ 
+-    gcmkONERROR(_QueryIntegerId(&Os->signalDB, (gctUINT32)(gctUINTPTR_T)Signal, (gctPOINTER)&signal));
+-
+     spin_lock_irqsave(&Os->signalDB.lock, flags);
++    status = _QueryIntegerId(&Os->signalDB, (gctUINT32)(gctUINTPTR_T)Signal, (gctPOINTER)&signal);
++    if (gcmIS_ERROR(status))
++    {
++        spin_unlock_irqrestore(&Os->signalDB.lock, flags);
++        gcmkONERROR(status);
++    }
++
+     gcmkASSERT(signal->id == (gctUINT32)(gctUINTPTR_T)Signal);
+     signal->ref--;
+ 
+@@ -5657,16 +5656,16 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     gcmkVERIFY_OBJECT(Os, gcvOBJ_OS);
+     gcmkVERIFY_ARGUMENT(Signal != gcvNULL);
+ 
++    spin_lock_irqsave(&Os->signalDB.lock, flags);
+     status = _QueryIntegerId(&Os->signalDB,
+                              (gctUINT32)(gctUINTPTR_T)Signal,
+                              (gctPOINTER)&signal);
+-
+     if (gcmIS_ERROR(status))
+     {
++        spin_unlock_irqrestore(&Os->signalDB.lock, flags);
+         gcmkONERROR(status);
+     }
+ 
+-    spin_lock_irqsave(&Os->signalDB.lock, flags);
+     /*
+      * Signal saved in event is not referenced. Inc reference here to avoid
+      * concurrent issue: signaling the signal while another thread is destroying
+@@ -5811,6 +5810,7 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     gceSTATUS status;
+     gcsSIGNAL_PTR signal;
+     int done;
++    unsigned long flags;
+ 
+     gcmkHEADER_ARG("Os=0x%X Signal=0x%X Wait=0x%08X", Os, Signal, Wait);
+ 
+@@ -5818,7 +5818,11 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     gcmkVERIFY_OBJECT(Os, gcvOBJ_OS);
+     gcmkVERIFY_ARGUMENT(Signal != gcvNULL);
+ 
+-    gcmkONERROR(_QueryIntegerId(&Os->signalDB, (gctUINT32)(gctUINTPTR_T)Signal, (gctPOINTER)&signal));
++    spin_lock_irqsave(&Os->signalDB.lock, flags);
++    status = _QueryIntegerId(&Os->signalDB, (gctUINT32)(gctUINTPTR_T)Signal, (gctPOINTER)&signal);
++    spin_unlock_irqrestore(&Os->signalDB.lock, flags);
++
++    gcmkONERROR(status);
+ 
+     gcmkASSERT(signal->id == (gctUINT32)(gctUINTPTR_T)Signal);
+ 
+@@ -5905,10 +5909,13 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+      */
+     gceSTATUS status;
+     gcsSIGNAL_PTR signal = gcvNULL;
++    unsigned long flags;
+ 
++    spin_lock_irqsave(&Os->signalDB.lock, flags);
+     status = _QueryIntegerId(&Os->signalDB,
+                              (gctUINT32)(gctUINTPTR_T)Signal,
+                              (gctPOINTER)&signal);
++    spin_unlock_irqrestore(&Os->signalDB.lock, flags);
+ 
+     if (gcmIS_SUCCESS(status))
+     {
+@@ -5958,9 +5965,14 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     gcmkVERIFY_ARGUMENT(Signal != gcvNULL);
+     gcmkVERIFY_ARGUMENT(MappedSignal != gcvNULL);
+ 
+-    gcmkONERROR(_QueryIntegerId(&Os->signalDB, (gctUINT32)(gctUINTPTR_T)Signal, (gctPOINTER)&signal));
+-
+     spin_lock_irqsave(&Os->signalDB.lock, flags);
++    status = _QueryIntegerId(&Os->signalDB, (gctUINT32)(gctUINTPTR_T)Signal, (gctPOINTER)&signal);
++    if (gcmIS_ERROR(status))
++    {
++        spin_unlock_irqrestore(&Os->signalDB.lock, flags);
++        gcmkONERROR(status);
++    }
++
+     signal->ref++;
+ 
+     if (signal->ref <= 1)
+@@ -6671,14 +6683,21 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     char name[32];
+     gcsSIGNAL_PTR signal;
+     gceSTATUS status;
++    unsigned long flags;
+ 
+     gcmkHEADER_ARG("Os=0x%X Timeline=0x%X Signal=%d",
+                    Os, Timeline, (gctUINT)(gctUINTPTR_T)Signal);
+ 
+-    gcmkONERROR(
+-        _QueryIntegerId(&Os->signalDB,
++    spin_lock_irqsave(&Os->signalDB.lock, flags);
++    status =  _QueryIntegerId(&Os->signalDB,
+                         (gctUINT32)(gctUINTPTR_T)Signal,
+-                        (gctPOINTER)&signal));
++                        (gctPOINTER)&signal);
++    if (gcmIS_ERROR(status))
++    {
++        spin_unlock_irqrestore(&Os->signalDB.lock, flags);
++        gcmkONERROR(status);
++    }
++    spin_unlock_irqrestore(&Os->signalDB.lock, flags);
+ 
+     /* Cast timeline. */
+     timeline = (struct viv_sync_timeline *) Timeline;
+@@ -6943,14 +6962,29 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     struct viv_sync_timeline *timeline;
+     gcsSIGNAL_PTR signal = gcvNULL;
+     gceSTATUS status = gcvSTATUS_OK;
++    unsigned long flags;
+ 
+     /* Create fence. */
+     timeline = (struct viv_sync_timeline *) Timeline;
+ 
+-    gcmkONERROR(
+-        _QueryIntegerId(&Os->signalDB,
++    spin_lock_irqsave(&Os->signalDB.lock, flags);
++    status =  _QueryIntegerId(&Os->signalDB,
+                         (gctUINT32)(gctUINTPTR_T)Signal,
+-                        (gctPOINTER)&signal));
++                        (gctPOINTER)&signal);
++    if (gcmIS_ERROR(status))
++    {
++        spin_unlock_irqrestore(&Os->signalDB.lock, flags);
++        gcmkONERROR(status);
++    }
++
++    signal->ref++;
++    if (signal->ref <= 1)
++    {
++        spin_unlock_irqrestore(&Os->signalDB.lock, flags);
++        /* The previous value is 0, it has been deleted. */
++        gcmkONERROR(gcvSTATUS_INVALID_ARGUMENT);
++    }
++    spin_unlock_irqrestore(&Os->signalDB.lock, flags);
+ 
+     fence = viv_fence_create(timeline, signal);
+ 
+diff --git a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_sync.c b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_sync.c
+index 37c95ab..12d8d35 100644
+--- a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_sync.c
++++ b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_sync.c
+@@ -308,7 +308,6 @@ static void viv_fence_release(struct dma_fence *fence)
+ struct dma_fence * viv_fence_create(struct viv_sync_timeline *timeline,
+                     gcsSIGNAL *signal)
+ {
+-    gceSTATUS status;
+     struct viv_fence *fence;
+     struct dma_fence *old_fence = NULL;
+     unsigned seqno;
+@@ -318,17 +317,9 @@ struct dma_fence * viv_fence_create(struct viv_sync_timeline *timeline,
+     if (!fence)
+         return NULL;
+ 
+-    /* Reference signal in fence. */
+-    status = gckOS_MapSignal(timeline->os, (gctSIGNAL)(uintptr_t)signal->id,
+-                NULL, &fence->signal);
+-
+-    if (gcmIS_ERROR(status)) {
+-        kfree(fence);
+-        return NULL;
+-    }
+-
+     spin_lock_init(&fence->lock);
+ 
++    fence->signal = signal;
+     fence->parent = timeline;
+ 
+     seqno = (unsigned)atomic64_inc_return(&timeline->seqno);
+-- 
+1.7.9.5
+

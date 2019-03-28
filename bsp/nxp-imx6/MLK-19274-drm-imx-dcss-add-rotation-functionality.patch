@@ -1,0 +1,199 @@
+From c3ca904b314ee072c191a9f96ebedc96d685e425 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Mon, 20 Aug 2018 11:27:29 +0300
+Subject: [PATCH 4431/5242] MLK-19274: drm: imx: dcss: add rotation
+ functionality
+
+commit  a95d74a594c44e3e077f1e131bd024f1ad59820f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch will allow userspace to rotate planes by setting the
+'rotation' property. Generally, 0 and 180 rotations are allowed for
+pretty much all 8-bit xRGB and 2-plane YUV420 formats. 90/270 rotations
+can be performed only for non-compressed tiled GPU xRGB formats. Tiled
+YUV420 formats do not allow rotations at all because these formats need
+DTRC for de-tiling and DTRC has no rotation support.
+
+For more info, consult the DPR Features chapter in the reference manual.
+
+Test example:
+
+modetest -M imx-drm -w 27:rotation:4 -w 32:rotation:33 -w 27:alpha:30 -s
+42@31:3840x2160-60@XR24 -P 32@31:3840x2160@NV21
+
+The above will perform:
+ * 180 degree rotation of primary plane (XR24);
+ * vertical flip of first overlay plane (rotate-0 | reflect-y);
+ * set primary plane alpha to 30;
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-plane.c |   55 +++++++++++++++++++++++++++++++--
+ drivers/gpu/imx/dcss/dcss-dpr.c       |   21 ++++++++++++-
+ include/video/imx-dcss.h              |    4 ++-
+ 3 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.c b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+index 0c19da0..8c9070c 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -177,6 +177,37 @@ static bool dcss_plane_format_mod_supported(struct drm_plane *plane,
+ 	.format_mod_supported = dcss_plane_format_mod_supported,
+ };
+ 
++static bool dcss_plane_can_rotate(u32 pixel_format, bool mod_present,
++				  u64 modifier, unsigned int rotation)
++{
++	enum dcss_color_space cs = dcss_drm_fourcc_to_colorspace(pixel_format);
++	bool linear_format = !mod_present ||
++			     (mod_present && modifier == DRM_FORMAT_MOD_LINEAR);
++	u32 supported_rotation = DRM_MODE_ROTATE_0;
++
++	if (cs == DCSS_COLORSPACE_RGB && linear_format)
++		supported_rotation = DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180 |
++				     DRM_MODE_REFLECT_MASK;
++	else if (cs == DCSS_COLORSPACE_RGB &&
++		 modifier == DRM_FORMAT_MOD_VIVANTE_TILED)
++		supported_rotation = DRM_MODE_ROTATE_MASK |
++				     DRM_MODE_REFLECT_MASK;
++	else if (cs == DCSS_COLORSPACE_RGB &&
++		 modifier == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED_FC)
++		supported_rotation = DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180 |
++				     DRM_MODE_REFLECT_MASK;
++	else if (cs == DCSS_COLORSPACE_YUV && linear_format &&
++		 (pixel_format == DRM_FORMAT_NV12 ||
++		 pixel_format == DRM_FORMAT_NV21))
++		supported_rotation = DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180 |
++				     DRM_MODE_REFLECT_MASK;
++	else if (cs == DCSS_COLORSPACE_YUV && linear_format &&
++		 pixel_format == DRM_FORMAT_P010)
++		supported_rotation = DRM_MODE_ROTATE_0 | DRM_MODE_REFLECT_Y;
++
++	return !!(rotation & supported_rotation);
++}
++
+ static int dcss_plane_atomic_check(struct drm_plane *plane,
+ 				   struct drm_plane_state *state)
+ {
+@@ -216,6 +247,14 @@ static int dcss_plane_atomic_check(struct drm_plane *plane,
+ 	if (!drm_rect_intersect(&crtc_rect, &disp_rect))
+ 		return -EINVAL;
+ 
++	if (!dcss_plane_can_rotate(fb->format->format,
++				   !!(fb->flags & DRM_MODE_FB_MODIFIERS),
++				   fb->modifier,
++				   state->rotation)) {
++		DRM_ERROR("requested rotation is not allowed!\n");
++		return -EINVAL;
++	}
++
+ 	/* cropping is only available on overlay planes when DTRC is used */
+ 	if (state->crtc_x < 0 || state->crtc_y < 0 ||
+ 	    state->crtc_x + state->crtc_w > hdisplay ||
+@@ -388,7 +427,8 @@ static bool dcss_plane_needs_setup(struct drm_plane_state *state,
+ 	       state->src_w  != old_state->src_w  ||
+ 	       state->src_h  != old_state->src_h  ||
+ 	       fb->format->format != old_fb->format->format ||
+-	       fb->modifier  != old_fb->modifier;
++	       fb->modifier  != old_fb->modifier ||
++	       state->rotation != old_state->rotation;
+ }
+ 
+ static void dcss_plane_adjust(struct drm_rect *dis_rect,
+@@ -509,6 +549,8 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	dcss_dpr_set_res(dcss_plane->dcss, dcss_plane->ch_num,
+ 			 src_w, src_h, adj_w, adj_h);
++	dcss_dpr_set_rotation(dcss_plane->dcss, dcss_plane->ch_num,
++			      state->rotation);
+ 	dcss_plane_atomic_set_base(dcss_plane);
+ 
+ 	if (fb->modifier == DRM_FORMAT_MOD_VSI_G2_TILED_COMPRESSED) {
+@@ -635,6 +677,15 @@ struct dcss_plane *dcss_plane_init(struct drm_device *drm,
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
++	drm_plane_create_rotation_property(&dcss_plane->base,
++					   DRM_MODE_ROTATE_0,
++					   DRM_MODE_ROTATE_0   |
++					   DRM_MODE_ROTATE_90  |
++					   DRM_MODE_ROTATE_180 |
++					   DRM_MODE_ROTATE_270 |
++					   DRM_MODE_REFLECT_X  |
++					   DRM_MODE_REFLECT_Y);
++
+ 	dcss_plane->ch_num = 2 - zpos;
+ 	dcss_plane->alpha_val = 255;
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index fee46bd..ef607ee 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2017 NXP
++ * Copyright (C) 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -18,6 +18,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/sizes.h>
+ #include <linux/io.h>
++#include <drm/drmP.h>
+ #include <drm/drm_fourcc.h>
+ 
+ #include <video/imx-dcss.h>
+@@ -733,3 +734,21 @@ void dcss_dpr_irq_enable(struct dcss_soc *dcss, bool en)
+ 	dcss_writel(en ? 0xfe : 0xff, dpr->ch[1].base_reg + DCSS_DPR_IRQ_MASK);
+ 	dcss_writel(en ? 0xfe : 0xff, dpr->ch[2].base_reg + DCSS_DPR_IRQ_MASK);
+ }
++
++void dcss_dpr_set_rotation(struct dcss_soc *dcss, int ch_num, u32 rotation)
++{
++	struct dcss_dpr_ch *ch = &dcss->dpr_priv->ch[ch_num];
++
++	ch->frame_ctrl &= ~(HFLIP_EN | VFLIP_EN | ROT_ENC_MASK);
++
++	ch->frame_ctrl |= rotation & DRM_MODE_REFLECT_X ? HFLIP_EN : 0;
++	ch->frame_ctrl |= rotation & DRM_MODE_REFLECT_Y ? VFLIP_EN : 0;
++
++	if (rotation & DRM_MODE_ROTATE_90)
++		ch->frame_ctrl |= 1 << ROT_ENC_POS;
++	else if (rotation & DRM_MODE_ROTATE_180)
++		ch->frame_ctrl |= 2 << ROT_ENC_POS;
++	else if (rotation & DRM_MODE_ROTATE_270)
++		ch->frame_ctrl |= 3 << ROT_ENC_POS;
++}
++EXPORT_SYMBOL(dcss_dpr_set_rotation);
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 03330f3..51a3615 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -84,6 +84,8 @@ void dcss_dpr_format_set(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ void dcss_dpr_tile_derive(struct dcss_soc *dcss,
+ 			  int ch_num,
+ 			  uint64_t modifier);
++void dcss_dpr_set_rotation(struct dcss_soc *dcss, int ch_num, u32 rotation);
++
+ /* DTG */
+ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm);
+ void dcss_dtg_plane_pos_set(struct dcss_soc *dcss, int ch_num,
+-- 
+1.7.9.5
+

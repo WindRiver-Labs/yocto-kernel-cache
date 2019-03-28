@@ -1,0 +1,185 @@
+From 5aaeab1d58da3fad8ea55ece7a8746fa0736dd31 Mon Sep 17 00:00:00 2001
+From: Li Jun <jun.li@nxp.com>
+Date: Thu, 27 Jul 2017 00:57:32 +0800
+Subject: [PATCH 2294/5242] MLK-16013-15: staging: typec: tcpci: Enable vbus
+ force discharge
+
+commit  2cb98d002955940e70285754d2bcc01e2607c97e from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Enable vbus low voltage alert and do force discharge, this can aid turn
+off vbus quickly.
+
+Reviewed-by: Peter Chen <peter.chen@nxp.com>
+Signed-off-by: Li Jun <jun.li@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/staging/typec/tcpci.c |   35 ++++++++++++++++++++++++++++++++++-
+ drivers/staging/typec/tcpci.h |    1 +
+ drivers/usb/typec/tcpm.c      |   22 ++++++++++++++++++++++
+ include/linux/usb/tcpm.h      |    3 +++
+ 4 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/typec/tcpci.c b/drivers/staging/typec/tcpci.c
+index 585cf9d..9a54028 100644
+--- a/drivers/staging/typec/tcpci.c
++++ b/drivers/staging/typec/tcpci.c
+@@ -53,6 +53,31 @@ static int tcpci_write16(struct tcpci *tcpci, unsigned int reg, u16 val)
+ 	return regmap_raw_write(tcpci->regmap, reg, &val, sizeof(u16));
+ }
+ 
++static int tcpci_vbus_force_discharge(struct tcpc_dev *tcpc, bool enable)
++{
++	struct tcpci *tcpci = tcpc_to_tcpci(tcpc);
++	unsigned int reg;
++	int ret;
++
++	if (enable)
++		regmap_write(tcpci->regmap,
++			TCPC_VBUS_VOLTAGE_ALARM_LO_CFG, 0x1c);
++	else
++		regmap_write(tcpci->regmap,
++			TCPC_VBUS_VOLTAGE_ALARM_LO_CFG, 0);
++
++	regmap_read(tcpci->regmap, TCPC_POWER_CTRL, &reg);
++	if (enable)
++		reg |= TCPC_POWER_CTRL_FORCEDISCH;
++	else
++		reg &= ~TCPC_POWER_CTRL_FORCEDISCH;
++	ret = regmap_write(tcpci->regmap, TCPC_POWER_CTRL, reg);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
+ static int tcpci_set_cc(struct tcpc_dev *tcpc, enum typec_cc_status cc)
+ {
+ 	struct tcpci *tcpci = tcpc_to_tcpci(tcpc);
+@@ -275,6 +300,9 @@ static int tcpci_set_vbus(struct tcpc_dev *tcpc, bool source, bool sink)
+ 				   TCPC_CMD_DISABLE_SRC_VBUS);
+ 		if (ret < 0)
+ 			return ret;
++
++		/* Enable force discharge */
++		tcpci_vbus_force_discharge(tcpc, true);
+ 	}
+ 
+ 	if (!sink) {
+@@ -399,7 +427,8 @@ static int tcpci_init(struct tcpc_dev *tcpc)
+ 	reg = TCPC_ALERT_TX_SUCCESS | TCPC_ALERT_TX_FAILED |
+ 		TCPC_ALERT_TX_DISCARDED | TCPC_ALERT_RX_STATUS |
+ 		TCPC_ALERT_RX_HARD_RST | TCPC_ALERT_CC_STATUS |
+-		TCPC_ALERT_RX_BUF_OVF | TCPC_ALERT_FAULT;
++		TCPC_ALERT_RX_BUF_OVF | TCPC_ALERT_FAULT |
++		TCPC_ALERT_V_ALARM_LO;
+ 	if (tcpci->controls_vbus)
+ 		reg |= TCPC_ALERT_POWER_STATUS;
+ 	tcpci->irq_mask = reg;
+@@ -439,6 +468,9 @@ irqreturn_t tcpci_irq(struct tcpci *tcpci)
+ 			tcpm_vbus_change(tcpci->port);
+ 	}
+ 
++	if (status & TCPC_ALERT_V_ALARM_LO)
++		tcpm_vbus_low_alarm(tcpci->port);
++
+ 	if (status & TCPC_ALERT_RX_STATUS) {
+ 		struct pd_message msg;
+ 		unsigned int cnt;
+@@ -538,6 +570,7 @@ struct tcpci *tcpci_register_port(struct device *dev, struct tcpci_data *data)
+ 	tcpci->tcpc.set_vconn = tcpci_set_vconn;
+ 	tcpci->tcpc.start_drp_toggling = tcpci_start_drp_toggling;
+ 	tcpci->tcpc.vbus_detect = tcpci_vbus_detect;
++	tcpci->tcpc.vbus_discharge = tcpci_vbus_force_discharge;
+ 
+ 	tcpci->tcpc.set_pd_rx = tcpci_set_pd_rx;
+ 	tcpci->tcpc.set_roles = tcpci_set_roles;
+diff --git a/drivers/staging/typec/tcpci.h b/drivers/staging/typec/tcpci.h
+index 8671e91..b0fac19 100644
+--- a/drivers/staging/typec/tcpci.h
++++ b/drivers/staging/typec/tcpci.h
+@@ -58,6 +58,7 @@
+ 
+ #define TCPC_POWER_CTRL			0x1c
+ #define TCPC_POWER_CTRL_VCONN_ENABLE	BIT(0)
++#define TCPC_POWER_CTRL_FORCEDISCH	BIT(2)
+ 
+ #define TCPC_CC_STATUS			0x1d
+ #define TCPC_CC_STATUS_TOGGLING		BIT(5)
+diff --git a/drivers/usb/typec/tcpm.c b/drivers/usb/typec/tcpm.c
+index bd94adf..674b434 100644
+--- a/drivers/usb/typec/tcpm.c
++++ b/drivers/usb/typec/tcpm.c
+@@ -162,6 +162,7 @@ enum pd_msg_request {
+ #define TCPM_CC_EVENT		BIT(0)
+ #define TCPM_VBUS_EVENT		BIT(1)
+ #define TCPM_RESET_EVENT	BIT(2)
++#define TCPM_VBUS_LOW_ALARM	BIT(3)
+ 
+ #define LOG_BUFFER_ENTRIES	1024
+ #define LOG_BUFFER_ENTRY_SIZE	128
+@@ -3763,6 +3764,14 @@ static void _tcpm_pd_hard_reset(struct tcpm_port *port)
+ 		       0);
+ }
+ 
++static void _tcpm_vbus_discharge(struct tcpm_port *port, bool on)
++{
++	tcpm_log_force(port, "%s force discharge", on ? "Enable":"Disable");
++
++	if (port->tcpc && port->tcpc->vbus_discharge)
++		port->tcpc->vbus_discharge(port->tcpc, false);
++}
++
+ static void tcpm_pd_event_handler(struct work_struct *work)
+ {
+ 	struct tcpm_port *port = container_of(work, struct tcpm_port,
+@@ -3787,6 +3796,10 @@ static void tcpm_pd_event_handler(struct work_struct *work)
+ 			else
+ 				_tcpm_pd_vbus_off(port);
+ 		}
++
++		if (events & TCPM_VBUS_LOW_ALARM)
++			_tcpm_vbus_discharge(port, false);
++
+ 		if (events & TCPM_CC_EVENT) {
+ 			enum typec_cc_status cc1, cc2;
+ 
+@@ -3817,6 +3830,15 @@ void tcpm_vbus_change(struct tcpm_port *port)
+ }
+ EXPORT_SYMBOL_GPL(tcpm_vbus_change);
+ 
++void tcpm_vbus_low_alarm(struct tcpm_port *port)
++{
++	spin_lock(&port->pd_event_lock);
++	port->pd_events |= TCPM_VBUS_LOW_ALARM;
++	spin_unlock(&port->pd_event_lock);
++	queue_work(port->wq, &port->event_work);
++}
++EXPORT_SYMBOL_GPL(tcpm_vbus_low_alarm);
++
+ void tcpm_pd_hard_reset(struct tcpm_port *port)
+ {
+ 	spin_lock(&port->pd_event_lock);
+diff --git a/include/linux/usb/tcpm.h b/include/linux/usb/tcpm.h
+index 0443ade..4737961 100644
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -159,6 +159,8 @@ struct tcpc_dev {
+ 	int (*pd_transmit)(struct tcpc_dev *dev, enum tcpm_transmit_type type,
+ 			   const struct pd_message *msg);
+ 	int (*vbus_detect)(struct tcpc_dev *dev, bool enable);
++	int (*vbus_discharge)(struct tcpc_dev *tcpc, bool enable);
++
+ };
+ 
+ struct tcpm_port;
+@@ -180,5 +182,6 @@ void tcpm_pd_transmit_complete(struct tcpm_port *port,
+ 			       enum tcpm_transmit_status status);
+ void tcpm_pd_hard_reset(struct tcpm_port *port);
+ void tcpm_tcpc_reset(struct tcpm_port *port);
++void tcpm_vbus_low_alarm(struct tcpm_port *port);
+ 
+ #endif /* __LINUX_USB_TCPM_H */
+-- 
+1.7.9.5
+

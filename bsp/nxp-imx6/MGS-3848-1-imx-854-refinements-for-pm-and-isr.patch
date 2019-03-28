@@ -1,0 +1,320 @@
+From e69209b21163c2e184bd9c5575f61aa958803392 Mon Sep 17 00:00:00 2001
+From: Xianzhong <xianzhong.li@nxp.com>
+Date: Thu, 26 Apr 2018 03:53:47 +0800
+Subject: [PATCH 3626/5242] MGS-3848-1 [#imx-854] refinements for pm and isr
+
+commit  a26f62a86126ba9da244beaa7e259c35b81f4c8a from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+1. slightly increate performance for interrupt handler
+2. refine powerMutex lock
+3. remove obsolete power management mode
+4. code refinement  preparing fix for bug #19216, #19230
+
+Signed-off-by: Xianzhong <xianzhong.li@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../hal/kernel/arch/gc_hal_kernel_hardware.c       |   73 ++++++--------------
+ .../hal/kernel/arch/gc_hal_kernel_hardware.h       |    1 +
+ .../hal/kernel/archvg/gc_hal_kernel_hardware_vg.c  |   19 -----
+ .../mxc/gpu-viv/hal/kernel/gc_hal_kernel_event.c   |    5 +-
+ drivers/mxc/gpu-viv/hal/kernel/inc/gc_hal_enum.h   |    4 +-
+ .../gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c |   12 ++--
+ 6 files changed, 33 insertions(+), 81 deletions(-)
+
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+index f960e7b..eea18c5 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+@@ -1842,6 +1842,9 @@
+         hardware->stallFEPrefetch = gcvTRUE;
+     }
+ 
++    hardware->hasAsyncFe
++        = gckHARDWARE_IsFeatureAvailable(hardware, gcvFEATURE_ASYNC_BLIT);
++
+     hardware->minFscaleValue = 1;
+     hardware->waitCount = 200;
+ 
+@@ -4416,14 +4419,8 @@
+     gctUINT32 dataEx;
+     gceSTATUS status;
+ 
+-    gcmkHEADER_ARG("Hardware=0x%x InterruptValid=%d", Hardware, InterruptValid);
+-
+-    /* Verify the arguments. */
+-    gcmkVERIFY_OBJECT(Hardware, gcvOBJ_HARDWARE);
+-
+     /* Extract gckEVENT object. */
+     eventObj = Hardware->kernel->eventObj;
+-    gcmkVERIFY_OBJECT(eventObj, gcvOBJ_EVENT);
+ 
+     if (InterruptValid)
+     {
+@@ -4447,11 +4444,10 @@
+ #endif
+ 
+             /* Inform gckEVENT of the interrupt. */
+-            status = gckEVENT_Interrupt(eventObj,
+-                                        data);
++            status = gckEVENT_Interrupt(eventObj, data);
+         }
+ 
+-        if (gckHARDWARE_IsFeatureAvailable(Hardware, gcvFEATURE_ASYNC_BLIT))
++        if (Hardware->hasAsyncFe)
+         {
+             /* Read BLT interrupt. */
+             gcmkONERROR(gckOS_ReadRegisterEx(
+@@ -4472,26 +4468,23 @@
+ 
+             if (dataEx)
+             {
+-                status = gckEVENT_Interrupt(Hardware->kernel->asyncEvent,
+-                                            dataEx
+-                                            );
++                status = gckEVENT_Interrupt(Hardware->kernel->asyncEvent, dataEx);
+             }
+         }
+     }
+     else
+     {
+-            /* Handle events. */
+-            status = gckEVENT_Notify(eventObj, 0);
++        /* Handle events. */
++        status = gckEVENT_Notify(eventObj, 0);
+ 
+-            if (gckHARDWARE_IsFeatureAvailable(Hardware, gcvFEATURE_ASYNC_BLIT))
+-            {
+-                status = gckEVENT_Notify(Hardware->kernel->asyncEvent, 0);
+-            }
++        if (Hardware->hasAsyncFe)
++        {
++            status = gckEVENT_Notify(Hardware->kernel->asyncEvent, 0);
++        }
+     }
+ 
+ OnError:
+     /* Return the status. */
+-    gcmkFOOTER();
+     return status;
+ }
+ 
+@@ -7355,12 +7348,9 @@
+         gcmSTRING(gcvPOWER_OFF),
+         gcmSTRING(gcvPOWER_IDLE),
+         gcmSTRING(gcvPOWER_SUSPEND),
+-        gcmSTRING(gcvPOWER_SUSPEND_ATPOWERON),
+-        gcmSTRING(gcvPOWER_OFF_ATPOWERON),
+         gcmSTRING(gcvPOWER_IDLE_BROADCAST),
+         gcmSTRING(gcvPOWER_SUSPEND_BROADCAST),
+         gcmSTRING(gcvPOWER_OFF_BROADCAST),
+-        gcmSTRING(gcvPOWER_OFF_RECOVERY),
+         gcmSTRING(gcvPOWER_OFF_TIMEOUT),
+         gcmSTRING(gcvPOWER_ON_AUTO)
+     };
+@@ -7401,7 +7391,6 @@
+     gctUINT flag, clock;
+     gctBOOL acquired = gcvFALSE;
+     gctBOOL mutexAcquired = gcvFALSE;
+-    gctBOOL stall = gcvTRUE;
+     gctBOOL broadcast = gcvFALSE;
+ #if gcdPOWEROFF_TIMEOUT
+     gctBOOL timeout = gcvFALSE;
+@@ -7592,18 +7581,6 @@
+     /* Convert the broadcast power state. */
+     switch (State)
+     {
+-    case gcvPOWER_SUSPEND_ATPOWERON:
+-        /* Convert to SUSPEND and don't wait for STALL. */
+-        State = gcvPOWER_SUSPEND;
+-        stall = gcvFALSE;
+-        break;
+-
+-    case gcvPOWER_OFF_ATPOWERON:
+-        /* Convert to OFF and don't wait for STALL. */
+-        State = gcvPOWER_OFF;
+-        stall = gcvFALSE;
+-        break;
+-
+     case gcvPOWER_IDLE_BROADCAST:
+         /* Convert to IDLE and note we are inside broadcast. */
+         State     = gcvPOWER_IDLE;
+@@ -7622,13 +7599,6 @@
+         broadcast = gcvTRUE;
+         break;
+ 
+-    case gcvPOWER_OFF_RECOVERY:
+-        /* Convert to OFF and note we are inside recovery. */
+-        State     = gcvPOWER_OFF;
+-        stall     = gcvFALSE;
+-        broadcast = gcvTRUE;
+-        break;
+-
+     case gcvPOWER_ON_AUTO:
+         /* Convert to ON and note we are inside recovery. */
+         State = gcvPOWER_ON;
+@@ -7673,7 +7643,11 @@
+         /* Try to acquire the power mutex. */
+         status = gckOS_AcquireMutex(os, Hardware->powerMutex, 0);
+ 
+-        if (status == gcvSTATUS_TIMEOUT)
++        if (gcmIS_SUCCESS(status))
++        {
++            mutexAcquired = gcvTRUE;
++        }
++        else if (status == gcvSTATUS_TIMEOUT)
+         {
+             /* Check if we already own this mutex. */
+             if ((Hardware->powerProcess == process)
+@@ -7692,19 +7666,14 @@
+                 status = gcvSTATUS_OK;
+                 goto OnError;
+             }
+-            else
+-            {
+-                /* Acquire the power mutex. */
+-                gcmkONERROR(gckOS_AcquireMutex(os,
+-                                               Hardware->powerMutex,
+-                                               gcvINFINITE));
+-            }
+         }
+     }
+-    else
++
++    if (!mutexAcquired)
+     {
+         /* Acquire the power mutex. */
+         gcmkONERROR(gckOS_AcquireMutex(os, Hardware->powerMutex, gcvINFINITE));
++        mutexAcquired = gcvTRUE;
+     }
+ 
+     /* Get time until mtuex acquired. */
+@@ -7950,7 +7919,7 @@
+     /* Get time until powered on. */
+     gcmkPROFILE_QUERY(time, onTime);
+ 
+-    if ((flag & gcvPOWER_FLAG_STALL) && stall)
++    if (flag & gcvPOWER_FLAG_STALL)
+     {
+         gctBOOL idle;
+         gctINT32 atomValue;
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h
+index 4711bd1..5dd2c25 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h
++++ b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h
+@@ -237,6 +237,7 @@ struct _gckHARDWARE
+     gcsLISTHEAD                 mmuHead;
+ 
+     gctPOINTER                  featureDatabase;
++    gctBOOL                     hasAsyncFe;
+ 
+     gcsHARDWARE_SIGNATURE       signature;
+ 
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/archvg/gc_hal_kernel_hardware_vg.c b/drivers/mxc/gpu-viv/hal/kernel/archvg/gc_hal_kernel_hardware_vg.c
+index 7f71b8f..a4f7f7f 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/archvg/gc_hal_kernel_hardware_vg.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/archvg/gc_hal_kernel_hardware_vg.c
+@@ -1799,18 +1799,6 @@ static gceSTATUS _CommandStall(
+     /* Convert the broadcast power state. */
+     switch (State)
+     {
+-    case gcvPOWER_SUSPEND_ATPOWERON:
+-        /* Convert to SUSPEND and don't wait for STALL. */
+-        State = gcvPOWER_SUSPEND;
+-        stall = gcvFALSE;
+-        break;
+-
+-    case gcvPOWER_OFF_ATPOWERON:
+-        /* Convert to OFF and don't wait for STALL. */
+-        State = gcvPOWER_OFF;
+-        stall = gcvFALSE;
+-        break;
+-
+     case gcvPOWER_IDLE_BROADCAST:
+         /* Convert to IDLE and note we are inside broadcast. */
+         State     = gcvPOWER_IDLE;
+@@ -1829,13 +1817,6 @@ static gceSTATUS _CommandStall(
+         broadcast = gcvTRUE;
+         break;
+ 
+-    case gcvPOWER_OFF_RECOVERY:
+-        /* Convert to OFF and note we are inside recovery. */
+-        State     = gcvPOWER_OFF;
+-        stall     = gcvFALSE;
+-        broadcast = gcvTRUE;
+-        break;
+-
+     case gcvPOWER_ON_AUTO:
+         /* Convert to ON and note we are inside recovery. */
+         State = gcvPOWER_ON;
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel_event.c b/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel_event.c
+index 7a3e6ed..92d43ca 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel_event.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel_event.c
+@@ -1845,7 +1845,10 @@
+         gcmkONERROR(gckCOMMAND_ExitCommit(command, FromPower));
+ 
+ #if !gcdNULL_DRIVER
+-        gcmkVERIFY_OK(_TryToIdleGPU(Event));
++        if (!FromPower)
++        {
++            gcmkVERIFY_OK(_TryToIdleGPU(Event));
++        }
+ #endif
+     }
+ 
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/inc/gc_hal_enum.h b/drivers/mxc/gpu-viv/hal/kernel/inc/gc_hal_enum.h
+index ff8824b..983cd33 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/inc/gc_hal_enum.h
++++ b/drivers/mxc/gpu-viv/hal/kernel/inc/gc_hal_enum.h
+@@ -606,12 +606,9 @@
+     gcvPOWER_OFF,
+     gcvPOWER_IDLE,
+     gcvPOWER_SUSPEND,
+-    gcvPOWER_SUSPEND_ATPOWERON,
+-    gcvPOWER_OFF_ATPOWERON,
+     gcvPOWER_IDLE_BROADCAST,
+     gcvPOWER_SUSPEND_BROADCAST,
+     gcvPOWER_OFF_BROADCAST,
+-    gcvPOWER_OFF_RECOVERY,
+     gcvPOWER_OFF_TIMEOUT,
+     gcvPOWER_ON_AUTO
+ }
+@@ -2171,3 +2168,4 @@
+ #endif
+ 
+ #endif /* __gc_hal_enum_h_ */
++
+diff --git a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c
+index 1a479e5..4b0a2ff 100644
+--- a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c
++++ b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_os.c
+@@ -4891,6 +4891,11 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+     )
+ {
+     gceSTATUS status;
++#if gcdPOWER_SUSPEND_WHEN_IDLE
++    gceCHIPPOWERSTATE state = gcvPOWER_SUSPEND_BROADCAST;
++#else
++    gceCHIPPOWERSTATE state = gcvPOWER_IDLE_BROADCAST;
++#endif
+ 
+     gcmkHEADER_ARG("Os=0x%X Hardware=0x%X Reason=%d", Os, Hardware, Reason);
+ 
+@@ -4918,12 +4923,7 @@ gceSTATUS gckOS_UserLogicalToPhysical(
+ 
+         /* Put GPU IDLE. */
+         gcmkONERROR(
+-            gckHARDWARE_SetPowerManagementState(Hardware,
+-#if gcdPOWER_SUSPEND_WHEN_IDLE
+-                                                gcvPOWER_SUSPEND_BROADCAST));
+-#else
+-                                                gcvPOWER_IDLE_BROADCAST));
+-#endif
++            gckHARDWARE_SetPowerManagementState(Hardware, state));
+ 
+         /* Add idle process DB. */
+         gcmkONERROR(gckKERNEL_AddProcessDB(Hardware->kernel,
+-- 
+1.7.9.5
+

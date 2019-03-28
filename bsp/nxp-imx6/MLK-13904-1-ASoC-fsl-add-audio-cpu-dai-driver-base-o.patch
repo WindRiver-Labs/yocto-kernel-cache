@@ -1,0 +1,687 @@
+From 255298d5e07ded7d1d0127afbb75bfee3f554ca6 Mon Sep 17 00:00:00 2001
+From: Shengjiu Wang <shengjiu.wang@freescale.com>
+Date: Wed, 15 Feb 2017 11:28:36 +0800
+Subject: [PATCH 1513/5242] MLK-13904-1: ASoC: fsl: add audio cpu dai driver
+ base on rpmsg
+
+commit  3cc7f40fd1640cd884f211e1e7bc605e1abcc4a3 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add the cpu dai driver, as the rpmsg_send api can't be used in
+atomic context, so using the workqueue instead of calling
+rpmsg_send() directly.
+The detail communication stack is defined in header file.
+
+Signed-off-by: Shengjiu Wang <shengjiu.wang@freescale.com>
+Acked-by: Robin Gong <yibin.gong@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../devicetree/bindings/sound/fsl,rpmsg-i2s.txt    |   20 ++
+ sound/soc/fsl/Kconfig                              |    9 +
+ sound/soc/fsl/Makefile                             |    2 +
+ sound/soc/fsl/fsl_rpmsg_i2s.c                      |  251 ++++++++++++++++
+ sound/soc/fsl/fsl_rpmsg_i2s.h                      |  306 ++++++++++++++++++++
+ sound/soc/fsl/imx-pcm.h                            |    9 +
+ 6 files changed, 597 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt
+ create mode 100644 sound/soc/fsl/fsl_rpmsg_i2s.c
+ create mode 100644 sound/soc/fsl/fsl_rpmsg_i2s.h
+
+diff --git a/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt b/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt
+new file mode 100644
+index 0000000..f38cf9d
+--- /dev/null
++++ b/Documentation/devicetree/bindings/sound/fsl,rpmsg-i2s.txt
+@@ -0,0 +1,20 @@
++Freescale rpmsg i2s interface.
++
++The rpmsg i2s is based on RPMSG that used communicating with M4 core,
++which provides a synchronous audio interface that supports fullduplex
++serial interfaces with frame synchronization such as I2S.
++
++Required properties:
++
++  - compatible		: Compatible list, contains "fsl,imx7ulp-rpmsg-i2s".
++
++  - fsl,audioindex      : This is an index indicating the audio device index in
++			  the M4 side.
++
++Example:
++rpmsg_i2s: rpmsg-i2s {
++	compatible = "fsl,imx7ulp-rpmsg-i2s";
++	/* the audio device index in m4 domain */
++	fsl,audioindex = <0> ;
++	status = "okay";
++};
+diff --git a/sound/soc/fsl/Kconfig b/sound/soc/fsl/Kconfig
+index b1ae74c..2b21350 100644
+--- a/sound/soc/fsl/Kconfig
++++ b/sound/soc/fsl/Kconfig
+@@ -57,6 +57,15 @@ config SND_SOC_FSL_ESAI
+ 	  This option is only useful for out-of-tree drivers since
+ 	  in-tree drivers select it automatically.
+ 
++config SND_SOC_FSL_RPMSG_I2S
++	tristate "I2S base on the RPMSG support"
++	depends on RPMSG
++	help
++	  Say Y if you want to add rpmsg i2s support for the Freescale CPUs.
++	  which is depends on the rpmsg.
++	  This option is only useful for out-of-tree drivers since
++	  in-tree drivers select it automatically.
++
+ config SND_SOC_FSL_UTILS
+ 	tristate
+ 
+diff --git a/sound/soc/fsl/Makefile b/sound/soc/fsl/Makefile
+index 3e8877e..5cf8c41c 100644
+--- a/sound/soc/fsl/Makefile
++++ b/sound/soc/fsl/Makefile
+@@ -21,6 +21,7 @@ snd-soc-fsl-spdif-objs := fsl_spdif.o
+ snd-soc-fsl-esai-objs := fsl_esai.o
+ snd-soc-fsl-utils-objs := fsl_utils.o
+ snd-soc-fsl-dma-objs := fsl_dma.o
++snd-soc-fsl-rpmsg-i2s-objs := fsl_rpmsg_i2s.o
+ obj-$(CONFIG_SND_SOC_FSL_ASOC_CARD) += snd-soc-fsl-asoc-card.o
+ snd-soc-fsl-hdmi-objs := fsl_hdmi.o
+ obj-$(CONFIG_SND_SOC_FSL_ASRC) += snd-soc-fsl-asrc.o
+@@ -31,6 +32,7 @@ obj-$(CONFIG_SND_SOC_FSL_ESAI) += snd-soc-fsl-esai.o
+ obj-$(CONFIG_SND_SOC_FSL_UTILS) += snd-soc-fsl-utils.o
+ obj-$(CONFIG_SND_SOC_FSL_HDMI) += snd-soc-fsl-hdmi.o
+ obj-$(CONFIG_SND_SOC_POWERPC_DMA) += snd-soc-fsl-dma.o
++obj-$(CONFIG_SND_SOC_FSL_RPMSG_I2S) += snd-soc-fsl-rpmsg-i2s.o
+ 
+ # MPC5200 Platform Support
+ obj-$(CONFIG_SND_MPC52xx_DMA) += mpc5200_dma.o
+diff --git a/sound/soc/fsl/fsl_rpmsg_i2s.c b/sound/soc/fsl/fsl_rpmsg_i2s.c
+new file mode 100644
+index 0000000..2768c65
+--- /dev/null
++++ b/sound/soc/fsl/fsl_rpmsg_i2s.c
+@@ -0,0 +1,251 @@
++/*
++ * Freescale ALSA SoC rpmsg i2s driver.
++ *
++ * Copyright 2017 NXP
++ *
++ * This program is free software, you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation, either version 2 of the License, or(at your
++ * option) any later version.
++ *
++ */
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dmaengine.h>
++#include <linux/module.h>
++#include <linux/of_device.h>
++#include <linux/of_address.h>
++#include <linux/pm_runtime.h>
++#include <linux/rpmsg.h>
++#include <linux/slab.h>
++
++#include <sound/core.h>
++#include <sound/dmaengine_pcm.h>
++#include <sound/pcm_params.h>
++
++#include "fsl_rpmsg_i2s.h"
++#include "imx-pcm.h"
++
++#define FSL_RPMSG_I2S_RATES	SNDRV_PCM_RATE_8000_96000
++#define FSL_RPMSG_I2S_FORMATS	SNDRV_PCM_FMTBIT_S16_LE
++
++static int i2s_send_message(struct i2s_rpmsg_s *msg,
++			       struct i2s_info *info)
++{
++	int err;
++
++	mutex_lock(&info->tx_lock);
++	if (!info->rpdev) {
++		dev_dbg(info->dev, "rpmsg channel not ready, m4 image ready?\n");
++		return -EINVAL;
++	}
++
++	dev_dbg(&info->rpdev->dev, "send cmd %d\n", msg->header.cmd);
++
++	reinit_completion(&info->cmd_complete);
++	err = rpmsg_send(info->rpdev->ept, (void *)msg,
++			 sizeof(struct i2s_rpmsg_s));
++	if (err) {
++		dev_err(&info->rpdev->dev, "rpmsg_send failed: %d\n", err);
++		return err;
++	}
++
++	/* wait response from rpmsg */
++	err = wait_for_completion_timeout(&info->cmd_complete,
++					  msecs_to_jiffies(RPMSG_TIMEOUT));
++	if (!err) {
++		dev_err(&info->rpdev->dev, "rpmsg_send cmd %d timeout!\n",
++							msg->header.cmd);
++		return -ETIMEDOUT;
++	}
++
++	dev_dbg(&info->rpdev->dev, "cmd:%d, resp %d\n", msg->header.cmd,
++						info->recv_msg.param.resp);
++	mutex_unlock(&info->tx_lock);
++
++	return 0;
++}
++
++static struct snd_soc_dai_driver fsl_rpmsg_i2s_dai = {
++	.playback = {
++		.stream_name = "CPU-Playback",
++		.channels_min = 1,
++		.channels_max = 2,
++		.rates = FSL_RPMSG_I2S_RATES,
++		.formats = FSL_RPMSG_I2S_FORMATS,
++	},
++	.capture = {
++		.stream_name = "CPU-Capture",
++		.channels_min = 1,
++		.channels_max = 2,
++		.rates = FSL_RPMSG_I2S_RATES,
++		.formats = FSL_RPMSG_I2S_FORMATS,
++	},
++	.symmetric_rates      = 1,
++	.symmetric_channels   = 1,
++	.symmetric_samplebits = 1,
++};
++
++static const struct snd_soc_component_driver fsl_component = {
++	.name           = "fsl-rpmsg-i2s",
++};
++
++static const struct of_device_id fsl_rpmsg_i2s_ids[] = {
++	{ .compatible = "fsl,imx7ulp-rpmsg-i2s"},
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, fsl_rpmsg_i2s_ids);
++
++static void rpmsg_i2s_work(struct work_struct *work)
++{
++	struct work_of_rpmsg *work_of_rpmsg;
++	struct i2s_info *i2s_info;
++
++	work_of_rpmsg = container_of(work, struct work_of_rpmsg, work);
++	i2s_info = work_of_rpmsg->i2s_info;
++
++	i2s_send_message(&work_of_rpmsg->msg, i2s_info);
++}
++
++static int fsl_rpmsg_i2s_probe(struct platform_device *pdev)
++{
++	struct device_node *np     = pdev->dev.of_node;
++	struct fsl_rpmsg_i2s         *rpmsg_i2s;
++	struct i2s_info              *i2s_info;
++	int audioindex = 0;
++	int ret;
++	int i;
++
++	rpmsg_i2s = devm_kzalloc(&pdev->dev, sizeof(struct fsl_rpmsg_i2s),
++								GFP_KERNEL);
++	if (!rpmsg_i2s)
++		return -ENOMEM;
++
++	rpmsg_i2s->pdev = pdev;
++	i2s_info =  &rpmsg_i2s->i2s_info;
++
++	ret = of_property_read_u32(np, "fsl,audioindex", &audioindex);
++	if (ret)
++		audioindex = 0;
++
++	/* Setup work queue */
++	i2s_info->rpmsg_wq = create_singlethread_workqueue("rpmsg_i2s");
++	if (i2s_info->rpmsg_wq == NULL) {
++		dev_err(&pdev->dev, "workqueue create failed\n");
++		return -ENOMEM;
++	}
++
++	i2s_info->send_message = i2s_send_message;
++
++	for (i = 0; i < WORK_MAX_NUM; i++) {
++		INIT_WORK(&i2s_info->work_list[i].work, rpmsg_i2s_work);
++		i2s_info->work_list[i].i2s_info = i2s_info;
++	}
++
++	for (i = 0; i < 2; i++) {
++		i2s_info->send_msg[i].header.cate  = IMX_RPMSG_AUDIO;
++		i2s_info->send_msg[i].header.major = IMX_RMPSG_MAJOR;
++		i2s_info->send_msg[i].header.minor = IMX_RMPSG_MINOR;
++		i2s_info->send_msg[i].header.type  = I2S_TYPE_A;
++		i2s_info->send_msg[i].param.audioindex = audioindex;
++	}
++
++	mutex_init(&i2s_info->tx_lock);
++
++	platform_set_drvdata(pdev, rpmsg_i2s);
++	pm_runtime_enable(&pdev->dev);
++
++	ret = devm_snd_soc_register_component(&pdev->dev, &fsl_component,
++			&fsl_rpmsg_i2s_dai, 1);
++	if (ret)
++		return ret;
++
++	return imx_rpmsg_platform_register(&pdev->dev);
++}
++
++static int fsl_rpmsg_i2s_remove(struct platform_device *pdev)
++{
++	struct fsl_rpmsg_i2s *rpmsg_i2s = platform_get_drvdata(pdev);
++	struct i2s_info      *i2s_info  = &rpmsg_i2s->i2s_info;
++
++	if (i2s_info->rpmsg_wq)
++		destroy_workqueue(i2s_info->rpmsg_wq);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM
++static int fsl_rpmsg_i2s_runtime_resume(struct device *dev)
++{
++	return 0;
++}
++
++static int fsl_rpmsg_i2s_runtime_suspend(struct device *dev)
++{
++	return 0;
++}
++#endif
++
++#ifdef CONFIG_PM_SLEEP
++static int fsl_rpmsg_i2s_suspend(struct device *dev)
++{
++	struct fsl_rpmsg_i2s *rpmsg_i2s = dev_get_drvdata(dev);
++	struct i2s_info  *i2s_info =  &rpmsg_i2s->i2s_info;
++	struct i2s_rpmsg_s *rpmsg_tx;
++	struct i2s_rpmsg_s *rpmsg_rx;
++
++	rpmsg_tx = &i2s_info->send_msg[SNDRV_PCM_STREAM_PLAYBACK];
++	rpmsg_rx = &i2s_info->send_msg[SNDRV_PCM_STREAM_CAPTURE];
++
++	rpmsg_tx->header.cmd = I2S_TX_SUSPEND;
++	i2s_send_message(rpmsg_tx, i2s_info);
++
++	rpmsg_tx->header.cmd = I2S_RX_SUSPEND;
++	i2s_send_message(rpmsg_rx, i2s_info);
++
++	return 0;
++}
++
++static int fsl_rpmsg_i2s_resume(struct device *dev)
++{
++	struct fsl_rpmsg_i2s *rpmsg_i2s = dev_get_drvdata(dev);
++	struct i2s_info  *i2s_info =  &rpmsg_i2s->i2s_info;
++	struct i2s_rpmsg_s *rpmsg_tx;
++	struct i2s_rpmsg_s *rpmsg_rx;
++
++	rpmsg_tx = &i2s_info->send_msg[SNDRV_PCM_STREAM_PLAYBACK];
++	rpmsg_rx = &i2s_info->send_msg[SNDRV_PCM_STREAM_CAPTURE];
++
++	rpmsg_tx->header.cmd = I2S_TX_RESUME;
++	i2s_send_message(rpmsg_tx, i2s_info);
++
++	rpmsg_tx->header.cmd = I2S_RX_RESUME;
++	i2s_send_message(rpmsg_rx, i2s_info);
++
++	return 0;
++}
++#endif /* CONFIG_PM_SLEEP */
++
++static const struct dev_pm_ops fsl_rpmsg_i2s_pm_ops = {
++	SET_RUNTIME_PM_OPS(fsl_rpmsg_i2s_runtime_suspend,
++			   fsl_rpmsg_i2s_runtime_resume,
++			   NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(fsl_rpmsg_i2s_suspend, fsl_rpmsg_i2s_resume)
++};
++
++static struct platform_driver fsl_rpmsg_i2s_driver = {
++	.probe  = fsl_rpmsg_i2s_probe,
++	.remove	= fsl_rpmsg_i2s_remove,
++	.driver = {
++		.name = "fsl-rpmsg-i2s",
++		.pm = &fsl_rpmsg_i2s_pm_ops,
++		.of_match_table = fsl_rpmsg_i2s_ids,
++	},
++};
++
++module_platform_driver(fsl_rpmsg_i2s_driver);
++
++MODULE_DESCRIPTION("Freescale Soc rpmsg_i2s Interface");
++MODULE_AUTHOR("Shengjiu Wang <shengjiu.wang@freescale.com>");
++MODULE_ALIAS("platform:fsl-rpmsg_i2s");
++MODULE_LICENSE("GPL");
+diff --git a/sound/soc/fsl/fsl_rpmsg_i2s.h b/sound/soc/fsl/fsl_rpmsg_i2s.h
+new file mode 100644
+index 0000000..7439f8a
+--- /dev/null
++++ b/sound/soc/fsl/fsl_rpmsg_i2s.h
+@@ -0,0 +1,306 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ ******************************************************************************
++ * communication stack of audio with rpmsg
++ ******************************************************************************
++ * Packet structure:
++ *   A SRTM message consists of a 10 bytes header followed by 0~N bytes of data
++ *
++ *   +---------------+-------------------------------+
++ *   |               |            Content            |
++ *   +---------------+-------------------------------+
++ *   |  Byte Offset  | 7   6   5   4   3   2   1   0 |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       0       |           Category            |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |     1 ~ 2     |           Version             |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       3       |             Type              |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       4       |           Command             |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       5       |           Reserved0           |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       6       |           Reserved1           |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       7       |           Reserved2           |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       8       |           Reserved3           |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       9       |           Reserved4           |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |       10      |            DATA 0             |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   :   :   :   :   :   :   :   :   :   :   :   :   :
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *   |   N + 10 - 1  |            DATA N-1           |
++ *   +---------------+---+---+---+---+---+---+---+---+
++ *
++ *   +----------+------------+------------------------------------------------+
++ *   |  Field   |    Byte    |                                                |
++ *   +----------+------------+------------------------------------------------+
++ *   | Category |     0      | The destination category.                      |
++ *   +----------+------------+------------------------------------------------+
++ *   | Version  |   1 ~ 2    | The category version of the sender of the      |
++ *   |          |            | packet.                                        |
++ *   |          |            | The first byte represent the major version of  |
++ *   |          |            | the packet.The second byte represent the minor |
++ *   |          |            | version of the packet.                         |
++ *   +----------+------------+------------------------------------------------+
++ *   |  Type    |     3      | The message type of current message packet.    |
++ *   +----------+------------+------------------------------------------------+
++ *   | Command  |     4      | The command byte sent to remote processor/SoC. |
++ *   +----------+------------+------------------------------------------------+
++ *   | Reserved |   5 ~ 9    | Reserved field for future extension.           |
++ *   +----------+------------+------------------------------------------------+
++ *   | Data     |     N      | The data payload of the message packet.        |
++ *   +----------+------------+------------------------------------------------+
++ *
++ * Audio control:
++ *   SRTM Audio Control Category Request Command Table:
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |  Category  | Version | Type | Command | Data                          | Function                                       |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x00   | Data[0]: Audio Device Index   | Open an Audio TX Instance.                     |
++ *       |            |         |      |         | Data[1]:     format           |                                                |
++ *       |            |         |      |         | Data[2]:     channels         |                                                |
++ *       |            |         |      |         | Data[3-6]:   samplerate       |                                                |
++ *       |            |         |      |         | Data[7-10]:  buffer_addr      |                                                |
++ *       |            |         |      |         | Data[11-14]: buffer_size      |                                                |
++ *       |            |         |      |         | Data[15-18]: period_size      |                                                |
++ *       |            |         |      |         | Data[19-22]: buffer_tail      |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x01   | Data[0]: Audio Device Index   | Start an Audio TX Instance.                    |
++ *       |            |         |      |         | Same as above command         |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x02   | Data[0]: Audio Device Index   | Pause an Audio TX Instance.                    |
++ *       |            |         |      |         | Same as above command         |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x03   | Data[0]: Audio Device Index   | Resume an Audio TX Instance.                   |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x04   | Data[0]: Audio Device Index   | Terminate an Audio TX Instance.                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x05   | Data[0]: Audio Device Index   | Close an Audio TX Instance.                    |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x06   | Data[0]: Audio Device Index   | Set Parameters for an Audio TX Instance.       |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x07   | Data[0]: Audio Device Index   | Set Audio TX Buffer.                           |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x08   | Data[0]: Audio Device Index   | Open an Audio RX Instance.                     |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x09   | Data[0]: Audio Device Index   | Start an Audio RX Instance.                    |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x0A   | Data[0]: Audio Device Index   | Pause an Audio RX Instance.                    |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x0B   | Data[0]: Audio Device Index   | Resume an Audio RX Instance.                   |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x0C   | Data[0]: Audio Device Index   | Terminate an Audio RX Instance.                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x0D   | Data[0]: Audio Device Index   | Close an Audio RX Instance.                    |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x0E   | Data[0]: Audio Device Index   | Set Parameters for an Audio RX Instance.       |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x00 |  0x0F   | Data[0]: Audio Device Index   | Set Audio RX Buffer.                           |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       Note 1: See <List of Sample Format> for available value of
++ *               Sample Format;
++ *       Note 2: See <List of Audio Channels> for available value of Channels;
++ *       Note 3: Sample Rate of Set Parameters for an Audio TX Instance
++ *               Command and Set Parameters for an Audio RX Instance Command is
++ *               in little-endian format.
++ *
++ *       SRTM Audio Control Category Response Command Table:
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |  Category  | Version | Type | Command | Data                          | Function                                       |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x00   | Data[0]: Audio Device Index   | Reply for Open an Audio TX Instance.           |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x01   | Data[0]: Audio Device Index   | Reply for Start an Audio TX Instance.          |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x02   | Data[0]: Audio Device Index   | Reply for Pause an Audio TX Instance.          |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x03   | Data[0]: Audio Device Index   | Reply for Resume an Audio TX Instance.         |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x04   | Data[0]: Audio Device Index   | Reply for Terminate an Audio TX Instance.      |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x05   | Data[0]: Audio Device Index   | Reply for Close an Audio TX Instance.          |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x06   | Data[0]: Audio Device Index   | Reply for Set Parameters for an Audio          |
++ *       |            |         |      |         | Data[1]: Return code          | TX Instance.                                   |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x07   | Data[0]: Audio Device Index   | Reply for Set Audio TX Buffer.                 |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x08   | Data[0]: Audio Device Index   | Reply for Open an Audio RX Instance.           |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x09   | Data[0]: Audio Device Index   | Reply for Start an Audio RX Instance.          |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x0A   | Data[0]: Audio Device Index   | Reply for Pause an Audio RX Instance.          |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x0B   | Data[0]: Audio Device Index   | Reply for Resume an Audio RX Instance.         |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x0C   | Data[0]: Audio Device Index   | Reply for Terminate an Audio RX Instance.      |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x0D   | Data[0]: Audio Device Index   | Reply for Close an Audio RX Instance.          |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x0E   | Data[0]: Audio Device Index   | Reply for Set Parameters for an Audio          |
++ *       |            |         |      |         | Data[1]: Return code          | RX Instance.                                   |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x01 |  0x0F   | Data[0]: Audio Device Index   | Reply for Set Audio RX Buffer.                 |
++ *       |            |         |      |         | Data[1]: Return code          |                                                |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *
++ *       SRTM Audio Control Category Notification Command Table:
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |  Category  | Version | Type | Command | Data                          | Function                                       |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x02 |  0x00   | Data[0]: Audio Device Index   | Notify one TX period is finished.              |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *       |    0x03    | 0x0100  | 0x02 |  0x01   | Data[0]: Audio Device Index   | Notify one RX period is finished.              |
++ *       +------------+---------+------+---------+-------------------------------+------------------------------------------------+
++ *
++ *       List of Sample Format:
++ *       +--------------------+----------------------------------------------+
++ *       |   Sample Format    |             Description                      |
++ *       +--------------------+----------------------------------------------+
++ *       |         0x0        | S16_LE                                       |
++ *       +--------------------+----------------------------------------------+
++ *       |         0x1        | S24_LE                                       |
++ *       +--------------------+----------------------------------------------+
++ *
++ *       List of Audio Channels
++ *       +--------------------+----------------------------------------------+
++ *       |    Audio Channel   |             Description                      |
++ *       +--------------------+----------------------------------------------+
++ *       |         0x0        | Left Channel                                 |
++ *       +--------------------+----------------------------------------------+
++ *       |         0x1        | Right Channel                                |
++ *       +--------------------+----------------------------------------------+
++ *       |         0x2        | Left & Right Channel                         |
++ *       +--------------------+----------------------------------------------+
++ *
++ */
++
++#ifndef __FSL_RPMSG_I2S_H
++#define __FSL_RPMSG_I2S_H
++
++#include <linux/pm_qos.h>
++#include <linux/imx_rpmsg.h>
++#include <linux/interrupt.h>
++#include <sound/dmaengine_pcm.h>
++
++#define RPMSG_TIMEOUT 1000
++
++#define		I2S_TX_OPEN		0x0
++#define		I2S_TX_START		0x1
++#define		I2S_TX_PAUSE		0x2
++#define		I2S_TX_RESTART		0x3
++#define		I2S_TX_TERMINATE	0x4
++#define		I2S_TX_CLOSE		0x5
++#define		I2S_TX_HW_PARAM		0x6
++#define		I2S_TX_BUFFER		0x7
++#define		I2S_TX_SUSPEND		0x8
++#define		I2S_TX_RESUME		0x9
++
++#define		I2S_RX_OPEN		0xA
++#define		I2S_RX_START		0xB
++#define		I2S_RX_PAUSE		0xC
++#define		I2S_RX_RESTART		0xD
++#define		I2S_RX_TERMINATE	0xE
++#define		I2S_RX_CLOSE		0xF
++#define		I2S_RX_HW_PARAM		0x10
++#define		I2S_RX_BUFFER		0x11
++#define		I2S_RX_SUSPEND		0x12
++#define		I2S_RX_RESUME		0x13
++#define         WORK_MAX_NUM		0x14
++
++#define		I2S_TX_PERIOD_DONE	0x0
++#define		I2S_RX_PERIOD_DONE	0x1
++
++#define         I2S_TYPE_A		0x0
++#define         I2S_TYPE_B		0x1
++#define         I2S_TYPE_C		0x2
++
++#define		I2S_RESP_NONE		0x0
++#define		I2S_RESP_NOT_ALLOWED	0x1
++#define		I2S_RESP_SUCCESS	0x2
++#define		I2S_RESP_FAILED		0x3
++
++struct i2s_param_s {
++	unsigned char audioindex;
++	unsigned char format;
++	unsigned char channels;
++	unsigned int  rate;
++	unsigned int  buffer_addr;
++	unsigned int  buffer_size;
++	unsigned int  period_size;
++	unsigned int  buffer_tail;
++} __packed;
++
++struct i2s_param_r {
++	unsigned char audioindex;
++	unsigned char resp;
++} __packed;
++
++/* struct of send message */
++struct i2s_rpmsg_s {
++	struct imx_rpmsg_head header;
++	struct i2s_param_s    param;
++};
++
++/* struct of received message */
++struct i2s_rpmsg_r {
++	struct imx_rpmsg_head header;
++	struct i2s_param_r    param;
++};
++
++struct work_of_rpmsg {
++	struct i2s_info		*i2s_info;
++	/* sent msg for each work */
++	struct i2s_rpmsg_s       msg;
++	struct work_struct       work;
++};
++
++typedef void (*dma_callback)(void *arg);
++struct i2s_info {
++	struct rpmsg_device     *rpdev;
++	struct device            *dev;
++	struct completion        cmd_complete;
++	/* received msg */
++	struct i2s_rpmsg_r       recv_msg;
++	/* backup sent msg */
++	struct i2s_rpmsg_s       send_msg[2];
++
++	struct workqueue_struct  *rpmsg_wq;
++	struct work_of_rpmsg	 work_list[WORK_MAX_NUM];
++	int                      num_period[2];
++	void                     *callback_param[2];
++	int (*send_message)(struct i2s_rpmsg_s *msg, struct i2s_info *info);
++	dma_callback             callback[2];
++	spinlock_t               lock[2];
++	struct mutex             tx_lock;
++};
++
++struct fsl_rpmsg_i2s {
++	struct platform_device *pdev;
++	struct i2s_info        i2s_info;
++};
++
++#endif /* __FSL_RPMSG_I2S_H */
+diff --git a/sound/soc/fsl/imx-pcm.h b/sound/soc/fsl/imx-pcm.h
+index 133c4470a..8859a35 100644
+--- a/sound/soc/fsl/imx-pcm.h
++++ b/sound/soc/fsl/imx-pcm.h
+@@ -43,6 +43,15 @@ struct imx_pcm_fiq_params {
+ 	struct snd_dmaengine_dai_dma_data *dma_params_tx;
+ };
+ 
++#if IS_ENABLED(CONFIG_SND_SOC_IMX_PCM_RPMSG)
++int imx_rpmsg_platform_register(struct device *dev);
++#else
++static inline int imx_rpmsg_platform_register(struct device *dev)
++{
++	return -ENODEV;
++}
++#endif
++
+ #if IS_ENABLED(CONFIG_SND_SOC_IMX_PCM_DMA)
+ int imx_pcm_dma_init(struct platform_device *pdev, size_t size);
+ #else
+-- 
+1.7.9.5
+

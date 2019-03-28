@@ -1,0 +1,356 @@
+From 543e9e05870f317bb47b06d02d1a28ee7c88b9eb Mon Sep 17 00:00:00 2001
+From: Daniel Baluta <daniel.baluta@nxp.com>
+Date: Thu, 4 Oct 2018 16:34:29 +0300
+Subject: [PATCH 4835/5242] MLK-18497-4: ASoC: fsl: dsp: Add message buffer
+ pool API
+
+commit  c9594348db60052c4ef56946777478a892c44bcd from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Memory is allocated to clients from memory pools. A memory pool
+allocation is requested to DSP framework via XF_ALLOC command and
+freed via XF_FREE.
+
+Memory pool allocation API offers two functions:
+	* xf_pool_alloc, allocate a number of buffers of given length
+	* xf_pool_free, free memory area allocated for a pool.
+
+Once a buffer pool is allocated users can handle buffers using the
+following API:
+	* xf_buffer_get(pool), gets a buffer from a pool
+	* xf_buffer_put(buf), puts back a buffer into its pool
+
+Reviewed-by: Cosmin-Gabriel Samoila <cosmin.samoila@nxp.com>
+Signed-off-by: Shengjiu Wang <shengjiu.wang@nxp.com
+Signed-off-by: Daniel Baluta <daniel.baluta@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/Makefile        |    2 +-
+ sound/soc/fsl/fsl_dsp.h       |    3 +
+ sound/soc/fsl/fsl_dsp_pool.c  |  151 +++++++++++++++++++++++++++++++++++++++++
+ sound/soc/fsl/fsl_dsp_pool.h  |  113 ++++++++++++++++++++++++++++++
+ sound/soc/fsl/fsl_dsp_proxy.h |    3 +
+ 5 files changed, 271 insertions(+), 1 deletion(-)
+ create mode 100644 sound/soc/fsl/fsl_dsp_pool.c
+ create mode 100644 sound/soc/fsl/fsl_dsp_pool.h
+
+diff --git a/sound/soc/fsl/Makefile b/sound/soc/fsl/Makefile
+index b3806f5..e3901b6 100644
+--- a/sound/soc/fsl/Makefile
++++ b/sound/soc/fsl/Makefile
+@@ -16,7 +16,7 @@ snd-soc-fsl-acm-objs := fsl_acm.o
+ snd-soc-fsl-amix-objs := fsl_amix.o
+ snd-soc-fsl-asrc-objs := fsl_asrc.o fsl_asrc_dma.o
+ snd-soc-fsl-dma-workaround-objs := fsl_dma_workaround.o
+-snd-soc-fsl-dsp-objs := fsl_dsp.o fsl_dsp_proxy.o
++snd-soc-fsl-dsp-objs := fsl_dsp.o fsl_dsp_proxy.o fsl_dsp_pool.o
+ snd-soc-fsl-sai-objs := fsl_sai.o
+ snd-soc-fsl-ssi-y := fsl_ssi.o
+ snd-soc-fsl-ssi-$(CONFIG_DEBUG_FS) += fsl_ssi_dbg.o
+diff --git a/sound/soc/fsl/fsl_dsp.h b/sound/soc/fsl/fsl_dsp.h
+index 1d1ca32..aac3fc6 100644
+--- a/sound/soc/fsl/fsl_dsp.h
++++ b/sound/soc/fsl/fsl_dsp.h
+@@ -37,6 +37,9 @@ struct xf_client {
+ 	/* ...global structure pointer */
+ 	void	*global;
+ 	struct xf_message m;
++
++	struct work_struct work;
++	struct completion compr_complete;
+ };
+ 
+ union xf_client_link {
+diff --git a/sound/soc/fsl/fsl_dsp_pool.c b/sound/soc/fsl/fsl_dsp_pool.c
+new file mode 100644
+index 0000000..1ac2454
+--- /dev/null
++++ b/sound/soc/fsl/fsl_dsp_pool.c
+@@ -0,0 +1,151 @@
++// SPDX-License-Identifier: GPL-2.0+
++//
++// Xtensa buffer pool API
++//
++// Copyright 2018 NXP
++// Copyright (c) 2012-2013 by Tensilica Inc.
++
++#include <linux/slab.h>
++#include <soc/imx8/sc/ipc.h>
++
++#include "fsl_dsp_pool.h"
++#include "fsl_dsp.h"
++
++/* ...allocate buffer pool */
++int xf_pool_alloc(struct xf_client *client, struct xf_proxy *proxy,
++		  u32 number, u32 length, xf_pool_type_t type,
++		  struct xf_pool **pool)
++{
++	struct xf_pool      *p;
++	struct xf_buffer    *b;
++	void  *data;
++	struct xf_message    msg;
++	struct xf_message   *rmsg;
++
++	/* ...basic sanity checks; number of buffers is positive */
++	if (number <=0)
++		return -EINVAL;
++
++	/* ...get properly aligned buffer length */
++	length = ALIGN(length, XF_PROXY_ALIGNMENT);
++
++	p = kzalloc(offsetof(struct xf_pool, buffer) +
++		    number * sizeof(struct xf_buffer), GFP_KERNEL);
++	if(!p)
++		return -ENOMEM;
++
++	/* ...prepare command parameters */
++	msg.id = __XF_MSG_ID(__XF_AP_PROXY(0), __XF_DSP_PROXY(0));
++	msg.id = XF_MSG_AP_FROM_USER(msg.id, client->id);
++	msg.opcode = XF_ALLOC;
++	msg.length = length * number;
++	msg.buffer = NULL;
++	msg.ret = 0;
++
++	/* ...execute command synchronously */
++	rmsg = xf_cmd_send_recv_complete(client, proxy, msg.id, msg.opcode,
++					 msg.buffer, msg.length, &client->work,
++					 &client->compr_complete);
++	if (IS_ERR(rmsg)) {
++		kfree(p);
++		return PTR_ERR(rmsg);
++	}
++
++	p->p = rmsg->buffer;
++	/* TODO: review cleanup */
++	/* xf_msg_free(proxy, rmsg);
++	 * xf_unlock(&proxy->lock); */
++
++	/* ...if operation is failed, do cleanup */
++	/* ...set pool parameters */
++	p->number = number, p->length = length;
++	p->proxy = proxy;
++
++	/* ...create individual buffers and link them into free list */
++	for (p->free = b = &p->buffer[0], data = p->p; number > 0;
++			number--, b++) {
++		/* ...set address of the buffer (no length there) */
++		b->address = data;
++
++		/* ...file buffer into the free list */
++		b->link.next = b + 1;
++
++		/* ...advance data pointer in contiguous buffer */
++		data += length;
++	}
++
++	/* ...terminate list of buffers (not too good - tbd) */
++	b[-1].link.next = NULL;
++
++	/* ...return buffer pointer */
++	*pool = p;
++
++	return 0;
++}
++/* ...buffer pool destruction */
++int xf_pool_free(struct xf_client *client, struct xf_pool *pool)
++{
++	struct xf_proxy     *proxy;
++	struct xf_message    msg;
++	struct xf_message   *rmsg;
++
++	/* ...basic sanity checks; pool is positive */
++	if (pool == NULL)
++		return -EINVAL;
++
++	/* ...get proxy pointer */
++	if ((proxy = pool->proxy) == NULL)
++		return -EINVAL;
++
++	/* ...prepare command parameters */
++	msg.id = __XF_MSG_ID(__XF_AP_PROXY(0), __XF_DSP_PROXY(0));
++	msg.id = XF_MSG_AP_FROM_USER(msg.id, client->id);
++	msg.opcode = XF_FREE;
++	msg.length = pool->length * pool->number;
++	msg.buffer = pool->p;
++	msg.ret = 0;
++
++	/* ...execute command synchronously */
++	rmsg = xf_cmd_send_recv_complete(client, proxy, msg.id, msg.opcode,
++					 msg.buffer, msg.length, &client->work,
++					 &client->compr_complete);
++	kfree(pool);
++	if (IS_ERR(rmsg))
++		return PTR_ERR(rmsg);
++
++	/* TODO: review cleanup */
++	/* xf_msg_free(proxy, rmsg);
++	 * xf_unlock(&proxy->lock); */
++
++	return 0;
++}
++
++/* ...get new buffer from a pool */
++struct xf_buffer *xf_buffer_get(struct xf_pool *pool)
++{
++	struct xf_buffer    *b;
++
++	xf_lock(&pool->proxy->lock);
++	/* ...take buffer from a head of the free list */
++	b = pool->free;
++	if (b) {
++		/* ...advance free list head */
++		pool->free = b->link.next, b->link.pool = pool;
++	}
++
++	xf_unlock(&pool->proxy->lock);
++	return b;
++}
++
++/* ...return buffer back to pool */
++void xf_buffer_put(struct xf_buffer *buffer)
++{
++	struct xf_pool  *pool = buffer->link.pool;
++
++	xf_lock(&pool->proxy->lock);
++	/* ...use global proxy lock for pool operations protection */
++	/* ...put buffer back to a pool */
++	buffer->link.next = pool->free, pool->free = buffer;
++
++	xf_unlock(&pool->proxy->lock);
++}
+diff --git a/sound/soc/fsl/fsl_dsp_pool.h b/sound/soc/fsl/fsl_dsp_pool.h
+new file mode 100644
+index 0000000..4a56262
+--- /dev/null
++++ b/sound/soc/fsl/fsl_dsp_pool.h
+@@ -0,0 +1,113 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Xtensa buffer pool API header
++ *
++ * Copyright 2018 NXP
++ * Copyright (c) 2012-2013 by Tensilica Inc
++ */
++#ifndef FSL_DSP_POOL_H
++#define FSL_DSP_POOL_H
++
++#include <linux/types.h>
++#include "fsl_dsp_proxy.h"
++
++/* ...buffer pool type */
++typedef u32 xf_pool_type_t;
++
++/* ...previous declaration of struct */
++struct xf_buffer;
++struct xf_pool;
++struct xf_handle;
++struct xf_message;
++struct xf_client;
++
++/* ...response callback */
++typedef void (*xf_response_cb)(struct xf_handle *h, struct xf_message *msg);
++
++/* ...buffer pool type */
++enum xf_pool_type {
++        XF_POOL_AUX = 0,
++        XF_POOL_INPUT = 1,
++        XF_POOL_OUTPUT = 2
++};
++
++/* ...buffer link pointer */
++union xf_buffer_link {
++        /* ...pointer to next free buffer in a pool (for free buffer) */
++        struct xf_buffer *next;
++        /* ...reference to a buffer pool (for allocated buffer) */
++        struct xf_pool *pool;
++};
++
++/* ...buffer descriptor */
++struct xf_buffer {
++        /* ...virtual address of contiguous buffer */
++        void *address;
++        /* ...link pointer */
++        union xf_buffer_link link;
++};
++
++/* ...buffer pool */
++struct xf_pool {
++        /* ...reference to proxy data */
++        struct xf_proxy *proxy;
++        /* ...length of individual buffer in a pool */
++        u32 length;
++        /* ...number of buffers in a pool */
++        u32 number;
++        /* ...pointer to pool memory */
++        void *p;
++        /* ...pointer to first free buffer in a pool */
++        struct xf_buffer *free;
++        /* ...individual buffers */
++        struct xf_buffer buffer[0];
++};
++
++/* component handle */
++struct xf_handle {
++        /* ...reference to proxy data */
++        struct xf_proxy *proxy;
++        /* ...auxiliary control buffer for control transactions */
++        struct xf_buffer *aux;
++        /* ...global client-id of the component */
++        u32 id;
++        /* ...local client number (think about merging into "id" field - tbd) */
++        u32 client;
++        /* ...response processing hook */
++        xf_response_cb response;
++};
++
++/* ...accessor to buffer data */
++static inline void *xf_buffer_data(struct xf_buffer *buffer)
++{
++        return buffer->address;
++}
++
++/* ...length of buffer data */
++static inline size_t xf_buffer_length(struct xf_buffer *buffer)
++{
++        struct xf_pool *pool = buffer->link.pool;
++
++        return (size_t)pool->length;
++}
++
++/* ...component client-id (global scope) */
++static inline u32 xf_handle_id(struct xf_handle *handle)
++{
++        return handle->id;
++}
++
++/* ...pointer to auxiliary buffer */
++static inline void *xf_handle_aux(struct xf_handle *handle)
++{
++        return xf_buffer_data(handle->aux);
++}
++
++int xf_pool_alloc(struct xf_client *client, struct xf_proxy *proxy, u32 number,
++		  u32 length, xf_pool_type_t type, struct xf_pool **pool);
++int xf_pool_free(struct xf_client *client, struct xf_pool *pool);
++
++struct xf_buffer *xf_buffer_get(struct xf_pool *pool);
++void xf_buffer_put(struct xf_buffer *buffer);
++
++#endif /* FSL_DSP_POOL_H */
+diff --git a/sound/soc/fsl/fsl_dsp_proxy.h b/sound/soc/fsl/fsl_dsp_proxy.h
+index dc54dc2..78b0337 100644
+--- a/sound/soc/fsl/fsl_dsp_proxy.h
++++ b/sound/soc/fsl/fsl_dsp_proxy.h
+@@ -309,6 +309,9 @@ struct xf_proxy {
+ 
+ 	/* ...pointer to first free message in the pool */
+ 	struct xf_message       *free;
++
++        /* ...auxiliary buffer pool for clients */
++	struct xf_pool          *aux;
+ };
+ 
+ union icm_header_t {
+-- 
+1.7.9.5
+

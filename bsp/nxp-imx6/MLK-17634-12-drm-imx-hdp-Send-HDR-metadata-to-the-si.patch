@@ -1,0 +1,150 @@
+From f30de6249f5abdb928499a0f6acdeece3324d876 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Mon, 12 Feb 2018 10:23:48 +0200
+Subject: [PATCH 3398/5242] MLK-17634-12: drm: imx: hdp: Send HDR metadata to
+ the sink
+
+commit  66e7685cbe3b8d2c09db68f383c19f6ac9e17102 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+If the HDR metadata proprety is set, then the metadata will be sent
+to the sink at the next mode set.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/hdp/imx-hdmi.c |   23 ++++++++++++++++++++++
+ drivers/gpu/drm/imx/hdp/imx-hdmi.h |    2 ++
+ drivers/gpu/drm/imx/hdp/imx-hdp.c  |   37 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/imx/hdp/imx-hdp.h  |    3 +++
+ 4 files changed, 65 insertions(+)
+
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdmi.c b/drivers/gpu/drm/imx/hdp/imx-hdmi.c
+index fe716cd..3541fda 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdmi.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdmi.c
+@@ -267,3 +267,26 @@ int hdmi_get_hpd_state(state_struct *state, u8 *hpd)
+ 	ret = CDN_API_HDMITX_GetHpdStatus_blocking(state, hpd);
+ 	return ret;
+ }
++
++int hdmi_write_hdr_metadata(state_struct *state,
++			    union hdmi_infoframe *hdr_infoframe)
++{
++	struct imx_hdp *hdp = container_of(state, struct imx_hdp, state);
++	u8 buffer[40];
++	int infoframe_size;
++
++	infoframe_size = hdmi_infoframe_pack(hdr_infoframe,
++					     buffer + 1, sizeof(buffer) - 1);
++	if (infoframe_size < 0) {
++		dev_err(hdp->dev, "Wrong metadata infoframe: %d\n",
++			infoframe_size);
++		return infoframe_size;
++	}
++
++	buffer[0] = 0;
++	infoframe_size++;
++
++	return CDN_API_InfoframeSet(state, 1, infoframe_size,
++				    (u32 *)buffer,
++				    HDMI_INFOFRAME_TYPE_DRM);
++}
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdmi.h b/drivers/gpu/drm/imx/hdp/imx-hdmi.h
+index de46462..c39f1ca 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdmi.h
++++ b/drivers/gpu/drm/imx/hdp/imx-hdmi.h
+@@ -22,5 +22,7 @@
+ int hdmi_get_hpd_state(state_struct *state, u8 *hpd);
+ int hdmi_phy_init_t28hpc(state_struct *state, int vic, int format, int color_depth);
+ void hdmi_mode_set_t28hpc(state_struct *state, int vic, int format, int color_depth, int temp);
++int hdmi_write_hdr_metadata(state_struct *state,
++			    union hdmi_infoframe *hdr_infoframe);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.c b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+index f3647a2..c99152c 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+@@ -677,13 +677,49 @@ static int imx_hdp_imx_encoder_atomic_check(struct drm_encoder *encoder,
+ 	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc_state);
+ 
+ 	imx_crtc_state->bus_format = MEDIA_BUS_FMT_RGB101010_1X30;
++
++	if (conn_state->hdr_metadata_changed)
++		crtc_state->mode_changed = true;
++
+ 	return 0;
+ }
+ 
++static void imx_hdp_imx_encoder_atomic_modeset(struct drm_encoder *encoder,
++					     struct drm_crtc_state *crtc_state,
++					struct drm_connector_state *conn_state)
++{
++	struct imx_hdp *hdp = container_of(encoder, struct imx_hdp, encoder);
++	union hdmi_infoframe frame;
++	struct hdr_static_metadata *hdr_metadata;
++	int ret;
++
++	if (!hdp->ops->write_hdr_metadata)
++		return;
++
++	if (!conn_state->hdr_source_metadata_blob_ptr ||
++	    conn_state->hdr_source_metadata_blob_ptr->length == 0)
++		return;
++
++	if (!conn_state->hdr_metadata_changed)
++		return;
++
++	hdr_metadata = (struct hdr_static_metadata *)
++			conn_state->hdr_source_metadata_blob_ptr->data;
++
++	ret = drm_hdmi_infoframe_set_hdr_metadata(&frame.drm, hdr_metadata);
++	if (ret < 0) {
++		DRM_ERROR("could not set HDR metadata in infoframe\n");
++		return;
++	}
++
++	hdp->ops->write_hdr_metadata(&hdp->state, &frame);
++}
++
+ static const struct drm_encoder_helper_funcs imx_hdp_imx_encoder_helper_funcs = {
+ 	.enable     = imx_hdp_imx_encoder_enable,
+ 	.disable    = imx_hdp_imx_encoder_disable,
+ 	.atomic_check = imx_hdp_imx_encoder_atomic_check,
++	.atomic_mode_set = imx_hdp_imx_encoder_atomic_modeset,
+ };
+ 
+ static const struct drm_encoder_funcs imx_hdp_imx_encoder_funcs = {
+@@ -855,6 +891,7 @@ static int imx8qm_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned in
+ 	.mode_set = hdmi_mode_set_t28hpc,
+ 	.get_edid_block = hdmi_get_edid_block,
+ 	.get_hpd_state = hdmi_get_hpd_state,
++	.write_hdr_metadata = hdmi_write_hdr_metadata,
+ };
+ 
+ static struct hdp_devtype imx8mq_hdmi_devtype = {
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.h b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+index e59413a..26bef6b 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.h
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+@@ -22,6 +22,7 @@
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_encoder_slave.h>
++#include <drm/drm_atomic.h>
+ #include <soc/imx8/sc/sci.h>
+ 
+ #include <drm/drm_dp_helper.h>
+@@ -89,6 +90,8 @@ struct hdp_ops {
+ 	void (*mode_set)(state_struct *state, int vic, int format, int color_depth, int max_link);
+ 	int (*get_edid_block)(void *data, u8 *buf, u32 block, size_t len);
+ 	int (*get_hpd_state)(state_struct *state, u8 *hpd);
++	int (*write_hdr_metadata)(state_struct *state,
++				  union hdmi_infoframe *hdr_infoframe);
+ 
+ 	void (*phy_reset)(sc_ipc_t ipcHndl, u8 reset);
+ 	int (*pixel_link_init)(state_struct *state);
+-- 
+1.7.9.5
+

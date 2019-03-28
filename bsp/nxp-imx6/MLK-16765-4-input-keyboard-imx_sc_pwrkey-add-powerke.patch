@@ -1,0 +1,269 @@
+From e6a37fa31de30bc2cf44eb8cecd950368cce55fc Mon Sep 17 00:00:00 2001
+From: Robin Gong <yibin.gong@nxp.com>
+Date: Tue, 7 Nov 2017 17:27:11 +0800
+Subject: [PATCH 2813/5242] MLK-16765-4 input: keyboard: imx_sc_pwrkey: add
+ powerkey driver on i.mx8QM/QXP
+
+commit  b62821254f864bd6230879ff007aa9290a645b4e from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This powerkey driver is a virtual driver based on scfw which control
+SNVS ON/OFF in SCU side. The key interrupt triggered by MU notfication
+
+BuildInfo:
+   - SCFW e7d95e1e, IMX-MKIMAGE 05d3d4a7, ATF 93dd1cc
+   - U-Boot 2017.03-00684-g28c5243
+
+Signed-off-by: Robin Gong <yibin.gong@nxp.com>
+Reviewed-by: Peng Fan <peng.fan@nxp.com>
+Reviewed-by: Anson Huang <Anson.Huang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../devicetree/bindings/input/imx-sc-pwrkey.txt    |   22 +++
+ drivers/input/keyboard/Kconfig                     |    7 +
+ drivers/input/keyboard/Makefile                    |    1 +
+ drivers/input/keyboard/imx_sc_pwrkey.c             |  173 ++++++++++++++++++++
+ 4 files changed, 203 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/input/imx-sc-pwrkey.txt
+ create mode 100644 drivers/input/keyboard/imx_sc_pwrkey.c
+
+diff --git a/Documentation/devicetree/bindings/input/imx-sc-pwrkey.txt b/Documentation/devicetree/bindings/input/imx-sc-pwrkey.txt
+new file mode 100644
+index 0000000..1084baa
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/imx-sc-pwrkey.txt
+@@ -0,0 +1,22 @@
++Device-Tree bindings for input/keyboard/imx_sc_pwrkey.c poweron/off driver
++over SCU. On i.mx8QM/QXP poweron/off key is connected on SCU side, so need
++to get key event by MU.
++
++Required properties:
++	- compatible = "fsl,imx8-pwrkey";
++
++Each button/key looked as the sub node:
++Required properties:
++	- linux,code: the key value defined in
++		include/dt-bindings/input/input.h
++Optional property:
++	- wakeup-source: wakeup feature, the keys can wakeup from
++	suspend if the keys with this property pressed.
++
++Example nodes:
++	sc_pwrkey: sc-powerkey {
++		compatible = "fsl,imx8-pwrkey";
++		linux,keycode = <KEY_POWER>;
++		wakeup-source;
++	};
++
+diff --git a/drivers/input/keyboard/Kconfig b/drivers/input/keyboard/Kconfig
+index b4b3320..e314d6a 100644
+--- a/drivers/input/keyboard/Kconfig
++++ b/drivers/input/keyboard/Kconfig
+@@ -438,6 +438,13 @@ config KEYBOARD_SNVS_PWRKEY
+ 	  To compile this driver as a module, choose M here; the
+ 	  module will be called snvs_pwrkey.
+ 
++config KEYBOARD_IMX_SC_PWRKEY
++	tristate "IMX SC Power Key Driver"
++	depends on (ARCH_FSL_IMX8QM || ARCH_FSL_IMX8QXP)
++	help
++	  This is the virtual snvs powerkey driver for NXP i.mx8Q/QXP family
++	  whose SCU hold snvs inside.
++
+ config KEYBOARD_PF1550_ONKEY
+ 	tristate "PF1550 OnKey Driver"
+ 	depends on MFD_PF1550
+diff --git a/drivers/input/keyboard/Makefile b/drivers/input/keyboard/Makefile
+index 7b9fde8..1045c6e 100644
+--- a/drivers/input/keyboard/Makefile
++++ b/drivers/input/keyboard/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_KEYBOARD_RPMSG)		+= rpmsg-keys.o
+ obj-$(CONFIG_KEYBOARD_SAMSUNG)		+= samsung-keypad.o
+ obj-$(CONFIG_KEYBOARD_SH_KEYSC)		+= sh_keysc.o
+ obj-$(CONFIG_KEYBOARD_SNVS_PWRKEY)	+= snvs_pwrkey.o
++obj-$(CONFIG_KEYBOARD_IMX_SC_PWRKEY)	+= imx_sc_pwrkey.o
+ obj-$(CONFIG_KEYBOARD_PF1550_ONKEY)	+= pf1550_onkey.o
+ obj-$(CONFIG_KEYBOARD_SPEAR)		+= spear-keyboard.o
+ obj-$(CONFIG_KEYBOARD_STMPE)		+= stmpe-keypad.o
+diff --git a/drivers/input/keyboard/imx_sc_pwrkey.c b/drivers/input/keyboard/imx_sc_pwrkey.c
+new file mode 100644
+index 0000000..10c0d06
+--- /dev/null
++++ b/drivers/input/keyboard/imx_sc_pwrkey.c
+@@ -0,0 +1,173 @@
++/*
++ * Driver for the IMX SNVS ON/OFF Power Key over sc api
++ * Copyright (C) 2017 NXP. All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <soc/imx8/sc/sci.h>
++#include <soc/imx8/sc/svc/irq/api.h>
++
++#define DEBOUNCE_TIME	100
++#define REPEAT_INTERVAL	60
++
++struct pwrkey_drv_data {
++	int keycode;
++	bool keystate;  /* 1: pressed, 0: release */
++	bool delay_check;
++	sc_ipc_t ipcHandle;
++	int wakeup;
++	struct delayed_work check_work;
++	struct input_dev *input;
++};
++
++static struct pwrkey_drv_data *pdata;
++
++static int imx_sc_pwrkey_notify(struct notifier_block *nb,
++				      unsigned long event, void *group)
++{
++	/* ignore other irqs */
++	if (!(pdata && pdata->ipcHandle && (event & SC_IRQ_BUTTON) &&
++		(*(sc_irq_group_t *)group == SC_IRQ_GROUP_WAKE)))
++		return 0;
++
++	if (!pdata->delay_check) {
++		pdata->delay_check = 1;
++		schedule_delayed_work(&pdata->check_work,
++					msecs_to_jiffies(REPEAT_INTERVAL));
++	}
++
++	return 0;
++}
++
++static void imx_sc_check_for_events(struct work_struct *work)
++{
++	struct input_dev *input = pdata->input;
++	bool state;
++
++	sc_misc_get_button_status(pdata->ipcHandle, &state);
++	/*
++	 * restore status back if press interrupt received but pin's status
++	 * released, which caused by pressing so quickly.
++	 */
++	if (!state && !pdata->keystate)
++		state = true;
++
++	if (state ^ pdata->keystate) {
++		pm_wakeup_event(input->dev.parent, 0);
++		pdata->keystate = !!state;
++		input_event(input, EV_KEY, pdata->keycode, !!state);
++		input_sync(input);
++		if (!state)
++			pdata->delay_check = 0;
++		pm_relax(pdata->input->dev.parent);
++	}
++	/* repeat check if pressed long */
++	if (state)
++		schedule_delayed_work(&pdata->check_work,
++					msecs_to_jiffies(DEBOUNCE_TIME));
++}
++
++static struct notifier_block imx_sc_pwrkey_notifier = {
++	.notifier_call = imx_sc_pwrkey_notify,
++};
++
++static int imx_sc_pwrkey_probe(struct platform_device *pdev)
++{
++	struct input_dev *input = NULL;
++	struct device_node *np = pdev->dev.of_node;
++	int error;
++	uint32_t mu_id;
++	sc_err_t sciErr;
++
++	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
++	if (!pdata)
++		return -ENOMEM;
++
++	if (of_property_read_u32(np, "linux,keycode", &pdata->keycode)) {
++		pdata->keycode = KEY_POWER;
++		dev_warn(&pdev->dev, "KEY_POWER without setting in dts\n");
++	}
++
++	sciErr = sc_ipc_getMuID(&mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		dev_err(&pdev->dev, "can not obtain mu id: %d\n", sciErr);
++		return sciErr;
++	}
++
++	sciErr = sc_ipc_open(&pdata->ipcHandle, mu_id);
++
++	if (sciErr != SC_ERR_NONE) {
++		dev_err(&pdev->dev, "can not get ipc handler: %d\n", sciErr);
++		return sciErr;
++	};
++
++	INIT_DELAYED_WORK(&pdata->check_work, imx_sc_check_for_events);
++
++	pdata->wakeup = of_property_read_bool(np, "wakeup-source");
++
++	input = devm_input_allocate_device(&pdev->dev);
++
++	if (!input) {
++		dev_err(&pdev->dev, "failed to allocate the input device\n");
++		return -ENOMEM;
++	}
++
++	input->name = pdev->name;
++	input->phys = "imx-sc-pwrkey/input0";
++	input->id.bustype = BUS_HOST;
++
++	input_set_capability(input, EV_KEY, pdata->keycode);
++
++	error = input_register_device(input);
++	if (error < 0) {
++		dev_err(&pdev->dev, "failed to register input device\n");
++		return error;
++	}
++
++	pdata->input = input;
++	platform_set_drvdata(pdev, pdata);
++
++	device_init_wakeup(&pdev->dev, !!(pdata->wakeup));
++
++	return register_scu_notifier(&imx_sc_pwrkey_notifier);
++}
++
++static const struct of_device_id imx_sc_pwrkey_ids[] = {
++	{ .compatible = "fsl,imx8-pwrkey" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx_sc_pwrkey_ids);
++
++static struct platform_driver imx_sc_pwrkey_driver = {
++	.driver = {
++		.name = "imx8-pwrkey",
++		.of_match_table = imx_sc_pwrkey_ids,
++	},
++	.probe = imx_sc_pwrkey_probe,
++};
++module_platform_driver(imx_sc_pwrkey_driver);
++
++MODULE_AUTHOR("Robin Gong <yibin.gong@nxp.com>");
++MODULE_DESCRIPTION("i.MX8 power key driver based on scu");
++MODULE_LICENSE("GPL");
+-- 
+1.7.9.5
+

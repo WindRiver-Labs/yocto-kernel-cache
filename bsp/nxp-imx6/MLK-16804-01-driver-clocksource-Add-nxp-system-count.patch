@@ -1,0 +1,286 @@
+From f6b61be7e25abd4cee7de9465cd9fea91bab14df Mon Sep 17 00:00:00 2001
+From: Bai Ping <ping.bai@nxp.com>
+Date: Sun, 5 Nov 2017 15:31:09 +0800
+Subject: [PATCH 2785/5242] MLK-16804-01 driver: clocksource: Add nxp system
+ counter broadcast timer
+
+commit  7715988d026346b0ccb610a3170ae9a832d05af9 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+On NXP i.MX8MQ SOC, it has system counter module for ARM
+generic timer implementation. In this system counter module
+it also has compare frame module to provide timer support.
+So we can use it as an alternative clockevent device for
+broadcast timer purpose when CPU core enter power down state
+with local timer stopped.
+
+Signed-off-by: Bai Ping <ping.bai@nxp.com>
+Reviewed-by: Anson Huang <anson.huang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi |   24 +---
+ drivers/clocksource/Kconfig                   |    4 +
+ drivers/clocksource/Makefile                  |    1 +
+ drivers/clocksource/timer-imx-sysctr.c        |  187 +++++++++++++++++++++++++
+ 4 files changed, 199 insertions(+), 17 deletions(-)
+ create mode 100644 drivers/clocksource/timer-imx-sysctr.c
+
+diff --git a/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi b/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi
+index 5613f8e..272b492 100644
+--- a/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi
++++ b/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi
+@@ -592,24 +592,14 @@
+ 		interrupt-parent = <&gic>;
+ 	};
+ 
+-	system_counter_rd: system-counter-rd@306a0000 {
+-		compatible = "fsl,imx8mq-system-counter-rd";
+-		reg = <0x0 0x306a0000 0x0 0x10000>;
+-		status = "disabled";
+-	};
+-
+-	system_counter_cmp: system-counter-cmp@306b0000 {
+-		compatible = "fsl,imx8mq-system-counter-cmp";
+-		reg = <0x0 0x306b0000 0x0 0x10000>;
+-		status = "disabled";
+-	};
+-
+-	system_counter_ctrl: system-counter-ctrl@306c0000 {
+-		compatible = "fsl,imx8mq-system-counter-ctrl";
+-		reg = <0x0 0x306c0000 0x0 0x10000>;
++	system_counter: system-counter@3036a0000 {
++		compatible = "nxp,sysctr-timer";
++		reg = <0x0 0x306a0000 0x0 0x10000>, /* system-counter-rd base */
++		      <0x0 0x306b0000 0x0 0x10000>, /* system-counter-cmp base */
++		      <0x0 0x306c0000 0x0 0x10000>; /* system-counter-ctrl base */
++		clock-frequency = <8333333>;
+ 		interrupts = <GIC_SPI 47 IRQ_TYPE_LEVEL_HIGH>,
+-			<GIC_SPI 48 IRQ_TYPE_LEVEL_HIGH>;
+-		status = "disabled";
++			     <GIC_SPI 48 IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+ 
+ 	spdif1: spdif@30810000 {
+diff --git a/drivers/clocksource/Kconfig b/drivers/clocksource/Kconfig
+index 4c0d54d..277fff3 100644
+--- a/drivers/clocksource/Kconfig
++++ b/drivers/clocksource/Kconfig
+@@ -603,6 +603,10 @@ config CLKSRC_IMX_TPM
+ 	  Enable this option to use IMX Timer/PWM Module (TPM) timer as
+ 	  clocksource.
+ 
++config CLKSRC_IMX_SYS_CNT
++	bool "Clocksource using i.MX system counter timer"
++	depends on ARM_ARCH_TIMER
++
+ config CLKSRC_ST_LPC
+ 	bool "Low power clocksource found in the LPC" if COMPILE_TEST
+ 	select TIMER_OF if OF
+diff --git a/drivers/clocksource/Makefile b/drivers/clocksource/Makefile
+index 6991348..86c1edd 100644
+--- a/drivers/clocksource/Makefile
++++ b/drivers/clocksource/Makefile
+@@ -72,6 +72,7 @@ obj-$(CONFIG_CLKSRC_MIPS_GIC)		+= mips-gic-timer.o
+ obj-$(CONFIG_CLKSRC_TANGO_XTAL)		+= tango_xtal.o
+ obj-$(CONFIG_CLKSRC_IMX_GPT)		+= timer-imx-gpt.o
+ obj-$(CONFIG_CLKSRC_IMX_TPM)		+= timer-imx-tpm.o
++obj-$(CONFIG_CLKSRC_IMX_SYS_CNT)	+= timer-imx-sysctr.o
+ obj-$(CONFIG_ASM9260_TIMER)		+= asm9260_timer.o
+ obj-$(CONFIG_H8300_TMR8)		+= h8300_timer8.o
+ obj-$(CONFIG_H8300_TMR16)		+= h8300_timer16.o
+diff --git a/drivers/clocksource/timer-imx-sysctr.c b/drivers/clocksource/timer-imx-sysctr.c
+new file mode 100644
+index 0000000..7c4d4ec
+--- /dev/null
++++ b/drivers/clocksource/timer-imx-sysctr.c
+@@ -0,0 +1,187 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ */
++
++#include <linux/interrupt.h>
++#include <linux/clockchips.h>
++#include <linux/clocksource.h>
++#include <linux/delay.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/sched_clock.h>
++
++#define CNTCV_LO	0x8
++#define CNTCV_HI	0xc
++#define CMPCV_LO	0x20
++#define CMPCV_HI	0x24
++#define CMPCR		0x2c
++
++#define SYS_CTR_EN		0x1
++#define SYS_CTR_IRQ_MASK	0x2
++
++static void __iomem *sys_ctr_rd_base;
++static void __iomem *sys_ctr_cmp_base;
++static struct clock_event_device clockevent_sysctr;
++
++static inline void sysctr_timer_enable(bool enable)
++{
++	u32 val;
++
++	val = readl(sys_ctr_cmp_base + CMPCR);
++	val &= ~SYS_CTR_EN;
++	if (enable)
++		val |= SYS_CTR_EN;
++
++	writel(val, sys_ctr_cmp_base + CMPCR);
++}
++
++static void sysctr_irq_acknowledge(void)
++{
++	u32 val;
++
++	/* clear th enable bit(EN=0) to clear the ISTAT */
++	val = readl(sys_ctr_cmp_base + CMPCR);
++	val &= ~SYS_CTR_EN;
++	writel(val, sys_ctr_cmp_base + CMPCR);
++}
++
++static inline u64 sysctr_read_counter(void)
++{
++	u32 cnt_hi, tmp_hi, cnt_lo;
++
++	do {
++		cnt_hi = readl_relaxed(sys_ctr_rd_base + CNTCV_HI);
++		cnt_lo = readl_relaxed(sys_ctr_rd_base + CNTCV_LO);
++		tmp_hi = readl_relaxed(sys_ctr_rd_base + CNTCV_HI);
++	} while (tmp_hi != cnt_hi);
++
++	return  ((u64) cnt_hi << 32) | cnt_lo;
++}
++
++static u64 notrace sysctr_read_sched_clock(void)
++{
++	return sysctr_read_counter();
++}
++
++static u64 sysctr_clocksourc_read(struct clocksource *cs)
++{
++	return sysctr_read_counter();
++}
++
++static int __init sysctr_clocksource_init(unsigned int rate)
++{
++	sched_clock_register(sysctr_read_sched_clock, 56, rate);
++	return clocksource_mmio_init(sys_ctr_rd_base, "imx sysctr",
++				     rate, 200, 56, sysctr_clocksourc_read);
++}
++
++static int sysctr_set_next_event(unsigned long delta,
++				 struct clock_event_device *evt)
++{
++	u32 cmp_hi, cmp_lo;
++	u64 next;
++
++	sysctr_timer_enable(false);
++
++	next = sysctr_read_counter();
++
++	next += delta;
++
++	cmp_hi = (next >> 32) & 0x00fffff;
++	cmp_lo = next & 0xffffffff;
++
++	writel_relaxed(cmp_hi, sys_ctr_cmp_base + CMPCV_HI);
++	writel_relaxed(cmp_lo, sys_ctr_cmp_base + CMPCV_LO);
++
++	sysctr_timer_enable(true);
++
++	return 0;
++}
++
++static int sysctr_set_state_oneshot(struct clock_event_device *evt)
++{
++	/* enable timer */
++	sysctr_timer_enable(true);
++
++	return 0;
++}
++
++static int sysctr_set_state_shutdown(struct clock_event_device *evt)
++{
++	/* disable the timer */
++	sysctr_timer_enable(false);
++
++	return 0;
++}
++
++static irqreturn_t sysctr_timer_interrupt(int irq, void *dev_id)
++{
++	struct clock_event_device *evt = &clockevent_sysctr;
++
++	sysctr_irq_acknowledge();
++
++	evt->event_handler(evt);
++
++	return IRQ_HANDLED;
++}
++
++static struct clock_event_device clockevent_sysctr = {
++	.name			= "i.MX system counter timer",
++	.features		= CLOCK_EVT_FEAT_ONESHOT | CLOCK_EVT_FEAT_DYNIRQ,
++	.set_state_oneshot	= sysctr_set_state_oneshot,
++	.set_next_event		= sysctr_set_next_event,
++	.set_state_shutdown	= sysctr_set_state_shutdown,
++	.rating			= 200,
++};
++
++static struct irqaction sysctr_timer_irq = {
++	.name		= "iMX system counter timer",
++	.flags		= IRQF_TIMER | IRQF_IRQPOLL,
++	.handler	= sysctr_timer_interrupt,
++	.dev_id		= &clockevent_sysctr,
++};
++
++static int __init sysctr_clockevent_init(unsigned long rate, int irq)
++{
++	setup_irq(irq, &sysctr_timer_irq);
++
++	clockevent_sysctr.cpumask = cpumask_of(0);
++	clockevent_sysctr.irq = irq;
++	clockevents_config_and_register(&clockevent_sysctr,
++			rate, 0xff, 0x7fffffff);
++
++	return 0;
++}
++
++static int __init sysctr_timer_init(struct device_node *np)
++{
++	u32 rate;
++	int irq;
++
++	pr_info("system counter timer init\n");
++	sys_ctr_rd_base = of_iomap(np, 0);
++	BUG_ON(!sys_ctr_rd_base);
++
++	sys_ctr_cmp_base = of_iomap(np, 1);
++	BUG_ON(!sys_ctr_cmp_base);
++
++	/*
++	 * the purpose of this driver is to provide a global timer,
++	 * So only use one compare frame, request frame0's irq only.
++	 */
++	irq = irq_of_parse_and_map(np, 0);
++
++	if (of_property_read_u32(np, "clock-frequency", &rate))
++		return -EINVAL;
++
++	sysctr_clocksource_init(rate);
++	sysctr_clockevent_init(rate, irq);
++
++	return 0;
++}
++CLOCKSOURCE_OF_DECLARE(imx8m, "nxp,sysctr-timer", sysctr_timer_init);
+-- 
+1.7.9.5
+

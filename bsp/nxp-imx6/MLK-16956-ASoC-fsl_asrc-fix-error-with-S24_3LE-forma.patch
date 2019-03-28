@@ -1,0 +1,169 @@
+From 885de275d952df4b4e811b3ee5b0998c6ff1c64d Mon Sep 17 00:00:00 2001
+From: Shengjiu Wang <shengjiu.wang@nxp.com>
+Date: Mon, 27 Nov 2017 10:51:49 +0800
+Subject: [PATCH 2899/5242] MLK-16956: ASoC: fsl_asrc: fix error with S24_3LE
+ format bitstream
+
+commit  95ecb4a58f7cc87dc708f9226fbf85dea1dffc8e from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The error is "aplay: pcm_write:2023: write error: Input/output error"
+
+query the caps of dma, then update the hw parameters according
+the caps. for EDMA can't support 24bit sample, but we didn't
+add any constraint, that cause issues.
+
+Signed-off-by: Shengjiu Wang <shengjiu.wang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_asrc.c     |    4 +--
+ sound/soc/fsl/fsl_asrc.h     |    2 ++
+ sound/soc/fsl/fsl_asrc_dma.c |   81 +++++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 81 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_asrc.c b/sound/soc/fsl/fsl_asrc.c
+index 0317c33..957f15a 100644
+--- a/sound/soc/fsl/fsl_asrc.c
++++ b/sound/soc/fsl/fsl_asrc.c
+@@ -112,7 +112,7 @@
+  * within range [ANCA, ANCA+ANCB-1], depends on the channels of pair A
+  * while pair A and pair C are comparatively independent.
+  */
+-static int fsl_asrc_request_pair(int channels, struct fsl_asrc_pair *pair)
++int fsl_asrc_request_pair(int channels, struct fsl_asrc_pair *pair)
+ {
+ 	enum asrc_pair_index index = ASRC_INVALID_PAIR;
+ 	struct fsl_asrc *asrc_priv = pair->asrc_priv;
+@@ -197,7 +197,7 @@ static int proc_autosel(int Fsin, int Fsout, int *pre_proc, int *post_proc)
+  *
+  * It clears the resource from asrc_priv and releases the occupied channels.
+  */
+-static void fsl_asrc_release_pair(struct fsl_asrc_pair *pair)
++void fsl_asrc_release_pair(struct fsl_asrc_pair *pair)
+ {
+ 	struct fsl_asrc *asrc_priv = pair->asrc_priv;
+ 	enum asrc_pair_index index = pair->index;
+diff --git a/sound/soc/fsl/fsl_asrc.h b/sound/soc/fsl/fsl_asrc.h
+index facf4fc..e12f349 100644
+--- a/sound/soc/fsl/fsl_asrc.h
++++ b/sound/soc/fsl/fsl_asrc.h
+@@ -379,4 +379,6 @@ struct fsl_asrc {
+ #define DRV_NAME "fsl-asrc-dai"
+ extern struct snd_soc_component_driver fsl_asrc_component;
+ struct dma_chan *fsl_asrc_get_dma_channel(struct fsl_asrc_pair *pair, bool dir);
++int fsl_asrc_request_pair(int channels, struct fsl_asrc_pair *pair);
++void fsl_asrc_release_pair(struct fsl_asrc_pair *pair);
+ #endif /* _FSL_ASRC_H */
+diff --git a/sound/soc/fsl/fsl_asrc_dma.c b/sound/soc/fsl/fsl_asrc_dma.c
+index be1b8b4..3d1ee49 100644
+--- a/sound/soc/fsl/fsl_asrc_dma.c
++++ b/sound/soc/fsl/fsl_asrc_dma.c
+@@ -20,13 +20,11 @@
+ 
+ #define FSL_ASRC_DMABUF_SIZE	(256 * 1024)
+ 
+-static const struct snd_pcm_hardware snd_imx_hardware = {
++static struct snd_pcm_hardware snd_imx_hardware = {
+ 	.info = SNDRV_PCM_INFO_INTERLEAVED |
+ 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
+ 		SNDRV_PCM_INFO_MMAP |
+-		SNDRV_PCM_INFO_MMAP_VALID |
+-		SNDRV_PCM_INFO_PAUSE |
+-		SNDRV_PCM_INFO_RESUME,
++		SNDRV_PCM_INFO_MMAP_VALID,
+ 	.buffer_bytes_max = FSL_ASRC_DMABUF_SIZE,
+ 	.period_bytes_min = 128,
+ 	.period_bytes_max = 65532, /* Limited by SDMA engine */
+@@ -314,7 +312,16 @@ static int fsl_asrc_dma_startup(struct snd_pcm_substream *substream)
+ 	struct device *dev = component->dev;
+ 	struct fsl_asrc *asrc_priv = dev_get_drvdata(dev);
+ 	struct fsl_asrc_pair *pair;
++	bool tx = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
++	u8 dir = tx ? OUT : IN;
++	struct dma_slave_caps dma_caps;
++	struct dma_chan *tmp_chan;
++	struct snd_dmaengine_dai_dma_data *dma_data;
++	u32 addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
++			  BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
++			  BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+ 	int ret;
++	int i;
+ 
+ 	pair = kzalloc(sizeof(struct fsl_asrc_pair), GFP_KERNEL);
+ 	if (!pair)
+@@ -330,6 +337,72 @@ static int fsl_asrc_dma_startup(struct snd_pcm_substream *substream)
+ 		dev_err(dev, "failed to set pcm hw params periods\n");
+ 		return ret;
+ 	}
++
++	dma_data = snd_soc_dai_get_dma_data(rtd->cpu_dai, substream);
++
++	fsl_asrc_request_pair(1, pair);
++
++	tmp_chan = fsl_asrc_get_dma_channel(pair, dir);
++	if (!tmp_chan) {
++		dev_err(dev, "can't get dma channel\n");
++		return -EINVAL;
++	}
++
++	ret = dma_get_slave_caps(tmp_chan, &dma_caps);
++	if (ret == 0) {
++		if (dma_caps.cmd_pause)
++			snd_imx_hardware.info |= SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME;
++		if (dma_caps.residue_granularity <= DMA_RESIDUE_GRANULARITY_SEGMENT)
++			snd_imx_hardware.info |= SNDRV_PCM_INFO_BATCH;
++
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			addr_widths = dma_caps.dst_addr_widths;
++		else
++			addr_widths = dma_caps.src_addr_widths;
++	}
++
++	/*
++	 * If SND_DMAENGINE_PCM_DAI_FLAG_PACK is set keep
++	 * hw.formats set to 0, meaning no restrictions are in place.
++	 * In this case it's the responsibility of the DAI driver to
++	 * provide the supported format information.
++	 */
++	if (!(dma_data->flags & SND_DMAENGINE_PCM_DAI_FLAG_PACK))
++		/*
++		 * Prepare formats mask for valid/allowed sample types. If the
++		 * dma does not have support for the given physical word size,
++		 * it needs to be masked out so user space can not use the
++		 * format which produces corrupted audio.
++		 * In case the dma driver does not implement the slave_caps the
++		 * default assumption is that it supports 1, 2 and 4 bytes
++		 * widths.
++		 */
++		for (i = 0; i <= SNDRV_PCM_FORMAT_LAST; i++) {
++			int bits = snd_pcm_format_physical_width(i);
++
++			/*
++			 * Enable only samples with DMA supported physical
++			 * widths
++			 */
++			switch (bits) {
++			case 8:
++			case 16:
++			case 24:
++			case 32:
++			case 64:
++				if (addr_widths & (1 << (bits / 8)))
++					snd_imx_hardware.formats |= (1LL << i);
++				break;
++			default:
++				/* Unsupported types */
++				break;
++			}
++		}
++
++	if (tmp_chan)
++		dma_release_channel(tmp_chan);
++	fsl_asrc_release_pair(pair);
++
+ 	snd_soc_set_runtime_hwparams(substream, &snd_imx_hardware);
+ 
+ 	return 0;
+-- 
+1.7.9.5
+

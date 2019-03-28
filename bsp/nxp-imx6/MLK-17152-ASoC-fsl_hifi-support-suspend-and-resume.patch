@@ -1,0 +1,262 @@
+From a191413b63dade9b2e0fa2ebf07f1b5f662e1a06 Mon Sep 17 00:00:00 2001
+From: Shengjiu Wang <shengjiu.wang@nxp.com>
+Date: Fri, 8 Dec 2017 15:50:35 +0800
+Subject: [PATCH 3077/5242] MLK-17152: ASoC: fsl_hifi: support suspend and
+ resume
+
+commit  63bb1458e49f9e0d100410a12d0e7ca9ffad8e34 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+For hifi need to enter runtime suspend state in suspend,
+then the power of HIFI can be down. In this case content
+in internal RAM will be lost, and need to be recovered
+in resume.
+
+Move the loading firmware to runtime resume function, and
+define ICM_SUSPEND and ICM_RESUME command, with ICM_SUSPEND
+the hifi framework will store the data in RAM and with
+ICM_RESUME the hifi framework will restore the data to RAM.
+
+Signed-off-by: Shengjiu Wang <shengjiu.wang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_hifi4.c |  126 ++++++++++++++++++++++++++++++++++++---------
+ sound/soc/fsl/fsl_hifi4.h |   36 ++++++++++++-
+ 2 files changed, 136 insertions(+), 26 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_hifi4.c b/sound/soc/fsl/fsl_hifi4.c
+index 52066de..11684a5 100644
+--- a/sound/soc/fsl/fsl_hifi4.c
++++ b/sound/soc/fsl/fsl_hifi4.c
+@@ -1567,28 +1567,6 @@ static int fsl_hifi4_open(struct inode *inode, struct file *file)
+ 
+ 	file->private_data = hifi4_engine;
+ 
+-	if (!hifi4_priv->is_ready) {
+-		init_completion(&hifi4_priv->cmd_complete);
+-
+-		ret = request_firmware_nowait(THIS_MODULE,
+-				FW_ACTION_HOTPLUG, hifi4_priv->fw_name,
+-				dev,
+-				GFP_KERNEL, hifi4_priv, hifi4_load_firmware);
+-
+-		if (ret) {
+-			dev_err(dev, "failed to load firmware\n");
+-			mutex_unlock(&hifi4_priv->hifi4_mutex);
+-			return ret;
+-		}
+-
+-		ret = icm_ack_wait(hifi4_priv, 0);
+-		if (ret) {
+-			mutex_unlock(&hifi4_priv->hifi4_mutex);
+-			return ret;
+-		}
+-		dev_info(dev, "hifi driver registered\n");
+-	}
+-
+ 	/* increase reference counter when opening device */
+ 	atomic_long_inc(&hifi4_priv->refcnt);
+ 
+@@ -1696,7 +1674,7 @@ long icm_ack_wait(struct fsl_hifi4 *hifi4_priv, u32 msg)
+ 	err = wait_for_completion_timeout(&hifi4_priv->cmd_complete,
+ 				msecs_to_jiffies(1000));
+ 	if (!err) {
+-		dev_err(dev, "icm ack timeout!\n");
++		dev_err(dev, "icm ack timeout! %x\n", msg);
+ 		return -ETIMEDOUT;
+ 	}
+ 
+@@ -1818,7 +1796,18 @@ int process_act_complete(struct fsl_hifi4 *hifi4_priv, u32 msg)
+ 			complete(&hifi4_priv->cmd_complete);
+ 		}
+ 		break;
+-
++	case ICM_CORE_EXIT:
++		hifi4_priv->is_done = 1;
++		complete(&hifi4_priv->cmd_complete);
++		break;
++	case ICM_SUSPEND:
++		hifi4_priv->is_done = 1;
++		complete(&hifi4_priv->cmd_complete);
++		break;
++	case ICM_RESUME:
++		hifi4_priv->is_done = 1;
++		complete(&hifi4_priv->cmd_complete);
++		break;
+ 	default:
+ 		ret_val = -1;
+ 		break;
+@@ -2239,6 +2228,7 @@ static int fsl_hifi4_remove(struct platform_device *pdev)
+ static int fsl_hifi4_runtime_resume(struct device *dev)
+ {
+ 	struct fsl_hifi4 *hifi4_priv = dev_get_drvdata(dev);
++	int ret;
+ 
+ 	if (sc_pm_set_resource_power_mode(hifi4_priv->hifi_ipcHandle,
+ 			SC_R_DSP_RAM, SC_PM_PW_MODE_ON) != SC_ERR_NONE) {
+@@ -2246,6 +2236,32 @@ static int fsl_hifi4_runtime_resume(struct device *dev)
+ 		return -EIO;
+ 	}
+ 
++	mutex_lock(&hifi4_priv->hifi4_mutex);
++
++	if (!hifi4_priv->is_ready) {
++		init_completion(&hifi4_priv->cmd_complete);
++
++		ret = request_firmware_nowait(THIS_MODULE,
++				FW_ACTION_HOTPLUG, hifi4_priv->fw_name,
++				dev,
++				GFP_KERNEL, hifi4_priv, hifi4_load_firmware);
++
++		if (ret) {
++			dev_err(dev, "failed to load firmware\n");
++			mutex_unlock(&hifi4_priv->hifi4_mutex);
++			return ret;
++		}
++
++		ret = icm_ack_wait(hifi4_priv, 0);
++		if (ret) {
++			mutex_unlock(&hifi4_priv->hifi4_mutex);
++			return ret;
++		}
++		dev_info(dev, "hifi driver registered\n");
++	}
++
++	mutex_unlock(&hifi4_priv->hifi4_mutex);
++
+ 	return 0;
+ }
+ 
+@@ -2263,14 +2279,74 @@ static int fsl_hifi4_runtime_suspend(struct device *dev)
+ }
+ #endif /* CONFIG_PM */
+ 
++
+ #ifdef CONFIG_PM_SLEEP
+ static int fsl_hifi4_suspend(struct device *dev)
+ {
+-	return 0;
++	union icm_header_t apu_icm;
++	struct fsl_hifi4 *hifi4_priv = dev_get_drvdata(dev);
++	int ret = 0;
++
++	mutex_lock(&hifi4_priv->hifi4_mutex);
++
++	if (hifi4_priv->is_ready) {
++		init_completion(&hifi4_priv->cmd_complete);
++		hifi4_priv->is_done = 0;
++
++		apu_icm.allbits = 0;	/* clear all bits;*/
++		apu_icm.ack = 0;
++		apu_icm.intr = 1;
++		apu_icm.msg = ICM_SUSPEND;
++		apu_icm.size = 0;
++		icm_intr_send(hifi4_priv, apu_icm.allbits);
++
++		/* wait for response here */
++		ret = icm_ack_wait(hifi4_priv, apu_icm.allbits);
++		if (ret) {
++			mutex_unlock(&hifi4_priv->hifi4_mutex);
++			return ret;
++		}
++	}
++
++	mutex_unlock(&hifi4_priv->hifi4_mutex);
++
++	ret = pm_runtime_force_suspend(dev);
++
++	return ret;
+ }
+ 
+ static int fsl_hifi4_resume(struct device *dev)
+ {
++	union icm_header_t apu_icm;
++	struct fsl_hifi4 *hifi4_priv = dev_get_drvdata(dev);
++	int ret = 0;
++
++	ret = pm_runtime_force_resume(dev);
++	if (ret)
++		return ret;
++
++	mutex_lock(&hifi4_priv->hifi4_mutex);
++
++	if (hifi4_priv->is_ready) {
++		init_completion(&hifi4_priv->cmd_complete);
++		hifi4_priv->is_done = 0;
++
++		apu_icm.allbits = 0;	/* clear all bits;*/
++		apu_icm.ack = 0;
++		apu_icm.intr = 1;
++		apu_icm.msg = ICM_RESUME;
++		apu_icm.size = 0;
++		icm_intr_send(hifi4_priv, apu_icm.allbits);
++
++		/* wait for response here */
++		ret = icm_ack_wait(hifi4_priv, apu_icm.allbits);
++		if (ret) {
++			mutex_unlock(&hifi4_priv->hifi4_mutex);
++			return ret;
++		}
++	}
++	mutex_unlock(&hifi4_priv->hifi4_mutex);
++
+ 	return 0;
+ }
+ #endif /* CONFIG_PM_SLEEP */
+diff --git a/sound/soc/fsl/fsl_hifi4.h b/sound/soc/fsl/fsl_hifi4.h
+index ee52119..7672f7a 100644
+--- a/sound/soc/fsl/fsl_hifi4.h
++++ b/sound/soc/fsl/fsl_hifi4.h
+@@ -137,6 +137,8 @@ enum icm_action_t {
+ 
+ 	ICM_SWITCH_CODEC,
+ 	ICM_RESET,
++	ICM_SUSPEND,
++	ICM_RESUME,
+ };
+ 
+ enum aud_status_t {
+@@ -300,7 +302,39 @@ struct hifi4_mem_msg {
+ #define INPUT_BUF_SIZE		4096
+ #define OUTPUT_BUF_SIZE		16384
+ #define FIRMWARE_DATA_BUF_SIZE	(MULTI_CODEC_NUM * 0x80000)
+-#define SCRATCH_DATA_BUF_SIZE	(MULTI_CODEC_NUM * 0x80000)
++
++
++/*scratch buf structure
++ *  ----------------------------------------------------------------------
++ *  |  name             |   size     |    description                    |
++ * -----------------------------------------------------------------------
++ *  |  CODEC 0          |   0x80000  |  Total support 5 instance.
++ * -----------------------------------  Each instance has 0x80000 size
++ *  |  CODEC 1          |   0x80000  |  buffer for store the code section
++ * -----------------------------------  and input/output buffer.
++ *  |  CODEC 2          |   0x80000  |
++ * -----------------------------------
++ *  |  CODEC 3          |   0x80000  |
++ * -----------------------------------
++ *  |  CODEC 4          |   0x80000  |
++ * ------------------------------------------------------------------------
++ *  |  codec info buf   |   4096     |  For alloc the codec info structure
++ * ------------------------------------------------------------------------
++ *  |  global structure |   4096     |  For store hifi config structure
++ * ------------------------------------------------------------------------
++ *  |  DRAM             |   64k      |  For store DRAM buffer in suspend
++ * ------------------------------------------------------------------------
++ */
++
++#define EACH_CODEC_BUF_SIZE         0x80000
++#define CODEC_INFO_BUF_OFF         (MULTI_CODEC_NUM * EACH_CODEC_BUF_SIZE)
++#define CODEC_INFO_BUF_SIZE         4096
++#define SUSPEND_GLOBAL_BUF_OFF      (CODEC_INFO_BUF_OFF + CODEC_INFO_BUF_SIZE)
++#define SUSPEND_GLOBAL_BUF_SIZE     4096
++#define SUSPEND_DRAM_BUF_OFF        (SUSPEND_GLOBAL_BUF_OFF + SUSPEND_GLOBAL_BUF_SIZE)
++#define SUSPEND_DRAM_BUF_SIZE       65536
++
++#define SCRATCH_DATA_BUF_SIZE	(SUSPEND_DRAM_BUF_OFF + SUSPEND_DRAM_BUF_SIZE)
+ 
+ #define MEMORY_REMAP_OFFSET	0x39000000
+ 
+-- 
+1.7.9.5
+

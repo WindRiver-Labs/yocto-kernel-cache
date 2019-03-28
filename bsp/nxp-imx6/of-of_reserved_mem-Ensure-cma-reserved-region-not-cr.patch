@@ -1,0 +1,130 @@
+From 7397b321c7aa6b4b9f1eed6b2b8185cfc6b0d018 Mon Sep 17 00:00:00 2001
+From: Jason Liu <jason.hui.liu@nxp.com>
+Date: Wed, 23 Nov 2016 15:42:54 +0800
+Subject: [PATCH 1368/5242] of: of_reserved_mem: Ensure cma reserved region
+ not cross the low/high memory
+
+commit  e6ba63ddc211075c05da4c3b9d027440bb7f3fe9 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Need ensure the cma reserved region not cross the low/high memory boundary
+when using the dynamic allocation methond through device-tree, otherwise,
+kernel will fail to boot up when cma reserved region cross how/high mem.
+
+Signed-off-by: Jason Liu <jason.hui.liu@nxp.com>
+Cc: Laura Abbott <labbott@redhat.com>
+Cc: Frank Rowand <frowand.list@gmail.com>
+Cc: Rob Herring <robh+dt@kernel.org>
+Cc: stable@vger.kernel.org
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/of/of_reserved_mem.c    |   43 ++++++++++++++++++++++++++++++---------
+ include/linux/of_reserved_mem.h |    4 ++--
+ 2 files changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/of/of_reserved_mem.c b/drivers/of/of_reserved_mem.c
+index 895c83e..0c5ae32 100644
+--- a/drivers/of/of_reserved_mem.c
++++ b/drivers/of/of_reserved_mem.c
+@@ -27,11 +27,15 @@
+ 
+ #if defined(CONFIG_HAVE_MEMBLOCK)
+ #include <linux/memblock.h>
+-int __init __weak early_init_dt_alloc_reserved_memory_arch(phys_addr_t size,
+-	phys_addr_t align, phys_addr_t start, phys_addr_t end, bool nomap,
+-	phys_addr_t *res_base)
++int __init __weak early_init_dt_alloc_reserved_memory_arch(unsigned long node,
++	phys_addr_t size, phys_addr_t align, phys_addr_t start, phys_addr_t end,
++	bool nomap, phys_addr_t *res_base)
+ {
+ 	phys_addr_t base;
++	phys_addr_t highmem_start;
++
++	highmem_start = __pa(high_memory - 1) + 1;
++
+ 	/*
+ 	 * We use __memblock_alloc_base() because memblock_alloc_base()
+ 	 * panic()s on allocation failure.
+@@ -49,15 +53,34 @@ int __init __weak early_init_dt_alloc_reserved_memory_arch(phys_addr_t size,
+ 		return -ENOMEM;
+ 	}
+ 
++	/*
++	 * Sanity check for the cma reserved region:If the reserved region
++	 * crosses the low/high memory boundary, try to fix it up and then
++	 * fall back to allocate the cma region from the low mememory space.
++	 */
++
++	if (IS_ENABLED(CONFIG_CMA)
++	    && of_flat_dt_is_compatible(node, "shared-dma-pool")
++	    && of_get_flat_dt_prop(node, "reusable", NULL) && !nomap) {
++		if (base < highmem_start && (base + size) > highmem_start) {
++			memblock_free(base, size);
++			base = memblock_alloc_range(size, align, start,
++						    highmem_start,
++						    MEMBLOCK_NONE);
++			if (!base)
++				return -ENOMEM;
++		}
++	}
++
+ 	*res_base = base;
+ 	if (nomap)
+ 		return memblock_remove(base, size);
+ 	return 0;
+ }
+ #else
+-int __init __weak early_init_dt_alloc_reserved_memory_arch(phys_addr_t size,
+-	phys_addr_t align, phys_addr_t start, phys_addr_t end, bool nomap,
+-	phys_addr_t *res_base)
++int __init __weak early_init_dt_alloc_reserved_memory_arch(unsigned long node,
++	phys_addr_t size, phys_addr_t align, phys_addr_t start, phys_addr_t end,
++	bool nomap, phys_addr_t *res_base)
+ {
+ 	pr_err("Reserved memory not supported, ignoring region 0x%llx%s\n",
+ 		  size, nomap ? " (nomap)" : "");
+@@ -151,8 +174,8 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
+ 			end = start + dt_mem_next_cell(dt_root_size_cells,
+ 						       &prop);
+ 
+-			ret = early_init_dt_alloc_reserved_memory_arch(size,
+-					align, start, end, nomap, &base);
++			ret = early_init_dt_alloc_reserved_memory_arch(node,
++					size, align, start, end, nomap, &base);
+ 			if (ret == 0) {
+ 				pr_debug("allocated memory for '%s' node: base %pa, size %ld MiB\n",
+ 					uname, &base,
+@@ -163,8 +186,8 @@ static int __init __reserved_mem_alloc_size(unsigned long node,
+ 		}
+ 
+ 	} else {
+-		ret = early_init_dt_alloc_reserved_memory_arch(size, align,
+-							0, 0, nomap, &base);
++		ret = early_init_dt_alloc_reserved_memory_arch(node,
++					size, align, 0, 0, nomap, &base);
+ 		if (ret == 0)
+ 			pr_debug("allocated memory for '%s' node: base %pa, size %ld MiB\n",
+ 				uname, &base, (unsigned long)size / SZ_1M);
+diff --git a/include/linux/of_reserved_mem.h b/include/linux/of_reserved_mem.h
+index 67ab8d2..6d36696 100644
+--- a/include/linux/of_reserved_mem.h
++++ b/include/linux/of_reserved_mem.h
+@@ -35,13 +35,13 @@ int of_reserved_mem_device_init_by_idx(struct device *dev,
+ 				       struct device_node *np, int idx);
+ void of_reserved_mem_device_release(struct device *dev);
+ 
+-int early_init_dt_alloc_reserved_memory_arch(phys_addr_t size,
++int early_init_dt_alloc_reserved_memory_arch(unsigned long node,
++					     phys_addr_t size,
+ 					     phys_addr_t align,
+ 					     phys_addr_t start,
+ 					     phys_addr_t end,
+ 					     bool nomap,
+ 					     phys_addr_t *res_base);
+-
+ void fdt_init_reserved_mem(void);
+ void fdt_reserved_mem_save_node(unsigned long node, const char *uname,
+ 			       phys_addr_t base, phys_addr_t size);
+-- 
+1.7.9.5
+

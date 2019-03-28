@@ -1,0 +1,119 @@
+From 6c0952b6877f6edf95c56253c3382214148935d1 Mon Sep 17 00:00:00 2001
+From: Haibo Chen <haibo.chen@nxp.com>
+Date: Wed, 10 Oct 2018 20:46:05 +0800
+Subject: [PATCH 4825/5242] MLK-19751 input: synaptics_dsx: free touch irq
+ when touch suspend
+
+commit  0797ecb62c6285d3f223caecbadf32d17ee84355 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+On the imx8 MIPI DSI oled board, MIPI panel and touch share one RST
+pin. when suspend the whole system, touch will suspend first, it
+disable touch irq, and let touch work in sleep mode. Then MIPI panel
+suspend, it will give a reset signal on the RST pin. Due to this reset
+signal, touch will trigger two interrupt on GPIO1_9. Because touch
+suspend code already disable touch irq, so these two new touch interrupt
+will be pending there, and pending there in GPIO forever.
+
+When system resume, GPIO will restore registers in runtime resume before
+synaptics_dsx_i2c touch driver resume, so the GPIO1_9 IRQ will be unmasked
+and since its IRQ is pending there so IRQ keeps coming without touch
+driver to handle it, since it is NOT resume yet, make the system can't
+resueme back normally.
+
+Due to this is the hardware limitation which cause this issue, I format this
+patch to workaround this issue.
+This patch free touch irq in the touch driver suspend procedure, rather than
+just disable the touch irq.
+
+Reviewed-by: Fugang Duan <fugang.duan@nxp.com>
+Signed-off-by: Haibo Chen <haibo.chen@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../touchscreen/synaptics_dsx/synaptics_dsx_i2c.c  |   25 +++++++-------------
+ 1 file changed, 9 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/input/touchscreen/synaptics_dsx/synaptics_dsx_i2c.c b/drivers/input/touchscreen/synaptics_dsx/synaptics_dsx_i2c.c
+index 35fc226..1ecf79c 100644
+--- a/drivers/input/touchscreen/synaptics_dsx/synaptics_dsx_i2c.c
++++ b/drivers/input/touchscreen/synaptics_dsx/synaptics_dsx_i2c.c
+@@ -132,7 +132,6 @@
+ 
+ static struct task_struct *thread;
+ static DECLARE_WAIT_QUEUE_HEAD(waiter);
+-int tpd_halt;
+ static int tpd_flag;
+ DEFINE_MUTEX(rmi4_report_mutex);
+ static struct device *g_dev;
+@@ -1591,11 +1590,6 @@ static int touch_event_handler(void *data)
+ 	do {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 
+-		while (tpd_halt) {
+-			tpd_flag = 0;
+-			msleep(20);
+-		}
+-
+ 		wait_event_interruptible(waiter, tpd_flag != 0);
+ 
+ 		tpd_flag = 0;
+@@ -3262,16 +3256,14 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
+ 
+ 	touch_irq = client->irq;
+ 	ret = devm_request_irq(&client->dev, touch_irq, (irq_handler_t) tpd_eint_handler,
+-				IRQF_TRIGGER_LOW, "synaptics_rmi4_touch", NULL);
+-
+-	disable_irq_nosync(touch_irq);
+-	retval = synaptics_rmi4_irq_enable(rmi4_data, true);
+-	if (retval < 0) {
++				IRQF_TRIGGER_LOW, "synaptics_rmi4_touch", rmi4_data);
++	if (ret < 0) {
+ 		dev_err(&client->dev,
+ 				"%s: Failed to register attention interrupt\n",
+ 				__func__);
+ 		goto err_enable_irq;
+ 	}
++	rmi4_data->irq_enabled = true;
+ 
+ 	if (!exp_data.initialized) {
+ 		mutex_init(&exp_data.mutex);
+@@ -3509,13 +3501,12 @@ static int __maybe_unused synaptics_rmi4_suspend(struct device *dev)
+ 
+ 	if (!rmi4_data->sensor_sleep) {
+ 		rmi4_data->touch_stopped = true;
+-		synaptics_rmi4_irq_enable(rmi4_data, false);
+ 		synaptics_rmi4_sleep_enable(rmi4_data, true);
+ 		synaptics_rmi4_free_fingers(rmi4_data);
++		rmi4_data->irq_enabled = false;
++		free_irq(touch_irq, rmi4_data);
+ 	}
+ 
+-	tpd_halt = 1;
+-
+ exit:
+ 	mutex_lock(&exp_data.mutex);
+ 	if (!list_empty(&exp_data.list)) {
+@@ -3555,8 +3546,11 @@ static int __maybe_unused synaptics_rmi4_resume(struct device *dev)
+ 		goto exit;
+ 	}
+ 
++	retval = devm_request_irq(dev, touch_irq, (irq_handler_t) tpd_eint_handler,
++				IRQF_TRIGGER_LOW, "synaptics_rmi4_touch", rmi4_data);
++	rmi4_data->irq_enabled = true;
++
+ 	synaptics_rmi4_sleep_enable(rmi4_data, false);
+-	synaptics_rmi4_irq_enable(rmi4_data, true);
+ 	retval = synaptics_rmi4_reinit_device(rmi4_data);
+ 	if (retval < 0) {
+ 		dev_err(&rmi4_data->i2c_client->dev,
+@@ -3576,7 +3570,6 @@ static int __maybe_unused synaptics_rmi4_resume(struct device *dev)
+ 
+ 	rmi4_data->sensor_sleep = false;
+ 	rmi4_data->touch_stopped = false;
+-	tpd_halt = 0;
+ 
+ 	return 0;
+ }
+-- 
+1.7.9.5
+

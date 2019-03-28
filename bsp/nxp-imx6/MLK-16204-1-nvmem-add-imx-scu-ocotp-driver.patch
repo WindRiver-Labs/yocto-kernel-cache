@@ -1,0 +1,258 @@
+From 8fa2e0c0abb73a7e40a8ffda5412451c715cb4c1 Mon Sep 17 00:00:00 2001
+From: Peng Fan <peng.fan@nxp.com>
+Date: Thu, 17 Aug 2017 17:06:21 +0800
+Subject: [PATCH 2395/5242] MLK-16204-1 nvmem: add imx-scu-ocotp driver
+
+commit  8bf00ee3af7fce069fbdc925252b8cddf8b28801 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add imx-scu-ocotp driver to support i.MX8QM/QXP.
+
+The usage, add an entry in ocotp node, such as the test_1 entry:
+	ocotp: ocotp {
+               #address-cells = <1>;
+               #size-cells = <1>;
+               compatible = "fsl,imx8qm-ocotp", "syscon";
+
+               test_1: test_1@40 {
+                       reg = <0x41 0x8>;
+                       bits = <4 40>;
+               };
+       };
+
+Then in your device node, add this:
+       node: node {
+	        .....
+                nvmem-cells = <&test_1>;
+                nvmem-cell-names = "test_1";
+       };
+
+Then in your driver, using the following piece code:
+
+       +#include <linux/nvmem-consumer.h>
+
+       struct nvmem_cell *cell;
+       u8 *val;
+       size_t len;
+       int i;
+       cell = devm_nvmem_cell_get(&pdev->dev, "test_1");
+       if (IS_ERR(cell)) {
+               if (PTR_ERR(cell) == -EPROBE_DEFER)
+                       return -EPROBE_DEFER;
+       }
+       val = nvmem_cell_read(cell, &len);
+
+The val points the contents that you need.
+
+After shutdown or driver remove, use this:
+       devm_nvmem_cell_put(&pdev->dev, cell);
+
+Note: we not reuse the imx-ocotp driver, because mix scu api with
+legacy code will cost many maintenance efforts. When we have common
+api support, we could merge the two.
+
+Signed-off-by: Peng Fan <peng.fan@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/nvmem/Kconfig         |   12 ++++
+ drivers/nvmem/Makefile        |    2 +
+ drivers/nvmem/imx-scu-ocotp.c |  151 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 165 insertions(+)
+ create mode 100644 drivers/nvmem/imx-scu-ocotp.c
+
+diff --git a/drivers/nvmem/Kconfig b/drivers/nvmem/Kconfig
+index 54a3c29..779e84e 100644
+--- a/drivers/nvmem/Kconfig
++++ b/drivers/nvmem/Kconfig
+@@ -36,6 +36,18 @@ config NVMEM_IMX_OCOTP
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called nvmem-imx-ocotp.
+ 
++config NVMEM_IMX_SCU_OCOTP
++	tristate "i.MX8QM On-Chip OTP Controller support"
++	depends on ARCH_MXC_ARM64|| COMPILE_TEST
++	depends on HAS_IOMEM
++	help
++	  This is a driver for the On-Chip OTP Controller (OCOTP) available on
++	  i.MX6 SoCs, providing access to 4 Kbits of one-time programmable
++	  eFuses.
++
++	  This driver can also be built as a module. If so, the module
++	  will be called nvmem-imx-ocotp.
++
+ config NVMEM_LPC18XX_EEPROM
+ 	tristate "NXP LPC18XX EEPROM Memory Support"
+ 	depends on ARCH_LPC18XX || COMPILE_TEST
+diff --git a/drivers/nvmem/Makefile b/drivers/nvmem/Makefile
+index 27e96a8..a3ca0a9 100644
+--- a/drivers/nvmem/Makefile
++++ b/drivers/nvmem/Makefile
+@@ -13,6 +13,8 @@ obj-$(CONFIG_NVMEM_IMX_IIM)	+= nvmem-imx-iim.o
+ nvmem-imx-iim-y			:= imx-iim.o
+ obj-$(CONFIG_NVMEM_IMX_OCOTP)	+= nvmem-imx-ocotp.o
+ nvmem-imx-ocotp-y		:= imx-ocotp.o
++obj-$(CONFIG_NVMEM_IMX_SCU_OCOTP) += nvmem-imx-scu-ocotp.o
++nvmem-imx-scu-ocotp-y		:= imx-scu-ocotp.o
+ obj-$(CONFIG_NVMEM_LPC18XX_EEPROM)	+= nvmem_lpc18xx_eeprom.o
+ nvmem_lpc18xx_eeprom-y	:= lpc18xx_eeprom.o
+ obj-$(CONFIG_NVMEM_LPC18XX_OTP)	+= nvmem_lpc18xx_otp.o
+diff --git a/drivers/nvmem/imx-scu-ocotp.c b/drivers/nvmem/imx-scu-ocotp.c
+new file mode 100644
+index 0000000..8c622df
+--- /dev/null
++++ b/drivers/nvmem/imx-scu-ocotp.c
+@@ -0,0 +1,151 @@
++/*
++ * i.MX6 OCOTP fusebox driver
++ *
++ * Copyright (c) 2015 Pengutronix, Philipp Zabel <p.zabel@pengutronix.de>
++ *
++ * Based on the barebox ocotp driver,
++ * Copyright (c) 2010 Baruch Siach <baruch@tkos.co.il>,
++ *	Orex Computed Radiography
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++#include <linux/clk.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/nvmem-provider.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <soc/imx8/sc/sci.h>
++
++struct ocotp_priv {
++	struct device *dev;
++	unsigned int nregs;
++	sc_ipc_t nvmem_ipc;
++};
++
++static int imx_scu_ocotp_read(void *context, unsigned int offset,
++			      void *val, size_t bytes)
++{
++	struct ocotp_priv *priv = context;
++	sc_err_t sciErr = SC_ERR_NONE;
++	unsigned int count;
++	u32 index;
++	u32 num_bytes;
++	int i;
++	u8 *buf, *p;
++
++	index = offset >> 2;
++	num_bytes = round_up((offset % 4) + bytes, 4);
++	count = num_bytes >> 2;
++
++	if (count > (priv->nregs - index))
++		count = priv->nregs - index;
++
++	p = kzalloc(num_bytes, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	buf = p;
++
++	for (i = index; i < (index + count); i++) {
++		sciErr = sc_misc_otp_fuse_read(priv->nvmem_ipc, i, (u32 *)buf);
++		if (sciErr != SC_ERR_NONE) {
++			kfree(p);
++			return -EIO;
++		}
++		buf += 4;
++	}
++
++	index = offset % 4;
++	memcpy(val, &p[index], bytes);
++
++	kfree(p);
++
++	return 0;
++}
++
++static struct nvmem_config imx_scu_ocotp_nvmem_config = {
++	.name = "imx-ocotp",
++	.read_only = true,
++	.word_size = 4,
++	.stride = 1,
++	.owner = THIS_MODULE,
++	.reg_read = imx_scu_ocotp_read,
++};
++
++static const struct of_device_id imx_scu_ocotp_dt_ids[] = {
++	{ .compatible = "fsl,imx8qm-ocotp", (void *)800 },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, imx_scu_ocotp_dt_ids);
++
++static int imx_scu_ocotp_probe(struct platform_device *pdev)
++{
++	const struct of_device_id *of_id;
++	struct device *dev = &pdev->dev;
++	struct ocotp_priv *priv;
++	struct nvmem_device *nvmem;
++	uint32_t mu_id;
++	sc_err_t sciErr = SC_ERR_NONE;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	sciErr = sc_ipc_getMuID(&mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_info("pinctrl: Cannot obtain MU ID\n");
++		return -EIO;
++	}
++
++	sciErr = sc_ipc_open(&priv->nvmem_ipc, mu_id);
++
++	if (sciErr != SC_ERR_NONE) {
++		pr_info("pinctrl: Cannot open MU channel to SCU\n");
++		return -EIO;
++	};
++
++	of_id = of_match_device(imx_scu_ocotp_dt_ids, dev);
++	priv->nregs = (unsigned long)of_id->data;
++	priv->dev = dev;
++	imx_scu_ocotp_nvmem_config.size = 4 * priv->nregs;
++	imx_scu_ocotp_nvmem_config.dev = dev;
++	imx_scu_ocotp_nvmem_config.priv = priv;
++	nvmem = nvmem_register(&imx_scu_ocotp_nvmem_config);
++	if (IS_ERR(nvmem))
++		return PTR_ERR(nvmem);
++
++	platform_set_drvdata(pdev, nvmem);
++
++	return 0;
++}
++
++static int imx_scu_ocotp_remove(struct platform_device *pdev)
++{
++	struct nvmem_device *nvmem = platform_get_drvdata(pdev);
++
++	return nvmem_unregister(nvmem);
++}
++
++static struct platform_driver imx_scu_ocotp_driver = {
++	.probe	= imx_scu_ocotp_probe,
++	.remove	= imx_scu_ocotp_remove,
++	.driver = {
++		.name	= "imx_scu_ocotp",
++		.of_match_table = imx_scu_ocotp_dt_ids,
++	},
++};
++module_platform_driver(imx_scu_ocotp_driver);
++
++MODULE_AUTHOR("Peng Fan <peng.fan@nxp.com>");
++MODULE_DESCRIPTION("i.MX8QM OCOTP fuse box driver");
++MODULE_LICENSE("GPL v2");
+-- 
+1.7.9.5
+

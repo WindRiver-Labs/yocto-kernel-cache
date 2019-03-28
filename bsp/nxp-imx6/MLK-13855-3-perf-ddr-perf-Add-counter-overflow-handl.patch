@@ -1,0 +1,154 @@
+From bc2207f703ba2c904aa8db7e360e2835a5a4c1f7 Mon Sep 17 00:00:00 2001
+From: Tiberiu Breana <andrei-tiberiu.breana@nxp.com>
+Date: Wed, 14 Jun 2017 17:50:11 +0300
+Subject: [PATCH 2011/5242] MLK-13855-3: perf: ddr-perf: Add counter overflow
+ handling
+
+commit  f768a0c5bf91b496b573c7f97a4b95516ceb268c from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Added support for counter overflow interrupts.
+When the cycles counter overflows, update all local event data,
+then reset it and let it continue counting.
+
+Signed-off-by: Tiberiu Breana <andrei-tiberiu.breana@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm64/boot/dts/freescale/fsl-imx8qm.dtsi |    4 ++
+ drivers/perf/ddr-perf.c                       |   64 +++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/freescale/fsl-imx8qm.dtsi b/arch/arm64/boot/dts/freescale/fsl-imx8qm.dtsi
+index 48ddfda..259ef7e 100644
+--- a/arch/arm64/boot/dts/freescale/fsl-imx8qm.dtsi
++++ b/arch/arm64/boot/dts/freescale/fsl-imx8qm.dtsi
+@@ -2031,11 +2031,15 @@
+ 	ddr_pmu0: ddr_pmu@5c020000 {
+ 		compatible = "fsl,imx8-ddr-pmu";
+ 		reg = <0x0 0x5c020000 0x0 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SPI 130 IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+ 
+ 	ddr_pmu1: ddr_pmu@5c120000 {
+ 		compatible = "fsl,imx8-ddr-pmu";
+ 		reg = <0x0 0x5c120000 0x0 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SPI 131 IRQ_TYPE_LEVEL_HIGH>;
+ 	};
+ 
+ 	vpu: vpu@2c000000 {
+diff --git a/drivers/perf/ddr-perf.c b/drivers/perf/ddr-perf.c
+index 7bc0585..2ec4ce9 100644
+--- a/drivers/perf/ddr-perf.c
++++ b/drivers/perf/ddr-perf.c
+@@ -13,6 +13,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
++#include <linux/of_irq.h>
+ #include <linux/perf_event.h>
+ #include <linux/slab.h>
+ 
+@@ -25,6 +26,7 @@
+ #define CNTL_EN			0x4
+ #define CNTL_EN_MASK		0xFFFFFFFB
+ #define CNTL_CLEAR_MASK		0xFFFFFFFD
++#define CNTL_OVER_MASK		0xFFFFFFFE
+ 
+ #define CNTL_CSV_SHIFT		24
+ #define CNTL_CSV_MASK		(0xFF << CNTL_CSV_SHIFT)
+@@ -360,14 +362,57 @@ static int ddr_perf_init(struct ddr_pmu *pmu, void __iomem *base,
+ 	return ida_simple_get(&ddr_ida, 0, 0, GFP_KERNEL);
+ }
+ 
++static irqreturn_t ddr_perf_irq_handler(int irq, void *p)
++{
++	int i;
++	u8 reg;
++	int val;
++	int counter;
++	struct ddr_pmu *pmu = (struct ddr_pmu *) p;
++	struct perf_event *event;
++
++	/*
++	 * The cycles counter has overflowed. Update all of the local counter
++	 * values, then reset the cycles counter, so the others can continue
++	 * counting.
++	 */
++	for (i = 0; i <= pmu->total_events; i++) {
++		if (pmu->active_events[i] != NULL) {
++			event = pmu->active_events[i];
++			counter = event->hw.idx;
++			reg = counter * 4 + COUNTER_CNTL;
++			val = readl(pmu->base + reg);
++			ddr_perf_event_update(event);
++			if (val & CNTL_OVER) {
++				/* Clear counter, then re-enable it. */
++				ddr_perf_event_enable(pmu, event->attr.config,
++						      counter, true);
++				/* Update event again to reset prev_count */
++				ddr_perf_event_update(event);
++			}
++		}
++	}
++
++	/*
++	 * Reset the cycles counter regardless if it was explicitly
++	 * enabled or not.
++	 */
++	ddr_perf_event_enable(pmu, EVENT_CYCLES_ID,
++			      EVENT_CYCLES_COUNTER, true);
++
++	return IRQ_HANDLED;
++}
++
+ static int ddr_perf_probe(struct platform_device *pdev)
+ {
+ 	struct ddr_pmu *pmu;
++	struct device_node *np;
+ 	void __iomem *base;
+ 	struct resource *iomem;
+ 	char *name;
+ 	int num;
+ 	int ret;
++	u32 irq;
+ 
+ 	iomem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	base = devm_ioremap_resource(&pdev->dev, iomem);
+@@ -376,6 +421,8 @@ static int ddr_perf_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	np = pdev->dev.of_node;
++
+ 	pmu = kzalloc(sizeof(*pmu), GFP_KERNEL);
+ 	if (!pmu)
+ 		return -ENOMEM;
+@@ -388,6 +435,23 @@ static int ddr_perf_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto ddr_perf_err;
+ 
++	/* Request irq */
++	irq = of_irq_get(np, 0);
++	if (irq < 0) {
++		pr_err("Failed to get irq: %d", irq);
++		goto ddr_perf_err;
++	}
++
++	ret = devm_request_threaded_irq(&pdev->dev, irq,
++					ddr_perf_irq_handler, NULL,
++					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
++					DDR_PERF_DEV_NAME,
++					pmu);
++	if (ret < 0) {
++		pr_err("Request irq failed: %d", ret);
++		goto ddr_perf_err;
++	}
++
+ 	return 0;
+ 
+ ddr_perf_err:
+-- 
+1.7.9.5
+

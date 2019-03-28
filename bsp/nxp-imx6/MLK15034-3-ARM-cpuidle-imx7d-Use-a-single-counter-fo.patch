@@ -1,0 +1,283 @@
+From 5f45872bd4ea98048b0bbcaf78ebcd34b4c0277c Mon Sep 17 00:00:00 2001
+From: Leonard Crestez <leonard.crestez@nxp.com>
+Date: Wed, 5 Jul 2017 20:34:01 +0300
+Subject: [PATCH 3646/5242] MLK15034-3: ARM: cpuidle imx7d: Use a single
+ counter for lpi flow
+
+commit  9e16e95fbea0e29923edf0c41aec9f02ee66fd8e from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The current code for deciding which CPU runs the complete lpi flow is
+too complicated. Since all enter/exit code now runs under the same lock
+we can just use a single non-atomic counter of cpus inside lpi.
+
+Another variable is used to make num_online_cpus() available to ASM code
+but idle code can treat it as a constant.
+
+Unlike on imx_4.9.y num_online_cpus is fetched every time idle is
+entered becuase hotplug notifiers are gone.
+
+Signed-off-by: Leonard Crestez <leonard.crestez@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm/mach-imx/cpuidle-imx7d.c        |   31 +++------
+ arch/arm/mach-imx/imx7d_low_power_idle.S |  107 ++++++++++--------------------
+ 2 files changed, 47 insertions(+), 91 deletions(-)
+
+diff --git a/arch/arm/mach-imx/cpuidle-imx7d.c b/arch/arm/mach-imx/cpuidle-imx7d.c
+index d19d76e..641cdca 100644
+--- a/arch/arm/mach-imx/cpuidle-imx7d.c
++++ b/arch/arm/mach-imx/cpuidle-imx7d.c
+@@ -62,10 +62,9 @@ struct imx7_cpuidle_pm_info {
+ 	phys_addr_t pbase; /* The physical address of pm_info. */
+ 	phys_addr_t resume_addr; /* The physical resume address for asm code */
+ 	u32 pm_info_size;
+-	int last_cpu;
+ 	u32 ttbr;
+-	u32 cpu1_wfi;
+-	u32 lpi_enter;
++	u32 num_online_cpus;
++	u32 num_lpi_cpus;
+ 	atomic_t val;
+ 	atomic_t flag0;
+ 	atomic_t flag1;
+@@ -78,7 +77,6 @@ struct imx7_cpuidle_pm_info {
+ 	struct imx7_pm_base gic_dist_base;
+ } __aligned(8);
+ 
+-static atomic_t master_lpi = ATOMIC_INIT(0);
+ static atomic_t master_wait = ATOMIC_INIT(0);
+ 
+ static void (*imx7d_wfi_in_iram_fn)(void __iomem *iram_vbase);
+@@ -140,6 +138,7 @@ static int imx7d_enter_low_power_idle(struct cpuidle_device *dev,
+ {
+ 	int mode = get_bus_freq_mode();
+ 
++
+ 	if ((index == 1) || ((mode != BUS_FREQ_LOW) && index == 2)) {
+ 		index = 1;
+ 		if (atomic_inc_return(&master_wait) == num_online_cpus())
+@@ -151,9 +150,11 @@ static int imx7d_enter_low_power_idle(struct cpuidle_device *dev,
+ 		imx_gpcv2_set_lpm_mode(WAIT_CLOCKED);
+ 	} else {
+ 		imx_pen_lock(dev->cpu);
++		cpuidle_pm_info->num_online_cpus = num_online_cpus();
++		++cpuidle_pm_info->num_lpi_cpus;
+ 		cpu_pm_enter();
+-		if (atomic_inc_return(&master_lpi) == num_online_cpus() &&
+-			cpuidle_pm_info->last_cpu == -1) {
++		if (cpuidle_pm_info->num_lpi_cpus ==
++				cpuidle_pm_info->num_online_cpus) {
+ 			/*
+ 			 * GPC will not wake on SGIs so check for them
+ 			 * manually here. At this point we know the other cpu
+@@ -167,26 +168,22 @@ static int imx7d_enter_low_power_idle(struct cpuidle_device *dev,
+ 			imx_gpcv2_set_lpm_mode(WAIT_UNCLOCKED);
+ 			imx_gpcv2_set_cpu_power_gate_in_idle(true);
+ 			cpu_cluster_pm_enter();
+-
+-			cpuidle_pm_info->last_cpu = dev->cpu;
+-
+ 		} else {
+ 			imx_set_cpu_jump(dev->cpu, ca7_cpu_resume);
+ 		}
+ 
+ 		cpu_suspend(0, imx7d_idle_finish);
+ 
+-		if (atomic_dec_return(&master_lpi) == (num_online_cpus() - 1)) {
++		if (cpuidle_pm_info->num_lpi_cpus ==
++				cpuidle_pm_info->num_online_cpus) {
+ 			cpu_cluster_pm_exit();
+ 			imx_gpcv2_set_cpu_power_gate_in_idle(false);
+ 			imx_gpcv2_set_lpm_mode(WAIT_CLOCKED);
+ 		}
+ 
+-		if (cpuidle_pm_info->last_cpu == dev->cpu)
+-			cpuidle_pm_info->last_cpu = -1;
+-
+ skip_lpi_flow:
+ 		cpu_pm_exit();
++		--cpuidle_pm_info->num_lpi_cpus;
+ 		imx_pen_unlock(dev->cpu);
+ 	}
+ 
+@@ -296,13 +293,7 @@ int __init imx7d_cpuidle_init(void)
+ 	cpuidle_pm_info->pbase = (phys_addr_t) wfi_iram_base_phys;
+ 	cpuidle_pm_info->pm_info_size = sizeof(*cpuidle_pm_info);
+ 	cpuidle_pm_info->resume_addr = virt_to_phys(ca7_cpu_resume);
+-	if (num_online_cpus() == 1)
+-		cpuidle_pm_info->cpu1_wfi = 1;
+-	else
+-		cpuidle_pm_info->cpu1_wfi = 0;
+-	cpuidle_pm_info->lpi_enter = 0;
+-	/* initialize the last cpu id to invalid here */
+-	cpuidle_pm_info->last_cpu = -1;
++	cpuidle_pm_info->num_online_cpus = num_online_cpus();
+ 
+ 	cpuidle_pm_info->ddrc_base.pbase = MX7D_DDRC_BASE_ADDR;
+ 	cpuidle_pm_info->ddrc_base.vbase =
+diff --git a/arch/arm/mach-imx/imx7d_low_power_idle.S b/arch/arm/mach-imx/imx7d_low_power_idle.S
+index 72a2ce7..1551d2c 100644
+--- a/arch/arm/mach-imx/imx7d_low_power_idle.S
++++ b/arch/arm/mach-imx/imx7d_low_power_idle.S
+@@ -18,27 +18,26 @@
+ #define PM_INFO_PBASE_OFFSET			0x4
+ #define PM_INFO_RESUME_ADDR_OFFSET		0x8
+ #define PM_INFO_PM_INFO_SIZE_OFFSET		0xc
+-#define PM_INFO_PM_INFO_LAST_CPU_OFFSET		0x10
+-#define PM_INFO_PM_INFO_TTBR_OFFSET		0x14
+-#define PM_INFO_PM_INFO_CPU1_IN_WFI_OFFSET	0x18
+-#define PM_INFO_PM_INFO_LPI_ENTER_OFFSET	0x1c
+-#define PM_INFO_VAL_OFFSET			0x20
+-#define PM_INFO_FLAG0_OFFSET			0x24
+-#define PM_INFO_FLAG1_OFFSET			0x28
+-#define PM_INFO_MX7D_DDRC_P_OFFSET		0x2c
+-#define PM_INFO_MX7D_DDRC_V_OFFSET		0x30
+-#define PM_INFO_MX7D_CCM_P_OFFSET		0x34
+-#define PM_INFO_MX7D_CCM_V_OFFSET		0x38
+-#define PM_INFO_MX7D_ANATOP_P_OFFSET		0x3c
+-#define PM_INFO_MX7D_ANATOP_V_OFFSET		0x40
+-#define PM_INFO_MX7D_SRC_P_OFFSET		0x44
+-#define PM_INFO_MX7D_SRC_V_OFFSET		0x48
+-#define PM_INFO_MX7D_IOMUXC_GPR_P_OFFSET	0x4c
+-#define PM_INFO_MX7D_IOMUXC_GPR_V_OFFSET	0x50
+-#define PM_INFO_MX7D_GPC_P_OFFSET		0x54
+-#define PM_INFO_MX7D_GPC_V_OFFSET		0x58
+-#define PM_INFO_MX7D_GIC_DIST_P_OFFSET		0x5c
+-#define PM_INFO_MX7D_GIC_DIST_V_OFFSET		0x60
++#define PM_INFO_PM_INFO_TTBR_OFFSET		0x10
++#define PM_INFO_PM_INFO_NUM_ONLINE_CPUS_OFFSET	0x14
++#define PM_INFO_PM_INFO_NUM_LPI_CPUS_OFFSET	0x18
++#define PM_INFO_VAL_OFFSET			0x1c
++#define PM_INFO_FLAG0_OFFSET			0x20
++#define PM_INFO_FLAG1_OFFSET			0x24
++#define PM_INFO_MX7D_DDRC_P_OFFSET		0x28
++#define PM_INFO_MX7D_DDRC_V_OFFSET		0x2c
++#define PM_INFO_MX7D_CCM_P_OFFSET		0x30
++#define PM_INFO_MX7D_CCM_V_OFFSET		0x34
++#define PM_INFO_MX7D_ANATOP_P_OFFSET		0x38
++#define PM_INFO_MX7D_ANATOP_V_OFFSET		0x3c
++#define PM_INFO_MX7D_SRC_P_OFFSET		0x40
++#define PM_INFO_MX7D_SRC_V_OFFSET		0x44
++#define PM_INFO_MX7D_IOMUXC_GPR_P_OFFSET	0x48
++#define PM_INFO_MX7D_IOMUXC_GPR_V_OFFSET	0x4c
++#define PM_INFO_MX7D_GPC_P_OFFSET		0x50
++#define PM_INFO_MX7D_GPC_V_OFFSET		0x54
++#define PM_INFO_MX7D_GIC_DIST_P_OFFSET		0x58
++#define PM_INFO_MX7D_GIC_DIST_V_OFFSET		0x5c
+ 
+ #define MX7D_SRC_GPR1	0x74
+ #define MX7D_SRC_GPR2	0x78
+@@ -612,13 +611,11 @@ ENTRY(imx7d_low_power_idle)
+ 
+ 	tlb_set_to_ocram
+ 
+-	ldr	r6, [r0, #PM_INFO_PM_INFO_LAST_CPU_OFFSET]
+-	cmp	r11, r6
+-	bne	first_cpu
+-last_cpu:
+-	ldr	r7, [r0, #PM_INFO_PM_INFO_CPU1_IN_WFI_OFFSET]
+-	cmp	r7, #0x0
+-	beq	lpi_enter_done
++	/* check last to sleep */
++	ldr	r6, [r0, #PM_INFO_PM_INFO_NUM_ONLINE_CPUS_OFFSET]
++	ldr	r7, [r0, #PM_INFO_PM_INFO_NUM_LPI_CPUS_OFFSET]
++	cmp	r6, r7
++	bne	lpi_enter_done
+ 
+ 	ddrc_enter_self_refresh
+ 	ccm_enter_idle
+@@ -679,14 +676,6 @@ rbc_loop:
+ 	subs	r4, r4, #0x1
+ 	bne	rbc_loop
+ 
+-	/* set low power idle enter flag */
+-	ldr	r7, =0x1
+-	str	r7, [r0, #PM_INFO_PM_INFO_LPI_ENTER_OFFSET]
+-	b	lpi_enter_done
+-first_cpu:
+-	/* set first cpu wfi flag */
+-	ldr	r7, =0x1
+-	str	r7, [r0, #PM_INFO_PM_INFO_CPU1_IN_WFI_OFFSET]
+ lpi_enter_done:
+ 
+ 	imx_pen_unlock
+@@ -725,17 +714,11 @@ lpi_enter_done:
+ 
+ 	imx_pen_lock
+ 
+-	ldr	r6, [r0, #PM_INFO_PM_INFO_LAST_CPU_OFFSET]
+-	cmp	r11, r6
+-	beq	do_exit_wfi
+-
+-	/* clear first cpu wfi flag */
+-	ldr	r7, =0x0
+-	str	r7, [r0, #PM_INFO_PM_INFO_CPU1_IN_WFI_OFFSET]
+-do_exit_wfi:
+-	ldr	r7, [r0, #PM_INFO_PM_INFO_LPI_ENTER_OFFSET]
+-	cmp	r7, #0
+-	beq	skip_lpi_flow
++	/* check first to wake */
++	ldr	r6, [r0, #PM_INFO_PM_INFO_NUM_ONLINE_CPUS_OFFSET]
++	ldr	r7, [r0, #PM_INFO_PM_INFO_NUM_LPI_CPUS_OFFSET]
++	cmp	r6, r7
++	bne	skip_lpi_flow
+ 
+ 	ldr	r5, =0x0
+ 	anatop_exit_idle
+@@ -747,11 +730,7 @@ do_exit_wfi:
+ 	ldr	r8, =0x1000
+ 	str	r7, [r10, r8]
+ 
+-	/* clear lpi enter flag */
+-	ldr	r7, =0x0
+-	str	r7, [r0, #PM_INFO_PM_INFO_LPI_ENTER_OFFSET]
+ skip_lpi_flow:
+-
+ 	tlb_back_to_ddr
+ 
+ #ifdef CONFIG_SMP
+@@ -785,34 +764,20 @@ wakeup:
+ 	mcr	p15, 0, r1, c1, c0, 0
+ 	isb
+ 
+-	/* r11 is cpu id */
+-	mrc	p15, 0, r11, c0, c0, 5
+-	and	r11, r11, #3
+-	cmp	r11, #0x0
+-
+ 	imx_pen_lock
+ 
+-	ldr	r6, [r0, #PM_INFO_PM_INFO_LAST_CPU_OFFSET]
+-	cmp	r11, r6
+-	beq	do_exit_lp_idle
+-
+-	/* clear first wfi flag */
+-	ldr	r7, =0x0
+-	str	r7, [r0, #PM_INFO_PM_INFO_CPU1_IN_WFI_OFFSET]
+-do_exit_lp_idle:
+-	ldr	r7, [r0, #PM_INFO_PM_INFO_LPI_ENTER_OFFSET]
+-	cmp	r7, #0
+-	beq	wakeup_skip_lpi_flow
++	/* check first to wake */
++	ldr	r6, [r0, #PM_INFO_PM_INFO_NUM_ONLINE_CPUS_OFFSET]
++	ldr	r7, [r0, #PM_INFO_PM_INFO_NUM_LPI_CPUS_OFFSET]
++	cmp	r6, r7
++	bne	wakeup_skip_lpi_flow
+ 
+ 	ldr	r5, =0x1
+ 	anatop_exit_idle
+ 	ccm_exit_idle
+ 	ddrc_exit_self_refresh
+-	/* clear lpi enter flag */
+-	ldr	r7, =0x0
+-	str	r7, [r0, #PM_INFO_PM_INFO_LPI_ENTER_OFFSET]
+-wakeup_skip_lpi_flow:
+ 
++wakeup_skip_lpi_flow:
+ 	/* get physical resume address from pm_info. */
+ 	ldr	lr, [r0, #PM_INFO_RESUME_ADDR_OFFSET]
+ 
+-- 
+1.7.9.5
+

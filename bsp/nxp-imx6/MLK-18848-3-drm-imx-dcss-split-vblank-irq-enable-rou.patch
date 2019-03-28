@@ -1,0 +1,159 @@
+From e9c3911660082e70cae7ec4c677a03245833aebc Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Fri, 14 Sep 2018 08:33:01 +0300
+Subject: [PATCH 4651/5242] MLK-18848-3: drm: imx: dcss: split vblank irq
+ enable routine
+
+commit  bbda9f67ba7fc1af0877d20cd76b317217bfb115 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Currently, when enabling/disabling vblank interrupt, we also
+enable/disable the CTXLD kick interrupt. Most of the time this is fine,
+because when vblank gets disabled user-space does not submit any buffers
+and CTXLD kick interrupt is not needed.
+
+There is one case when we actually need to be able to have the CTXLD
+kick interrupt enabled: when disabling CRTC. Vblank interrupt, in this
+case, is disabled before the crtc_atomic_disable routine is called.
+However, we still need CTXLD to push the changes to SUBSAM and DTG.
+
+This patch will create a routine just for enabling/disabling CTXLD kick
+interrupt and move the code from vblank routine to the new one.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-crtc.c |   12 ++++++++++--
+ drivers/gpu/imx/dcss/dcss-dtg.c      |   23 ++++++++++++++++++-----
+ include/video/imx-dcss.h             |    1 +
+ 3 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.c b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+index fd169e9..2d488be 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-crtc.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -111,6 +111,8 @@ static int dcss_enable_vblank(struct drm_crtc *crtc)
+ 
+ 	dcss_vblank_irq_enable(dcss, true);
+ 
++	dcss_dtg_ctxld_kick_irq_enable(dcss, true);
++
+ 	enable_irq(dcss_crtc->irq);
+ 
+ 	return 0;
+@@ -126,6 +128,8 @@ static void dcss_disable_vblank(struct drm_crtc *crtc)
+ 
+ 	dcss_vblank_irq_enable(dcss, false);
+ 
++	dcss_dtg_ctxld_kick_irq_enable(dcss, false);
++
+ 	dcss_crtc->irq_enabled = false;
+ }
+ 
+@@ -244,7 +248,7 @@ static void dcss_crtc_atomic_enable(struct drm_crtc *crtc,
+ 
+ 	pm_runtime_get_sync(dcss_crtc->dev->parent);
+ 
+-	dcss_enable_vblank(crtc);
++	dcss_dtg_ctxld_kick_irq_enable(dcss, true);
+ 
+ 	dcss_dtg_sync_set(dcss, &vm);
+ 
+@@ -281,6 +285,8 @@ static void dcss_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	}
+ 	spin_unlock_irq(&crtc->dev->event_lock);
+ 
++	dcss_dtg_ctxld_kick_irq_enable(dcss, true);
++
+ 	dcss_ss_enable(dcss, false);
+ 	dcss_dtg_enable(dcss, false, &dcss_crtc->en_dis_completion);
+ 	dcss_ctxld_enable(dcss);
+@@ -293,6 +299,8 @@ static void dcss_crtc_atomic_disable(struct drm_crtc *crtc,
+ 
+ 	drm_crtc_vblank_off(crtc);
+ 
++	dcss_dtg_ctxld_kick_irq_enable(dcss, false);
++
+ 	pm_runtime_put_sync(dcss_crtc->dev->parent);
+ }
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 9d94694..5ba12e4 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2017 NXP
++ * Copyright (C) 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -483,6 +483,18 @@ void dcss_dtg_vblank_irq_enable(struct dcss_soc *dcss, bool en)
+ 
+ 	dcss_dpr_irq_enable(dcss, en);
+ 
++	if (en) {
++		status = dcss_readl(dtg->base_reg + DCSS_DTG_INT_STATUS);
++		dcss_writel(status & LINE1_IRQ,
++			    dtg->base_reg + DCSS_DTG_INT_CONTROL);
++	}
++}
++
++void dcss_dtg_ctxld_kick_irq_enable(struct dcss_soc *dcss, bool en)
++{
++	struct dcss_dtg_priv *dtg = dcss->dtg_priv;
++	u32 status;
++
+ 	/* need to keep the CTXLD kick interrupt ON if DTRC is used */
+ 	if (!en && (dcss_dtrc_is_running(dcss, 1) ||
+ 		    dcss_dtrc_is_running(dcss, 2)))
+@@ -492,22 +504,23 @@ void dcss_dtg_vblank_irq_enable(struct dcss_soc *dcss, bool en)
+ 		status = dcss_readl(dtg->base_reg + DCSS_DTG_INT_STATUS);
+ 
+ 		if (!dtg->ctxld_kick_irq_en) {
+-			dcss_writel(status & (LINE0_IRQ | LINE1_IRQ),
++			dcss_writel(status & LINE0_IRQ,
+ 				    dtg->base_reg + DCSS_DTG_INT_CONTROL);
+ 			enable_irq(dtg->ctxld_kick_irq);
+ 			dtg->ctxld_kick_irq_en = true;
+ 			return;
+ 		}
+ 
+-		dcss_writel(status & LINE1_IRQ,
+-			    dtg->base_reg + DCSS_DTG_INT_CONTROL);
+-
+ 		return;
+ 	}
+ 
++	if (!dtg->ctxld_kick_irq_en)
++		return;
++
+ 	disable_irq(dtg->ctxld_kick_irq);
+ 	dtg->ctxld_kick_irq_en = false;
+ }
++EXPORT_SYMBOL(dcss_dtg_ctxld_kick_irq_enable);
+ 
+ void dcss_dtg_vblank_irq_clear(struct dcss_soc *dcss)
+ {
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 232f125..ef2f0a7 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -97,6 +97,7 @@ bool dcss_dtg_global_alpha_changed(struct dcss_soc *dcss, int ch_num,
+ 				   u32 pix_format, int alpha,
+ 				   int use_global_alpha);
+ void dcss_dtg_css_set(struct dcss_soc *dcss, u32 pix_format);
++void dcss_dtg_ctxld_kick_irq_enable(struct dcss_soc *dcss, bool en);
+ 
+ /* SUBSAM */
+ void dcss_ss_sync_set(struct dcss_soc *dcss, struct videomode *vm,
+-- 
+1.7.9.5
+

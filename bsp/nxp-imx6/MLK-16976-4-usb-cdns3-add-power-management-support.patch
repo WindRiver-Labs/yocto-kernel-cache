@@ -1,0 +1,945 @@
+From b6b313e69f960b6977dabe15dc12cd058e2fc4df Mon Sep 17 00:00:00 2001
+From: Peter Chen <peter.chen@nxp.com>
+Date: Fri, 1 Dec 2017 14:13:06 +0800
+Subject: [PATCH 3012/5242] MLK-16976-4 usb: cdns3: add power management
+ support
+
+commit  44a5052dc7416bb0dfe96778db880a1bfcf7cc45 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch set adds both runtime and system-level pm support.
+For runtime-pm: both host and device wakeup events are supported.
+For system-pm: only host wakeup events are supported, device wakeup
+events are from other peripherals, and will support later.
+
+BuildInfo:
+- SCFW 245582b, IMX-MKIMAGE 0ad6069a, ATF 6bd98a3
+- U-Boot 2017.03-imx_v2017.03+gfa65b0a
+
+Acked-by: Jun Li <jun.li@nxp.com>
+Signed-off-by: Peter Chen <peter.chen@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/usb/cdns3/cdns3-nxp-reg-def.h |   42 +++-
+ drivers/usb/cdns3/core.c              |  367 ++++++++++++++++++++++++++++++++-
+ drivers/usb/cdns3/core.h              |   12 +-
+ drivers/usb/cdns3/gadget.c            |  136 ++++++------
+ drivers/usb/cdns3/host.c              |   49 ++++-
+ 5 files changed, 539 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/usb/cdns3/cdns3-nxp-reg-def.h b/drivers/usb/cdns3/cdns3-nxp-reg-def.h
+index 2a07e8f..8866322 100644
+--- a/drivers/usb/cdns3/cdns3-nxp-reg-def.h
++++ b/drivers/usb/cdns3/cdns3-nxp-reg-def.h
+@@ -35,6 +35,7 @@
+ /* Register bits definition */
+ 
+ /* USB3_CORE_CTRL1 */
++#define SW_RESET_MASK	(0x3f << 26)
+ #define PWR_SW_RESET	(1 << 31)
+ #define APB_SW_RESET	(1 << 30)
+ #define AXI_SW_RESET	(1 << 29)
+@@ -44,19 +45,28 @@
+ #define ALL_SW_RESET	(PWR_SW_RESET | APB_SW_RESET | AXI_SW_RESET | \
+ 		RW_SW_RESET | PHY_SW_RESET | PHYAHB_SW_RESET)
+ #define OC_DISABLE	(1 << 9)
++#define MDCTRL_CLK_SEL	(1 << 7)
+ #define MODE_STRAP_MASK	(0x7)
+ #define DEV_MODE	(1 << 2)
+ #define HOST_MODE	(1 << 1)
+ #define OTG_MODE	(1 << 0)
+ 
+ /* USB3_INT_REG */
+-#define HOST_INT1_EN (1 << 0) /* HOST INT b7:0 */
++#define CLK_125_REQ	(1 << 29)
++#define LPM_CLK_REQ	(1 << 28)
++#define DEVU3_WAEKUP_EN	(1 << 14)
++#define OTG_WAKEUP_EN	(1 << 12)
+ #define DEV_INT_EN (3 << 8) /* DEV INT b9:8 */
++#define HOST_INT1_EN (1 << 0) /* HOST INT b7:0 */
+ 
+ /* USB3_CORE_STATUS */
++#define MDCTRL_CLK_STATUS	(1 << 15)
+ #define DEV_POWER_ON_READY	(1 << 13)
+ #define HOST_POWER_ON_READY	(1 << 12)
+ 
++/* USB3_SSPHY_STATUS */
++#define PHY_REFCLK_REQ		(1 << 0)
++
+ 
+ /* PHY register definition */
+ #define PHY_PMA_CMN_CTRL1			(0xC800 * 4)
+@@ -128,5 +138,35 @@
+ #define TB_ADDR_TX_RCVDET_EN_TMR	        (0x4122 * 4)
+ #define TB_ADDR_TX_RCVDET_ST_TMR	        (0x4123 * 4)
+ #define TB_ADDR_XCVR_DIAG_LANE_FCM_EN_MGN_TMR	(0x40f2 * 4)
++#define TB_ADDR_TX_RCVDETSC_CTRL	        (0x4124 * 4)
++
++/* Register bits definition */
++
++/* TB_ADDR_TX_RCVDETSC_CTRL */
++#define RXDET_IN_P3_32KHZ			(1 << 0)
++
++/* OTG registers definition */
++#define OTGSTS		0x4
++#define OTGREFCLK	0xc
++
++/* Register bits definition */
++/* OTGSTS */
++#define OTG_NRDY	(1 << 11)
++/* OTGREFCLK */
++#define OTG_STB_CLK_SWITCH_EN	(1 << 31)
++
++/* xHCI registers definition  */
++#define XECP_PORT_CAP_REG	0x8000
++#define XECP_PM_PMCSR		0x8018
++#define XECP_AUX_CTRL_REG1	0x8120
++
++/* Register bits definition */
++/* XECP_PORT_CAP_REG */
++#define LPM_2_STB_SWITCH_EN	(1 << 25)
++
++/* XECP_AUX_CTRL_REG1 */
++#define CFG_RXDET_P3_EN		(1 << 15)
+ 
++/* XECP_PM_PMCSR */
++#define PS_D0			(1 << 0)
+ #endif /* __DRIVERS_USB_CDNS3_NXP_H */
+diff --git a/drivers/usb/cdns3/core.c b/drivers/usb/cdns3/core.c
+index 66264e0..4aa1fc1 100644
+--- a/drivers/usb/cdns3/core.c
++++ b/drivers/usb/cdns3/core.c
+@@ -29,6 +29,7 @@
+ #include <linux/usb/of.h>
+ #include <linux/usb/phy.h>
+ #include <linux/extcon.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "cdns3-nxp-reg-def.h"
+ #include "core.h"
+@@ -280,6 +281,13 @@ static irqreturn_t cdns3_irq(int irq, void *data)
+ 	struct cdns3 *cdns = data;
+ 	irqreturn_t ret = IRQ_NONE;
+ 
++	if (cdns->in_lpm) {
++		disable_irq_nosync(cdns->irq);
++		cdns->wakeup_int = true;
++		pm_runtime_get(cdns->dev);
++		return IRQ_HANDLED;
++	}
++
+ 	/* Handle device/host interrupt */
+ 	if (cdns->role != CDNS3_ROLE_END)
+ 		ret = cdns3_role(cdns)->irq(cdns);
+@@ -379,11 +387,13 @@ static int cdsn3_do_role_switch(struct cdns3 *cdns, enum cdns3_roles role)
+ 	if (cdns->role == role)
+ 		return 0;
+ 
++	pm_runtime_get_sync(cdns->dev);
+ 	current_role = cdns->role;
+ 	cdns3_role_stop(cdns);
+ 	if (role == CDNS3_ROLE_END) {
+ 		/* Force B Session Valid as 0 */
+ 		writel(0x0040, cdns->phy_regs + 0x380a4);
++		pm_runtime_put_sync(cdns->dev);
+ 		return 0;
+ 	}
+ 
+@@ -391,6 +401,7 @@ static int cdsn3_do_role_switch(struct cdns3 *cdns, enum cdns3_roles role)
+ 	if (role == CDNS3_ROLE_GADGET || role == CDNS3_ROLE_HOST)
+ 		/* Force B Session Valid as 1 */
+ 		writel(0x0060, cdns->phy_regs + 0x380a4);
++
+ 	ret = cdns3_role_start(cdns, role);
+ 	if (ret) {
+ 		/* Back to current role */
+@@ -400,6 +411,7 @@ static int cdsn3_do_role_switch(struct cdns3 *cdns, enum cdns3_roles role)
+ 		ret = cdns3_role_start(cdns, current_role);
+ 	}
+ 
++	pm_runtime_put_sync(cdns->dev);
+ 	return ret;
+ }
+ 
+@@ -431,7 +443,7 @@ static int cdns3_extcon_notifier(struct notifier_block *nb, unsigned long event,
+ {
+ 	struct cdns3 *cdns = container_of(nb, struct cdns3, extcon_nb);
+ 
+-	queue_work(system_power_efficient_wq, &cdns->role_switch_wq);
++	queue_work(system_freezable_wq, &cdns->role_switch_wq);
+ 
+ 	return NOTIFY_DONE;
+ }
+@@ -502,6 +514,7 @@ static int cdns3_probe(struct platform_device *pdev)
+ 	 * region-1: xHCI
+ 	 * region-2: Peripheral
+ 	 * region-3: PHY registers
++	 * region-4: OTG registers
+ 	 */
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	regs = devm_ioremap_resource(dev, res);
+@@ -528,6 +541,12 @@ static int cdns3_probe(struct platform_device *pdev)
+ 		return PTR_ERR(regs);
+ 	cdns->phy_regs = regs;
+ 
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 4);
++	regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(regs))
++		return PTR_ERR(regs);
++	cdns->otg_regs = regs;
++
+ 	ret = cdns3_get_clks(dev);
+ 	if (ret)
+ 		return ret;
+@@ -572,6 +591,12 @@ static int cdns3_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err4;
+ 
++	device_set_wakeup_capable(dev, true);
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++	pm_runtime_set_autosuspend_delay(dev, 2000);
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_use_autosuspend(dev);
+ 	dev_dbg(dev, "Cadence USB3 core: probe succeed\n");
+ 
+ 	return 0;
+@@ -597,6 +622,9 @@ static int cdns3_remove(struct platform_device *pdev)
+ {
+ 	struct cdns3 *cdns = platform_get_drvdata(pdev);
+ 
++	pm_runtime_get_sync(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	pm_runtime_put_noidle(&pdev->dev);
+ 	cdns3_remove_roles(cdns);
+ 	usb_phy_shutdown(cdns->usbphy);
+ 	cdns3_disable_unprepare_clks(&pdev->dev);
+@@ -612,12 +640,349 @@ static int cdns3_remove(struct platform_device *pdev)
+ MODULE_DEVICE_TABLE(of, of_cdns3_match);
+ #endif
+ 
++#ifdef CONFIG_PM
++static inline bool controller_power_is_lost(struct cdns3 *cdns)
++{
++	u32 value;
++
++	value = readl(cdns->none_core_regs + USB3_CORE_CTRL1);
++	if ((value & SW_RESET_MASK) == ALL_SW_RESET)
++		return true;
++	else
++		return false;
++}
++
++static void cdns3_set_wakeup(void *none_core_regs, bool enable)
++{
++	u32 value;
++
++	if (enable) {
++		/* Enable wakeup and phy_refclk_req */
++		value = readl(none_core_regs + USB3_INT_REG);
++		value |= OTG_WAKEUP_EN | DEVU3_WAEKUP_EN;
++		writel(value, none_core_regs + USB3_INT_REG);
++	} else {
++		/* disable wakeup and phy_refclk_req */
++		value = readl(none_core_regs + USB3_INT_REG);
++		value &= ~(OTG_WAKEUP_EN | DEVU3_WAEKUP_EN);
++		writel(value, none_core_regs + USB3_INT_REG);
++	}
++}
++
++static void cdns3_enter_suspend(struct cdns3 *cdns, bool suspend, bool wakeup)
++{
++	void __iomem *otg_regs = cdns->otg_regs;
++	void __iomem *xhci_regs = cdns->xhci_regs;
++	void __iomem *phy_regs = cdns->phy_regs;
++	void __iomem *none_core_regs = cdns->none_core_regs;
++	u32 value;
++	int timeout_us = 100000;
++
++	if (cdns->role != CDNS3_ROLE_HOST)
++		return;
++
++	if (suspend) {
++		value = readl(otg_regs + OTGREFCLK);
++		value |= OTG_STB_CLK_SWITCH_EN;
++		writel(value, otg_regs + OTGREFCLK);
++
++		value = readl(xhci_regs + XECP_PORT_CAP_REG);
++		value |= LPM_2_STB_SWITCH_EN;
++		writel(value, xhci_regs + XECP_PORT_CAP_REG);
++		if (cdns3_role(cdns)->suspend)
++			cdns3_role(cdns)->suspend(cdns, wakeup);
++
++		/* RXDET_IN_P3_32KHZ, Receiver detect slow clock enable */
++		value = readl(phy_regs + TB_ADDR_TX_RCVDETSC_CTRL);
++		value |= RXDET_IN_P3_32KHZ;
++		writel(value, phy_regs + TB_ADDR_TX_RCVDETSC_CTRL);
++		/*
++		 * SW should ensure LPM_2_STB_SWITCH_EN and RXDET_IN_P3_32KHZ
++		 * are aligned before setting CFG_RXDET_P3_EN
++		 */
++		value = readl(xhci_regs + XECP_AUX_CTRL_REG1);
++		value |= CFG_RXDET_P3_EN;
++		writel(value, xhci_regs + XECP_AUX_CTRL_REG1);
++		/* SW request low power when all usb ports allow to it ??? */
++		value = readl(xhci_regs + XECP_PM_PMCSR);
++		value |= PS_D0;
++		writel(value, xhci_regs + XECP_PM_PMCSR);
++
++		/* mdctrl_clk_sel */
++		value = readl(none_core_regs + USB3_CORE_CTRL1);
++		value |= MDCTRL_CLK_SEL;
++		writel(value, none_core_regs + USB3_CORE_CTRL1);
++
++		/* wait for mdctrl_clk_status */
++		value = readl(none_core_regs + USB3_CORE_STATUS);
++		while (!(value & MDCTRL_CLK_STATUS) && timeout_us-- > 0) {
++			value = readl(none_core_regs + USB3_CORE_STATUS);
++			udelay(1);
++		}
++
++		if (timeout_us <= 0)
++			dev_err(cdns->dev, "wait mdctrl_clk_status timeout\n");
++
++		dev_dbg(cdns->dev, "mdctrl_clk_status is set\n");
++
++		/* wait lpm_clk_req to be 0 */
++		value = readl(none_core_regs + USB3_INT_REG);
++		timeout_us = 100000;
++		while ((value & LPM_CLK_REQ) && timeout_us-- > 0) {
++			value = readl(none_core_regs + USB3_INT_REG);
++			udelay(1);
++		}
++
++		if (timeout_us <= 0)
++			dev_err(cdns->dev, "wait lpm_clk_req timeout\n");
++
++		dev_dbg(cdns->dev, "lpm_clk_req cleared\n");
++
++		/* wait phy_refclk_req to be 0 */
++		value = readl(none_core_regs + USB3_SSPHY_STATUS);
++		timeout_us = 100000;
++		while ((value & PHY_REFCLK_REQ) && timeout_us-- > 0) {
++			value = readl(none_core_regs + USB3_SSPHY_STATUS);
++			udelay(1);
++		}
++
++		if (timeout_us <= 0)
++			dev_err(cdns->dev, "wait phy_refclk_req timeout\n");
++
++		dev_dbg(cdns->dev, "phy_refclk_req cleared\n");
++
++		/* rxdet fix in P3, default is 0x5098 */
++		writel(0x509b, phy_regs + TB_ADDR_TX_PSC_A3);
++
++		cdns3_set_wakeup(none_core_regs, true);
++	} else {
++		value = readl(none_core_regs + USB3_INT_REG);
++		/* wait CLK_125_REQ to be 1 */
++		value = readl(none_core_regs + USB3_INT_REG);
++		while (!(value & CLK_125_REQ) && timeout_us-- > 0) {
++			value = readl(none_core_regs + USB3_INT_REG);
++			udelay(1);
++		}
++
++		cdns3_set_wakeup(none_core_regs, false);
++
++		/* SW request D0 */
++		value = readl(xhci_regs + XECP_PM_PMCSR);
++		value &= ~PS_D0;
++		writel(value, xhci_regs + XECP_PM_PMCSR);
++
++		/* clr CFG_RXDET_P3_EN */
++		value = readl(xhci_regs + XECP_AUX_CTRL_REG1);
++		value &= ~CFG_RXDET_P3_EN;
++		writel(value, xhci_regs + XECP_AUX_CTRL_REG1);
++
++		/* clear RXDET_IN_P3_32KHZ */
++		value = readl(phy_regs + TB_ADDR_TX_RCVDETSC_CTRL);
++		value &= ~RXDET_IN_P3_32KHZ;
++		writel(value, phy_regs + TB_ADDR_TX_RCVDETSC_CTRL);
++
++		/* clear mdctrl_clk_sel */
++		value = readl(none_core_regs + USB3_CORE_CTRL1);
++		value &= ~MDCTRL_CLK_SEL;
++		writel(value, none_core_regs + USB3_CORE_CTRL1);
++
++		/* wait for mdctrl_clk_status is cleared */
++		value = readl(none_core_regs + USB3_CORE_STATUS);
++		timeout_us = 100000;
++		while ((value & MDCTRL_CLK_STATUS) && timeout_us-- > 0) {
++			value = readl(none_core_regs + USB3_CORE_STATUS);
++			udelay(1);
++		}
++
++		if (timeout_us <= 0)
++			dev_err(cdns->dev, "wait mdctrl_clk_status timeout\n");
++
++		dev_dbg(cdns->dev, "mdctrl_clk_status cleared\n");
++
++		writel(0x5098, phy_regs + TB_ADDR_TX_PSC_A3);
++
++		/* Wait until OTG_NRDY is 0 */
++		value = readl(otg_regs + OTGSTS);
++		timeout_us = 100000;
++		while ((value & OTG_NRDY) && timeout_us-- > 0) {
++			value = readl(otg_regs + OTGSTS);
++			udelay(1);
++		}
++
++		if (timeout_us <= 0)
++			dev_err(cdns->dev, "wait OTG ready timeout\n");
++
++		value = readl(none_core_regs + USB3_CORE_STATUS);
++		timeout_us = 100000;
++		while (!(value & HOST_POWER_ON_READY) && timeout_us-- > 0) {
++			value = readl(none_core_regs + USB3_CORE_STATUS);
++			udelay(1);
++		}
++
++		if (timeout_us <= 0)
++			dev_err(cdns->dev, "wait xhci_power_on_ready timeout\n");
++	}
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int cdns3_suspend(struct device *dev)
++{
++	struct cdns3 *cdns = dev_get_drvdata(dev);
++	bool wakeup = device_may_wakeup(dev);
++	u32 value;
++
++	dev_dbg(dev, "at %s\n", __func__);
++
++	if (pm_runtime_status_suspended(dev))
++		pm_runtime_resume(dev);
++
++	if (cdns->role == CDNS3_ROLE_HOST)
++		cdns3_enter_suspend(cdns, true, wakeup);
++	else if (cdns->role == CDNS3_ROLE_GADGET) {
++		/* When at device mode, always set controller at reset mode */
++		value = readl(cdns->none_core_regs + USB3_CORE_CTRL1);
++		value |= ALL_SW_RESET;
++		writel(value, cdns->none_core_regs + USB3_CORE_CTRL1);
++	}
++
++	if (wakeup)
++		enable_irq_wake(cdns->irq);
++
++	usb_phy_set_suspend(cdns->usbphy, 1);
++	cdns3_disable_unprepare_clks(dev);
++	cdns->in_lpm = true;
++
++	return 0;
++}
++
++static int cdns3_resume(struct device *dev)
++{
++	struct cdns3 *cdns = dev_get_drvdata(dev);
++	int ret;
++	bool power_lost;
++
++	dev_dbg(dev, "at %s\n", __func__);
++	if (!cdns->in_lpm) {
++		WARN_ON(1);
++		return 0;
++	}
++
++	ret = cdns3_prepare_enable_clks(dev);
++	if (ret)
++		return ret;
++
++	usb_phy_set_suspend(cdns->usbphy, 0);
++	cdns->in_lpm = false;
++	if (device_may_wakeup(dev))
++		disable_irq_wake(cdns->irq);
++	power_lost = controller_power_is_lost(cdns);
++	if (power_lost) {
++		dev_dbg(dev, "power is lost, the role is %d\n", cdns->role);
++		cdns_set_role(cdns, cdns->role);
++		if ((cdns->role != CDNS3_ROLE_END)
++				&& cdns3_role(cdns)->resume) {
++			/* Force B Session Valid as 1 */
++			writel(0x0060, cdns->phy_regs + 0x380a4);
++			cdns3_role(cdns)->resume(cdns, true);
++		}
++	} else {
++		cdns3_enter_suspend(cdns, false, false);
++		if (cdns->wakeup_int) {
++			cdns->wakeup_int = false;
++			pm_runtime_mark_last_busy(cdns->dev);
++			pm_runtime_put_autosuspend(cdns->dev);
++			enable_irq(cdns->irq);
++		}
++
++		if ((cdns->role != CDNS3_ROLE_END) && cdns3_role(cdns)->resume)
++			cdns3_role(cdns)->resume(cdns, false);
++	}
++
++	pm_runtime_disable(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	if (cdns->role == CDNS3_ROLE_HOST) {
++		/*
++		 * There is no PM APIs for cdns->host_dev, we can only do
++		 * it at its parent PM APIs
++		 */
++		pm_runtime_disable(cdns->host_dev);
++		pm_runtime_set_active(cdns->host_dev);
++		pm_runtime_enable(cdns->host_dev);
++	}
++
++	dev_dbg(dev, "at end of %s\n", __func__);
++
++	return 0;
++}
++#endif /* CONFIG_PM_SLEEP */
++static int cdns3_runtime_suspend(struct device *dev)
++{
++	struct cdns3 *cdns = dev_get_drvdata(dev);
++
++	dev_dbg(dev, "at the begin of %s\n", __func__);
++	if (cdns->in_lpm) {
++		WARN_ON(1);
++		return 0;
++	}
++
++	cdns3_enter_suspend(cdns, true, true);
++	usb_phy_set_suspend(cdns->usbphy, 1);
++	cdns3_disable_unprepare_clks(dev);
++	cdns->in_lpm = true;
++
++	dev_dbg(dev, "at the end of %s\n", __func__);
++
++	return 0;
++}
++
++static int cdns3_runtime_resume(struct device *dev)
++{
++	struct cdns3 *cdns = dev_get_drvdata(dev);
++	int ret;
++
++	if (!cdns->in_lpm) {
++		WARN_ON(1);
++		return 0;
++	}
++
++	ret = cdns3_prepare_enable_clks(dev);
++	if (ret)
++		return ret;
++
++	usb_phy_set_suspend(cdns->usbphy, 0);
++	cdns3_enter_suspend(cdns, false, false);
++	cdns->in_lpm = 0;
++
++	if (cdns->role == CDNS3_ROLE_HOST) {
++		if (cdns->wakeup_int) {
++			cdns->wakeup_int = false;
++			pm_runtime_mark_last_busy(cdns->dev);
++			pm_runtime_put_autosuspend(cdns->dev);
++			enable_irq(cdns->irq);
++		}
++
++		if ((cdns->role != CDNS3_ROLE_END) && cdns3_role(cdns)->resume)
++			cdns3_role(cdns)->resume(cdns, false);
++	}
++
++	dev_dbg(dev, "at %s\n", __func__);
++	return 0;
++}
++#endif /* CONFIG_PM */
++static const struct dev_pm_ops cdns3_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(cdns3_suspend, cdns3_resume)
++	SET_RUNTIME_PM_OPS(cdns3_runtime_suspend, cdns3_runtime_resume, NULL)
++};
++
+ static struct platform_driver cdns3_driver = {
+ 	.probe		= cdns3_probe,
+ 	.remove		= cdns3_remove,
+ 	.driver		= {
+ 		.name	= "cdns-usb3",
+ 		.of_match_table	= of_match_ptr(of_cdns3_match),
++		.pm	= &cdns3_pm_ops,
+ 	},
+ };
+ 
+diff --git a/drivers/usb/cdns3/core.h b/drivers/usb/cdns3/core.h
+index d2c2ffe..1f8d6ef 100644
+--- a/drivers/usb/cdns3/core.h
++++ b/drivers/usb/cdns3/core.h
+@@ -32,12 +32,16 @@ enum cdns3_roles {
+  * struct cdns3_role_driver - host/gadget role driver
+  * @start: start this role
+  * @stop: stop this role
++ * @suspend: suspend callback for this role
++ * @resume: resume callback for this role
+  * @irq: irq handler for this role
+  * @name: role name string (host/gadget)
+  */
+ struct cdns3_role_driver {
+ 	int (*start)(struct cdns3 *);
+ 	void (*stop)(struct cdns3 *);
++	int (*suspend)(struct cdns3 *, bool do_wakeup);
++	int (*resume)(struct cdns3 *, bool hibernated);
+ 	irqreturn_t (*irq)(struct cdns3 *);
+ 	const char *name;
+ };
+@@ -51,6 +55,7 @@ struct cdns3_role_driver {
+  * @dev_regs: pointer to base of dev registers
+  * @none_core_regs: pointer to base of nxp wrapper registers
+  * @phy_regs: pointer to base of phy registers
++ * @otg_regs: pointer to base of otg registers
+  * @irq: irq number for controller
+  * @roles: array of supported roles for this controller
+  * @role: current role
+@@ -61,6 +66,8 @@ struct cdns3_role_driver {
+  * @extcon: Type-C extern connector
+  * @extcon_nb: notifier block for Type-C extern connector
+  * @role_switch_wq: work queue item for role switch
++ * @in_lpm: the controller in low power mode
++ * @wakeup_int: the wakeup interrupt
+  */
+ struct cdns3 {
+ 	struct device *dev;
+@@ -68,17 +75,20 @@ struct cdns3 {
+ 	struct resource *xhci_res;
+ 	struct usbss_dev_register_block_type __iomem *dev_regs;
+ 	void __iomem *none_core_regs;
++	void __iomem *phy_regs;
++	void __iomem *otg_regs;
+ 	int irq;
+ 	struct cdns3_role_driver *roles[CDNS3_ROLE_END];
+ 	enum cdns3_roles role;
+ 	struct device *host_dev;
+ 	struct device *gadget_dev;
+-	void __iomem *phy_regs;
+ 	struct usb_phy *usbphy;
+ 	struct clk *cdns3_clks[CDNS3_NUM_OF_CLKS];
+ 	struct extcon_dev *extcon;
+ 	struct notifier_block extcon_nb;
+ 	struct work_struct role_switch_wq;
++	bool in_lpm;
++	bool wakeup_int;
+ };
+ 
+ static inline struct cdns3_role_driver *cdns3_role(struct cdns3 *cdns)
+diff --git a/drivers/usb/cdns3/gadget.c b/drivers/usb/cdns3/gadget.c
+index dd6984b..b9d12d2 100644
+--- a/drivers/usb/cdns3/gadget.c
++++ b/drivers/usb/cdns3/gadget.c
+@@ -21,6 +21,7 @@
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
+ #include <linux/dma-mapping.h>
++#include <linux/pm_runtime.h>
+ #include <linux/usb/composite.h>
+ #include <linux/of_platform.h>
+ #include <linux/usb/gadget.h>
+@@ -98,6 +99,7 @@ static int usb_ss_gadget_udc_start(struct usb_gadget *gadget,
+ static int usb_ss_gadget_udc_stop(struct usb_gadget *gadget);
+ static int usb_ss_init_ep(struct usb_ss_dev *usb_ss);
+ static int usb_ss_init_ep0(struct usb_ss_dev *usb_ss);
++static void __cdns3_gadget_start(struct usb_ss_dev *usb_ss);
+ 
+ static struct usb_endpoint_descriptor cdns3_gadget_ep0_desc = {
+ 	.bLength	= USB_DT_ENDPOINT_SIZE,
+@@ -1501,6 +1503,12 @@ static int usb_ss_gadget_ep_disable(struct usb_ep *ep)
+ 	usb_ss = usb_ss_ep->usb_ss;
+ 
+ 	spin_lock_irqsave(&usb_ss->lock, flags);
++	if (!usb_ss->start_gadget) {
++		dev_dbg(&usb_ss->dev,
++			"Disabling endpoint at disconnection: %s\n", ep->name);
++		spin_unlock_irqrestore(&usb_ss->lock, flags);
++		return 0;
++	}
+ 	dev_dbg(&usb_ss->dev,
+ 		"Disabling endpoint: %s\n", ep->name);
+ 	select_ep(usb_ss, ep->desc->bEndpointAddress);
+@@ -1630,6 +1638,12 @@ static int usb_ss_gadget_ep_dequeue(struct usb_ep *ep,
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&usb_ss->lock, flags);
++	if (!usb_ss->start_gadget) {
++		dev_dbg(&usb_ss->dev,
++			"DEQUEUE at disconnection: %s\n", ep->name);
++		spin_unlock_irqrestore(&usb_ss->lock, flags);
++		return 0;
++	}
+ 	dev_dbg(&usb_ss->dev, "DEQUEUE(%02X) %d\n",
+ 		ep->address, request->length);
+ 	usb_gadget_unmap_request_by_dev(usb_ss->sysdev, request,
+@@ -1820,54 +1834,7 @@ static int usb_ss_gadget_udc_start(struct usb_gadget *gadget,
+ 		return 0;
+ 	}
+ 
+-	/* configure endpoint 0 hardware */
+-	cdns_ep0_config(usb_ss);
+-
+-	/* enable interrupts for endpoint 0 (in and out) */
+-	gadget_writel(usb_ss, &usb_ss->regs->ep_ien,
+-	EP_IEN__EOUTEN0__MASK | EP_IEN__EINEN0__MASK);
+-
+-	/* enable interrupt for device */
+-	gadget_writel(usb_ss, &usb_ss->regs->usb_ien,
+-			USB_IEN__U2RESIEN__MASK
+-			| USB_ISTS__DIS2I__MASK
+-			| USB_IEN__CON2IEN__MASK
+-			| USB_IEN__UHRESIEN__MASK
+-			| USB_IEN__UWRESIEN__MASK
+-			| USB_IEN__DISIEN__MASK
+-			| USB_IEN__CONIEN__MASK
+-			| USB_IEN__U3EXTIEN__MASK
+-			| USB_IEN__L2ENTIEN__MASK
+-			| USB_IEN__L2EXTIEN__MASK);
+-
+-	gadget_writel(usb_ss, &usb_ss->regs->usb_conf,
+-		    USB_CONF__CLK2OFFDS__MASK
+-	/*	    | USB_CONF__USB3DIS__MASK */
+-		    | USB_CONF__L1DS__MASK);
+-
+-	gadget_writel(usb_ss, &usb_ss->regs->usb_conf,
+-			USB_CONF__DEVEN__MASK
+-			| USB_CONF__U1DS__MASK
+-			| USB_CONF__U2DS__MASK
+-			/*
+-			 * TODO:
+-			 * | USB_CONF__L1EN__MASK
+-			 */
+-			);
+-
+-	gadget_writel(usb_ss, &usb_ss->regs->usb_conf,
+-			USB_CONF__DEVEN__MASK
+-			| USB_CONF__U1DS__MASK
+-			| USB_CONF__U2DS__MASK
+-			/*
+-			 * TODO:
+-			 * | USB_CONF__L1EN__MASK
+-			 */
+-			);
+-
+-	gadget_writel(usb_ss, &usb_ss->regs->dbg_link1,
+-		DBG_LINK1__LFPS_MIN_GEN_U1_EXIT_SET__MASK |
+-		DBG_LINK1__LFPS_MIN_GEN_U1_EXIT__WRITE(0x3C));
++	__cdns3_gadget_start(usb_ss);
+ 	spin_unlock_irqrestore(&usb_ss->lock, flags);
+ 	dev_dbg(&usb_ss->dev, "%s ends\n", __func__);
+ 
+@@ -2153,20 +2120,8 @@ void cdns3_gadget_remove(struct cdns3 *cdns)
+ 	cdns->gadget_dev = NULL;
+ }
+ 
+-static int cdns3_gadget_start(struct cdns3 *cdns)
++static void __cdns3_gadget_start(struct usb_ss_dev *usb_ss)
+ {
+-	struct usb_ss_dev *usb_ss = container_of(cdns->gadget_dev,
+-			struct usb_ss_dev, dev);
+-	unsigned long flags;
+-
+-	dev_dbg(&usb_ss->dev, "%s begins\n", __func__);
+-
+-	spin_lock_irqsave(&usb_ss->lock, flags);
+-	usb_ss->start_gadget = 1;
+-	if (!usb_ss->gadget_driver) {
+-		spin_unlock_irqrestore(&usb_ss->lock, flags);
+-		return 0;
+-	}
+ 
+ 	/* configure endpoint 0 hardware */
+ 	cdns_ep0_config(usb_ss);
+@@ -2207,6 +2162,25 @@ static int cdns3_gadget_start(struct cdns3 *cdns)
+ 	gadget_writel(usb_ss, &usb_ss->regs->dbg_link1,
+ 		DBG_LINK1__LFPS_MIN_GEN_U1_EXIT_SET__MASK |
+ 		DBG_LINK1__LFPS_MIN_GEN_U1_EXIT__WRITE(0x3C));
++}
++
++static int cdns3_gadget_start(struct cdns3 *cdns)
++{
++	struct usb_ss_dev *usb_ss = container_of(cdns->gadget_dev,
++			struct usb_ss_dev, dev);
++	unsigned long flags;
++
++	dev_dbg(&usb_ss->dev, "%s begins\n", __func__);
++
++	pm_runtime_get_sync(cdns->dev);
++	spin_lock_irqsave(&usb_ss->lock, flags);
++	usb_ss->start_gadget = 1;
++	if (!usb_ss->gadget_driver) {
++		spin_unlock_irqrestore(&usb_ss->lock, flags);
++		return 0;
++	}
++
++	__cdns3_gadget_start(usb_ss);
+ 	usb_ss->in_standby_mode = 0;
+ 	spin_unlock_irqrestore(&usb_ss->lock, flags);
+ 	dev_dbg(&usb_ss->dev, "%s ends\n", __func__);
+@@ -2214,7 +2188,7 @@ static int cdns3_gadget_start(struct cdns3 *cdns)
+ 	return 0;
+ }
+ 
+-static void cdns3_gadget_stop(struct cdns3 *cdns)
++static void __cdns3_gadget_stop(struct cdns3 *cdns)
+ {
+ 	struct usb_ss_dev *usb_ss;
+ 	unsigned long flags;
+@@ -2225,10 +2199,46 @@ static void cdns3_gadget_stop(struct cdns3 *cdns)
+ 	/* disable interrupt for device */
+ 	gadget_writel(usb_ss, &usb_ss->regs->usb_ien, 0);
+ 	gadget_writel(usb_ss, &usb_ss->regs->usb_conf, USB_CONF__DEVDS__MASK);
++	if (usb_ss->gadget_driver)
++		usb_ss->gadget_driver->disconnect(&usb_ss->gadget);
++	usb_gadget_disconnect(&usb_ss->gadget);
+ 	usb_ss->start_gadget = 0;
+ 	spin_unlock_irqrestore(&usb_ss->lock, flags);
+ }
+ 
++static void cdns3_gadget_stop(struct cdns3 *cdns)
++{
++	if (cdns->role == CDNS3_ROLE_GADGET)
++		__cdns3_gadget_stop(cdns);
++	pm_runtime_mark_last_busy(cdns->dev);
++	pm_runtime_put_autosuspend(cdns->dev);
++}
++
++static int cdns3_gadget_suspend(struct cdns3 *cdns, bool do_wakeup)
++{
++	__cdns3_gadget_stop(cdns);
++	return 0;
++}
++
++static int cdns3_gadget_resume(struct cdns3 *cdns, bool hibernated)
++{
++	struct usb_ss_dev *usb_ss = container_of(cdns->gadget_dev,
++			struct usb_ss_dev, dev);
++	unsigned long flags;
++
++	spin_lock_irqsave(&usb_ss->lock, flags);
++	usb_ss->start_gadget = 1;
++	if (!usb_ss->gadget_driver) {
++		spin_unlock_irqrestore(&usb_ss->lock, flags);
++		return 0;
++	}
++
++	__cdns3_gadget_start(usb_ss);
++	usb_ss->in_standby_mode = 0;
++	spin_unlock_irqrestore(&usb_ss->lock, flags);
++	return 0;
++}
++
+ /**
+  * cdns3_gadget_init - initialize device structure
+  *
+@@ -2246,6 +2256,8 @@ int cdns3_gadget_init(struct cdns3 *cdns)
+ 
+ 	rdrv->start	= cdns3_gadget_start;
+ 	rdrv->stop	= cdns3_gadget_stop;
++	rdrv->suspend	= cdns3_gadget_suspend;
++	rdrv->resume	= cdns3_gadget_resume;
+ 	rdrv->irq	= cdns_irq_handler_thread;
+ 	rdrv->name	= "gadget";
+ 	cdns->roles[CDNS3_ROLE_GADGET] = rdrv;
+diff --git a/drivers/usb/cdns3/host.c b/drivers/usb/cdns3/host.c
+index 22f6b19..433bffa 100644
+--- a/drivers/usb/cdns3/host.c
++++ b/drivers/usb/cdns3/host.c
+@@ -19,6 +19,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/usb.h>
+ #include <linux/usb/hcd.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "../host/xhci.h"
+ 
+@@ -39,7 +40,19 @@ static void xhci_cdns3_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 
+ static int xhci_cdns3_setup(struct usb_hcd *hcd)
+ {
+-	return xhci_gen_setup(hcd, xhci_cdns3_quirks);
++	int ret;
++	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
++	u32 command;
++
++	ret = xhci_gen_setup(hcd, xhci_cdns3_quirks);
++	if (ret)
++		return ret;
++	/* set usbcmd.EU3S */
++	command = readl(&xhci->op_regs->command);
++	command |= CMD_PM_INDEX;
++	writel(command, &xhci->op_regs->command);
++
++	return 0;
+ }
+ 
+ static const struct xhci_driver_overrides xhci_cdns3_overrides __initconst = {
+@@ -112,7 +125,9 @@ static int cdns3_host_start(struct cdns3 *cdns)
+ 		if (ret)
+ 			return ret;
+ 	}
+-	dev_info(dev, "%s begins create hcd\n", __func__);
++	pm_runtime_set_active(dev);
++	pm_runtime_no_callbacks(dev);
++	pm_runtime_enable(dev);
+ 
+ 	host->hcd = __usb_create_hcd(&xhci_cdns3_hc_driver, sysdev, dev,
+ 			       dev_name(dev), NULL);
+@@ -146,7 +161,9 @@ static int cdns3_host_start(struct cdns3 *cdns)
+ 	if (ret)
+ 		goto err5;
+ 
++	device_set_wakeup_capable(dev, true);
+ 	dev_dbg(dev, "%s ends\n", __func__);
++
+ 	return 0;
+ 
+ err5:
+@@ -178,11 +195,37 @@ static void cdns3_host_stop(struct cdns3 *cdns)
+ 		usb_put_hcd(xhci->shared_hcd);
+ 		usb_put_hcd(hcd);
+ 		cdns->host_dev = NULL;
++		pm_runtime_set_suspended(dev);
++		pm_runtime_disable(dev);
+ 		device_del(dev);
+ 		put_device(dev);
+ 	}
+ }
+ 
++static int cdns3_host_suspend(struct cdns3 *cdns, bool do_wakeup)
++{
++	struct device *dev = cdns->host_dev;
++	struct xhci_hcd	*xhci;
++
++	if (!dev)
++		return 0;
++
++	xhci = hcd_to_xhci(dev_get_drvdata(dev));
++	return xhci_suspend(xhci, do_wakeup);
++}
++
++static int cdns3_host_resume(struct cdns3 *cdns, bool hibernated)
++{
++	struct device *dev = cdns->host_dev;
++	struct xhci_hcd	*xhci;
++
++	if (!dev)
++		return 0;
++
++	xhci = hcd_to_xhci(dev_get_drvdata(dev));
++	return xhci_resume(xhci, hibernated);
++}
++
+ int cdns3_host_init(struct cdns3 *cdns)
+ {
+ 	struct cdns3_role_driver *rdrv;
+@@ -194,6 +237,8 @@ int cdns3_host_init(struct cdns3 *cdns)
+ 	rdrv->start	= cdns3_host_start;
+ 	rdrv->stop	= cdns3_host_stop;
+ 	rdrv->irq	= cdns3_host_irq;
++	rdrv->suspend	= cdns3_host_suspend;
++	rdrv->resume	= cdns3_host_resume;
+ 	rdrv->name	= "host";
+ 	cdns->roles[CDNS3_ROLE_HOST] = rdrv;
+ 
+-- 
+1.7.9.5
+

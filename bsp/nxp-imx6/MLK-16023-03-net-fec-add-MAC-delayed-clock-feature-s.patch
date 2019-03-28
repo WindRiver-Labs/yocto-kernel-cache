@@ -1,0 +1,155 @@
+From 6a8939438f7c4f51deadf9ac8029f547d8c3c1a0 Mon Sep 17 00:00:00 2001
+From: Fugang Duan <fugang.duan@nxp.com>
+Date: Tue, 18 Jul 2017 17:52:44 +0800
+Subject: [PATCH 2160/5242] MLK-16023-03: net: fec: add MAC delayed clock
+ feature support
+
+commit  ff715b051702ec2c59992bc5d9771833ff9f60c3 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+i.MX8QM/QXP ENET IP version add new feture to generate delayed TXC/RXC
+as an alternative option to make sure it can work well with various PHYs,
+which also is useful for MAC-to-MAC case. Add the new feature support.
+
+Signed-off-by: Fugang Duan <fugang.duan@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/ethernet/freescale/fec.h      |   17 +++++++++++++++-
+ drivers/net/ethernet/freescale/fec_main.c |   31 +++++++++++++++++++++++++++--
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/fec.h b/drivers/net/ethernet/freescale/fec.h
+index fcabe33..9572880 100644
+--- a/drivers/net/ethernet/freescale/fec.h
++++ b/drivers/net/ethernet/freescale/fec.h
+@@ -384,6 +384,8 @@ struct bufdesc_ex {
+ #define FEC_RX_DISABLED_IMASK (FEC_DEFAULT_IMASK & (~FEC_ENET_RXF))
+ 
+ #define FEC_ENET_ETHEREN	((uint)0x00000002)
++#define FEC_ENET_TXC_DLY	((uint)0x00010000)
++#define FEC_ENET_RXC_DLY	((uint)0x00020000)
+ 
+ /* ENET interrupt coalescing macro define */
+ #define FEC_ITR_CLK_SEL		(0x1 << 30)
+@@ -469,7 +471,17 @@ struct bufdesc_ex {
+ #define FEC_QUIRK_BUG_WAITMODE		(1 << 17)
+ 
+ /* PHY fixup flag define */
+-#define FEC_QUIRK_AR8031_FIXUP		(1 << 0)
++#define FEC_QUIRK_AR8031_FIXUP		(1 << 18)
++
++/* i.MX8QM/QXP ENET IP version add new feture to  generate delayed TXC/RXC
++ * as an alternative option to make sure it can work well with various PHYs.
++ * - For the implementation of delayed TXC, ENET will take synchronized 250/125MHz
++ *   clocks to generate 2ns delay by registering original TXC with positive edge
++ *   of inverted 250MHz clock.
++ * - For the implementation of delayed RXC, there will be buffers in the subsystem
++ *   level. The exact length of delay buffers will be decided when closing I/O timing.
++ */
++#define FEC_QUIRK_DELAYED_CLKS_SUPPORT	(1 << 19)
+ 
+ struct bufdesc_prop {
+ 	int qid;
+@@ -527,6 +539,7 @@ struct fec_enet_private {
+ 	struct clk *clk_ref;
+ 	struct clk *clk_enet_out;
+ 	struct clk *clk_ptp;
++	struct clk *clk_2x_txclk;
+ 
+ 	bool ptp_clk_on;
+ 	struct mutex ptp_clk_mutex;
+@@ -559,6 +572,8 @@ struct fec_enet_private {
+ 	struct device_node *phy_node;
+ 	int	link;
+ 	bool	fixed_link;
++	bool	rgmii_txc_dly;
++	bool	rgmii_rxc_dly;
+ 	int	full_duplex;
+ 	int	speed;
+ 	struct	completion mdio_done;
+diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
+index eeec5f5..7f45f13 100644
+--- a/drivers/net/ethernet/freescale/fec_main.c
++++ b/drivers/net/ethernet/freescale/fec_main.c
+@@ -136,7 +136,8 @@
+ 				FEC_QUIRK_HAS_BUFDESC_EX | FEC_QUIRK_HAS_CSUM |
+ 				FEC_QUIRK_HAS_VLAN | FEC_QUIRK_HAS_AVB |
+ 				FEC_QUIRK_ERR007885 | FEC_QUIRK_BUG_CAPTURE |
+-				FEC_QUIRK_HAS_RACC | FEC_QUIRK_HAS_COALESCE,
++				FEC_QUIRK_HAS_RACC | FEC_QUIRK_HAS_COALESCE |
++				FEC_QUIRK_DELAYED_CLKS_SUPPORT,
+ 	}, {
+ 		/* sentinel */
+ 	}
+@@ -1090,6 +1091,13 @@ static void fec_enet_reset_skb(struct net_device *ndev)
+ 	if (fep->bufdesc_ex)
+ 		ecntl |= (1 << 4);
+ 
++	if (fep->quirks & FEC_QUIRK_DELAYED_CLKS_SUPPORT &&
++		fep->rgmii_txc_dly)
++		ecntl |= FEC_ENET_TXC_DLY;
++	if (fep->quirks & FEC_QUIRK_DELAYED_CLKS_SUPPORT &&
++		fep->rgmii_rxc_dly)
++		ecntl |= FEC_ENET_RXC_DLY;
++
+ #ifndef CONFIG_M5272
+ 	/* Enable the MIB statistic event counters */
+ 	writel(0 << 31, fep->hwp + FEC_MIB_CTRLSTAT);
+@@ -1924,6 +1932,10 @@ static int fec_enet_clk_enable(struct net_device *ndev, bool enable)
+ 		if (ret)
+ 			goto failed_clk_ref;
+ 
++		ret = clk_prepare_enable(fep->clk_2x_txclk);
++		if (ret)
++			goto failed_clk_2x_txclk;
++
+ 		phy_reset_after_clk_enable(ndev->phydev);
+ 	} else {
+ 		clk_disable_unprepare(fep->clk_enet_out);
+@@ -1934,13 +1946,17 @@ static int fec_enet_clk_enable(struct net_device *ndev, bool enable)
+ 			mutex_unlock(&fep->ptp_clk_mutex);
+ 		}
+ 		clk_disable_unprepare(fep->clk_ref);
++		clk_disable_unprepare(fep->clk_2x_txclk);
+ 	}
+ 
+ 	return 0;
+ 
+-failed_clk_ref:
++failed_clk_2x_txclk:
+ 	if (fep->clk_ref)
+ 		clk_disable_unprepare(fep->clk_ref);
++failed_clk_ref:
++	if (fep->clk_ptp)
++		clk_disable_unprepare(fep->clk_ptp);
+ failed_clk_ptp:
+ 	if (fep->clk_enet_out)
+ 		clk_disable_unprepare(fep->clk_enet_out);
+@@ -3597,6 +3613,12 @@ static void fec_enet_of_parse_stop_mode(struct platform_device *pdev)
+ 	if (of_get_property(np, "fsl,magic-packet", NULL))
+ 		fep->wol_flag |= FEC_WOL_HAS_MAGIC_PACKET;
+ 
++	if (of_get_property(np, "fsl,rgmii_txc_dly", NULL))
++		fep->rgmii_txc_dly = true;
++
++	if (of_get_property(np, "fsl,rgmii_rxc_dly", NULL))
++		fep->rgmii_rxc_dly = true;
++
+ 	phy_node = of_parse_phandle(np, "phy-handle", 0);
+ 	if (!phy_node && of_phy_is_fixed_link(np)) {
+ 		ret = of_phy_register_fixed_link(np);
+@@ -3652,6 +3674,11 @@ static void fec_enet_of_parse_stop_mode(struct platform_device *pdev)
+ 	if (IS_ERR(fep->clk_ref))
+ 		fep->clk_ref = NULL;
+ 
++	/* clk_2x_txclk is optional, depends on board */
++	fep->clk_2x_txclk = devm_clk_get(&pdev->dev, "enet_2x_txclk");
++	if (IS_ERR(fep->clk_2x_txclk))
++		fep->clk_2x_txclk = NULL;
++
+ 	fep->bufdesc_ex = fep->quirks & FEC_QUIRK_HAS_BUFDESC_EX;
+ 	fep->clk_ptp = devm_clk_get(&pdev->dev, "ptp");
+ 	if (IS_ERR(fep->clk_ptp)) {
+-- 
+1.7.9.5
+

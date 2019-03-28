@@ -1,0 +1,238 @@
+From cd15c2186d855159c49bd38895903a29852df7f3 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Mon, 25 Jun 2018 13:43:05 +0300
+Subject: [PATCH 4076/5242] MLK-18680-1: drm: imx: dcss: low latency tracing
+ mechanism
+
+commit  e3073c421752c364c0fe1faa55eb5a3332e4b314 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch adds a DCSS tracing mechanism that introduces as low latency
+as possible, so that it does not affect timings. Instead of text, 64 bit
+tags will be logged, together with the system time in nanoseconds. Based
+on these, post-processing can be done on any PC to compute deltas,
+delays, missed buffers, etc.
+
+Example usage:
+
+echo 1 > /sys/module/imx_dcss_core/parameters/tracing
+gplay-1.0 movie.mpg
+echo 0 > /sys/module/imx_dcss_core/parameters/tracing
+
+To dump the trace:
+cat /sys/kernel/debug/imx-dcss/dump_trace_log > trace.txt
+
+With the help of a scripting language (awk), the trace can then be
+post-processed and analyzed on the PC.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/imx/dcss/dcss-common.c |  136 ++++++++++++++++++++++++++++++++++++
+ include/video/imx-dcss.h           |   22 ++++++
+ 2 files changed, 158 insertions(+)
+
+diff --git a/drivers/gpu/imx/dcss/dcss-common.c b/drivers/gpu/imx/dcss/dcss-common.c
+index 757c5b9..e55da66 100644
+--- a/drivers/gpu/imx/dcss/dcss-common.c
++++ b/drivers/gpu/imx/dcss/dcss-common.c
+@@ -326,6 +326,125 @@ static void dcss_clocks_enable(struct dcss_soc *dcss, bool en)
+ 
+ #ifdef CONFIG_DEBUG_FS
+ #include <linux/debugfs.h>
++#include <linux/slab.h>
++#include <linux/sched/clock.h>
++
++static unsigned int dcss_tracing;
++EXPORT_SYMBOL(dcss_tracing);
++
++module_param_named(tracing, dcss_tracing, int, 0600);
++
++struct dcss_trace {
++	u64 seq;
++	u64 time_ns;
++	u64 tag;
++	struct list_head node;
++};
++
++static LIST_HEAD(dcss_trace_list);
++static spinlock_t lock;
++static u64 seq;
++
++void dcss_trace_write(u64 tag)
++{
++	struct dcss_trace *trace;
++	unsigned long flags;
++
++	if (!dcss_tracing)
++		return;
++
++	trace = kzalloc(sizeof(*trace), GFP_KERNEL);
++	if (!trace)
++		return;
++
++	trace->time_ns = local_clock();
++	trace->tag = tag;
++	trace->seq = seq;
++
++	spin_lock_irqsave(&lock, flags);
++	list_add_tail(&trace->node, &dcss_trace_list);
++	seq++;
++	spin_unlock_irqrestore(&lock, flags);
++}
++EXPORT_SYMBOL(dcss_trace_write);
++
++static int dcss_trace_dump_show(struct seq_file *s, void *data)
++{
++	struct dcss_trace *trace = data;
++
++	if (trace)
++		seq_printf(s, "%lld %lld %lld\n",
++			   trace->seq, trace->time_ns, trace->tag);
++
++	return 0;
++}
++
++static void *dcss_trace_dump_start(struct seq_file *s, loff_t *pos)
++{
++	unsigned long flags;
++	struct dcss_trace *trace = NULL;
++
++	spin_lock_irqsave(&lock, flags);
++	if (!list_empty(&dcss_trace_list)) {
++		trace = list_first_entry(&dcss_trace_list,
++					 struct dcss_trace, node);
++		goto exit;
++	}
++
++exit:
++	spin_unlock_irqrestore(&lock, flags);
++	return trace;
++}
++
++static void *dcss_trace_dump_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	unsigned long flags;
++	struct dcss_trace *next_trace = NULL;
++	struct dcss_trace *trace = v;
++
++	++*pos;
++	spin_lock_irqsave(&lock, flags);
++	if (!list_is_last(&trace->node, &dcss_trace_list)) {
++		next_trace = list_entry(trace->node.next,
++					struct dcss_trace, node);
++		goto exit;
++	}
++
++exit:
++	spin_unlock_irqrestore(&lock, flags);
++	return next_trace;
++}
++
++static void dcss_trace_dump_stop(struct seq_file *s, void *v)
++{
++	unsigned long flags;
++	struct dcss_trace *trace, *tmp;
++	struct dcss_trace *last_trace = v;
++
++	spin_lock_irqsave(&lock, flags);
++	if (!list_empty(&dcss_trace_list)) {
++		list_for_each_entry_safe(trace, tmp, &dcss_trace_list, node) {
++			if (last_trace && trace->seq >= last_trace->seq)
++				break;
++
++			list_del(&trace->node);
++			kfree(trace);
++		}
++	}
++	spin_unlock_irqrestore(&lock, flags);
++}
++
++static const struct seq_operations dcss_trace_seq_ops = {
++	.start = dcss_trace_dump_start,
++	.next = dcss_trace_dump_next,
++	.stop = dcss_trace_dump_stop,
++	.show = dcss_trace_dump_show,
++};
++
++static int dcss_trace_dump_open(struct inode *inode, struct file *file)
++{
++	return seq_open(file, &dcss_trace_seq_ops);
++}
+ 
+ static int dcss_dump_regs_show(struct seq_file *s, void *data)
+ {
+@@ -374,6 +493,13 @@ static int dcss_dump_ctx_open(struct inode *inode, struct file *file)
+ 	.release	= single_release,
+ };
+ 
++static const struct file_operations dcss_dump_trace_fops = {
++	.open		= dcss_trace_dump_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
+ static void dcss_debugfs_init(struct dcss_soc *dcss)
+ {
+ 	struct dentry *d, *root;
+@@ -392,6 +518,11 @@ static void dcss_debugfs_init(struct dcss_soc *dcss)
+ 	if (!d)
+ 		goto err;
+ 
++	d = debugfs_create_file("dump_trace_log", 0444, root, dcss,
++				&dcss_dump_trace_fops);
++	if (!d)
++		goto err;
++
+ 	return;
+ 
+ err:
+@@ -401,6 +532,11 @@ static void dcss_debugfs_init(struct dcss_soc *dcss)
+ static void dcss_debugfs_init(struct dcss_soc *dcss)
+ {
+ }
++
++void dcss_trace_write(u64 tag)
++{
++}
++EXPORT_SYMBOL(dcss_trace_write);
+ #endif
+ 
+ static void dcss_bus_freq(struct dcss_soc *dcss, bool en)
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 2c6476d..2236fe5 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -30,6 +30,28 @@ struct dcss_client_platformdata {
+ void dcss_vblank_irq_enable(struct dcss_soc *dcss, bool en);
+ void dcss_vblank_irq_clear(struct dcss_soc *dcss);
+ enum dcss_color_space dcss_drm_fourcc_to_colorspace(u32 drm_fourcc);
++void dcss_trace_write(u64 tag);
++
++
++#define TAG(x)			((x) << 56)
++
++#define TRACE_COMMON		TAG(0LL)
++#define TRACE_DTG		TAG(1LL)
++#define TRACE_SS		TAG(2LL)
++#define TRACE_DPR		TAG(3LL)
++#define TRACE_SCALER		TAG(4LL)
++#define TRACE_CTXLD		TAG(5LL)
++#define TRACE_DEC400D		TAG(6LL)
++#define TRACE_DTRC		TAG(7LL)
++#define TRACE_HDR10		TAG(8LL)
++#define TRACE_RDSRC		TAG(9LL)
++#define TRACE_WRSCL		TAG(10LL)
++
++#define TRACE_DRM_CRTC		TAG(11LL)
++#define TRACE_DRM_PLANE		TAG(12LL)
++#define TRACE_DRM_KMS		TAG(13LL)
++
++#define dcss_trace_module(mod_tag, val) dcss_trace_write((mod_tag) | (val));
+ 
+ /* BLKCTL */
+ void dcss_blkctl_hdmi_secure_src_en(struct dcss_soc *dcss);
+-- 
+1.7.9.5
+

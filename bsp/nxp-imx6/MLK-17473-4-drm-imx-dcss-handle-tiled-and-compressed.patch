@@ -1,0 +1,479 @@
+From 8a67cc386979a4f3b9242737c18bdb11d1500542 Mon Sep 17 00:00:00 2001
+From: Fancy Fang <chen.fang@nxp.com>
+Date: Tue, 23 Jan 2018 22:17:23 +0800
+Subject: [PATCH 3298/5242] MLK-17473-4 drm/imx: dcss: handle tiled and
+ compressed layout for primary plane
+
+commit  24bd117119887cdf3d78878626e689a0135ca28a from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add handling code to support tiled and compressed pixel source
+layout. The tiled only layout will bypass DEC400D and be resolved
+by DPR, since DEC400D is only responsible for decompression.
+
+Signed-off-by: Fancy Fang <chen.fang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-plane.c |   88 ++++++++++++++---
+ drivers/gpu/imx/dcss/dcss-dec400d.c   |  175 ++++++++++++++++++++++++++++++++-
+ drivers/gpu/imx/dcss/dcss-dpr.c       |   43 +++++++-
+ include/video/imx-dcss.h              |   19 +++-
+ 4 files changed, 306 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.c b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+index ae45217..c2b1a83 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+@@ -220,11 +220,13 @@ static int dcss_plane_atomic_check(struct drm_plane *plane,
+ 
+ static void dcss_plane_atomic_set_base(struct dcss_plane *dcss_plane)
+ {
++	int mod_idx;
+ 	struct drm_plane *plane = &dcss_plane->base;
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
+ 	struct drm_gem_cma_object *cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
+ 	unsigned long p1_ba, p2_ba;
++	dma_addr_t caddr;
+ 	bool modifiers_present = !!(fb->flags & DRM_MODE_FB_MODIFIERS);
+ 	u32 pix_format = state->fb->format->format;
+ 
+@@ -241,21 +243,59 @@ static void dcss_plane_atomic_set_base(struct dcss_plane *dcss_plane)
+ 	dcss_dpr_addr_set(dcss_plane->dcss, dcss_plane->ch_num,
+ 			  p1_ba, p2_ba, fb->pitches[0]);
+ 
+-	if (!modifiers_present || (pix_format != DRM_FORMAT_NV12 &&
+-				   pix_format != DRM_FORMAT_NV21)) {
+-		dcss_dtrc_bypass(dcss_plane->dcss, dcss_plane->ch_num);
++	switch (plane->type) {
++	case DRM_PLANE_TYPE_PRIMARY:
++		if (modifiers_present) {
++			for (mod_idx = 0; mod_idx < 4; mod_idx++)
++				dcss_dec400d_set_format_mod(dcss_plane->dcss,
++						pix_format,
++						mod_idx,
++						fb->modifier);
++		}
++
++		switch (fb->modifier) {
++		case DRM_FORMAT_MOD_LINEAR:
++		case DRM_FORMAT_MOD_VIVANTE_TILED:
++		case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
++			/* Bypass dec400d */
++			dcss_dec400d_bypass(dcss_plane->dcss);
++			return;
++		case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED_FC:
++			caddr = cma_obj->paddr + ALIGN(fb->height, 64) * fb->pitches[0];
++			dcss_dec400d_read_config(dcss_plane->dcss, 0, true);
++			dcss_dec400d_addr_set(dcss_plane->dcss, p1_ba, caddr);
++			break;
++		default:
++			WARN_ON(1);
++			return;
++		}
++
++		break;
++	case DRM_PLANE_TYPE_OVERLAY:
++		if (!modifiers_present ||
++		    (pix_format != DRM_FORMAT_NV12 &&
++		     pix_format != DRM_FORMAT_NV21)) {
++			dcss_dtrc_bypass(dcss_plane->dcss, dcss_plane->ch_num);
++			return;
++		}
++
++		dcss_dtrc_set_format_mod(dcss_plane->dcss, dcss_plane->ch_num,
++					 fb->modifier);
++		dcss_dtrc_addr_set(dcss_plane->dcss, dcss_plane->ch_num,
++				   p1_ba, p2_ba, dcss_plane->dtrc_table_ofs_val);
++		break;
++	default:
++		WARN_ON(1);
+ 		return;
+ 	}
+-
+-	dcss_dtrc_set_format_mod(dcss_plane->dcss, dcss_plane->ch_num,
+-				 fb->modifier);
+-	dcss_dtrc_addr_set(dcss_plane->dcss, dcss_plane->ch_num,
+-			   p1_ba, p2_ba, dcss_plane->dtrc_table_ofs_val);
+ }
+ 
+ static bool dcss_plane_needs_setup(struct drm_plane_state *state,
+ 				   struct drm_plane_state *old_state)
+ {
++	struct drm_framebuffer *fb = state->fb;
++	struct drm_framebuffer *old_fb = old_state->fb;
++
+ 	return state->crtc_x != old_state->crtc_x ||
+ 	       state->crtc_y != old_state->crtc_y ||
+ 	       state->crtc_w != old_state->crtc_w ||
+@@ -264,7 +304,8 @@ static bool dcss_plane_needs_setup(struct drm_plane_state *state,
+ 	       state->src_y  != old_state->src_y  ||
+ 	       state->src_w  != old_state->src_w  ||
+ 	       state->src_h  != old_state->src_h  ||
+-	       state->fb->format->format != old_state->fb->format->format;
++	       fb->format->format != old_fb->format->format ||
++	       fb->modifier  != old_fb->modifier;
+ }
+ 
+ static void dcss_plane_atomic_update(struct drm_plane *plane,
+@@ -272,8 +313,10 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct dcss_plane *dcss_plane = to_dcss_plane(plane);
++	struct drm_framebuffer *fb = state->fb;
+ 	u32 pixel_format = state->fb->format->format;
+ 	struct drm_crtc_state *crtc_state = state->crtc->state;
++	bool modifiers_present = !!(fb->flags & DRM_MODE_FB_MODIFIERS);
+ 
+ 	if (!state->fb)
+ 		return;
+@@ -284,13 +327,24 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 					   pixel_format, dcss_plane->alpha_val,
+ 					   dcss_plane->use_global_val)) {
+ 		dcss_plane_atomic_set_base(dcss_plane);
++		dcss_dec400d_shadow_trig(dcss_plane->dcss);
+ 		return;
+ 	}
+ 
+-	dcss_dtrc_set_res(dcss_plane->dcss, dcss_plane->ch_num,
+-			  state->src_w >> 16, state->src_h >> 16);
++	if (plane->type == DRM_PLANE_TYPE_OVERLAY)
++		dcss_dtrc_set_res(dcss_plane->dcss, dcss_plane->ch_num,
++				  state->src_w >> 16, state->src_h >> 16);
+ 
+ 	dcss_dpr_format_set(dcss_plane->dcss, dcss_plane->ch_num, pixel_format);
++	if (!modifiers_present)
++		dcss_dpr_tile_derive(dcss_plane->dcss,
++				     dcss_plane->ch_num,
++				     DRM_FORMAT_MOD_LINEAR);
++	else
++		dcss_dpr_tile_derive(dcss_plane->dcss,
++				     dcss_plane->ch_num,
++				     fb->modifier);
++
+ 	dcss_dpr_set_res(dcss_plane->dcss, dcss_plane->ch_num,
+ 			 state->src_w >> 16, state->src_h >> 16);
+ 	dcss_plane_atomic_set_base(dcss_plane);
+@@ -315,7 +369,17 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 				 pixel_format, dcss_plane->alpha_val,
+ 				 dcss_plane->use_global_val);
+ 
+-	dcss_dtrc_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
++	switch (plane->type) {
++	case DRM_PLANE_TYPE_PRIMARY:
++		dcss_dec400d_enable(dcss_plane->dcss);
++		break;
++	case DRM_PLANE_TYPE_OVERLAY:
++		dcss_dtrc_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
++		break;
++	default:
++		WARN_ON(1);
++		break;
++	}
+ 	dcss_dpr_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+ 	dcss_scaler_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+ 	dcss_dtg_ch_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+diff --git a/drivers/gpu/imx/dcss/dcss-dec400d.c b/drivers/gpu/imx/dcss/dcss-dec400d.c
+index 645919e..0bcd12b 100644
+--- a/drivers/gpu/imx/dcss/dcss-dec400d.c
++++ b/drivers/gpu/imx/dcss/dcss-dec400d.c
+@@ -15,15 +15,48 @@
+ #include <linux/device.h>
+ #include <linux/bitops.h>
+ #include <linux/io.h>
++#include <drm/drm_fourcc.h>
+ 
+ #include <video/imx-dcss.h>
+ #include "dcss-prv.h"
+ 
++#define USE_CTXLD			1
++
++/* DEC400D registers offsets */
++#define DEC400D_READCONFIG_BASE		0x800
++#define DEC400D_READCONFIG(i)		(DEC400D_READCONFIG_BASE + ((i) << 2))
++#define   COMPRESSION_ENABLE_BIT	0
++#define   COMPRESSION_FORMAT_BIT	3
++#define   COMPRESSION_ALIGN_MODE_BIT	16
++#define   TILE_ALIGN_MODE_BIT		22
++#define   TILE_MODE_BIT			25
++#define DEC400D_READBUFFERBASE0		0x900
++#define DEC400D_READCACHEBASE0		0x980
++#define DEC400D_CONTROL			0xB00
++#define   DISABLE_COMPRESSION_BIT	1
++#define   SHADOW_TRIGGER_BIT		29
++
+ struct dcss_dec400d_priv {
+ 	struct dcss_soc *dcss;
+ 	void __iomem *dec400d_reg;
++	uint64_t modifier[4];
++	uint32_t pixel_format;
++	uint32_t ctx_id;
++	bool bypass;		/* bypass or decompress */
+ };
+ 
++static void dcss_dec400d_write(struct dcss_dec400d_priv *dec400d,
++			       uint32_t value,
++			       uint32_t offset)
++{
++#if USE_CTXLD
++	dcss_writel(value, dec400d->dec400d_reg + offset);
++#else
++	dcss_ctxld_write(dec400d->dcss, dec400d->ctx_id,
++			 value, dec400d->dec400d_reg + offset);
++#endif
++}
++
+ int dcss_dec400d_init(struct dcss_soc *dcss, unsigned long dec400d_base)
+ {
+ 	struct dcss_dec400d_priv *dec400d;
+@@ -41,12 +74,150 @@ int dcss_dec400d_init(struct dcss_soc *dcss, unsigned long dec400d_base)
+ 		return -ENOMEM;
+ 	}
+ 
+-	/* PUT IN BYPASS FOR NOW */
+-//[lp]	dcss_writel(0, dec400d->dec400d_reg + 0x2c0);
++#if USE_CTXLD
++	dec400d->ctx_id = CTX_SB_HP;
++#endif
+ 
+ 	return 0;
+ }
+ 
+ void dcss_dec400d_exit(struct dcss_soc *dcss)
+ {
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	if (!IS_ERR(dec400d)) {
++		devm_kfree(dcss->dev, dec400d);
++		dcss->dec400d_priv = NULL;
++	}
++}
++
++void dcss_dec400d_set_format_mod(struct dcss_soc *dcss,
++				 uint32_t fourcc,
++				 uint32_t mod_idx,
++				 uint64_t modifier)
++{
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	if (mod_idx > 3) {
++		WARN_ON(1);
++		return;
++	}
++
++	if (mod_idx == 0)
++		dec400d->pixel_format = fourcc;
++
++	dec400d->modifier[mod_idx] = modifier;
++}
++EXPORT_SYMBOL(dcss_dec400d_set_format_mod);
++
++void dcss_dec400d_bypass(struct dcss_soc *dcss)
++{
++	uint32_t control;
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	control = dcss_readl(dec400d->dec400d_reg + DEC400D_CONTROL);
++	pr_debug("%s: dec400d control = %#x\n", __func__, control);
++
++	control |= 0x1 << DISABLE_COMPRESSION_BIT;
++	dcss_dec400d_write(dec400d, control, DEC400D_CONTROL);
++
++	/* Trigger shadow registers */
++	control |= 0x1 << SHADOW_TRIGGER_BIT;
++	dcss_dec400d_write(dec400d, control, DEC400D_CONTROL);
++
++	dec400d->bypass = true;
++}
++EXPORT_SYMBOL(dcss_dec400d_bypass);
++
++void dcss_dec400d_shadow_trig(struct dcss_soc *dcss)
++{
++	uint32_t control;
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	control = dcss_readl(dec400d->dec400d_reg + DEC400D_CONTROL);
++
++	/* Trigger shadow registers */
++	control |= 0x1 << SHADOW_TRIGGER_BIT;
++	dcss_dec400d_write(dec400d, control, DEC400D_CONTROL);
++}
++EXPORT_SYMBOL(dcss_dec400d_shadow_trig);
++
++void dcss_dec400d_addr_set(struct dcss_soc *dcss,
++			   uint32_t baddr,
++			   uint32_t caddr)
++{
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	/* set frame buffer base addr */
++	dcss_dec400d_write(dec400d, baddr, DEC400D_READBUFFERBASE0);
++
++	/* set tile status cache addr */
++	dcss_dec400d_write(dec400d, caddr, DEC400D_READCACHEBASE0);
++
++	dec400d->bypass = false;
++}
++EXPORT_SYMBOL(dcss_dec400d_addr_set);
++
++void dcss_dec400d_read_config(struct dcss_soc *dcss,
++			      uint32_t read_id,
++			      bool compress_en)
++{
++	uint32_t read_config = 0x0;
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	/* TODO: using 'read_id' 0 by default */
++	if (read_id) {
++		WARN_ON(1);
++		return;
++	}
++
++	if (compress_en == false)
++		goto config;
++
++	switch (dec400d->pixel_format) {
++	case DRM_FORMAT_ARGB8888:
++	case DRM_FORMAT_XRGB8888:
++		read_config |= 0x0 << COMPRESSION_FORMAT_BIT;
++		break;
++	default:
++		/* TODO: not support yet */
++		WARN_ON(1);
++		return;
++	}
++
++	/* ALIGN32_BYTE */
++	read_config |= 0x2 << COMPRESSION_ALIGN_MODE_BIT;
++
++	/* TILE1_ALIGN */
++	read_config |= 0x0 << TILE_ALIGN_MODE_BIT;
++
++	/* TILE8x4 */
++	read_config |= 0x3 << TILE_MODE_BIT;
++
++	/* Compression Enable */
++	read_config |= 0x1 << COMPRESSION_ENABLE_BIT;
++
++config:
++	dcss_dec400d_write(dec400d, read_config, DEC400D_READCONFIG(read_id));
++}
++EXPORT_SYMBOL(dcss_dec400d_read_config);
++
++void dcss_dec400d_enable(struct dcss_soc *dcss)
++{
++	uint32_t control;
++	struct dcss_dec400d_priv *dec400d = dcss->dec400d_priv;
++
++	if (dec400d->bypass)
++		return;
++
++	control = dcss_readl(dec400d->dec400d_reg + DEC400D_CONTROL);
++
++	/* enable compression */
++	control &= ~(0x1 << DISABLE_COMPRESSION_BIT);
++	dcss_dec400d_write(dec400d, control, DEC400D_CONTROL);
++
++	/* Trigger shadow registers */
++	control |= 0x1 << SHADOW_TRIGGER_BIT;
++	dcss_dec400d_write(dec400d, control, DEC400D_CONTROL);
+ }
++EXPORT_SYMBOL(dcss_dec400d_enable);
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index f822bc7..5d32bb3 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -547,6 +547,45 @@ static int dcss_dpr_get_bpp(u32 pix_format)
+ 	return bpp;
+ }
+ 
++void dcss_dpr_tile_derive(struct dcss_soc *dcss,
++			  int ch_num,
++			  uint64_t modifier)
++{
++	struct dcss_dpr_ch *ch = &dcss->dpr_priv->ch[ch_num];
++
++	switch (ch_num) {
++	case 0:
++		switch (modifier) {
++		case DRM_FORMAT_MOD_LINEAR:
++			dcss_dpr_tile_set(dcss, ch_num, TILE_LINEAR);
++			ch->tile = TILE_LINEAR;
++			break;
++		case DRM_FORMAT_MOD_VIVANTE_TILED:
++			dcss_dpr_tile_set(dcss, ch_num, TILE_GPU_STANDARD);
++			ch->tile = TILE_GPU_STANDARD;
++			break;
++		case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
++		case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED_FC:
++			dcss_dpr_tile_set(dcss, ch_num, TILE_GPU_SUPER);
++			ch->tile = TILE_GPU_SUPER;
++			break;
++		default:
++			WARN_ON(1);
++			break;
++		}
++		break;
++	case 1:
++	case 2:
++		dcss_dpr_tile_set(dcss, ch_num, TILE_LINEAR);
++		ch->tile = TILE_LINEAR;
++		break;
++	default:
++		WARN_ON(1);
++		return;
++	}
++}
++EXPORT_SYMBOL(dcss_dpr_tile_set);
++
+ void dcss_dpr_format_set(struct dcss_soc *dcss, int ch_num, u32 pix_format)
+ {
+ 	struct dcss_dpr_ch *ch = &dcss->dpr_priv->ch[ch_num];
+@@ -572,9 +611,5 @@ void dcss_dpr_format_set(struct dcss_soc *dcss, int ch_num, u32 pix_format)
+ 	dcss_dpr_2plane_en(dcss, ch_num, ch->planes == 2 ? true : false);
+ 
+ 	dcss_dpr_rtram_set(dcss, ch_num, pix_format);
+-
+-	/* TODO: do not hardcode tile type */
+-	dcss_dpr_tile_set(dcss, ch_num, TILE_LINEAR);
+-	ch->tile = TILE_LINEAR;
+ }
+ EXPORT_SYMBOL(dcss_dpr_format_set);
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 0354bf9..4c5bd0c 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -53,7 +53,9 @@ void dcss_dpr_addr_set(struct dcss_soc *dcss, int ch_num, u32 luma_base_addr,
+ 		       u32 chroma_base_addr, u16 pitch);
+ void dcss_dpr_enable(struct dcss_soc *dcss, int ch_num, bool en);
+ void dcss_dpr_format_set(struct dcss_soc *dcss, int ch_num, u32 pix_format);
+-
++void dcss_dpr_tile_derive(struct dcss_soc *dcss,
++			  int ch_num,
++			  uint64_t modifier);
+ /* DTG */
+ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm);
+ void dcss_dtg_plane_pos_set(struct dcss_soc *dcss, int ch_num,
+@@ -103,4 +105,19 @@ enum dcss_color_space {
+ 	DCSS_COLORSPACE_YUV,
+ 	DCSS_COLORSPACE_UNKNOWN,
+ };
++
++/* DEC400D */
++void dcss_dec400d_set_format_mod(struct dcss_soc *dcss,
++				 uint32_t fourcc,
++				 uint32_t mod_idx,
++				 uint64_t modifier);
++void dcss_dec400d_bypass(struct dcss_soc *dcss);
++void dcss_dec400d_shadow_trig(struct dcss_soc *dcss);
++void dcss_dec400d_addr_set(struct dcss_soc *dcss,
++			   uint32_t baddr,
++			   uint32_t caddr);
++void dcss_dec400d_read_config(struct dcss_soc *dcss,
++			      uint32_t read_id,
++			      bool compress_en);
++void dcss_dec400d_enable(struct dcss_soc *dcss);
+ #endif /* __IMX_DCSS_H__ */
+-- 
+1.7.9.5
+

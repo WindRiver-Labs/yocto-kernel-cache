@@ -1,0 +1,222 @@
+From 15768b5e45d301c0d831610c55219bd04a3b3f6a Mon Sep 17 00:00:00 2001
+From: Octavian Purdila <octavian.purdila@nxp.com>
+Date: Mon, 14 Nov 2016 18:20:05 +0200
+Subject: [PATCH 1482/5242] MLK-13457 ARM: imx: busfreq: fix deadlock detected
+ by lockdep
+
+commit  edf582ee06814b5fd945b864b1838124f327a1f5 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The deadlock scenario is the following:
+
+1. We schedule low_bus_freq_handle() but it does not run yet.
+
+2. We run set_high_bus_freq() or some other function, that does the
+following two things: (a) takes the busfreq mutex and (b)
+synchronously cancel the low_bus_freq_handle work
+
+If between (a) and (b) the low_bus_freq_handle work starts running, it
+will take the bus freq mutex and block which will cause (b) to
+deadlock since the work will never finish now.
+
+To fix this issue avoid synchronously canceling the work and instead
+use a new global variable (protected by the busfreq mutex) to mark the
+cancellation and abort the work when it is scheduled. In order to
+avoid unnecessary schedules we also try to cancel the work with
+cancel_delayed_work().
+
+ ======================================================
+ [ INFO: possible circular locking dependency detected ]
+ 4.9.0-rc4-00776-gd4f2779 #348 Tainted: G        W
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+ -------------------------------------------------------
+ kworker/3:1/68 is trying to acquire lock:
+  (
+ bus_freq_mutex
+ ){+.+...}
+ , at:
+ [<c0128a20>] reduce_bus_freq_handler+0x1c/0x30
+
+ but task is already holding lock:
+  (
+ (&(&low_bus_freq_handler)->work)
+ ){+.+...}
+ , at:
+ [<c014f4ec>] process_one_work+0x128/0x418
+
+ which lock already depends on the new lock.
+
+ the existing dependency chain (in reverse order) is:
+
+ -> #1
+  (
+ (&(&low_bus_freq_handler)->work)
+ ){+.+...}
+ :
+
+ [<c014dafc>] flush_work+0x44/0x234
+ [<c0150348>] __cancel_work_timer+0x98/0x1c8
+ [<c01504a4>] cancel_delayed_work_sync+0x14/0x18
+ [<c0129d9c>] request_bus_freq+0x9c/0x150
+ [<c06b2b28>] imx6q_cpufreq_init+0x8c/0xb8
+ [<c06afc9c>] cpufreq_online+0xc0/0x67c
+ [<c06b0308>] cpufreq_add_dev+0xb0/0xd4
+ [<c05251b0>] subsys_interface_register+0x9c/0xd8
+ [<c06af124>] cpufreq_register_driver+0x130/0x1dc
+ [<c06b3224>] imx6q_cpufreq_probe+0x5c8/0x8a0
+ [<c0528768>] platform_drv_probe+0x54/0xb8
+ [<c0526bf8>] driver_probe_device+0x20c/0x2c4
+ [<c0526e4c>] __device_attach_driver+0x9c/0xb4
+ [<c0524e3c>] bus_for_each_drv+0x6c/0xa0
+ [<c05268c8>] __device_attach+0xb8/0x11c
+ [<c0526fc4>] device_initial_probe+0x14/0x18
+ [<c0525ee8>] bus_probe_device+0x90/0x98
+ [<c052401c>] device_add+0x3c8/0x578
+ [<c052846c>] platform_device_add+0xa8/0x208
+ [<c0529030>] platform_device_register+0x28/0x2c
+ [<c0d0f63c>] imx6q_init_late+0x180/0x1c8
+ [<c0d03880>] init_machine_late+0x24/0x98
+ [<c01019ec>] do_one_initcall+0x44/0x180
+ [<c0d00e28>] kernel_init_freeable+0x12c/0x1f4
+ [<c0978ba8>] kernel_init+0x10/0x120
+ [<c0107ff0>] ret_from_fork+0x14/0x24
+
+ -> #0
+  (
+ bus_freq_mutex
+ ){+.+...}
+ :
+
+ [<c01811e4>] lock_acquire+0x78/0x98
+ [<c097cedc>] mutex_lock_nested+0x54/0x3e4
+ [<c0128a20>] reduce_bus_freq_handler+0x1c/0x30
+ [<c014f558>] process_one_work+0x194/0x418
+ [<c014f810>] worker_thread+0x34/0x4fc
+ [<c0155e44>] kthread+0xdc/0xf8
+ [<c0107ff0>] ret_from_fork+0x14/0x24
+
+ other info that might help us debug this:
+
+  Possible unsafe locking scenario:
+
+        CPU0                    CPU1
+        ----                    ----
+   lock( (&(&low_bus_freq_handler)->work) );
+                                lock( bus_freq_mutex );
+                                lock( (&(&low_bus_freq_handler)->work) );
+   lock( bus_freq_mutex );
+
+  *** DEADLOCK ***
+
+ 2 locks held by kworker/3:1/68:
+  #0:
+  (
+ "events"
+ ){.+.+.+}
+ , at:
+ [<c014f4ec>] process_one_work+0x128/0x418
+  #1:
+  (
+ (&(&low_bus_freq_handler)->work)
+ ){+.+...}
+ , at:
+ [<c014f4ec>] process_one_work+0x128/0x418
+
+ stack backtrace:
+ CPU: 3 PID: 68 Comm: kworker/3:1 Tainted: G        W       4.9.0-rc4-00776-gd4f2779 #348
+ Hardware name: Freescale i.MX6 Quad/DualLite (Device Tree)
+ Workqueue: events reduce_bus_freq_handler
+ Backtrace:
+ [<c010c538>] (dump_backtrace) from [<c010c730>] (show_stack+0x18/0x1c)
+ [<c010c718>] (show_stack) from [<c0403a58>] (dump_stack+0xb4/0xe8)
+ [<c04039a4>] (dump_stack) from [<c017d4f0>] (print_circular_bug+0x1d4/0x318)
+ [<c017d31c>] (print_circular_bug) from [<c0180bb4>] (__lock_acquire+0x1864/0x1ad4)
+ [<c017f350>] (__lock_acquire) from [<c01811e4>] (lock_acquire+0x78/0x98)
+ [<c018116c>] (lock_acquire) from [<c097cedc>] (mutex_lock_nested+0x54/0x3e4)
+ [<c097ce88>] (mutex_lock_nested) from [<c0128a20>] (reduce_bus_freq_handler+0x1c/0x30)
+ [<c0128a04>] (reduce_bus_freq_handler) from [<c014f558>] (process_one_work+0x194/0x418)
+ [<c014f3c4>] (process_one_work) from [<c014f810>] (worker_thread+0x34/0x4fc)
+ [<c014f7dc>] (worker_thread) from [<c0155e44>] (kthread+0xdc/0xf8)
+ [<c0155d68>] (kthread) from [<c0107ff0>] (ret_from_fork+0x14/0x24)
+
+Signed-off-by: Octavian Purdila <octavian.purdila@nxp.com>
+Reviewed-by: Ranjani Vaidyanathan <ranjani.vaidyanathan@nxp.com>
+---
+ arch/arm/mach-imx/busfreq-imx.c |   19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/mach-imx/busfreq-imx.c b/arch/arm/mach-imx/busfreq-imx.c
+index cc8da8c..adc1a0e 100644
+--- a/arch/arm/mach-imx/busfreq-imx.c
++++ b/arch/arm/mach-imx/busfreq-imx.c
+@@ -57,6 +57,7 @@
+ static int high_bus_freq_mode;
+ static int med_bus_freq_mode;
+ static int bus_freq_scaling_initialized;
++static bool cancel_reduce_bus_freq;
+ static struct device *busfreq_dev;
+ static int busfreq_suspended;
+ static int bus_freq_scaling_is_active;
+@@ -661,7 +662,8 @@ static void reduce_bus_freq_handler(struct work_struct *work)
+ {
+ 	mutex_lock(&bus_freq_mutex);
+ 
+-	reduce_bus_freq();
++	if (!cancel_reduce_bus_freq)
++		reduce_bus_freq();
+ 
+ 	mutex_unlock(&bus_freq_mutex);
+ }
+@@ -671,7 +673,7 @@ static void reduce_bus_freq_handler(struct work_struct *work)
+  * This mode will be activated only when none of the modules that
+  * need a higher DDR or AHB frequency are active.
+  */
+-int set_low_bus_freq(void)
++static int set_low_bus_freq(void)
+ {
+ 	if (busfreq_suspended)
+ 		return 0;
+@@ -679,6 +681,8 @@ int set_low_bus_freq(void)
+ 	if (!bus_freq_scaling_initialized || !bus_freq_scaling_is_active)
+ 		return 0;
+ 
++	cancel_reduce_bus_freq = false;
++
+ 	/*
+ 	 * Check to see if we need to got from
+ 	 * low bus freq mode to audio bus freq mode.
+@@ -697,6 +701,12 @@ int set_low_bus_freq(void)
+ 	return 0;
+ }
+ 
++static inline void cancel_low_bus_freq_handler(void)
++{
++	cancel_delayed_work(&low_bus_freq_handler);
++	cancel_reduce_bus_freq = true;
++}
++
+ /*
+  * Set the DDR to either 528MHz or 400MHz for iMX6qd
+  * or 400MHz for iMX6dl.
+@@ -704,7 +714,7 @@ int set_low_bus_freq(void)
+ static int set_high_bus_freq(int high_bus_freq)
+ {
+ 	if (bus_freq_scaling_initialized && bus_freq_scaling_is_active)
+-		cancel_delayed_work_sync(&low_bus_freq_handler);
++		cancel_low_bus_freq_handler();
+ 
+ 	if (busfreq_suspended)
+ 		return 0;
+@@ -779,7 +789,8 @@ void request_bus_freq(enum bus_freq_mode mode)
+ 		mutex_unlock(&bus_freq_mutex);
+ 		return;
+ 	}
+-	cancel_delayed_work_sync(&low_bus_freq_handler);
++
++	cancel_low_bus_freq_handler();
+ 
+ 	if ((mode == BUS_FREQ_HIGH) && (!high_bus_freq_mode)) {
+ 		set_high_bus_freq(1);
+-- 
+1.7.9.5
+

@@ -1,0 +1,139 @@
+From a4b44627e40df2dee71b99d4aad19e9e73336698 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Fri, 31 Aug 2018 17:00:01 +0300
+Subject: [PATCH 4587/5242] MLK-18848-1: drm: imx: dcss: do not turn off DTG
+ LINE0/1 interrupts
+
+commit  159c071e878b864352f502b22cc3cb539c1fff7f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+DTG registers are double bufferred. Hence, enabling LINE0/1 interrupts
+in DTG in frame 0 will actually activate them in frame 1. Hence, the
+LINE0/1 interrupts (vblank and ctxld kick) will be missed in frame 0.
+
+This patch will permanently activate the LINE0/1 interrupts in DTG and
+only mask/unmask them at irq_steer controller level (disable_irq/enable_irq).
+
+While at it, do the same change for DPR completion interrupts. Since, these are
+only used for tracing purposes, the change is not supposed to affect
+driver functionality in any way.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/imx/dcss/dcss-dpr.c |   22 +++++++++++++++++++---
+ drivers/gpu/imx/dcss/dcss-dtg.c |   36 ++++++++++++++++++++++++++++++------
+ 2 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index ef607ee..3d9bd0f 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -219,6 +219,10 @@ static int dcss_dpr_irq_config(struct dcss_soc *dcss, int ch_num)
+ 		return ret;
+ 	}
+ 
++	disable_irq(ch->irq);
++
++	dcss_writel(0xfe, ch->base_reg + DCSS_DPR_IRQ_MASK);
++
+ 	return 0;
+ }
+ 
+@@ -730,9 +734,21 @@ void dcss_dpr_irq_enable(struct dcss_soc *dcss, bool en)
+ {
+ 	struct dcss_dpr_priv *dpr = dcss->dpr_priv;
+ 
+-	dcss_writel(en ? 0xfe : 0xff, dpr->ch[0].base_reg + DCSS_DPR_IRQ_MASK);
+-	dcss_writel(en ? 0xfe : 0xff, dpr->ch[1].base_reg + DCSS_DPR_IRQ_MASK);
+-	dcss_writel(en ? 0xfe : 0xff, dpr->ch[2].base_reg + DCSS_DPR_IRQ_MASK);
++	if (!en) {
++		disable_irq(dpr->ch[0].irq);
++		disable_irq(dpr->ch[1].irq);
++		disable_irq(dpr->ch[2].irq);
++
++		return;
++	}
++
++	dcss_clr(1, dpr->ch[0].base_reg + DCSS_DPR_IRQ_NONMASK_STATUS);
++	dcss_clr(1, dpr->ch[1].base_reg + DCSS_DPR_IRQ_NONMASK_STATUS);
++	dcss_clr(1, dpr->ch[2].base_reg + DCSS_DPR_IRQ_NONMASK_STATUS);
++
++	enable_irq(dpr->ch[0].irq);
++	enable_irq(dpr->ch[1].irq);
++	enable_irq(dpr->ch[2].irq);
+ }
+ 
+ void dcss_dpr_set_rotation(struct dcss_soc *dcss, int ch_num, u32 rotation)
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 410f3c8..4d6c4e4 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -139,6 +139,7 @@ struct dcss_dtg_priv {
+ 	u32 use_global;
+ 
+ 	int ctxld_kick_irq;
++	bool ctxld_kick_irq_en;
+ 
+ 	/*
+ 	 * This will be passed on by DRM CRTC so that we can signal when DTG has
+@@ -208,6 +209,12 @@ static int dcss_dtg_irq_config(struct dcss_dtg_priv *dtg)
+ 		return ret;
+ 	}
+ 
++	disable_irq(dtg->ctxld_kick_irq);
++
++	dtg->ctxld_kick_irq_en = false;
++
++	dcss_update(LINE1_IRQ, LINE1_IRQ, dtg->base_reg + DCSS_DTG_INT_MASK);
++
+ 	return 0;
+ }
+ 
+@@ -469,20 +476,37 @@ void dcss_dtg_ch_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ 
+ void dcss_dtg_vblank_irq_enable(struct dcss_soc *dcss, bool en)
+ {
+-	void __iomem *reg;
+ 	struct dcss_dtg_priv *dtg = dcss->dtg_priv;
+-	u32 val = en ? (LINE0_IRQ | LINE1_IRQ) : 0;
++	u32 status;
++
++	dcss_update(LINE0_IRQ, LINE0_IRQ, dtg->base_reg + DCSS_DTG_INT_MASK);
++
++	dcss_dpr_irq_enable(dcss, en);
+ 
+ 	/* need to keep the CTXLD kick interrupt ON if DTRC is used */
+ 	if (!en && (dcss_dtrc_is_running(dcss, 1) ||
+ 		    dcss_dtrc_is_running(dcss, 2)))
+-		val |= LINE1_IRQ;
++		return;
+ 
+-	reg = dtg->base_reg + DCSS_DTG_INT_MASK;
++	if (en) {
++		status = dcss_readl(dtg->base_reg + DCSS_DTG_INT_STATUS);
+ 
+-	dcss_update(val, LINE0_IRQ | LINE1_IRQ, reg);
++		if (!dtg->ctxld_kick_irq_en) {
++			dcss_writel(status & (LINE0_IRQ | LINE1_IRQ),
++				    dtg->base_reg + DCSS_DTG_INT_CONTROL);
++			enable_irq(dtg->ctxld_kick_irq);
++			dtg->ctxld_kick_irq_en = true;
++			return;
++		}
+ 
+-	dcss_dpr_irq_enable(dcss, en);
++		dcss_writel(status & LINE0_IRQ,
++			    dtg->base_reg + DCSS_DTG_INT_CONTROL);
++
++		return;
++	}
++
++	disable_irq(dtg->ctxld_kick_irq);
++	dtg->ctxld_kick_irq_en = false;
+ }
+ 
+ void dcss_dtg_vblank_irq_clear(struct dcss_soc *dcss)
+-- 
+1.7.9.5
+

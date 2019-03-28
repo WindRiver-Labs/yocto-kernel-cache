@@ -1,0 +1,144 @@
+From d62499d7021646ce0c35c108dec4689c2a7383cd Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Tue, 10 Jul 2018 08:24:27 +0300
+Subject: [PATCH 4089/5242] MLK-18844: drm: imx: dcss: lower mode change time
+
+commit  9b3cd7eed14df6106efb4851073b92499efb724c from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Currently, there's a hardcoded wait time (500ms) after enabling DTG
+clocks. This is supposed to avoid VBLANK timeout warning messages.
+However, this time is quite big. This patch changes this by lowering this
+time as much as possible, with the use of completion events. After
+enabling CRTC we just block until the first VBLANK interrupt comes. This
+way, we know for sure that we'll never get a VBLANK timeout.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-crtc.c |   31 +++++++++++++++++++++----------
+ drivers/gpu/imx/dcss/dcss-dtg.c      |    2 +-
+ 2 files changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.c b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+index 9ce374b..be383f5 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-crtc.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+@@ -38,19 +38,18 @@ struct dcss_crtc {
+ 	struct dcss_plane	*plane[3];
+ 
+ 	int			irq;
++	bool			irq_enabled;
+ 
+ 	struct drm_property *alpha;
+ 	struct drm_property *use_global;
+ 	struct drm_property *dtrc_table_ofs;
+ 
+-	struct completion disable_completion;
++	struct completion en_dis_completion;
+ 
+ 	enum dcss_hdr10_nonlinearity opipe_nl;
+ 	enum dcss_hdr10_gamut opipe_g;
+ 	enum dcss_hdr10_pixel_range opipe_pr;
+ 	u32 opipe_pix_format;
+-
+-	bool fist_vblank_after_en;
+ };
+ 
+ static void dcss_crtc_reset(struct drm_crtc *crtc)
+@@ -102,6 +101,11 @@ static int dcss_enable_vblank(struct drm_crtc *crtc)
+ 						   base);
+ 	struct dcss_soc *dcss = dev_get_drvdata(dcss_crtc->dev->parent);
+ 
++	if (dcss_crtc->irq_enabled)
++		return 0;
++
++	dcss_crtc->irq_enabled = true;
++
+ 	dcss_vblank_irq_enable(dcss, true);
+ 
+ 	enable_irq(dcss_crtc->irq);
+@@ -118,6 +122,8 @@ static void dcss_disable_vblank(struct drm_crtc *crtc)
+ 	disable_irq_nosync(dcss_crtc->irq);
+ 
+ 	dcss_vblank_irq_enable(dcss, false);
++
++	dcss_crtc->irq_enabled = false;
+ }
+ 
+ static const struct drm_crtc_funcs dcss_crtc_funcs = {
+@@ -235,6 +241,8 @@ static void dcss_crtc_atomic_enable(struct drm_crtc *crtc,
+ 
+ 	pm_runtime_get_sync(dcss_crtc->dev->parent);
+ 
++	dcss_enable_vblank(crtc);
++
+ 	dcss_dtg_sync_set(dcss, &vm);
+ 
+ 	dcss_ss_subsam_set(dcss, dcss_crtc->opipe_pix_format);
+@@ -247,7 +255,9 @@ static void dcss_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	dcss_dtg_enable(dcss, true, NULL);
+ 	dcss_ctxld_enable(dcss);
+ 
+-	dcss_crtc->fist_vblank_after_en = true;
++	reinit_completion(&dcss_crtc->en_dis_completion);
++	wait_for_completion_timeout(&dcss_crtc->en_dis_completion,
++				    msecs_to_jiffies(100));
+ 
+ 	crtc->enabled = true;
+ }
+@@ -269,12 +279,13 @@ static void dcss_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	spin_unlock_irq(&crtc->dev->event_lock);
+ 
+ 	dcss_ss_enable(dcss, false);
+-	dcss_dtg_enable(dcss, false, &dcss_crtc->disable_completion);
++	dcss_dtg_enable(dcss, false, &dcss_crtc->en_dis_completion);
+ 	dcss_ctxld_enable(dcss);
+ 
+ 	crtc->enabled = false;
+ 
+-	wait_for_completion_timeout(&dcss_crtc->disable_completion,
++	reinit_completion(&dcss_crtc->en_dis_completion);
++	wait_for_completion_timeout(&dcss_crtc->en_dis_completion,
+ 				    msecs_to_jiffies(100));
+ 
+ 	drm_crtc_vblank_off(crtc);
+@@ -297,10 +308,10 @@ static irqreturn_t dcss_crtc_irq_handler(int irq, void *dev_id)
+ 
+ 	dcss_trace_module(TRACE_DRM_CRTC, TRACE_VBLANK);
+ 
+-	if (dcss_ctxld_is_flushed(dcss) || dcss_crtc->fist_vblank_after_en) {
++	complete(&dcss_crtc->en_dis_completion);
++
++	if (dcss_ctxld_is_flushed(dcss))
+ 		drm_crtc_handle_vblank(&dcss_crtc->base);
+-		dcss_crtc->fist_vblank_after_en = false;
+-	}
+ 
+ 	dcss_vblank_irq_clear(dcss);
+ 
+@@ -383,7 +394,7 @@ static int dcss_crtc_init(struct dcss_crtc *crtc,
+ 		return crtc->irq;
+ 	}
+ 
+-	init_completion(&crtc->disable_completion);
++	init_completion(&crtc->en_dis_completion);
+ 
+ 	ret = devm_request_irq(crtc->dev, crtc->irq, dcss_crtc_irq_handler,
+ 			       IRQF_TRIGGER_RISING, "dcss_drm", crtc);
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index fc79ec9..cf56ef1 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -284,7 +284,7 @@ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm)
+ 	clk_prepare_enable(dcss->pdiv_clk);
+ 	clk_prepare_enable(dcss->pout_clk);
+ 
+-	msleep(500);
++	msleep(50);
+ 
+ 	dcss_dtg_write(dtg, ((dtg_lrc_y << TC_Y_POS) | dtg_lrc_x),
+ 		       DCSS_DTG_TC_DTG);
+-- 
+1.7.9.5
+

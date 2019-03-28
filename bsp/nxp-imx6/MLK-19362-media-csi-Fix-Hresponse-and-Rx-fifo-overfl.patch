@@ -1,0 +1,143 @@
+From 4e743fc7e6a41f19ad72cffaca5f5f97ec00f65c Mon Sep 17 00:00:00 2001
+From: Mirela Rabulea <mirela.rabulea@nxp.com>
+Date: Wed, 12 Sep 2018 11:50:54 +0300
+Subject: [PATCH 4661/5242] MLK-19362: media: csi: Fix "Hresponse" and "Rx
+ fifo overflow" camera errors
+
+commit  80aa74175d56c82258bae86249761b6d77514a9d from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+When the register setting for fifo_send_level is set to high, some residual
+data of a frame which cannot fill up to the send_level, will be sent with
+the next frame data. In this case, for CSI receive dma, sometimes,
+the vertical blanking is too short to finish the storage of the previous
+frame before the next frame start, depending on the system bandwidth.
+
+Tested on imx8mq-evk rev B4 and B3, with OV5640 camera.
+
+This patch was proposed by Tom Zheng <haidong.zheng@nxp.com>
+
+Signed-off-by: Mirela Rabulea <mirela.rabulea@nxp.com>
+Reviewed-by: Robby Cai <robby.cai@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/mxc-mipi-csi2_yav.c   |    3 +-
+ drivers/media/platform/mxc/capture/mx6s_capture.c |   38 ++++++++++++++++-----
+ 2 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/imx8/mxc-mipi-csi2_yav.c b/drivers/media/platform/imx8/mxc-mipi-csi2_yav.c
+index e16746e..abeb382 100644
+--- a/drivers/media/platform/imx8/mxc-mipi-csi2_yav.c
++++ b/drivers/media/platform/imx8/mxc-mipi-csi2_yav.c
+@@ -406,11 +406,10 @@ static int mipi_csi2_set_fmt(struct v4l2_subdev *sd,
+ 
+ 	if (fmt->format.width * fmt->format.height > 720 * 480) {
+ 		csi2dev->hs_settle = rxhs_settle[1];
+-		csi2dev->send_level = 0x300;
+ 	} else {
+ 		csi2dev->hs_settle = rxhs_settle[0];
+-		csi2dev->send_level = 0x240;
+ 	}
++	csi2dev->send_level = 64;
+ 
+ 	return v4l2_subdev_call(sensor_sd, pad, set_fmt, NULL, fmt);
+ }
+diff --git a/drivers/media/platform/mxc/capture/mx6s_capture.c b/drivers/media/platform/mxc/capture/mx6s_capture.c
+index c84089c..f129229 100644
+--- a/drivers/media/platform/mxc/capture/mx6s_capture.c
++++ b/drivers/media/platform/mxc/capture/mx6s_capture.c
+@@ -295,6 +295,11 @@ struct mx6s_csi_mux {
+ 	u8 req_bit;
+ };
+ 
++struct mx6s_csi_soc {
++	bool rx_fifo_rst;
++	int baseaddr_switch;
++};
++
+ struct mx6s_csi_dev {
+ 	struct device		*dev;
+ 	struct video_device *vdev;
+@@ -339,7 +344,7 @@ struct mx6s_csi_dev {
+ 
+ 	bool csi_mipi_mode;
+ 	bool csi_two_8bit_sensor_mode;
+-	const bool *rx_fifo_rst;
++	const struct mx6s_csi_soc *soc;
+ 	struct mx6s_csi_mux csi_mux;
+ };
+ 
+@@ -445,7 +450,9 @@ static void csisw_reset(struct mx6s_csi_dev *csi_dev)
+ 	isr = csi_read(csi_dev, CSI_CSISR);
+ 	csi_write(csi_dev, isr, CSI_CSISR);
+ 
+-	/* Ensable csi  */
++	cr18 |= csi_dev->soc->baseaddr_switch;
++
++	/* Enable csi  */
+ 	cr18 |= BIT_CSI_ENABLE;
+ 	csi_write(csi_dev, cr18, CSI_CSICR18);
+ }
+@@ -856,7 +863,7 @@ static int mx6s_configure_csi(struct mx6s_csi_dev *csi_dev)
+ 		csi_write(csi_dev, cr1, CSI_CSICR1);
+ 
+ 		cr18 = csi_read(csi_dev, CSI_CSICR18);
+-		cr18 &= BIT_MIPI_DATA_FORMAT_MASK;
++		cr18 &= ~BIT_MIPI_DATA_FORMAT_MASK;
+ 		cr18 |= BIT_DATA_FROM_MIPI;
+ 
+ 		switch (csi_dev->fmt->pixelformat) {
+@@ -1098,7 +1105,7 @@ static irqreturn_t mx6s_csi_irq_handler(int irq, void *data)
+ 
+ 	if (status & BIT_RFF_OR_INT) {
+ 		dev_warn(csi_dev->dev, "%s Rx fifo overflow\n", __func__);
+-		if (*csi_dev->rx_fifo_rst)
++		if (csi_dev->soc->rx_fifo_rst)
+ 			csi_error_recovery(csi_dev);
+ 	}
+ 
+@@ -1875,7 +1882,7 @@ static int mx6s_csi_probe(struct platform_device *pdev)
+ 	of_id = of_match_node(mx6s_csi_dt_ids, csi_dev->dev->of_node);
+ 	if (!of_id)
+ 		return -EINVAL;
+-	csi_dev->rx_fifo_rst = of_id->data;
++	csi_dev->soc = of_id->data;
+ 
+ 	snprintf(csi_dev->v4l2_dev.name,
+ 		 sizeof(csi_dev->v4l2_dev.name), "CSI");
+@@ -1975,15 +1982,28 @@ static int mx6s_csi_runtime_resume(struct device *dev)
+ 	SET_RUNTIME_PM_OPS(mx6s_csi_runtime_suspend, mx6s_csi_runtime_resume, NULL)
+ };
+ 
+-static const u8 mx6s_fifo_rst = true;
+-static const u8 mx6sl_fifo_rst = false;
++static const struct mx6s_csi_soc mx6s_soc = {
++	.rx_fifo_rst = true,
++	.baseaddr_switch = 0,
++};
++static const struct mx6s_csi_soc mx6sl_soc = {
++	.rx_fifo_rst = false,
++	.baseaddr_switch = 0,
++};
++static const struct mx6s_csi_soc mx8mq_soc = {
++	.rx_fifo_rst = true,
++	.baseaddr_switch = 0x80030,
++};
+ 
+ static const struct of_device_id mx6s_csi_dt_ids[] = {
+ 	{ .compatible = "fsl,imx6s-csi",
+-	  .data = &mx6s_fifo_rst,
++	  .data = &mx6s_soc,
+ 	},
+ 	{ .compatible = "fsl,imx6sl-csi",
+-	  .data = &mx6sl_fifo_rst,
++	  .data = &mx6sl_soc,
++	},
++	{ .compatible = "fsl,imx8mq-csi",
++	  .data = &mx8mq_soc,
+ 	},
+ 	{ /* sentinel */ }
+ };
+-- 
+1.7.9.5
+

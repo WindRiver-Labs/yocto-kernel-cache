@@ -1,0 +1,174 @@
+From ac1dedfa1977939e09fbbff5648e2cc0028abf44 Mon Sep 17 00:00:00 2001
+From: Dong Aisheng <aisheng.dong@nxp.com>
+Date: Thu, 7 Dec 2017 20:23:53 +0800
+Subject: [PATCH 3047/5242] MLK-17124 imx8: pm-domains: fix clock rate may
+ lost due to domain off during probe phase
+
+commit  6ba15ead04f3d63d7a15cf1008bd97351196c598 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+With current design, there may be a clock state issue lost due to driver
+probe fail and power domain go to OFF. Then the next driver probe using the
+same domain and clocks may fail because the kernel already caches the last clk
+settings, the next retry will return directly. As a result, driver may believe
+the the clk setting is passed but actually no in HW. So a state mismatach
+happenes between SW and HW.
+
+This is actually a nature limitation with current design as there's no state
+alignment mechanism between clk SW status and HW status. Power Domain and CLK
+subsystem are two separate subsystems in current kernel design, re-architecure
+the kernel power domain and clk probably is the best way to handle this issue.
+
+However, this patch implements a quick workaround to trap the possible state
+lost case and give the driver one more chance to re-set the clk when power
+domain is enabled. This can tempororily fix this issue although may be not
+be so good from architecture point of view.
+
+One note is that as a parent clk rate restore will cause the clk recalc
+to all possible child clks which may result in child clk previous state lost
+due to power domain lost before,  we have to first walk through all child clks
+to retrieve the state via clk_hw_get_rate which bypassed the clk recalc,
+then we can restore them one by one.
+
+Signed-off-by: Dong Aisheng <aisheng.dong@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/soc/imx/pm-domain-imx8.h |    4 ++
+ drivers/soc/imx/pm-domains.c     |   90 ++++++++++++++++++++++++++++++--------
+ 2 files changed, 76 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/soc/imx/pm-domain-imx8.h b/drivers/soc/imx/pm-domain-imx8.h
+index bbda879..58b5328 100644
+--- a/drivers/soc/imx/pm-domain-imx8.h
++++ b/drivers/soc/imx/pm-domain-imx8.h
+@@ -39,6 +39,10 @@ struct imx8_pm_domain {
+ 	sc_rsrc_t rsrc_id;
+ 	bool runtime_idle_active;
+ 	struct list_head clks;
++
++	/* indicate the possible clk state lost */
++	bool clk_state_saved;
++	bool clk_state_may_lost;
+ };
+ 
+ static inline
+diff --git a/drivers/soc/imx/pm-domains.c b/drivers/soc/imx/pm-domains.c
+index cb4d414..2361150 100644
+--- a/drivers/soc/imx/pm-domains.c
++++ b/drivers/soc/imx/pm-domains.c
+@@ -52,6 +52,11 @@ enum imx_pd_state {
+ 	PD_OFF,
+ };
+ 
++struct clk_stat {
++	struct clk *clk;
++	unsigned long rate;
++};
++
+ static int imx8_pd_power(struct generic_pm_domain *domain, bool power_on)
+ {
+ 	struct imx8_pm_domain *pd;
+@@ -92,26 +97,67 @@ static int imx8_pd_power_on(struct generic_pm_domain *domain)
+ 	ret = imx8_pd_power(domain, true);
+ 
+ 	if (!list_empty(&pd->clks) && (pd->pd.state_idx == PD_OFF)) {
+-		/*
+-		 * The SS is powered on restore the clock rates that
+-		 * may be lost.
+-		 */
+-		list_for_each_entry(imx8_rsrc_clk, &pd->clks, node) {
+ 
+-			if (imx8_rsrc_clk->parent)
+-				clk_set_parent(imx8_rsrc_clk->clk,
+-					imx8_rsrc_clk->parent);
+-
+-			if (imx8_rsrc_clk->rate) {
+-				/*
+-				 * Need to read the clock so that rate in
+-				 * Linux is reset.
+-				 */
+-				clk_get_rate(imx8_rsrc_clk->clk);
+-				/* Restore the clock rate. */
+-				clk_set_rate(imx8_rsrc_clk->clk,
+-					imx8_rsrc_clk->rate);
++		if (pd->clk_state_saved) {
++			/*
++			 * The SS is powered on restore the clock rates that
++			 * may be lost.
++			 */
++			list_for_each_entry(imx8_rsrc_clk, &pd->clks, node) {
++
++				if (imx8_rsrc_clk->parent)
++					clk_set_parent(imx8_rsrc_clk->clk,
++						imx8_rsrc_clk->parent);
++
++				if (imx8_rsrc_clk->rate) {
++					/*
++					 * Need to read the clock so that rate in
++					 * Linux is reset.
++					 */
++					clk_get_rate(imx8_rsrc_clk->clk);
++					/* Restore the clock rate. */
++					clk_set_rate(imx8_rsrc_clk->clk,
++						imx8_rsrc_clk->rate);
++				}
++			}
++		} else if (pd->clk_state_may_lost) {
++			struct clk_stat *clk_stats;
++			int count = 0;
++			int i = 0;
++			/*
++			 * The SS is powered down before without saving clk rates,
++			 * try to restore the lost clock rates if any
++			 *
++			 * As a parent clk rate restore will cause the clk recalc
++			 * to all possible child clks which may result in child clk
++			 * previous state lost due to power domain lost before,  we
++			 * have to first walk through all child clks to retrieve the
++			 * state via clk_hw_get_rate which bypassed the clk recalc,
++			 * then we can restore them one by one.
++			 */
++			list_for_each_entry(imx8_rsrc_clk, &pd->clks, node)
++				count++;
++
++			clk_stats = kzalloc(count * sizeof(*clk_stats), GFP_KERNEL);
++			if (!clk_stats) {
++				pr_warn("%s: failed to alloc mem for clk state recovery\n", pd->name);
++				return -ENOMEM;
+ 			}
++
++			list_for_each_entry(imx8_rsrc_clk, &pd->clks, node) {
++				clk_stats[i].clk = imx8_rsrc_clk->clk;
++				clk_stats[i].rate = clk_hw_get_rate(__clk_get_hw(imx8_rsrc_clk->clk));
++				i++;
++			}
++
++			for (i = 0; i <= count; i++) {
++				/* invalid cached rate first by get rate once */
++				clk_get_rate(clk_stats[i].clk);
++				/* restore the lost rate */
++				clk_set_rate(clk_stats[i].clk, clk_stats[i].rate);
++			}
++
++			kfree(clk_stats);
+ 		}
+ 	}
+ 
+@@ -134,6 +180,14 @@ static int imx8_pd_power_off(struct generic_pm_domain *domain)
+ 			imx8_rsrc_clk->parent = clk_get_parent(imx8_rsrc_clk->clk);
+ 			imx8_rsrc_clk->rate = clk_hw_get_rate(__clk_get_hw(imx8_rsrc_clk->clk));
+ 		}
++		pd->clk_state_saved = true;
++		pd->clk_state_may_lost = false;
++	} else if (pd->pd.state_idx == PD_OFF) {
++		pd->clk_state_saved = false;
++		pd->clk_state_may_lost = true;
++	} else {
++		pd->clk_state_saved = false;
++		pd->clk_state_may_lost = false;
+ 	}
+ 	return imx8_pd_power(domain, false);
+ }
+-- 
+1.7.9.5
+

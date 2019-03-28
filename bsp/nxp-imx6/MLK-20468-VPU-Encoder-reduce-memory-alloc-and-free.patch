@@ -1,0 +1,281 @@
+From 3b3b1bc3cf4173e23615053c8d043d8d32db9aa0 Mon Sep 17 00:00:00 2001
+From: ming_qian <ming.qian@nxp.com>
+Date: Tue, 27 Nov 2018 13:55:45 +0800
+Subject: [PATCH 5204/5242] MLK-20468:VPU Encoder:reduce memory alloc and free
+
+commit  b2fde8a468ab9f2a36596fce04047ab7fcdb727c from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Signed-off-by: ming_qian <ming.qian@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c     |  120 +++++++++++++++++++----
+ drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.h     |    2 +
+ drivers/mxc/vpu-encoder-b0/vpu_encoder_config.h |    1 +
+ 3 files changed, 105 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c b/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c
+index 7fe9931..08c3d4b 100644
+--- a/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c
++++ b/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c
+@@ -63,6 +63,7 @@ struct vpu_frame_info {
+ 	bool eos;
+ 	bool is_start;
+ 	unsigned long index;
++	struct queue_data *queue;
+ };
+ 
+ unsigned int vpu_dbg_level_encoder = LVL_WARN;
+@@ -2089,6 +2090,82 @@ static int precheck_frame(struct vpu_ctx *ctx, struct vpu_frame_info *frame)
+ 	return 0;
+ }
+ 
++static int inc_frame(struct queue_data *queue)
++{
++	struct vpu_frame_info *frame = NULL;
++
++	if (!queue)
++		return -EINVAL;
++
++	frame = vzalloc(sizeof(*frame));
++	if (!frame)
++		return -EINVAL;
++
++	frame->queue = queue;
++	list_add_tail(&frame->list, &queue->frame_idle);
++	atomic64_inc(&queue->frame_count);
++
++	vpu_dbg(LVL_DEBUG, "++ frame : %ld\n",
++			atomic64_read(&queue->frame_count));
++
++	return 0;
++}
++
++static void dec_frame(struct vpu_frame_info *frame)
++{
++	if (!frame)
++		return;
++	list_del_init(&frame->list);
++	if (frame->queue) {
++		atomic64_dec(&frame->queue->frame_count);
++
++		vpu_dbg(LVL_DEBUG, "-- frame : %ld\n",
++				atomic64_read(&frame->queue->frame_count));
++	}
++	vfree(frame);
++}
++
++static struct vpu_frame_info *get_idle_frame(struct queue_data *queue)
++{
++	struct vpu_frame_info *frame = NULL;
++
++	if (!queue)
++		return NULL;
++
++	if (list_empty(&queue->frame_idle))
++		inc_frame(queue);
++	frame = list_first_entry(&queue->frame_idle,
++				struct vpu_frame_info, list);
++	if (frame)
++		list_del_init(&frame->list);
++
++	return frame;
++}
++
++static void put_frame_idle(struct vpu_frame_info *frame)
++{
++	struct queue_data *queue;
++
++	if (!frame)
++		return;
++
++	list_del_init(&frame->list);
++	memset(&frame->info, 0, sizeof(frame->info));
++	frame->bytesleft = 0;
++	frame->wptr = 0;
++	frame->rptr = 0;
++	frame->start = 0;
++	frame->end = 0;
++	frame->eos = false;
++	frame->is_start = false;
++	frame->index = 0;
++	queue = frame->queue;
++	if (queue && atomic64_read(&queue->frame_count) <= FRAME_COUNT_THD)
++		list_add_tail(&frame->list, &queue->frame_idle);
++	else
++		dec_frame(frame);
++}
++
+ static bool process_frame_done(struct queue_data *queue)
+ {
+ 	struct vpu_ctx *ctx;
+@@ -2109,8 +2186,7 @@ static bool process_frame_done(struct queue_data *queue)
+ 	frame->rptr = get_ptr(stream_buffer_desc->rptr);
+ 
+ 	if (precheck_frame(ctx, frame)) {
+-		list_del(&frame->list);
+-		vfree(frame);
++		put_frame_idle(frame);
+ 		frame = NULL;
+ 		return true;
+ 	}
+@@ -2127,8 +2203,7 @@ static bool process_frame_done(struct queue_data *queue)
+ 
+ 	stream_buffer_desc->rptr = frame->rptr;
+ 	if (frame && !frame->bytesleft) {
+-		list_del(&frame->list);
+-		vfree(frame);
++		put_frame_idle(frame);
+ 		frame = NULL;
+ 	}
+ 	list_del(&p_data_req->list);
+@@ -2229,6 +2304,7 @@ static int handle_event_mem_request(struct vpu_ctx *ctx,
+ static int handle_event_frame_done(struct vpu_ctx *ctx,
+ 				MEDIAIP_ENC_PIC_INFO *pEncPicInfo)
+ {
++	struct queue_data *queue;
+ 	struct vpu_frame_info *frame;
+ 
+ 	if (!ctx || !pEncPicInfo)
+@@ -2237,6 +2313,7 @@ static int handle_event_frame_done(struct vpu_ctx *ctx,
+ 	vpu_dbg(LVL_DEBUG, "pEncPicInfo->uPicEncodDone=%d\n",
+ 			pEncPicInfo->uPicEncodDone);
+ 
++	queue = &ctx->q_data[V4L2_DST];
+ 	if (!pEncPicInfo->uPicEncodDone) {
+ 		vpu_err("Pic Encoder Not Done\n");
+ 		return -EINVAL;
+@@ -2245,9 +2322,10 @@ static int handle_event_frame_done(struct vpu_ctx *ctx,
+ 	show_enc_pic_info(pEncPicInfo);
+ 
+ 	record_start_time(ctx, V4L2_DST);
+-	frame = vmalloc(sizeof(*frame));
++
++	down(&queue->drv_q_lock);
++	frame = get_idle_frame(queue);
+ 	if (frame) {
+-		struct queue_data *queue = &ctx->q_data[V4L2_DST];
+ 		pBUFFER_DESCRIPTOR_TYPE stream_buffer_desc;
+ 		struct vpu_attr *attr = get_vpu_ctx_attr(ctx);
+ 
+@@ -2263,12 +2341,11 @@ static int handle_event_frame_done(struct vpu_ctx *ctx,
+ 		if (attr)
+ 			frame->index = attr->statistic.encoded_count;
+ 
+-		down(&queue->drv_q_lock);
+ 		list_add_tail(&frame->list, &queue->frame_q);
+-		up(&queue->drv_q_lock);
+ 	} else {
+ 		vpu_err("fail to alloc memory for frame info\n");
+ 	}
++	up(&queue->drv_q_lock);
+ 	count_encoded_frame(ctx);
+ 
+ 	/* Sync the write pointer to the local view of it */
+@@ -2296,28 +2373,26 @@ static int handle_event_frame_release(struct vpu_ctx *ctx, u_int32 *uFrameID)
+ 
+ static int handle_event_stop_done(struct vpu_ctx *ctx)
+ {
++	struct queue_data *queue;
+ 	struct vpu_frame_info *frame;
+ 
+ 	WARN_ON(!ctx);
++	queue = &ctx->q_data[V4L2_DST];
+ 
+ 	disable_fps_sts(get_vpu_ctx_attr(ctx));
+ 
+ 	set_bit(VPU_ENC_STATUS_STOP_DONE, &ctx->status);
+ 	notify_eos(ctx);
+ 
+-	frame = vmalloc(sizeof(*frame));
++	down(&queue->drv_q_lock);
++	frame = get_idle_frame(queue);
+ 	if (frame) {
+-		struct queue_data *queue = &ctx->q_data[V4L2_DST];
+-
+-		memset(frame, 0, sizeof(*frame));
+ 		frame->eos = true;
+-
+-		down(&queue->drv_q_lock);
+ 		list_add_tail(&frame->list, &queue->frame_q);
+-		up(&queue->drv_q_lock);
+ 	} else {
+ 		vpu_err("fail to alloc memory for last frame\n");
+ 	}
++	up(&queue->drv_q_lock);
+ 
+ 	process_stream_output(ctx);
+ 
+@@ -2723,11 +2798,13 @@ static void clear_queue(struct queue_data *queue)
+ 	down(&queue->drv_q_lock);
+ 
+ 	list_for_each_entry_safe(frame, tmp, &queue->frame_q, list) {
+-		vpu_dbg(LVL_DEBUG, "drop frame\n");
+-		list_del(&frame->list);
+-		vfree(frame);
++		vpu_dbg(LVL_INFO, "drop frame\n");
++		put_frame_idle(frame);
+ 	}
+ 
++	list_for_each_entry_safe(frame, tmp, &queue->frame_idle, list)
++		dec_frame(frame);
++
+ 	list_for_each_entry_safe(p_data_req, p_temp, &queue->drv_q, list) {
+ 		vpu_dbg(LVL_DEBUG, "%s(%d) - list_del(%p)\n", __func__,
+ 				p_data_req->id, p_data_req);
+@@ -2740,6 +2817,7 @@ static void clear_queue(struct queue_data *queue)
+ 
+ 	INIT_LIST_HEAD(&queue->drv_q);
+ 	INIT_LIST_HEAD(&queue->frame_q);
++	INIT_LIST_HEAD(&queue->frame_idle);
+ 
+ 	up(&queue->drv_q_lock);
+ }
+@@ -2864,6 +2942,8 @@ static void init_vb2_queue(struct queue_data *This, unsigned int type,
+ 	// initialze driver queue
+ 	INIT_LIST_HEAD(&This->drv_q);
+ 	INIT_LIST_HEAD(&This->frame_q);
++	INIT_LIST_HEAD(&This->frame_idle);
++	atomic64_set(&This->frame_count, 0);
+ 	// initialize vb2 queue
+ 	vb2_q->type = type;
+ 	vb2_q->io_modes = VB2_MMAP | VB2_USERPTR | VB2_DMABUF;
+@@ -3505,6 +3585,10 @@ static ssize_t show_instance_info(struct device *dev,
+ 	mutex_lock(&vpudev->dev_mutex);
+ 	ctx = get_vpu_attr_ctx(vpu_attr);
+ 	if (ctx) {
++		num += snprintf(buf + num, PAGE_SIZE - num,
++			"\ttotal frame obj count     :%ld\n",
++			atomic64_read(&ctx->q_data[V4L2_DST].frame_count));
++
+ 		if (test_bit(VPU_ENC_STATUS_HANG, &ctx->status))
+ 			num += snprintf(buf + num, PAGE_SIZE - num, "<hang>\n");
+ 	} else {
+diff --git a/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.h b/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.h
+index f414f28..652339b 100644
+--- a/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.h
++++ b/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.h
+@@ -200,6 +200,8 @@ struct queue_data {
+ 	struct vpu_v4l2_fmt *current_fmt;
+ 	unsigned long rw_flag;
+ 	struct list_head frame_q;
++	atomic64_t frame_count;
++	struct list_head frame_idle;
+ 	struct vpu_ctx *ctx;
+ };
+ 
+diff --git a/drivers/mxc/vpu-encoder-b0/vpu_encoder_config.h b/drivers/mxc/vpu-encoder-b0/vpu_encoder_config.h
+index 3be36b1..0086349 100644
+--- a/drivers/mxc/vpu-encoder-b0/vpu_encoder_config.h
++++ b/drivers/mxc/vpu-encoder-b0/vpu_encoder_config.h
+@@ -33,6 +33,7 @@
+ 
+ #define MSG_DATA_DEFAULT_SIZE		256
+ #define MSG_COUNT_THD			16
++#define FRAME_COUNT_THD			16
+ 
+ #define VPU_WATCHDOG_INTERVAL_MS	1000
+ #define VPU_ENC_HANG_THD		15
+-- 
+1.7.9.5
+

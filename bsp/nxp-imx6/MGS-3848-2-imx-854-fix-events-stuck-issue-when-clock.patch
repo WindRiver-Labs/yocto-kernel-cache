@@ -1,0 +1,194 @@
+From f29f7c40f056354b36b07f8fc53cac568cf2705c Mon Sep 17 00:00:00 2001
+From: Xianzhong <xianzhong.li@nxp.com>
+Date: Thu, 26 Apr 2018 03:56:08 +0800
+Subject: [PATCH 3627/5242] MGS-3848-2 [#imx-854] fix events stuck issue when
+ clock off
+
+commit  d7cdf2060342d172ee299f408889c2fb8496dac3 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+When pm (SetPowerManagementState) is running power ON to
+SUSPEND_BROADCAST, it only checks wait-link FE, but not Async FE. Clock
+can be off when read AsyncFE Acknowledge register and other.
+
+	pm thread:
+	    ...
+	    check commit atom ok
+	    >> check idle OK
+	    (former stopIsr before cl144673 is here)
+	    set GPU clock off
+	    ...
+
+	isr:
+	    gcmkONERROR(ReadRegister(AQ_INTR_ACKNOWLEDGE_Address));
+	    gckEVENT_Interrupt
+	    >>> here, at this point, all interrupt comes, check idle in
+	    >>> pm thread can pass.
+	    gcmkONERROR(ReadRegister(AQ_INTR_ACKNOWLEDGE_EX_Address));
+	    gckFE_UpdateAvaiable -> ReadRegister(GCREG_FE_ASYNC_STATUS_Address)
+
+If gcmkONERROR(ReadRegister(AQ_INTR_ACKNOWLEDGE_EX_Address))
+fail of clock off, then gckHARDWARE_Interrupt fails. In isrRoutine, it
+won't wake up threadRoutine. Then it's stuck!
+ReadRegister(GCREG_FE_ASYNC_STATUS_Address) failure can cause
+unexpected behavior, too.
+
+Former stopIsr (free_irq, before cl144673) can remove isr before
+GPU clock off. So the issue is hidden.
+
+To fix:
+1. We should return success when either FE or AsyncFE reports
+correct interrupts, so that isr can wake up threadRoutine for either FE.
+That means, only need return ERROR when both FEs reports ERROR.
+2. Add check for status of
+ReadRegister(GCREG_FE_ASYNC_STATUS_Address).
+
+Fix bug #19216, #19230.
+
+merged BUG#19216 BUG#19230 CL152073 add missing part for CL151955
+
+Signed-off-by: Xianzhong <xianzhong.li@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../hal/kernel/arch/gc_hal_kernel_hardware.c       |   84 ++++++++++++++------
+ 1 file changed, 59 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+index eea18c5..be8ca1c 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+@@ -4418,12 +4418,20 @@
+     gctUINT32 data = 0;
+     gctUINT32 dataEx;
+     gceSTATUS status;
++    gceSTATUS statusEx;
+ 
+     /* Extract gckEVENT object. */
+     eventObj = Hardware->kernel->eventObj;
+ 
+     if (InterruptValid)
+     {
++        /*
++         * Notice:
++         * In isr here.
++         * We should return success when either FE or AsyncFE reports correct
++         * interrupts, so that isr can wake up threadRoutine for either FE.
++         * That means, only need return ERROR when both FEs reports ERROR.
++         */
+         /* Read AQIntrAcknowledge register. */
+         gcmkONERROR(
+             gckOS_ReadRegisterEx(Hardware->os,
+@@ -4438,37 +4446,59 @@
+         }
+         else
+         {
+-
+ #if gcdINTERRUPT_STATISTIC
+             gckOS_AtomClearMask(Hardware->pendingEvent, data);
+ #endif
+-
+             /* Inform gckEVENT of the interrupt. */
+             status = gckEVENT_Interrupt(eventObj, data);
+         }
+ 
+-        if (Hardware->hasAsyncFe)
++        if (!Hardware->hasAsyncFe)
+         {
+-            /* Read BLT interrupt. */
+-            gcmkONERROR(gckOS_ReadRegisterEx(
+-                Hardware->os,
+-                Hardware->core,
+-                0x000D4,
+-                &dataEx
+-                ));
++            /* Done. */
++            goto OnError;
++        }
+ 
+-            /* this bit looks useless now, we can use this check if this interrupt is from FE */
+-            dataEx &= ~0x80000000;
++        /* Read BLT interrupt. */
++        statusEx = gckOS_ReadRegisterEx(
++            Hardware->os,
++            Hardware->core,
++            0x000D4,
++            &dataEx
++            );
+ 
+-            /* Descriptor fetched, update counter.
+-               We can't do this at dataEx != 0 only, as read HW acknowledge register will overwrite
+-               0x007E4. At one interrupt we don't read it, we will miss it.
+-            */
+-            gckFE_UpdateAvaiable(Hardware, &Hardware->kernel->asyncCommand->fe);
++        if (gcmIS_ERROR(statusEx))
++        {
++            /*
++             * Do not overwrite status here, so that former status from
++             * AQIntrAck is returned.
++             */
++            goto OnError;
++        }
++
++        /*
++         * This bit looks useless now, we can use this check if this interrupt
++         * is from FE.
++         */
++        dataEx &= ~0x80000000;
+ 
+-            if (dataEx)
++        /*
++         * Descriptor fetched, update counter.
++         * We can't do this at dataEx != 0 only, because read HW acknowledge
++         * register will overwrite 0x007E4. If one
++         * interrupt we don't read it, we will miss it for ever.
++         */
++        gckFE_UpdateAvaiable(Hardware, &Hardware->kernel->asyncCommand->fe);
++
++        /* Do not need report NOT_OUT_INTERRUPT error if dataEx is 0. */
++        if (dataEx)
++        {
++            statusEx = gckEVENT_Interrupt(Hardware->kernel->asyncEvent, dataEx);
++
++            if (gcmIS_SUCCESS(statusEx))
+             {
+-                status = gckEVENT_Interrupt(Hardware->kernel->asyncEvent, dataEx);
++                /* At least AsyncFE is success, treat all as success. */
++                status = gcvSTATUS_OK;
+             }
+         }
+     }
+@@ -12322,21 +12352,25 @@
+     OUT gckFE FE
+     )
+ {
++    gceSTATUS status;
+     gctUINT32 data;
+     gctINT32 oldValue;
+ 
+-    gcmkVERIFY_OK(gckOS_ReadRegisterEx(
++    status = gckOS_ReadRegisterEx(
+         Hardware->os,
+         Hardware->core,
+         0x007E4,
+         &data
+-        ));
+-
+-    data = (((((gctUINT32) (data)) >> (0 ? 6:0)) & ((gctUINT32) ((((1 ? 6:0) - (0 ? 6:0) + 1) == 32) ? ~0U : (~(~0U << ((1 ? 6:0) - (0 ? 6:0) + 1)))))) );
++        );
+ 
+-    while (data--)
++    if (gcmIS_SUCCESS(status))
+     {
+-        gckOS_AtomIncrement(Hardware->os, FE->freeDscriptors, &oldValue);
++        data = (((((gctUINT32) (data)) >> (0 ? 6:0)) & ((gctUINT32) ((((1 ? 6:0) - (0 ? 6:0) + 1) == 32) ? ~0U : (~(~0U << ((1 ? 6:0) - (0 ? 6:0) + 1)))))) );
++
++        while (data--)
++        {
++            gckOS_AtomIncrement(Hardware->os, FE->freeDscriptors, &oldValue);
++        }
+     }
+ }
+ 
+-- 
+1.7.9.5
+

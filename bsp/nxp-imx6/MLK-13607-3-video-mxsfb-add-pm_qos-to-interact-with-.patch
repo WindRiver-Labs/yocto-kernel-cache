@@ -1,0 +1,157 @@
+From d5f5a849d03121dfcdc67b4da4ae56c2b39b1898 Mon Sep 17 00:00:00 2001
+From: Fancy Fang <chen.fang@nxp.com>
+Date: Thu, 8 Dec 2016 16:15:45 +0800
+Subject: [PATCH 1371/5242] MLK-13607-3 video: mxsfb: add pm_qos to interact
+ with cpuidle
+
+commit  60ea409846e205b29d846eb2036378262acf9ace from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+In imx7ulp board, it doesn't support busfreq but pm_qos to
+interact with cpuidle.
+
+Signed-off-by: Fancy Fang <chen.fang@nxp.com>
+(cherry picked from commit d33f95300aae724fc0f0bbff5444f24022f7a38c)
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/video/fbdev/mxsfb.c |   50 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/video/fbdev/mxsfb.c b/drivers/video/fbdev/mxsfb.c
+index 533612f..fca1d46 100644
+--- a/drivers/video/fbdev/mxsfb.c
++++ b/drivers/video/fbdev/mxsfb.c
+@@ -45,6 +45,7 @@
+ #include <linux/kernel.h>
+ #include <linux/of_device.h>
+ #include <linux/of_gpio.h>
++#include <linux/pm_qos.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/interrupt.h>
+@@ -185,6 +186,7 @@
+ enum mxsfb_devtype {
+ 	MXSFB_V3,
+ 	MXSFB_V4,
++	MXSFB_V5,
+ };
+ 
+ /* CPU dependent register offsets */
+@@ -196,6 +198,7 @@ struct mxsfb_devdata {
+ 	unsigned hs_wdth_mask;
+ 	unsigned hs_wdth_shift;
+ 	unsigned ipversion;
++	u32 flags;
+ };
+ 
+ struct mxsfb_info {
+@@ -223,10 +226,16 @@ struct mxsfb_info {
+ 	struct mxc_dispdrv_handle *dispdrv;
+ 	int id;
+ 	struct fb_var_screeninfo var;
++	struct pm_qos_request pm_qos_req;
+ };
+ 
+ #define mxsfb_is_v3(host) (host->devdata->ipversion == 3)
+ #define mxsfb_is_v4(host) (host->devdata->ipversion == 4)
++#define mxsfb_is_v5(host) (host->devdata->ipversion == 5)
++
++#define MXSFB_FLAG_NULL		0x0
++#define MXSFB_FLAG_BUSFREQ	0x1
++#define MXSFB_FLAG_PMQOS	0x2
+ 
+ static const struct mxsfb_devdata mxsfb_devdata[] = {
+ 	[MXSFB_V3] = {
+@@ -237,6 +246,7 @@ struct mxsfb_info {
+ 		.hs_wdth_mask = 0xff,
+ 		.hs_wdth_shift = 24,
+ 		.ipversion = 3,
++		.flags = MXSFB_FLAG_NULL,
+ 	},
+ 	[MXSFB_V4] = {
+ 		.transfer_count = LCDC_V4_TRANSFER_COUNT,
+@@ -246,6 +256,17 @@ struct mxsfb_info {
+ 		.hs_wdth_mask = 0x3fff,
+ 		.hs_wdth_shift = 18,
+ 		.ipversion = 4,
++		.flags = MXSFB_FLAG_BUSFREQ,
++	},
++	[MXSFB_V5] = {
++		.transfer_count = LCDC_V4_TRANSFER_COUNT,
++		.cur_buf = LCDC_V4_CUR_BUF,
++		.next_buf = LCDC_V4_NEXT_BUF,
++		.debug0 = LCDC_V4_DEBUG0,
++		.hs_wdth_mask = 0x3fff,
++		.hs_wdth_shift = 18,
++		.ipversion = 4,
++		.flags = MXSFB_FLAG_PMQOS,
+ 	},
+ };
+ 
+@@ -1353,6 +1374,9 @@ static int mxsfb_unmap_videomem(struct fb_info *fbi)
+ 		.name = "imx28-fb",
+ 		.driver_data = MXSFB_V4,
+ 	}, {
++		.name = "imx7ulp-fb",
++		.driver_data = MXSFB_V5,
++	}, {
+ 		/* sentinel */
+ 	}
+ };
+@@ -1361,7 +1385,7 @@ static int mxsfb_unmap_videomem(struct fb_info *fbi)
+ static const struct of_device_id mxsfb_dt_ids[] = {
+ 	{ .compatible = "fsl,imx23-lcdif", .data = &mxsfb_devtype[0], },
+ 	{ .compatible = "fsl,imx28-lcdif", .data = &mxsfb_devtype[1], },
+-	{ .compatible = "fsl,imx7ulp-lcdif", .data = &mxsfb_devtype[1], },
++	{ .compatible = "fsl,imx7ulp-lcdif", .data = &mxsfb_devtype[2], },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, mxsfb_dt_ids);
+@@ -1526,6 +1550,9 @@ static int mxsfb_remove(struct platform_device *pdev)
+ 	if (host->enabled)
+ 		mxsfb_disable_controller(fb_info);
+ 
++	if (host->devdata->flags & MXSFB_FLAG_PMQOS)
++		pm_qos_remove_request(&host->pm_qos_req);
++
+ 	pm_runtime_disable(&host->pdev->dev);
+ 	unregister_framebuffer(fb_info);
+ 	mxsfb_free_videomem(fb_info);
+@@ -1556,7 +1583,15 @@ static void mxsfb_shutdown(struct platform_device *pdev)
+ #ifdef CONFIG_PM
+ static int mxsfb_runtime_suspend(struct device *dev)
+ {
+-	release_bus_freq(BUS_FREQ_HIGH);
++	struct fb_info *fb_info = dev_get_drvdata(dev);
++	struct mxsfb_info *host = fb_info->par;
++
++	if (host->devdata->flags & MXSFB_FLAG_BUSFREQ)
++		release_bus_freq(BUS_FREQ_HIGH);
++
++	if (host->devdata->flags & MXSFB_FLAG_PMQOS)
++		pm_qos_remove_request(&host->pm_qos_req);
++
+ 	dev_dbg(dev, "mxsfb busfreq high release.\n");
+ 
+ 	return 0;
+@@ -1564,7 +1599,16 @@ static int mxsfb_runtime_suspend(struct device *dev)
+ 
+ static int mxsfb_runtime_resume(struct device *dev)
+ {
+-	request_bus_freq(BUS_FREQ_HIGH);
++	struct fb_info *fb_info = dev_get_drvdata(dev);
++	struct mxsfb_info *host = fb_info->par;
++
++	if (host->devdata->flags & MXSFB_FLAG_BUSFREQ)
++		request_bus_freq(BUS_FREQ_HIGH);
++
++	if (host->devdata->flags & MXSFB_FLAG_PMQOS)
++		pm_qos_add_request(&host->pm_qos_req,
++			PM_QOS_CPU_DMA_LATENCY, 0);
++
+ 	dev_dbg(dev, "mxsfb busfreq high request.\n");
+ 
+ 	return 0;
+-- 
+1.7.9.5
+

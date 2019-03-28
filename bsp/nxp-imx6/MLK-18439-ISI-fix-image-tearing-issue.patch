@@ -1,0 +1,418 @@
+From 31dd885720fa429adf3a9e926312e0f194f7dd2a Mon Sep 17 00:00:00 2001
+From: "Guoniu.Zhou" <guoniu.zhou@nxp.com>
+Date: Mon, 16 Jul 2018 09:03:19 +0800
+Subject: [PATCH 4360/5242] MLK-18439: ISI: fix image tearing issue
+
+commit  c81771665a5ca751c1f129cf06dbb906fed10767 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+When there is no free buffer in driver as isi output, isi
+will still write buffer which has been dequeue to userspace
+and the buffer maybe is being scanning out by DC. So add a
+temporary buffer as its output when the case happen
+
+Signed-off-by: Guoniu.Zhou <guoniu.zhou@nxp.com>
+Reviewed-by: Robby.Cai <robby.cai@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/mxc-isi-cap.c  |  146 ++++++++++++++++++++--------
+ drivers/media/platform/imx8/mxc-isi-core.h |   10 +-
+ drivers/media/platform/imx8/mxc-isi-hw.c   |   40 +++++---
+ 3 files changed, 140 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/media/platform/imx8/mxc-isi-cap.c b/drivers/media/platform/imx8/mxc-isi-cap.c
+index 4556bcf..b09c56b 100644
+--- a/drivers/media/platform/imx8/mxc-isi-cap.c
++++ b/drivers/media/platform/imx8/mxc-isi-cap.c
+@@ -267,31 +267,52 @@ void mxc_isi_frame_write_done(struct mxc_isi_dev *mxc_isi)
+ 	struct mxc_isi_buffer *buf;
+ 	struct vb2_buffer *vb2;
+ 
+-	/* Retrun if no pending buffer */
+-	if (!list_empty(&mxc_isi->isi_cap.out_active)) {
++	if (list_empty(&mxc_isi->isi_cap.out_active)) {
++		dev_warn(&mxc_isi->pdev->dev,
++				"%s trying to access empty active list\n", __func__);
++		return;
++	}
+ 
+-		buf = list_first_entry(&mxc_isi->isi_cap.out_active,
+-					struct mxc_isi_buffer, list);
++	buf = list_first_entry(&mxc_isi->isi_cap.out_active,
++				struct mxc_isi_buffer, list);
+ 
+-		list_del(&buf->list);
++	if (buf->discard) {
++		list_move_tail(mxc_isi->isi_cap.out_active.next,
++					&mxc_isi->isi_cap.out_discard);
++	} else {
++		vb2 = &buf->v4l2_buf.vb2_buf;
++		list_del_init(&buf->list);
+ 		buf->v4l2_buf.vb2_buf.timestamp = ktime_get_ns();
+-		buf->v4l2_buf.sequence = mxc_isi->isi_cap.frame_count++;
+ 		vb2_buffer_done(&buf->v4l2_buf.vb2_buf, VB2_BUF_STATE_DONE);
+ 	}
+ 
+-	if (!list_empty(&mxc_isi->isi_cap.out_pending)) {
++	mxc_isi->isi_cap.frame_count++;
+ 
+-		/* ISI channel output buffer */
+-		buf = list_first_entry(&mxc_isi->isi_cap.out_pending,
+-						struct mxc_isi_buffer, list);
+-		list_del(&buf->list);
++	if (list_empty(&mxc_isi->isi_cap.out_pending)) {
++		if (list_empty(&mxc_isi->isi_cap.out_discard)) {
++			dev_warn(&mxc_isi->pdev->dev,
++					"%s: trying to access empty discard list\n", __func__);
++			return;
++		}
+ 
++		buf = list_first_entry(&mxc_isi->isi_cap.out_discard,
++					struct mxc_isi_buffer, list);
+ 		buf->v4l2_buf.sequence = mxc_isi->isi_cap.frame_count;
+ 		mxc_isi_channel_set_outbuf(mxc_isi, buf);
+-		vb2 = &buf->v4l2_buf.vb2_buf;
+-		vb2->state = VB2_BUF_STATE_ACTIVE;
+-		list_add_tail(&buf->list, &mxc_isi->isi_cap.out_active);
++		list_move_tail(mxc_isi->isi_cap.out_discard.next,
++					&mxc_isi->isi_cap.out_active);
++		return;
+ 	}
++
++	/* ISI channel output buffer */
++	buf = list_first_entry(&mxc_isi->isi_cap.out_pending,
++					struct mxc_isi_buffer, list);
++
++	buf->v4l2_buf.sequence = mxc_isi->isi_cap.frame_count;
++	mxc_isi_channel_set_outbuf(mxc_isi, buf);
++	vb2 = &buf->v4l2_buf.vb2_buf;
++	vb2->state = VB2_BUF_STATE_ACTIVE;
++	list_move_tail(mxc_isi->isi_cap.out_pending.next, &mxc_isi->isi_cap.out_active);
+ }
+ 
+ static int cap_vb2_queue_setup(struct vb2_queue *q,
+@@ -375,48 +396,84 @@ static void cap_vb2_buffer_queue(struct vb2_buffer *vb2)
+ 	spin_unlock_irqrestore(&mxc_isi->slock, flags);
+ }
+ 
+-
+ static int cap_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
+ {
+ 	struct mxc_isi_dev *mxc_isi = q->drv_priv;
+ 	struct mxc_isi_buffer *buf;
+ 	struct vb2_buffer *vb2;
+ 	unsigned long flags;
++	int i, j;
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s\n", __func__);
+ 
++	if (count < 2)
++		return -ENOBUFS;
++
++	/* Create a buffer for discard operation */
++	for (i = 0; i < mxc_isi->pix.num_planes; i++) {
++		mxc_isi->discard_size[i] = mxc_isi->isi_cap.dst_f.sizeimage[i];
++		mxc_isi->discard_buffer[i] = dma_alloc_coherent(&mxc_isi->pdev->dev,
++					PAGE_ALIGN(mxc_isi->discard_size[i]),
++					&mxc_isi->discard_buffer_dma[i], GFP_DMA | GFP_KERNEL);
++		if (!mxc_isi->discard_buffer[i]) {
++			for (j = 0; j < i; j++) {
++				dma_free_coherent(&mxc_isi->pdev->dev,
++							mxc_isi->discard_size[j],
++							mxc_isi->discard_buffer[j],
++							mxc_isi->discard_buffer_dma[j]);
++				dev_err(&mxc_isi->pdev->dev, "%s: alloc dma buffer_%d fail\n",
++							__func__, j);
++			}
++			return -ENOMEM;
++		}
++		dev_dbg(&mxc_isi->pdev->dev,
++				"%s: num_plane=%d discard_size=%d discard_buffer=%p\n"
++				, __func__, i,
++				(int)mxc_isi->discard_size[i],
++				mxc_isi->discard_buffer[i]);
++	}
++
+ 	spin_lock_irqsave(&mxc_isi->slock, flags);
+ 
+-	mxc_isi->isi_cap.frame_count = 0;
++	/* add two list member to out_discard list head */
++	mxc_isi->buf_discard[0].discard = true;
++	list_add_tail(&mxc_isi->buf_discard[0].list, &mxc_isi->isi_cap.out_discard);
++
++	mxc_isi->buf_discard[1].discard = true;
++	list_add_tail(&mxc_isi->buf_discard[1].list, &mxc_isi->isi_cap.out_discard);
++
+ 
+ 	/* ISI channel output buffer 1 */
+-	buf = list_first_entry(&mxc_isi->isi_cap.out_pending,
++	buf = list_first_entry(&mxc_isi->isi_cap.out_discard,
+ 					struct mxc_isi_buffer, list);
+ 	buf->v4l2_buf.sequence = 0;
+-	mxc_isi_channel_set_outbuf(mxc_isi, buf);
+ 	vb2 = &buf->v4l2_buf.vb2_buf;
+ 	vb2->state = VB2_BUF_STATE_ACTIVE;
+-	list_move_tail(mxc_isi->isi_cap.out_pending.next, &mxc_isi->isi_cap.out_active);
++	mxc_isi_channel_set_outbuf(mxc_isi, buf);
++	list_move_tail(mxc_isi->isi_cap.out_discard.next, &mxc_isi->isi_cap.out_active);
+ 
+ 	/* ISI channel output buffer 2 */
+ 	buf = list_first_entry(&mxc_isi->isi_cap.out_pending,
+ 					struct mxc_isi_buffer, list);
+ 	buf->v4l2_buf.sequence = 1;
+-	mxc_isi_channel_set_outbuf(mxc_isi, buf);
+ 	vb2 = &buf->v4l2_buf.vb2_buf;
+ 	vb2->state = VB2_BUF_STATE_ACTIVE;
++	mxc_isi_channel_set_outbuf(mxc_isi, buf);
+ 	list_move_tail(mxc_isi->isi_cap.out_pending.next, &mxc_isi->isi_cap.out_active);
++
++	/* Clear frame count */
++	mxc_isi->isi_cap.frame_count = 1;
+ 	spin_unlock_irqrestore(&mxc_isi->slock, flags);
+ 
+ 	return 0;
+ }
+ 
+-
+ static void cap_vb2_stop_streaming(struct vb2_queue *q)
+ {
+ 	struct mxc_isi_dev *mxc_isi = q->drv_priv;
+ 	struct mxc_isi_buffer *buf, *tmp;
+ 	unsigned long flags;
++	int i;
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s\n", __func__);
+ 
+@@ -428,6 +485,9 @@ static void cap_vb2_stop_streaming(struct vb2_queue *q)
+ 		buf = list_entry(mxc_isi->isi_cap.out_active.next, struct mxc_isi_buffer, list);
+ 
+ 		list_del(&buf->list);
++		if (buf->discard)
++			continue;
++
+ 		vb2_buffer_done(&buf->v4l2_buf.vb2_buf, VB2_BUF_STATE_ERROR);
+ 	}
+ 
+@@ -438,6 +498,11 @@ static void cap_vb2_stop_streaming(struct vb2_queue *q)
+ 		vb2_buffer_done(&buf->v4l2_buf.vb2_buf, VB2_BUF_STATE_ERROR);
+ 	}
+ 
++	while (!list_empty(&mxc_isi->isi_cap.out_discard)) {
++		buf = list_entry(mxc_isi->isi_cap.out_discard.next, struct mxc_isi_buffer, list);
++		list_del(&buf->list);
++	}
++
+ 	list_for_each_entry_safe(buf, tmp,
+ 				&mxc_isi->isi_cap.out_active, list) {
+ 		list_del(&buf->list);
+@@ -452,8 +517,15 @@ static void cap_vb2_stop_streaming(struct vb2_queue *q)
+ 
+ 	INIT_LIST_HEAD(&mxc_isi->isi_cap.out_active);
+ 	INIT_LIST_HEAD(&mxc_isi->isi_cap.out_pending);
++	INIT_LIST_HEAD(&mxc_isi->isi_cap.out_discard);
+ 
+ 	spin_unlock_irqrestore(&mxc_isi->slock, flags);
++
++	for (i = 0; i < mxc_isi->pix.num_planes; i++)
++		dma_free_coherent(&mxc_isi->pdev->dev,
++					mxc_isi->discard_size[i],
++					mxc_isi->discard_buffer[i],
++					mxc_isi->discard_buffer_dma[i]);
+ }
+ 
+ static struct vb2_ops mxc_cap_vb2_qops = {
+@@ -732,6 +804,7 @@ static int mxc_isi_cap_g_fmt_mplane(struct file *file, void *fh,
+ 		pix->plane_fmt[i].bytesperline = dst_f->bytesperline[i];
+ 		pix->plane_fmt[i].sizeimage = dst_f->sizeimage[i];
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -757,8 +830,8 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ 	}
+ 
+ 	if (pix->width <= 0 || pix->height <= 0) {
+-		v4l2_err(mxc_isi->v4l2_dev, "%s, width %d, height %d is not valid\n",
+-				__func__, pix->width, pix->height);
++		v4l2_err(mxc_isi->v4l2_dev, "%s, width %d, height %d is not valid\n"
++				, __func__, pix->width, pix->height);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -878,6 +951,8 @@ static int mxc_isi_cap_s_fmt_mplane(struct file *file, void *priv,
+ 		dst_f->sizeimage[0] = dst_f->height * dst_f->bytesperline[0];
+ 	}
+ 
++	memcpy(&mxc_isi->pix, pix, sizeof(*pix));
++
+ 	set_frame_bounds(dst_f, pix->width, pix->height);
+ 
+ 	mxc_isi_source_fmt_init(mxc_isi);
+@@ -897,15 +972,9 @@ static int mxc_isi_cap_streamon(struct file *file, void *priv,
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s\n", __func__);
+ 
+-	if (mxc_isi->interface[IN_PORT] == ISI_INPUT_INTERFACE_HDMI) {
+-		mxc_isi_channel_enable(mxc_isi);
+-		ret = vb2_ioctl_streamon(file, priv, type);
+-		mxc_isi_pipeline_enable(mxc_isi, 1);
+-	} else {
+-		mxc_isi_pipeline_enable(mxc_isi, 1);
+-		ret = vb2_ioctl_streamon(file, priv, type);
+-		mxc_isi_channel_enable(mxc_isi);
+-	}
++	mxc_isi_channel_enable(mxc_isi);
++	ret = vb2_ioctl_streamon(file, priv, type);
++	mxc_isi_pipeline_enable(mxc_isi, 1);
+ 
+ 	return ret;
+ }
+@@ -918,15 +987,9 @@ static int mxc_isi_cap_streamoff(struct file *file, void *priv,
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s\n", __func__);
+ 
+-	if (mxc_isi->interface[IN_PORT] == ISI_INPUT_INTERFACE_HDMI) {
+-		mxc_isi_channel_disable(mxc_isi);
+-		ret = vb2_ioctl_streamoff(file, priv, type);
+-		mxc_isi_pipeline_enable(mxc_isi, 0);
+-	} else {
+-		mxc_isi_pipeline_enable(mxc_isi, 0);
+-		ret = vb2_ioctl_streamoff(file, priv, type);
+-		mxc_isi_channel_disable(mxc_isi);
+-	}
++	mxc_isi_channel_disable(mxc_isi);
++	ret = vb2_ioctl_streamoff(file, priv, type);
++	mxc_isi_pipeline_enable(mxc_isi, 0);
+ 
+ 	return ret;
+ }
+@@ -1515,6 +1578,7 @@ static int mxc_isi_register_cap_device(struct mxc_isi_dev *mxc_isi,
+ 
+ 	INIT_LIST_HEAD(&mxc_isi->isi_cap.out_pending);
+ 	INIT_LIST_HEAD(&mxc_isi->isi_cap.out_active);
++	INIT_LIST_HEAD(&mxc_isi->isi_cap.out_discard);
+ 
+ 	memset(q, 0, sizeof(*q));
+ 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+diff --git a/drivers/media/platform/imx8/mxc-isi-core.h b/drivers/media/platform/imx8/mxc-isi-core.h
+index ebb1e09..bae5c24 100644
+--- a/drivers/media/platform/imx8/mxc-isi-core.h
++++ b/drivers/media/platform/imx8/mxc-isi-core.h
+@@ -225,6 +225,7 @@ struct mxc_isi_buffer {
+ 	struct vb2_v4l2_buffer v4l2_buf;
+ 	struct list_head	list;
+ 	struct frame_addr	paddr;
++	bool discard;
+ };
+ 
+ struct mxc_isi_m2m_dev {
+@@ -245,13 +246,13 @@ struct mxc_isi_cap_dev {
+ 	struct vb2_queue		vb2_q;
+ 	struct list_head		out_pending;
+ 	struct list_head		out_active;
++	struct list_head		out_discard;
+ 
+ 	struct mxc_isi_frame	src_f;
+ 	struct mxc_isi_frame	dst_f;
+ 	u32						frame_count;
+ 
+ 	u32 buf_index;
+-
+ };
+ 
+ struct mxc_isi_dev {
+@@ -292,6 +293,13 @@ struct mxc_isi_dev {
+ 	struct mxc_isi_ctrls ctrls;
+ 	u8			alpha;		/* goable alpha */
+ 	struct mxc_isi_roi_alpha alpha_roi[5];		/* ROI alpha */
++
++	struct v4l2_pix_format_mplane pix;
++
++	size_t discard_size[MXC_MAX_PLANES];
++	void *discard_buffer[MXC_MAX_PLANES];
++	dma_addr_t discard_buffer_dma[MXC_MAX_PLANES];
++	struct mxc_isi_buffer buf_discard[2];
+ };
+ 
+ static inline void set_frame_bounds(struct mxc_isi_frame *f, u32 width, u32 height)
+diff --git a/drivers/media/platform/imx8/mxc-isi-hw.c b/drivers/media/platform/imx8/mxc-isi-hw.c
+index 1875077..b4064a6 100644
+--- a/drivers/media/platform/imx8/mxc-isi-hw.c
++++ b/drivers/media/platform/imx8/mxc-isi-hw.c
+@@ -108,31 +108,42 @@ void mxc_isi_channel_set_outbuf(struct mxc_isi_dev *mxc_isi, struct mxc_isi_buff
+ {
+ 	struct vb2_buffer *vb2_buf = &buf->v4l2_buf.vb2_buf;
+ 	struct frame_addr *paddr = &buf->paddr;
++	struct v4l2_pix_format_mplane *pix = &mxc_isi->pix;
+ 	u32 framecount = buf->v4l2_buf.sequence;
+ 	int val = 0;
+ 
+-	paddr->y = vb2_dma_contig_plane_dma_addr(vb2_buf, 0);
++	if (buf->discard) {
++		paddr->y = mxc_isi->discard_buffer_dma[0];
++		if (pix->num_planes == 2)
++			paddr->cb = mxc_isi->discard_buffer_dma[1];
++		if (pix->num_planes == 3) {
++			paddr->cb = mxc_isi->discard_buffer_dma[1];
++			paddr->cr = mxc_isi->discard_buffer_dma[2];
++		}
++	} else {
++		paddr->y = vb2_dma_contig_plane_dma_addr(vb2_buf, 0);
+ 
+-	if (vb2_buf->num_planes == 2)
+-		paddr->cb = vb2_dma_contig_plane_dma_addr(vb2_buf, 1);
+-	if (vb2_buf->num_planes == 3) {
+-		paddr->cb = vb2_dma_contig_plane_dma_addr(vb2_buf, 1);
+-		paddr->cr = vb2_dma_contig_plane_dma_addr(vb2_buf, 2);
++		if (vb2_buf->num_planes == 2)
++			paddr->cb = vb2_dma_contig_plane_dma_addr(vb2_buf, 1);
++		if (vb2_buf->num_planes == 3) {
++			paddr->cb = vb2_dma_contig_plane_dma_addr(vb2_buf, 1);
++			paddr->cr = vb2_dma_contig_plane_dma_addr(vb2_buf, 2);
++		}
+ 	}
+ 
+ 	val = readl(mxc_isi->regs + CHNL_OUT_BUF_CTRL);
+-	if (framecount % 2 == 1) {
+-		writel(paddr->y, mxc_isi->regs + CHNL_OUT_BUF2_ADDR_Y);
+-		writel(paddr->cb, mxc_isi->regs + CHNL_OUT_BUF2_ADDR_U);
+-		writel(paddr->cr, mxc_isi->regs + CHNL_OUT_BUF2_ADDR_V);
+-		val ^= CHNL_OUT_BUF_CTRL_LOAD_BUF2_ADDR_MASK;
+-	} else {
++	if (framecount % 2 == 0) {
+ 		writel(paddr->y, mxc_isi->regs + CHNL_OUT_BUF1_ADDR_Y);
+ 		writel(paddr->cb, mxc_isi->regs + CHNL_OUT_BUF1_ADDR_U);
+ 		writel(paddr->cr, mxc_isi->regs + CHNL_OUT_BUF1_ADDR_V);
+ 		val ^= CHNL_OUT_BUF_CTRL_LOAD_BUF1_ADDR_MASK;
++	} else if (framecount % 2 == 1) {
++		writel(paddr->y, mxc_isi->regs + CHNL_OUT_BUF2_ADDR_Y);
++		writel(paddr->cb, mxc_isi->regs + CHNL_OUT_BUF2_ADDR_U);
++		writel(paddr->cr, mxc_isi->regs + CHNL_OUT_BUF2_ADDR_V);
++		val ^= CHNL_OUT_BUF_CTRL_LOAD_BUF2_ADDR_MASK;
+ 	}
+-	writel(val,	mxc_isi->regs + CHNL_OUT_BUF_CTRL);
++	writel(val, mxc_isi->regs + CHNL_OUT_BUF_CTRL);
+ }
+ 
+ void mxc_isi_channel_hw_reset(struct mxc_isi_dev *mxc_isi)
+@@ -543,6 +554,7 @@ void mxc_isi_channel_enable(struct mxc_isi_dev *mxc_isi)
+ 	val |= 0xff << CHNL_CTRL_BLANK_PXL_OFFSET;
+ 	writel(val, mxc_isi->regs + CHNL_CTRL);
+ 
++	mxc_isi_clean_irq_status(mxc_isi, 0);
+ 	mxc_isi_enable_irq(mxc_isi);
+ 	msleep(300);
+ 	dump_isi_regs(mxc_isi);
+@@ -585,7 +597,7 @@ void  mxc_isi_enable_irq(struct mxc_isi_dev *mxc_isi)
+ 
+ void mxc_isi_disable_irq(struct mxc_isi_dev *mxc_isi)
+ {
+-	writel(0, mxc_isi->regs + CHNL_CTRL);
++	writel(0, mxc_isi->regs + CHNL_IER);
+ }
+ 
+ u32 mxc_isi_get_irq_status(struct mxc_isi_dev *mxc_isi)
+-- 
+1.7.9.5
+

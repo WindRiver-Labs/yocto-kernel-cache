@@ -1,0 +1,591 @@
+From fce2a83117969dda61b41eecab2b9b97acbd8a98 Mon Sep 17 00:00:00 2001
+From: Huang Chaofan <chaofan.huang@nxp.com>
+Date: Wed, 18 Jul 2018 10:39:48 +0800
+Subject: [PATCH 4294/5242] MLK-18954 VPU: Add support for H263 and VC1
+
+commit  ca9d18147737ce913a17815ce4b58b48046ea273 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add support for VC1 by adding start code and adjust transfer format for
+H263
+
+Signed-off-by: Huang Chaofan <chaofan.huang@nxp.com>
+(cherry picked from commit 5bf003ce4fda812286eb9dc2f365e2608bfd5bad)
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/mxc/vpu-decoder-b0/Makefile           |    3 +-
+ drivers/mxc/vpu-decoder-b0/insert_startcode.c |  267 +++++++++++++++++++++++++
+ drivers/mxc/vpu-decoder-b0/insert_startcode.h |   39 ++++
+ drivers/mxc/vpu-decoder-b0/vpu_b0.c           |   69 ++++---
+ drivers/mxc/vpu-decoder-b0/vpu_b0.h           |   18 +-
+ drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c   |    2 +-
+ 6 files changed, 359 insertions(+), 39 deletions(-)
+ create mode 100644 drivers/mxc/vpu-decoder-b0/insert_startcode.c
+ create mode 100644 drivers/mxc/vpu-decoder-b0/insert_startcode.h
+
+diff --git a/drivers/mxc/vpu-decoder-b0/Makefile b/drivers/mxc/vpu-decoder-b0/Makefile
+index f0de329..fc4c91a 100644
+--- a/drivers/mxc/vpu-decoder-b0/Makefile
++++ b/drivers/mxc/vpu-decoder-b0/Makefile
+@@ -8,7 +8,8 @@ EXTRA_CFLAGS += $(DEFINES)
+ 
+ obj-y = vpu-decoder.o
+ vpu-decoder-objs = vpu_b0.o \
+-	vpu_rpc.o
++	vpu_rpc.o \
++	insert_startcode.o
+ 
+ clean:
+ 	rm -rf $(vpu-decoder-objs)
+diff --git a/drivers/mxc/vpu-decoder-b0/insert_startcode.c b/drivers/mxc/vpu-decoder-b0/insert_startcode.c
+new file mode 100644
+index 0000000..a5f9b5b
+--- /dev/null
++++ b/drivers/mxc/vpu-decoder-b0/insert_startcode.c
+@@ -0,0 +1,267 @@
++/*
++ * Copyright 2018 NXP
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file insert_startcode.c
++ *
++ * copyright here may be changed later
++ *
++ *
++ */
++#include "insert_startcode.h"
++// Global VC1 ID and version
++u_int32 uVC1CodecID = 0x10; // Simple = 0x10, Main = 0x11
++u_int32 uVC1VersionID = 1;
++
++static int insert_RCV_seqhdr(unsigned char *pHeader, u_int32 *pHeaderLen, unsigned char *src,
++		u_int32 nFrameSize, u_int32 nWidth, u_int32 nHeight, int *pNoError)
++{
++	int nHeaderLen;
++
++	unsigned int nValue;
++	unsigned int HdrExtDataLen;
++	int i = 0;
++	int profile;
++
++	nHeaderLen = RCV_HEADER_LEN;
++
++	//Number of Frames, Header Extension Bit, Codec Version
++	nValue = RCV_NUM_FRAMES | RCV_SET_HDR_EXT | RCV_CODEC_VERSION;
++	pHeader[i++] = (unsigned char)nValue;
++	pHeader[i++] = (unsigned char)(nValue >> 8);
++	pHeader[i++] = (unsigned char)(nValue >> 16);
++#if 0 //1 ???
++	pHeader[i++] = 0xC5;
++#else
++	pHeader[i++] = (unsigned char)(nValue >> 24);
++#endif
++
++	//Header Extension Size
++	//ASF Parser gives 5 bytes whereas the VPU expects only 4 bytes, so limiting it
++	HdrExtDataLen = 4;
++	pHeader[i++] = (unsigned char)HdrExtDataLen;
++	pHeader[i++] = (unsigned char)(HdrExtDataLen >> 8);
++	pHeader[i++] = (unsigned char)(HdrExtDataLen >> 16);
++	pHeader[i++] = (unsigned char)(HdrExtDataLen >> 24);
++
++	profile = (*src)>>4;
++	if ((profile != 0) && (profile != 4) && (profile != 12)) {
++		//it is reasonable to return error immediately since only one sequence header inserted in whole rcv clip
++		*pNoError = 0;
++	}
++	memcpy(pHeader+i, src, HdrExtDataLen);
++	i += HdrExtDataLen;
++
++	//Height
++	pHeader[i++] = (unsigned char)nHeight;
++	pHeader[i++] = (unsigned char)(((nHeight >> 8) & 0xff));
++	pHeader[i++] = (unsigned char)(((nHeight >> 16) & 0xff));
++	pHeader[i++] = (unsigned char)(((nHeight >> 24) & 0xff));
++	//Width
++	pHeader[i++] = (unsigned char)nWidth;
++	pHeader[i++] = (unsigned char)(((nWidth >> 8) & 0xff));
++	pHeader[i++] = (unsigned char)(((nWidth >> 16) & 0xff));
++	pHeader[i++] = (unsigned char)(((nWidth >> 24) & 0xff));
++
++	//Frame Size
++	pHeader[i++] = (unsigned char)nFrameSize;
++	pHeader[i++] = (unsigned char)(nFrameSize >> 8);
++	pHeader[i++] = (unsigned char)(nFrameSize >> 16);
++#if 0	//1 ???
++	pHeader[i++] = (unsigned char)((nFrameSize >> 24));
++#else
++	pHeader[i++] = (unsigned char)((nFrameSize >> 24) | 0x80);
++#endif
++
++	*pHeaderLen = nHeaderLen;
++
++	return 1;
++}
++
++static int insert_RCV_pichdr(unsigned char *pHeader, int *pHeaderLen, unsigned int nInSize)
++{
++	pHeader[0] = (unsigned char)nInSize;
++	pHeader[1] = (unsigned char)(nInSize >> 8);
++	pHeader[2] = (unsigned char)(nInSize >> 16);
++	pHeader[3] = (unsigned char)(nInSize >> 24);
++	*pHeaderLen = 4;
++
++	return 1;
++}
++
++/*
++ * Byte 0-3: Startcode
++ * Byte 4:   Payload length bits[23:16]
++ * Byte 5:   Payload length bits[15:8]
++ * Byte 6:   0x4e
++ * Byte 7:   Payload length bits[7:0]
++ * Byte 8:   Codec ID			Non-zero
++ * Byte 9:   Codec Version ID		Non-zero
++ * Byte 10:  Picture Width bits[15:8]
++ * Byte 11:  Picture Width bits[7:0]
++ * Byte 12:  0x58
++ * Byte 13:  Picture Height bits[15:8]
++ * Byte 14:  Picture Height bits[7:0]
++ * Byte 15:  0x50
++ */
++
++static void insert_payload_header_vc1(u_int8 *dst, u_int32 uScodeType, u_int32 uPayloadSize, u_int32 uWidth, u_int32 uHeight)
++{
++	// Startcode
++	dst[0] = 0x00;
++	dst[1] = 0x00;
++	dst[2] = 0x01;
++	dst[3] = uScodeType;
++
++	// Length
++	dst[4] = ((uPayloadSize>>16)&0xff);
++	dst[5] = ((uPayloadSize>>8)&0xff);
++	dst[6] = 0x4e;
++	dst[7] = ((uPayloadSize>>0)&0xff);
++
++	// Codec ID and Version
++	dst[8] = uVC1CodecID;
++	dst[9] = uVC1VersionID;
++
++	// Width
++	dst[10] = ((uWidth>>8)&0xff);
++	dst[11] = ((uWidth>>0)&0xff);
++	dst[12] = 0x58;
++
++	// Height
++	dst[13] = ((uHeight>>8)&0xff);
++	dst[14] = ((uHeight>>0)&0xff);
++	dst[15] = 0x50;
++}
++
++static int VC1CreateNALSeqHeader(unsigned char *pHeader, int *pHeaderLen,
++		unsigned char *pCodecPri, int nCodecSize, unsigned int *pData, int nMaxHeader)
++{
++	int nHeaderLen;
++	unsigned char temp[4] = {0x00, 0x00, 0x01, 0x0D};
++
++	nHeaderLen = nCodecSize - 1;
++	if ((4+nHeaderLen) > nMaxHeader) {
++		//for case: WVC1_stress_a0_stress06.wmv: header size is 176, In fact, it is also OK if we only copy 128 bytes
++		nHeaderLen = nMaxHeader - 4;
++		vpu_dbg(LVL_ERR, "error: header length %d overrun !!! \r\n", nCodecSize);
++	}
++	memcpy(pHeader, pCodecPri+1, nHeaderLen);
++
++	if (VC1_IS_NOT_NAL(pData[0])) {
++		//insert 0x0000010D at the end of header
++		memcpy(pHeader+nHeaderLen, temp, 4);
++		nHeaderLen += 4;
++	}
++
++	*pHeaderLen = nHeaderLen;
++
++	return 1;
++}
++
++static int VC1CreateNalFrameHeader(unsigned char *pHeader, int *pHeaderLen, unsigned int *pInData)
++{
++	unsigned int VC1Id;
++
++	VC1Id = *pInData;
++	if (VC1_IS_NOT_NAL(VC1Id)) {
++		//need insert header : special ID
++		pHeader[0] = 0x0;
++		pHeader[1] = 0x0;
++		pHeader[2] = 0x01;
++		pHeader[3] = 0x0D;
++		*pHeaderLen = 4;
++	} else {
++		//need not insert header
++		//do nothing
++		*pHeaderLen = 0;
++	}
++
++	return 1;
++}
++
++u_int32 insert_scode_4_seq(struct vpu_ctx *ctx, u_int8 *src, u_int8 *dst, u_int32 vdec_std, u_int32 uPayloadSize)
++{
++	struct queue_data *q_data = &ctx->q_data[V4L2_SRC];
++	u_int32 length = 0;
++
++	switch (vdec_std) {
++	case VPU_VIDEO_VC1: {
++		if (q_data->fourcc == V4L2_PIX_FMT_VC1_ANNEX_G) {
++			u_int8 Header[VC1_MAX_SEQ_HEADER_SIZE];
++			u_int32 uWidth = q_data->width;
++			u_int32 uHeight = q_data->height; //Width & Height in the generic payload header are ignored
++			u_int32 FrameSize = 0x60;
++			u_int32 HeaderLen, NoError = 1;
++			//insert startcode for vc1
++			insert_payload_header_vc1(dst, VC1_SCODE_NEW_SEQUENCE, 20, uWidth, uHeight);
++			length = 16;
++			//insert RCV sequence header for vc1 v1, length=20
++			insert_RCV_seqhdr(Header, &HeaderLen, src, FrameSize, uWidth, uHeight, &NoError);
++			HeaderLen = RCV_HEADER_LEN - 4;
++			memcpy(dst + 16, Header, HeaderLen);
++			length += HeaderLen;
++		} else {
++			u_int8 Header[VC1_MAX_SEQ_HEADER_SIZE];
++			u_int32 HeaderLen;
++
++			VC1CreateNALSeqHeader(Header, &HeaderLen, src, uPayloadSize,
++					(unsigned int *)src, VC1_MAX_SEQ_HEADER_SIZE);
++			if (VC1_IS_NOT_NAL(((unsigned int *)src)[0]))
++				HeaderLen -= 4;
++			memcpy(dst, Header, HeaderLen);
++			length += HeaderLen;
++		}
++	}
++	break;
++	default:
++	break;
++	}
++	return length;
++}
++
++u_int32 insert_scode_4_pic(struct vpu_ctx *ctx, u_int8 *dst, u_int8 *src, u_int32 vdec_std, u_int32 uPayloadSize)
++{
++	struct queue_data *q_data = &ctx->q_data[V4L2_SRC];
++	u_int32 length = 0;
++
++	switch (vdec_std) {
++	case VPU_VIDEO_VC1: {
++		if (q_data->fourcc == V4L2_PIX_FMT_VC1_ANNEX_G) {
++			u_int8 Header[VC1_MAX_FRM_HEADER_SIZE];
++			u_int32 HeaderLen;
++			u_int32 uWidth = q_data->width;
++			u_int32 uHeight = q_data->height; //Width & Height in the generic payload header are ignored
++
++			insert_payload_header_vc1(dst, VC1_SCODE_NEW_PICTURE, uPayloadSize + 4, uWidth, uHeight);
++			insert_RCV_pichdr(Header, &HeaderLen, uPayloadSize);
++			memcpy(dst+16, Header, 4);
++			length = 16 + 4;
++		} else {
++			u_int8 Header[VC1_MAX_FRM_HEADER_SIZE];
++			u_int32 HeaderLen;
++
++			VC1CreateNalFrameHeader(Header, (int *)(&HeaderLen), (unsigned int *)(src));
++			memcpy(dst, Header, HeaderLen);
++			length = HeaderLen;
++		}
++	}
++	break;
++	default:
++	break;
++	}
++	return length;
++}
++
++
++
+diff --git a/drivers/mxc/vpu-decoder-b0/insert_startcode.h b/drivers/mxc/vpu-decoder-b0/insert_startcode.h
+new file mode 100644
+index 0000000..5032a22
+--- /dev/null
++++ b/drivers/mxc/vpu-decoder-b0/insert_startcode.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright 2018 NXP
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++/*!
++ * @file insert_startcode.h
++ *
++ */
++#ifndef __INSERT_STARTCODE_H__
++#define __INSERT_STARTCODE_H__
++
++#include "vpu_b0.h"
++#include "mediasys_types.h"
++// Startcode insertion types for VC1
++#define VC1_SCODE_NEW_SEQUENCE 0x31
++#define VC1_SCODE_NEW_PICTURE 0x32
++#define VC1_SCODE_NEW_SLICE 0x33
++#define RCV_V2_FRAMESIZE_FLAGS (0xFF000000)
++#define RCV_HEADER_LEN          24
++#define RCV_CODEC_VERSION       (0x5 << 24) //FOURCC_WMV3_WMV
++#define RCV_NUM_FRAMES          0xFF
++#define RCV_SET_HDR_EXT     0x80000000
++#define VC1_IS_NOT_NAL(id)      ((id & 0x00FFFFFF) != 0x00010000)
++#define VC1_MAX_FRM_HEADER_SIZE 32
++#define VC1_MAX_SEQ_HEADER_SIZE 256
++
++u_int32 insert_scode_4_pic(struct vpu_ctx *ctx, u_int8 *dst, u_int8 *src, u_int32 vdec_std, u_int32 uPayloadSize);
++u_int32 insert_scode_4_seq(struct vpu_ctx *ctx, u_int8 *src, u_int8 *dst, u_int32 vdec_std, u_int32 uPayloadSize);
++
++#endif
+diff --git a/drivers/mxc/vpu-decoder-b0/vpu_b0.c b/drivers/mxc/vpu-decoder-b0/vpu_b0.c
+index d65760c..50fff8d 100755
+--- a/drivers/mxc/vpu-decoder-b0/vpu_b0.c
++++ b/drivers/mxc/vpu-decoder-b0/vpu_b0.c
+@@ -47,6 +47,7 @@
+ #include <media/videobuf2-dma-sg.h>
+ 
+ #include "vpu_b0.h"
++#include "insert_startcode.h"
+ 
+ unsigned int vpu_dbg_level_decoder = 1;
+ 
+@@ -271,16 +272,10 @@ static void vpu_log_shared_mem(struct vpu_ctx *ctx)
+ 		.vdec_std   = VPU_VIDEO_JPEG,
+ 	},
+ 	{
+-		.name       = "RV8 Encoded Stream",
+-		.fourcc     = VPU_PIX_FMT_RV8,
++		.name       = "RV Encoded Stream",
++		.fourcc     = VPU_PIX_FMT_RV,
+ 		.num_planes = 1,
+-		.vdec_std   = VPU_VIDEO_RV8,
+-	},
+-	{
+-		.name       = "RV9 Encoded Stream",
+-		.fourcc     = VPU_PIX_FMT_RV9,
+-		.num_planes = 1,
+-		.vdec_std   = VPU_VIDEO_RV9,
++		.vdec_std   = VPU_VIDEO_RV,
+ 	},
+ 	{
+ 		.name       = "VP6 Encoded Stream",
+@@ -289,12 +284,18 @@ static void vpu_log_shared_mem(struct vpu_ctx *ctx)
+ 		.vdec_std   = VPU_VIDEO_VP6,
+ 	},
+ 	{
+-		.name       = "VP6 SPK Encoded Stream",
++		.name       = "SPK Encoded Stream",
+ 		.fourcc     = VPU_PIX_FMT_SPK,
+ 		.num_planes = 1,
+ 		.vdec_std   = VPU_VIDEO_SPK,
+ 	},
+ 	{
++		.name       = "H263 Encoded Stream",
++		.fourcc     = V4L2_PIX_FMT_H263,
++		.num_planes = 1,
++		.vdec_std   = VPU_VIDEO_ASP,
++	},
++	{
+ 		.name       = "VP8 Encoded Stream",
+ 		.fourcc     = V4L2_PIX_FMT_VP8,
+ 		.num_planes = 1,
+@@ -313,12 +314,6 @@ static void vpu_log_shared_mem(struct vpu_ctx *ctx)
+ 		.vdec_std   = VPU_VIDEO_HEVC,
+ 	},
+ 	{
+-		.name       = "VP9 Encoded Stream",
+-		.fourcc     = VPU_PIX_FMT_VP9,
+-		.num_planes = 1,
+-		.vdec_std   = VPU_VIDEO_VP9,
+-	},
+-	{
+ 		.name       = "Logo",
+ 		.fourcc     = VPU_PIX_FMT_LOGO,
+ 		.num_planes = 1,
+@@ -1108,8 +1103,7 @@ static bool add_eos(struct vpu_ctx *ctx, u_int32 uStrBufIdx)
+ 	case VPU_VIDEO_SPK:
+ 	case VPU_VIDEO_VP6:
+ 	case VPU_VIDEO_VP8:
+-	case VPU_VIDEO_RV8:
+-	case VPU_VIDEO_RV9:
++	case VPU_VIDEO_RV:
+ 		last = 0x34010000;
+ 		break;
+ 	case VPU_VIDEO_JPEG:
+@@ -1209,11 +1203,7 @@ TB_API_DEC_FMT vpu_format_remap(uint32_t vdec_std)
+ 		malone_format = VSys_HevcFrmt;
+ 		vpu_dbg(LVL_INFO, "format translated to HEVC");
+ 		break;
+-	case VPU_VIDEO_RV8:
+-		malone_format = VSys_RvFrmt;
+-		vpu_dbg(LVL_INFO, "format translated to RV");
+-		break;
+-	case VPU_VIDEO_RV9:
++	case VPU_VIDEO_RV:
+ 		malone_format = VSys_RvFrmt;
+ 		vpu_dbg(LVL_INFO, "format translated to RV");
+ 		break;
+@@ -1240,6 +1230,7 @@ static void v4l2_vpu_send_cmd(struct vpu_ctx *ctx, uint32_t idx, uint32_t cmdid,
+ 	mb();
+ 	MU_SendMessage(ctx->dev->mu_base_virtaddr, 0, COMMAND);
+ }
++
+ static void transfer_buffer_to_firmware(struct vpu_ctx *ctx, void *input_buffer, uint32_t buffer_size, uint32_t vdec_std)
+ {
+ 	pSTREAM_BUFFER_DESCRIPTOR_TYPE pStrBufDesc;
+@@ -1248,19 +1239,26 @@ static void transfer_buffer_to_firmware(struct vpu_ctx *ctx, void *input_buffer,
+ 		&ctx->dev->shared_mem.pSharedInterface->UDataBuffer[ctx->str_index];
+ 	pDEC_RPC_HOST_IFACE pSharedInterface = ctx->dev->shared_mem.pSharedInterface;
+ 	unsigned int *CurrStrfg = &pSharedInterface->StreamConfig[ctx->str_index];
++	u_int32 length;
+ 
+ 	vpu_dbg(LVL_INFO, "enter %s, start_flag %d, index=%d, firmware_started=%d\n", __func__, ctx->start_flag, ctx->str_index, ctx->dev->firmware_started);
+ 
+ 	vpu_dbg(LVL_ALL, "firmware version is %d.%d.%d\n", (pSharedInterface->FWVersion & 0x00ff0000) >> 16, (pSharedInterface->FWVersion & 0x0000ff00) >> 8, pSharedInterface->FWVersion & 0x000000ff);
+ 
++
+ 	if (ctx->stream_buffer_size < buffer_size + MIN_SPACE)
+ 		vpu_dbg(LVL_INFO, "circular buffer size is too small\n");
+-	memcpy(ctx->stream_buffer_virt, input_buffer, buffer_size);
++	length = insert_scode_4_seq(ctx, input_buffer, ctx->stream_buffer_virt, vdec_std, buffer_size);
++	if (length == 0) {
++		memcpy(ctx->stream_buffer_virt + length, input_buffer, buffer_size);
++		length = buffer_size;
++	}
++//	memcpy(ctx->stream_buffer_virt + length, input_buffer, buffer_size);
+ 	vpu_dbg(LVL_INFO, "transfer data from virt 0x%p: size:%d\n", ctx->stream_buffer_virt, buffer_size);
+ 	mb();
+ 	pStrBufDesc = ctx->dev->regs_base + DEC_MFD_XREG_SLV_BASE + MFD_MCX + MFD_MCX_OFF * ctx->str_index;
+ 	// CAUTION: wptr must not be end
+-	pStrBufDesc->wptr = ctx->stream_buffer_phy + buffer_size - ctx->dev->cm_offset;
++	pStrBufDesc->wptr = ctx->stream_buffer_phy + length - ctx->dev->cm_offset;
+ 	pStrBufDesc->rptr = ctx->stream_buffer_phy - ctx->dev->cm_offset;
+ 	pStrBufDesc->start = ctx->stream_buffer_phy - ctx->dev->cm_offset;
+ 	pStrBufDesc->end = ctx->stream_buffer_phy + ctx->stream_buffer_size - ctx->dev->cm_offset;
+@@ -1308,6 +1306,8 @@ static int update_stream_addr(struct vpu_ctx *ctx, void *input_buffer, uint32_t
+ 	struct vpu_dev *dev = ctx->dev;
+ 	uint32_t index = ctx->str_index;
+ 	pSTREAM_BUFFER_DESCRIPTOR_TYPE pStrBufDesc;
++	struct queue_data *q_data = &ctx->q_data[V4L2_SRC];
++	u_int8 payload_header[256];
+ 	uint32_t nfreespace = 0;
+ 	uint32_t wptr;
+ 	uint32_t rptr;
+@@ -1315,6 +1315,7 @@ static int update_stream_addr(struct vpu_ctx *ctx, void *input_buffer, uint32_t
+ 	uint32_t end;
+ 	void *wptr_virt;
+ 	uint32_t ret = 1;
++	u_int32 length = 0;
+ 
+ 	vpu_dbg(LVL_INFO, "enter %s\n", __func__);
+ 
+@@ -1335,6 +1336,8 @@ static int update_stream_addr(struct vpu_ctx *ctx, void *input_buffer, uint32_t
+ 	end = pStrBufDesc->end;
+ 	wptr_virt = (void *)ctx->stream_buffer_virt + wptr - start;
+ 
++	length = insert_scode_4_pic(ctx, payload_header, input_buffer, q_data->vdec_std, buffer_size);
++
+ 	vpu_dbg(LVL_INFO, "update_stream_addr down\n");
+ 
+ 	if (wptr == rptr)
+@@ -1347,8 +1350,22 @@ static int update_stream_addr(struct vpu_ctx *ctx, void *input_buffer, uint32_t
+ 	if (nfreespace-buffer_size < MIN_SPACE)
+ 			return 0;
+ 
+-	if (nfreespace >= buffer_size) {
++	if (nfreespace >= buffer_size + length) {
+ 		if ((wptr == rptr) || (wptr > rptr)) {
++			if (end - wptr >= length) {
++				memcpy(wptr_virt, payload_header, length);
++				wptr += length;
++				wptr_virt += length;
++				if (wptr == end) {
++					wptr = start;
++					wptr_virt = (void *)ctx->stream_buffer_virt;
++				}
++			} else {
++				memcpy(wptr_virt, payload_header, end-wptr);
++				memcpy(ctx->stream_buffer_virt, payload_header + (end-wptr), length - (end-wptr));
++				wptr = start + length - (end-wptr);
++				wptr_virt = (void *)ctx->stream_buffer_virt + length - (end-wptr);
++			}
+ 			if (end - wptr >= buffer_size) {
+ 				memcpy(wptr_virt, input_buffer, buffer_size);
+ 				wptr += buffer_size;
+diff --git a/drivers/mxc/vpu-decoder-b0/vpu_b0.h b/drivers/mxc/vpu-decoder-b0/vpu_b0.h
+index 0c70758..0372960 100644
+--- a/drivers/mxc/vpu-decoder-b0/vpu_b0.h
++++ b/drivers/mxc/vpu-decoder-b0/vpu_b0.h
+@@ -101,24 +101,20 @@ enum vpu_video_standard {
+ 	VPU_VIDEO_AVS = 4,
+ 	VPU_VIDEO_ASP = 5,
+ 	VPU_VIDEO_JPEG = 6,
+-	VPU_VIDEO_RV8 = 7,
+-	VPU_VIDEO_RV9 = 8,
+-	VPU_VIDEO_VP6 = 9,
+-	VPU_VIDEO_SPK = 10,
+-	VPU_VIDEO_VP8 = 11,
+-	VPU_VIDEO_AVC_MVC = 12,
+-	VPU_VIDEO_HEVC = 13,
+-	VPU_VIDEO_VP9 = 14,
++	VPU_VIDEO_RV = 7,
++	VPU_VIDEO_VP6 = 8,
++	VPU_VIDEO_SPK = 9,
++	VPU_VIDEO_VP8 = 10,
++	VPU_VIDEO_AVC_MVC = 11,
++	VPU_VIDEO_HEVC = 12,
+ };
+ 
+ #define VPU_PIX_FMT_AVS         v4l2_fourcc('A', 'V', 'S', '0')
+ #define VPU_PIX_FMT_ASP         v4l2_fourcc('A', 'S', 'P', '0')
+-#define VPU_PIX_FMT_RV8         v4l2_fourcc('R', 'V', '8', '0')
+-#define VPU_PIX_FMT_RV9         v4l2_fourcc('R', 'V', '9', '0')
++#define VPU_PIX_FMT_RV          v4l2_fourcc('R', 'V', '0', '0')
+ #define VPU_PIX_FMT_VP6         v4l2_fourcc('V', 'P', '6', '0')
+ #define VPU_PIX_FMT_SPK         v4l2_fourcc('S', 'P', 'K', '0')
+ #define VPU_PIX_FMT_HEVC        v4l2_fourcc('H', 'E', 'V', 'C')
+-#define VPU_PIX_FMT_VP9         v4l2_fourcc('V', 'P', '9', '0')
+ #define VPU_PIX_FMT_LOGO        v4l2_fourcc('L', 'O', 'G', 'O')
+ 
+ #define VPU_PIX_FMT_TILED_8     v4l2_fourcc('Z', 'T', '0', '8')
+diff --git a/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c b/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c
+index c7d3724..30ca5ce 100644
+--- a/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c
++++ b/drivers/mxc/vpu-encoder-b0/vpu_encoder_b0.c
+@@ -156,6 +156,7 @@ static int v4l2_ioctl_enum_fmt_vid_cap_mplane(struct file *file,
+ 	fmt = &formats_compressed_enc[f->index];
+ 	strlcpy(f->description, fmt->name, sizeof(f->description));
+ 	f->pixelformat = fmt->fourcc;
++	f->flags |= V4L2_FMT_FLAG_COMPRESSED;
+ 	return 0;
+ }
+ static int v4l2_ioctl_enum_fmt_vid_out_mplane(struct file *file,
+@@ -173,7 +174,6 @@ static int v4l2_ioctl_enum_fmt_vid_out_mplane(struct file *file,
+ 	fmt = &formats_yuv_enc[f->index];
+ 	strlcpy(f->description, fmt->name, sizeof(f->description));
+ 	f->pixelformat = fmt->fourcc;
+-	f->flags |= V4L2_FMT_FLAG_COMPRESSED;
+ 	return 0;
+ }
+ 
+-- 
+1.7.9.5
+

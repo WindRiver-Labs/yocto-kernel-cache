@@ -1,0 +1,831 @@
+From 2a3b6754f75f12f884270de8d553298487716655 Mon Sep 17 00:00:00 2001
+From: "Guoniu.Zhou" <guoniu.zhou@nxp.com>
+Date: Mon, 5 Feb 2018 15:43:23 +0800
+Subject: [PATCH 3498/5242] MLK-17230-5: CI_PI: enable CI_PI SS
+
+commit  482758e51634fb13959b9b437d147cf139df8c35 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add driver for CI_PI controller.
+
+Reviewed-by: Sandor.Yu <sandor.yu@nxp.com>
+Signed-off-by: Guoniu.Zhou <guoniu.zhou@nxp.com>
+(cherry picked from commit 980ac5f965bd8e94cce8a8c3fa78b1062dbd1727)
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/Kconfig            |    4 +
+ drivers/media/platform/imx8/Makefile           |    1 +
+ drivers/media/platform/imx8/mxc-parallel-csi.c |  601 ++++++++++++++++++++++++
+ drivers/media/platform/imx8/mxc-parallel-csi.h |  165 +++++++
+ 4 files changed, 771 insertions(+)
+ create mode 100644 drivers/media/platform/imx8/mxc-parallel-csi.c
+ create mode 100644 drivers/media/platform/imx8/mxc-parallel-csi.h
+
+diff --git a/drivers/media/platform/imx8/Kconfig b/drivers/media/platform/imx8/Kconfig
+index 8e72d7d..7635df8 100644
+--- a/drivers/media/platform/imx8/Kconfig
++++ b/drivers/media/platform/imx8/Kconfig
+@@ -17,6 +17,10 @@ config IMX8_MIPI_CSI2
+ 	tristate "IMX8 MIPI CSI2 Controller"
+ 	default y
+ 
++config IMX8_PARALLEL_CSI
++	tristate "IMX8 PARALLEL CSI Controller"
++	default y
++
+ config IMX8_MIPI_CSI2_YAV
+ 	tristate "IMX8 MIPI CSI2 Controller Yet Another Version"
+ 	default y
+diff --git a/drivers/media/platform/imx8/Makefile b/drivers/media/platform/imx8/Makefile
+index c98d82d..6cd330c 100644
+--- a/drivers/media/platform/imx8/Makefile
++++ b/drivers/media/platform/imx8/Makefile
+@@ -2,6 +2,7 @@ mxc-capture-objs := mxc-isi-core.o mxc-isi-cap.o mxc-isi-hw.o
+ 
+ obj-$(CONFIG_IMX8_CAPTURE_DRIVER) += mxc-capture.o
+ obj-$(CONFIG_IMX8_MIPI_CSI2) += mxc-mipi-csi2.o
++obj-$(CONFIG_IMX8_PARALLEL_CSI) += mxc-parallel-csi.o
+ obj-$(CONFIG_IMX8_MIPI_CSI2_YAV) += mxc-mipi-csi2_yav.o
+ max9286_gmsl-objs := max9286.o
+ obj-$(CONFIG_GMSL_MAX9286) += max9286_gmsl.o
+diff --git a/drivers/media/platform/imx8/mxc-parallel-csi.c b/drivers/media/platform/imx8/mxc-parallel-csi.c
+new file mode 100644
+index 0000000..c6d5ddb
+--- /dev/null
++++ b/drivers/media/platform/imx8/mxc-parallel-csi.c
+@@ -0,0 +1,601 @@
++/*
++ * Copyright 2018 NXP
++ */
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++#define DEBUG
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/kernel.h>
++#include <linux/memory.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_graph.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/videodev2.h>
++#include <media/v4l2-fwnode.h>
++#include <media/v4l2-subdev.h>
++#include <media/v4l2-device.h>
++#include <soc/imx8/sc/sci.h>
++#include <dt-bindings/pinctrl/pads-imx8qxp.h>
++#include <linux/init.h>
++
++#include "mxc-parallel-csi.h"
++
++static int debug;
++module_param(debug, int, 0644);
++MODULE_PARM_DESC(debug, "Debug level (0-2)");
++
++static int format;
++module_param(format, int, 0644);
++MODULE_PARM_DESC(format, "Format level (0-2)");
++
++#ifdef DEBUG
++static void mxc_pcsi_regs_dump(struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct device *dev = &pcsidev->pdev->dev;
++
++	dev_dbg(dev, "HW_IF_CTRL_REG = 0x%08x\n",
++		readl(pcsidev->csr_regs + IF_CTRL_REG));
++	dev_dbg(dev, "HW_CSI_CTRL_REG = 0x%08x\n",
++		readl(pcsidev->csr_regs + CSI_CTRL_REG));
++	dev_dbg(dev, "HW_CSI_STATUS = 0x%08x\n",
++		readl(pcsidev->csr_regs + CSI_STATUS));
++	dev_dbg(dev, "HW_CSI_CTRL_REG1 = 0x%08x\n",
++		readl(pcsidev->csr_regs + CSI_CTRL_REG1));
++}
++#else
++static void mxc_pcsi_regs_dump(struct mxc_parallel_csi_dev *pcsidev) { }
++#endif
++
++static struct mxc_parallel_csi_dev *sd_to_mxc_pcsi_dev(struct v4l2_subdev *sdev)
++{
++	return container_of(sdev, struct mxc_parallel_csi_dev, sd);
++}
++
++static int mxc_pcsi_clk_get(struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct device *dev = &pcsidev->pdev->dev;
++
++	pcsidev->clk_pixel = devm_clk_get(dev, "pixel");
++	if (IS_ERR(pcsidev->clk_pixel)) {
++		dev_info(dev, "%s failed to get parallel csi pixel clk\n", __func__);
++		return PTR_ERR(pcsidev->clk_pixel);
++	}
++
++	pcsidev->clk_ipg = devm_clk_get(dev, "ipg");
++	if (IS_ERR(pcsidev->clk_ipg)) {
++		dev_info(dev, "%s failed to get parallel ipg pixel clk\n", __func__);
++		return PTR_ERR(pcsidev->clk_ipg);
++	}
++
++	return 0;
++}
++
++static int mxc_pcsi_clk_enable(struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct device *dev = &pcsidev->pdev->dev;
++	int ret;
++
++	ret = clk_prepare_enable(pcsidev->clk_pixel);
++	if (ret < 0) {
++		dev_info(dev, "%s, enable pixel clk error\n", __func__);
++		return ret;
++	}
++
++	ret = clk_prepare_enable(pcsidev->clk_ipg);
++	if (ret < 0) {
++		dev_info(dev, "%s, enable ipg clk error\n", __func__);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void mxc_pcsi_clk_disable(struct mxc_parallel_csi_dev *pcsidev)
++{
++	clk_disable_unprepare(pcsidev->clk_pixel);
++	clk_disable_unprepare(pcsidev->clk_ipg);
++}
++
++static void mxc_pcsi_sw_reset(struct mxc_parallel_csi_dev *pcsidev)
++{
++	u32 val;
++
++	/* Softwaret Reset */
++	val = CSI_CTRL_REG_SOFTRST;
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_SET);
++
++	msleep(1);
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_CLR);
++}
++
++static void mxc_pcsi_csr_config(struct mxc_parallel_csi_dev *pcsidev)
++{
++	u32 val;
++
++	/* Software Reset */
++	mxc_pcsi_sw_reset(pcsidev);
++
++	/* Config PL Data Type */
++	val = IF_CTRL_REG_DATA_TYPE(DATA_TYPE_OUT_YUV444);
++	writel(val, pcsidev->csr_regs + IF_CTRL_REG_SET);
++
++	/* Enable sync Force */
++	val = (CSI_CTRL_REG_HSYNC_FORCE_EN | CSI_CTRL_REG_VSYNC_FORCE_EN);
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_SET);
++
++	/* Enable Pixel Link */
++	val = IF_CTRL_REG_PL_ENABLE;
++	writel(val , pcsidev->csr_regs + IF_CTRL_REG_SET);
++
++	/* Enable Pixel Link */
++	val = IF_CTRL_REG_PL_VALID;
++	writel(val , pcsidev->csr_regs + IF_CTRL_REG_SET);
++
++	/* Config CTRL REG */
++	val = readl(pcsidev->csr_regs + CSI_CTRL_REG);
++	val |= (
++		CSI_CTRL_REG_DATA_TYPE_IN(DATA_TYPE_IN_YVYU_8BITS) |
++		CSI_CTRL_REG_HSYNC_POL |
++		CSI_CTRL_REG_MASK_VSYNC_COUNTER(3) |
++		CSI_CTRL_REG_HSYNC_PULSE(2));
++
++	if (pcsidev->uv_swap)
++		val |= CSI_CTRL_REG_UV_SWAP_EN;
++
++	if (pcsidev->mode & GATE_CLOCK_MODE)
++		val |= CSI_CTRL_REG_GCLK_MODE_EN;
++	else if (pcsidev->mode & CCIR_MODE) {
++		val |= (CSI_CTRL_REG_CCIR_EN |
++			CSI_CTRL_REG_CCIR_VSYNC_RESET_EN |
++			CSI_CTRL_REG_CCIR_EXT_VSYNC_EN |
++			CSI_CTRL_REG_CCIR_ECC_ERR_CORRECT_EN);
++	}
++
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG);
++}
++
++static void mxc_pcsi_config_ctrl_reg1(struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct device *dev = &pcsidev->pdev->dev;
++	u32 val;
++
++	if (pcsidev->format.width <= 0 || pcsidev->format.height <= 0) {
++		dev_dbg(dev, "%s width/height invalid\n", __func__);
++		return;
++	}
++
++	/* Config Pixel Width */
++	val = (CSI_CTRL_REG1_PIXEL_WIDTH(pcsidev->format.width - 1) |
++		CSI_CTRL_REG1_VSYNC_PULSE(3));
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG1);
++
++}
++
++static void mxc_pcsi_enable_csi(struct mxc_parallel_csi_dev *pcsidev)
++{
++	u32 val;
++
++	/* Enable CSI */
++	val = CSI_CTRL_REG_CSI_EN;
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_SET);
++
++	/* Disable SYNC Force */
++	val = (CSI_CTRL_REG_HSYNC_FORCE_EN | CSI_CTRL_REG_VSYNC_FORCE_EN);
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_CLR);
++}
++
++static void mxc_pcsi_disable_csi(struct mxc_parallel_csi_dev *pcsidev)
++{
++	u32 val;
++
++	/* Enable Sync Force */
++	val = (CSI_CTRL_REG_HSYNC_FORCE_EN | CSI_CTRL_REG_VSYNC_FORCE_EN);
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_SET);
++
++	/* Disable CSI */
++	val = CSI_CTRL_REG_CSI_EN;
++	writel(val, pcsidev->csr_regs + CSI_CTRL_REG_CLR);
++
++	/* Disable Pixel Link */
++	val = IF_CTRL_REG_PL_VALID | IF_CTRL_REG_PL_ENABLE;
++	writel(val , pcsidev->csr_regs + IF_CTRL_REG_CLR);
++}
++
++static struct media_pad *mxc_pcsi_get_remote_sensor_pad(
++			struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct v4l2_subdev *subdev = &pcsidev->sd;
++	struct media_pad *sink_pad, *source_pad;
++	int i;
++
++	while (1) {
++		source_pad = NULL;
++		for (i = 0; i < subdev->entity.num_pads; i++) {
++			sink_pad = &subdev->entity.pads[i];
++
++			if (sink_pad->flags & MEDIA_PAD_FL_SINK) {
++				source_pad = media_entity_remote_pad(sink_pad);
++				if (source_pad)
++					break;
++			}
++		}
++		/* return first pad point in the loop  */
++		return source_pad;
++	}
++
++	if (i == subdev->entity.num_pads)
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++
++	return NULL;
++}
++
++static int mxc_pcsi_get_sensor_fmt(struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct v4l2_mbus_framefmt *mf = &pcsidev->format;
++	struct v4l2_subdev *sen_sd;
++	struct media_pad *source_pad;
++	struct v4l2_subdev_format src_fmt;
++	int ret;
++
++	/* Get remote source pad */
++	source_pad = mxc_pcsi_get_remote_sensor_pad(pcsidev);
++	if (source_pad == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sen_sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sen_sd == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
++	src_fmt.pad = source_pad->index;
++	ret = v4l2_subdev_call(sen_sd, pad, get_fmt, NULL, &src_fmt);
++	if (ret < 0 && ret != -ENOIOCTLCMD)
++		return -EINVAL;
++
++	/* Update input frame size and formate  */
++	memcpy(mf, &src_fmt.format, sizeof(struct v4l2_mbus_framefmt));
++
++	if (mf->code == MEDIA_BUS_FMT_YUYV8_2X8)
++		pcsidev->uv_swap = 1;
++
++	dev_dbg(&pcsidev->pdev->dev, "width=%d, height=%d, fmt.code=0x%x\n", mf->width, mf->height, mf->code);
++
++	return 0;
++}
++
++static int mxc_pcsi_enum_framesizes(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_pad_config *cfg,
++			       struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sen_sd;
++
++	/* Get remote source pad */
++	source_pad = mxc_pcsi_get_remote_sensor_pad(pcsidev);
++	if (source_pad == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sen_sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sen_sd == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
++	return v4l2_subdev_call(sen_sd, pad, enum_frame_size, NULL, fse);
++}
++
++static int mxc_pcsi_enum_frame_interval(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_pad_config *cfg,
++				   struct v4l2_subdev_frame_interval_enum *fie)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sen_sd;
++
++	/* Get remote source pad */
++	source_pad = mxc_pcsi_get_remote_sensor_pad(pcsidev);
++	if (source_pad == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sen_sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sen_sd == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
++	return v4l2_subdev_call(sd, pad, enum_frame_interval, NULL, fie);
++}
++
++static int mxc_pcsi_get_fmt(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_pad_config *cfg,
++			       struct v4l2_subdev_format *fmt)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct v4l2_mbus_framefmt *mf = &fmt->format;
++
++	mxc_pcsi_get_sensor_fmt(pcsidev);
++
++	memcpy(mf, &pcsidev->format, sizeof(struct v4l2_mbus_framefmt));
++	/* Source/Sink pads crop rectangle size */
++
++	return 0;
++}
++
++static int mxc_pcsi_set_fmt(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_pad_config *cfg,
++			       struct v4l2_subdev_format *fmt)
++{
++	return 0;
++}
++
++static int mxc_pcsi_s_power(struct v4l2_subdev *sd, int on)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sen_sd;
++
++	/* Get remote source pad */
++	source_pad = mxc_pcsi_get_remote_sensor_pad(pcsidev);
++	if (source_pad == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sen_sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sen_sd == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
++	return v4l2_subdev_call(sen_sd, core, s_power, on);
++}
++
++static int mxc_pcsi_s_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *a)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sen_sd;
++
++	/* Get remote source pad */
++	source_pad = mxc_pcsi_get_remote_sensor_pad(pcsidev);
++	if (source_pad == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sen_sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sen_sd == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
++	return v4l2_subdev_call(sen_sd, video, s_parm, a);
++}
++
++static int mxc_pcsi_g_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *a)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sen_sd;
++
++	/* Get remote source pad */
++	source_pad = mxc_pcsi_get_remote_sensor_pad(pcsidev);
++	if (source_pad == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sen_sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sen_sd == NULL) {
++		v4l2_err(&pcsidev->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++	return v4l2_subdev_call(sen_sd, video, g_parm, a);
++}
++
++static int mxc_pcsi_s_stream(struct v4l2_subdev *sd, int enable)
++{
++	struct mxc_parallel_csi_dev *pcsidev = sd_to_mxc_pcsi_dev(sd);
++	struct device *dev = &pcsidev->pdev->dev;
++
++	dev_dbg(dev, "%s: %d, pcsidev: 0x%d\n", __func__, __LINE__, enable);
++
++	if (enable) {
++		if (!pcsidev->running) {
++			mxc_pcsi_get_sensor_fmt(pcsidev);
++			mxc_pcsi_csr_config(pcsidev);
++			mxc_pcsi_config_ctrl_reg1(pcsidev);
++			mxc_pcsi_enable_csi(pcsidev);
++			mxc_pcsi_regs_dump(pcsidev);
++		}
++		pcsidev->running++;
++	} else {
++		if (pcsidev->running) {
++			mxc_pcsi_disable_csi(pcsidev);
++		}
++		pcsidev->running--;
++	}
++
++	return 0;
++}
++
++static int mxc_pcsi_link_setup(struct media_entity *entity,
++			   const struct media_pad *local,
++			   const struct media_pad *remote, u32 flags)
++{
++	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
++	struct platform_device *pdev = v4l2_get_subdevdata(sd);
++
++	if (local->flags & MEDIA_PAD_FL_SOURCE) {
++		switch (local->index) {
++		case MXC_PARALLEL_CSI_PAD_SOURCE:
++			break;
++		default:
++			dev_err(&pdev->dev, "%s invalid source pad\n", __func__);
++			return -EINVAL;
++		}
++	} else if (local->flags & MEDIA_PAD_FL_SINK) {
++		switch (local->index) {
++		case MXC_PARALLEL_CSI_PAD_SINK:
++			break;
++		default:
++			dev_err(&pdev->dev, "%s invalid sink pad\n", __func__);
++			return -EINVAL;
++		}
++	}
++	return 0;
++}
++
++static struct v4l2_subdev_pad_ops pcsi_pad_ops = {
++	.enum_frame_size = mxc_pcsi_enum_framesizes,
++	.enum_frame_interval = mxc_pcsi_enum_frame_interval,
++	.get_fmt = mxc_pcsi_get_fmt,
++	.set_fmt = mxc_pcsi_set_fmt,
++};
++
++static struct v4l2_subdev_core_ops pcsi_core_ops = {
++	.s_power = mxc_pcsi_s_power,
++};
++
++static struct v4l2_subdev_video_ops pcsi_video_ops = {
++	.s_parm = mxc_pcsi_s_parm,
++	.g_parm = mxc_pcsi_g_parm,
++	.s_stream = mxc_pcsi_s_stream,
++};
++
++static struct v4l2_subdev_ops pcsi_subdev_ops = {
++	.core = &pcsi_core_ops,
++	.video = &pcsi_video_ops,
++	.pad = &pcsi_pad_ops,
++};
++static const struct media_entity_operations mxc_pcsi_sd_media_ops = {
++	.link_setup = mxc_pcsi_link_setup,
++};
++
++static int mxc_parallel_csi_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *mem_res;
++	struct mxc_parallel_csi_dev *pcsidev;
++	int ret;
++
++	pcsidev = devm_kzalloc(dev, sizeof(*pcsidev), GFP_KERNEL);
++	if (!pcsidev)
++		return -ENOMEM;
++
++	pcsidev->pdev = pdev;
++
++	mem_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	pcsidev->csr_regs = devm_ioremap_resource(dev, mem_res);
++	if (IS_ERR(pcsidev->csr_regs)) {
++		dev_dbg(dev, "Failed to get parallel CSI CSR register\n");
++		return PTR_ERR(pcsidev->csr_regs);
++	}
++
++	ret = mxc_pcsi_clk_get(pcsidev);
++	if (ret < 0)
++		return ret;
++
++	v4l2_subdev_init(&pcsidev->sd, &pcsi_subdev_ops);
++
++	pcsidev->mode = GATE_CLOCK_MODE;
++
++	pcsidev->sd.owner = THIS_MODULE;
++	sprintf(pcsidev->sd.name, "%s", MXC_PARALLEL_CSI_SUBDEV_NAME);
++
++	pcsidev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	pcsidev->sd.entity.function = MEDIA_ENT_F_IO_V4L;
++
++	pcsidev->pads[MXC_PARALLEL_CSI_PAD_SINK].flags = MEDIA_PAD_FL_SINK;
++	pcsidev->pads[MXC_PARALLEL_CSI_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&pcsidev->sd.entity,
++				MXC_PARALLEL_CSI_PADS_NUM, pcsidev->pads);
++	if (ret < 0)
++		goto e_clkdis;
++
++	pcsidev->sd.entity.ops = &mxc_pcsi_sd_media_ops;
++
++	v4l2_set_subdevdata(&pcsidev->sd, pdev);
++
++	platform_set_drvdata(pdev, pcsidev);
++
++	ret = mxc_pcsi_clk_enable(pcsidev);
++	if (ret < 0)
++		return ret;
++
++	pcsidev->running = 0;
++
++	dev_info(dev, "%s probe successfully\n", __func__);
++	return 0;
++
++e_clkdis:
++	media_entity_cleanup(&pcsidev->sd.entity);
++	return ret;
++}
++
++static int mxc_parallel_csi_remove(struct platform_device *pdev)
++{
++	/*struct device *dev = &pdev->dev;*/
++	struct mxc_parallel_csi_dev *pcsidev =
++			(struct mxc_parallel_csi_dev *)platform_get_drvdata(pdev);
++
++	media_entity_cleanup(&pcsidev->sd.entity);
++	mxc_pcsi_clk_disable(pcsidev);
++
++	return 0;
++}
++
++static const struct of_device_id parallel_csi_of_match[] = {
++	{	.compatible = "fsl,mxc-parallel-csi",},
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(of, parallel_csi_of_match);
++
++
++static struct platform_driver parallel_csi_driver = {
++	.driver = {
++		.name = MXC_PARALLEL_CSI_DRIVER_NAME,
++		.of_match_table = parallel_csi_of_match,
++	},
++	.probe = mxc_parallel_csi_probe,
++	.remove = mxc_parallel_csi_remove,
++};
++
++module_platform_driver(parallel_csi_driver);
++
++MODULE_AUTHOR("Freescale Semiconductor, Inc.");
++MODULE_DESCRIPTION("MXC PARALLEL CSI driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" MXC_PARALLEL_CSI_DRIVER_NAME);
+diff --git a/drivers/media/platform/imx8/mxc-parallel-csi.h b/drivers/media/platform/imx8/mxc-parallel-csi.h
+new file mode 100644
+index 0000000..4f32856
+--- /dev/null
++++ b/drivers/media/platform/imx8/mxc-parallel-csi.h
+@@ -0,0 +1,165 @@
++
++/*
++ * Copyright 2018 NXP
++ */
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++#ifndef MXC_PARALLEL_CSI_H_
++#define MXC_PARALLEL_CSI_H_
++
++#include <media/v4l2-device.h>
++
++#define MXC_PARALLEL_CSI_DRIVER_NAME	"mxc-parallel-csi"
++#define MXC_PARALLEL_CSI_SUBDEV_NAME	MXC_PARALLEL_CSI_DRIVER_NAME
++
++#define PARALLEL_CSI_OF_NODE_NAME	"pcsi"
++#define BIT_U(nr) (1U << (nr))
++
++#define MXC_PARALLEL_CSI_PAD_SOURCE		0
++#define MXC_PARALLEL_CSI_PAD_SINK		1
++#define MXC_PARALLEL_CSI_PADS_NUM		2
++
++#define CI_PI_BASE_OFFSET       0x0U
++
++/* CI_PI INTERFACE Control */
++#define IF_CTRL_REG                     (CI_PI_BASE_OFFSET + 0x00)
++#define IF_CTRL_REG_PL_ENABLE           BIT_U(0)
++#define IF_CTRL_REG_PL_VALID            BIT_U(1)
++#define IF_CTRL_REG_PL_ADDR(x)          (((x) & 0x7U) << 2)
++#define IF_CTRL_REG_IF_FORCE(x)         (((x) & 0x7U) << 5)
++#define IF_CTRL_REG_DATA_TYPE_SEL       BIT_U(8)
++#define IF_CTRL_REG_DATA_TYPE(x)        (((x) & 0x1FU) << 9)
++
++#define DATA_TYPE_OUT_NULL           (0x00)
++#define DATA_TYPE_OUT_RGB            (0x04)
++#define DATA_TYPE_OUT_YUV444         (0x08)
++#define DATA_TYPE_OUT_YYU420_ODD     (0x10)
++#define DATA_TYPE_OUT_YYU420_EVEN    (0x12)
++#define DATA_TYPE_OUT_YYY_ODD        (0x18)
++#define DATA_TYPE_OUT_UYVY_EVEN      (0x1A)
++#define DATA_TYPE_OUT_RAW            (0x1C)
++
++#define IF_CTRL_REG_IF_FORCE_HSYNV_OVERRIDE         0x4
++#define IF_CTRL_REG_IF_FORCE_VSYNV_OVERRIDE         0x2
++#define IF_CTRL_REG_IF_FORCE_DATA_ENABLE_OVERRIDE   0x1
++
++#define IF_CTRL_REG_SET                 (CI_PI_BASE_OFFSET + 0x04)
++#define IF_CTRL_REG_CLR                 (CI_PI_BASE_OFFSET + 0x08)
++#define IF_CTRL_REG_TOG                 (CI_PI_BASE_OFFSET + 0x0C)
++
++/* CSI INTERFACE CONTROL REG */
++#define CSI_CTRL_REG                    (CI_PI_BASE_OFFSET + 0x10)
++#define CSI_CTRL_REG_CSI_EN                     BIT_U(0)
++#define CSI_CTRL_REG_PIXEL_CLK_POL              BIT_U(1)
++#define CSI_CTRL_REG_HSYNC_POL                  BIT_U(2)
++#define CSI_CTRL_REG_VSYNC_POL                  BIT_U(3)
++#define CSI_CTRL_REG_DE_POL                     BIT_U(4)
++#define CSI_CTRL_REG_PIXEL_DATA_POL             BIT_U(5)
++#define CSI_CTRL_REG_CCIR_EXT_VSYNC_EN          BIT_U(6)
++#define CSI_CTRL_REG_CCIR_EN                    BIT_U(7)
++#define CSI_CTRL_REG_CCIR_VIDEO_MODE            BIT_U(8)
++#define CSI_CTRL_REG_CCIR_NTSC_EN               BIT_U(9)
++#define CSI_CTRL_REG_CCIR_VSYNC_RESET_EN        BIT_U(10)
++#define CSI_CTRL_REG_CCIR_ECC_ERR_CORRECT_EN    BIT_U(11)
++#define CSI_CTRL_REG_HSYNC_FORCE_EN             BIT_U(12)
++#define CSI_CTRL_REG_VSYNC_FORCE_EN             BIT_U(13)
++#define CSI_CTRL_REG_GCLK_MODE_EN               BIT_U(14)
++#define CSI_CTRL_REG_VALID_SEL                  BIT_U(15)
++#define CSI_CTRL_REG_RAW_OUT_SEL                BIT_U(16)
++#define CSI_CTRL_REG_HSYNC_OUT_SEL              BIT_U(17)
++#define CSI_CTRL_REG_HSYNC_PULSE(x)             (((x) & 0x7U) << 19)
++#define CSI_CTRL_REG_UV_SWAP_EN                 BIT_U(22)
++#define CSI_CTRL_REG_DATA_TYPE_IN(x)            (((x) & 0xFU) << 23)
++#define CSI_CTRL_REG_MASK_VSYNC_COUNTER(x)      (((x) & 0x3U) << 27)
++#define CSI_CTRL_REG_SOFTRST                    BIT_U(31)
++
++#define DATA_TYPE_IN_UYVY_BT656_8BITS     0x0
++#define DATA_TYPE_IN_UYVY_BT656_10BITS    0x1
++#define DATA_TYPE_IN_RGB_8BITS            0x2
++#define DATA_TYPE_IN_BGR_8BITS            0x3
++#define DATA_TYPE_IN_RGB_24BITS           0x4
++#define DATA_TYPE_IN_YVYU_8BITS           0x5
++#define DATA_TYPE_IN_YUV_8BITS            0x6
++#define DATA_TYPE_IN_YVYU_16BITS          0x7
++#define DATA_TYPE_IN_YUV_24BITS           0x8
++#define DATA_TYPE_IN_BAYER_8BITS          0x9
++#define DATA_TYPE_IN_BAYER_10BITS         0xA
++#define DATA_TYPE_IN_BAYER_12BITS         0xB
++#define DATA_TYPE_IN_BAYER_16BITS         0xC
++
++#define CSI_CTRL_REG_SET                (CI_PI_BASE_OFFSET + 0x14)
++#define CSI_CTRL_REG_CLR                (CI_PI_BASE_OFFSET + 0x18)
++#define CSI_CTRL_REG_TOG                (CI_PI_BASE_OFFSET + 0x1C)
++
++/* CSI interface Status */
++#define CSI_STATUS                      (CI_PI_BASE_OFFSET + 0x20)
++#define CSI_STATUS_FIELD_TOGGLE         BIT_U(0)
++#define CSI_STATUS_ECC_ERROR            BIT_U(1)
++
++#define CSI_STATUS_SET                  (CI_PI_BASE_OFFSET + 0x24)
++#define CSI_STATUS_CLR                  (CI_PI_BASE_OFFSET + 0x28)
++#define CSI_STATUS_TOG                  (CI_PI_BASE_OFFSET + 0x2C)
++
++/* CSI INTERFACE CONTROL REG1 */
++#define CSI_CTRL_REG1                   (CI_PI_BASE_OFFSET + 0x30)
++#define CSI_CTRL_REG1_PIXEL_WIDTH(v)    (((v) & 0xFFFFU) << 0)
++#define CSI_CTRL_REG1_VSYNC_PULSE(v)    (((v) & 0xFFFFU) << 16)
++
++#define CSI_CTRL_REG1_SET               (CI_PI_BASE_OFFSET + 0x34)
++#define CSI_CTRL_REG1_CLR               (CI_PI_BASE_OFFSET + 0x38)
++#define CSI_CTRL_REG1_TOG               (CI_PI_BASE_OFFSET + 0x3C)
++
++/***********************************************************/
++#define LPCG_BASE		(void __iomem *)0x58263000
++#define LPCG_LIS_CLK			(0x00)
++#define LPCG_CSR_CLK			(0x04)
++#define LPCG_GPIO_CLK			(0x08)
++#define LPCG_PWM_CLK			(0x0c)
++#define LPCG_I2C_CLK			(0x10)
++#define LPCG_CSI_INTERFACE_CLK	(0x18)
++#define LPCG_CSI_MCLK			(0x1c)
++/***********************************************************/
++
++//#define CSI_INTERFACE_CCIR656	1
++
++struct mxc_parallel_csi_dev {
++	struct v4l2_device		v4l2_dev;
++	struct v4l2_subdev		sd;
++	struct v4l2_subdev		*sensor_sd;
++
++	struct media_pad pads[MXC_PARALLEL_CSI_PADS_NUM];
++	struct v4l2_mbus_framefmt format;
++
++	void __iomem *csr_regs;
++	void __iomem *lpcg_regs;
++	struct platform_device *pdev;
++	u32 flags;
++	int irq;
++
++	struct clk *clk_ipg;
++	struct clk *clk_pixel;
++
++	struct v4l2_async_subdev	asd;
++	struct v4l2_async_notifier	subdev_notifier;
++	struct v4l2_async_subdev	*async_subdevs[2];
++
++	struct mutex lock;
++
++	u8 running;
++	u8 mode;
++	u8 uv_swap;
++	u8 tvdec;
++};
++#endif
++
++enum {
++	GATE_CLOCK_MODE = 0x01,
++	CCIR_MODE = 0x02,
++};
+-- 
+1.7.9.5
+

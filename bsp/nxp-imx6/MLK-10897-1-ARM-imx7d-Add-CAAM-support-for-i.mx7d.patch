@@ -1,0 +1,218 @@
+From f3c6de95da65fa3d466d77e6b4be685df2b36886 Mon Sep 17 00:00:00 2001
+From: Dan Douglass <dan.douglass@freescale.com>
+Date: Thu, 14 May 2015 16:28:52 -0500
+Subject: [PATCH 0904/5242] MLK-10897-1 ARM: imx7d: Add CAAM support for
+ i.mx7d
+
+commit  bcce93d5342fdf1943b36c79f27b7cfc0f7db781 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+CAAM only has a single clock in i.mx7d. Logic was added to initialize only the
+single clock.
+
+The Secure Memory registers moved in CAAM era included in i.mx7d. This required
+changes to support access to two different versions of the register map. The
+registers are access through a data structure that overlay the register region.
+Two new Secure Memory register structures were created to support the different
+versions. Logic was also added to determine which version is implemented based on
+the CAAM era, and access functions were added to support register access to the
+Secure Memory Command and Status registers.
+
+Signed-off-by: Dan Douglass <dan.douglass@freescale.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/crypto/caam/regs.h     |   42 +++++++++++++++++--------
+ drivers/crypto/caam/sm.h       |    3 ++
+ drivers/crypto/caam/sm_store.c |   67 ++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 93 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/crypto/caam/regs.h b/drivers/crypto/caam/regs.h
+index 9203fa2..02d1ad7 100644
+--- a/drivers/crypto/caam/regs.h
++++ b/drivers/crypto/caam/regs.h
+@@ -600,6 +600,34 @@ struct caam_ctrl {
+ #define JRSTART_JR2_START       0x00000004 /* Start Job ring 2 */
+ #define JRSTART_JR3_START       0x00000008 /* Start Job ring 3 */
+ 
++/* Secure Memory Configuration - if you have it */
++/* Secure Memory Register Offset from JR Base Reg*/
++#define SM_V1_OFFSET 0x0f4
++#define SM_V2_OFFSET 0xa00
++
++/* Minimum SM Version ID requiring v2 SM register mapping */
++#define SMVID_V2 0x20105
++
++struct caam_secure_mem_v1 {
++	u32 sm_cmd;	/* SMCJRx - Secure memory command */
++	u32 rsvd1;
++	u32 sm_status;	/* SMCSJRx - Secure memory status */
++
++	u32 sm_perm;	/* SMAPJRx - Secure memory access perms */
++	u32 sm_group2;	/* SMAP2JRx - Secure memory access group 2 */
++	u32 sm_group1;	/* SMAP1JRx - Secure memory access group 1 */
++};
++
++struct caam_secure_mem_v2 {
++	u32 sm_perm;	/* SMAPJRx - Secure memory access perms */
++	u32 sm_group2;	/* SMAP2JRx - Secure memory access group 2 */
++	u32 sm_group1;	/* SMAP1JRx - Secure memory access group 1 */
++	u32 rsvd1[118];
++	u32 sm_cmd;	/* SMCJRx - Secure memory command */
++	u32 rsvd2;
++	u32 sm_status;	/* SMCSJRx - Secure memory status */
++};
++
+ /*
+  * caam_job_ring - direct job ring setup
+  * 1-4 possible per instantiation, base + 1000/2000/3000/4000
+@@ -641,19 +669,7 @@ struct caam_job_ring {
+ 	/* Command/control */
+ 	u32 rsvd11;
+ 	u32 jrcommand;	/* JRCRx - JobR command */
+-
+-	u32 rsvd12[33];
+-
+-	/* Secure Memory Configuration - if you have it */
+-	u32 sm_cmd;	/* SMCJRx - Secure memory command */
+-	u32 rsvd13;
+-	u32 sm_status;	/* SMCSJRx - Secure memory status */
+-	u32 rsvd14;
+-	u32 sm_perm;	/* SMAPJRx - Secure memory access perms */
+-	u32 sm_group2;	/* SMAP2JRx - Secure memory access group 2 */
+-	u32 sm_group1;	/* SMAP1JRx - Secure memory access group 1 */
+-
+-	u32 rsvd15[891];
++	u32 rsvd12[931];
+ 
+ 	/* Performance Monitor                                  f00-fff */
+ 	struct caam_perfmon perfmon;
+diff --git a/drivers/crypto/caam/sm.h b/drivers/crypto/caam/sm.h
+index c8114d1..65ec9d7 100644
+--- a/drivers/crypto/caam/sm.h
++++ b/drivers/crypto/caam/sm.h
+@@ -96,6 +96,9 @@ struct caam_drv_private_sm {
+ 	struct platform_device *sm_pdev;  /* Secure Memory platform device */
+ 	spinlock_t kslock ____cacheline_aligned;
+ 
++	/* SM Register offset from JR base address */
++	u32 sm_reg_offset;
++
+ 	/* Default parameters for geometry */
+ 	u32 max_pages;		/* maximum pages this instance can support */
+ 	u32 top_partition;	/* highest partition number in this instance */
+diff --git a/drivers/crypto/caam/sm_store.c b/drivers/crypto/caam/sm_store.c
+index a52a854..64da8d2 100644
+--- a/drivers/crypto/caam/sm_store.c
++++ b/drivers/crypto/caam/sm_store.c
+@@ -59,6 +59,50 @@ void sm_show_page(struct device *dev, struct sm_page_descriptor *pgdesc)
+ 
+ #define INITIAL_DESCSZ 16	/* size of tmp buffer for descriptor const. */
+ 
++static __always_inline int sm_set_cmd_reg(struct caam_drv_private_sm *smpriv,
++					  struct caam_drv_private_jr *jrpriv,
++					  u32 val)
++{
++
++	if (smpriv->sm_reg_offset == SM_V1_OFFSET) {
++		struct caam_secure_mem_v1 *sm_regs_v1;
++		sm_regs_v1 = (struct caam_secure_mem_v1 *)
++			((void *)jrpriv->rregs + SM_V1_OFFSET);
++		wr_reg32(&sm_regs_v1->sm_cmd, val);
++
++	} else if (smpriv->sm_reg_offset == SM_V2_OFFSET) {
++		struct caam_secure_mem_v2 *sm_regs_v2;
++		sm_regs_v2 = (struct caam_secure_mem_v2 *)
++			((void *)jrpriv->rregs + SM_V2_OFFSET);
++		wr_reg32(&sm_regs_v2->sm_cmd, val);
++	} else {
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static __always_inline u32 sm_get_status_reg(struct caam_drv_private_sm *smpriv,
++					     struct caam_drv_private_jr *jrpriv,
++					     u32 *val)
++{
++	if (smpriv->sm_reg_offset == SM_V1_OFFSET) {
++		struct caam_secure_mem_v1 *sm_regs_v1;
++		sm_regs_v1 = (struct caam_secure_mem_v1 *)
++			((void *)jrpriv->rregs + SM_V1_OFFSET);
++		*val = rd_reg32(&sm_regs_v1->sm_status);
++	} else if (smpriv->sm_reg_offset == SM_V2_OFFSET) {
++		struct caam_secure_mem_v2 *sm_regs_v2;
++		sm_regs_v2 = (struct caam_secure_mem_v2 *)
++			((void *)jrpriv->rregs + SM_V2_OFFSET);
++		*val = rd_reg32(&sm_regs_v2->sm_status);
++	} else {
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /*
+  * Construct a black key conversion job descriptor
+  *
+@@ -950,7 +994,7 @@ int caam_sm_startup(struct platform_device *pdev)
+ 	struct caam_drv_private_jr *jrpriv;	/* need this for reg page */
+ 	struct platform_device *sm_pdev;
+ 	struct sm_page_descriptor *lpagedesc;
+-	u32 page, pgstat, lpagect, detectedpage;
++	u32 page, pgstat, lpagect, detectedpage, smvid;
+ 
+ 	struct device_node *np;
+ 	ctrldev = &pdev->dev;
+@@ -989,6 +1033,13 @@ int caam_sm_startup(struct platform_device *pdev)
+ 	dev_set_drvdata(smdev, smpriv);
+ 	ctrlpriv->smdev = smdev;
+ 
++	/* Set the Secure Memory Register Map Version */
++	smvid = rd_reg32(&ctrlpriv->ctrl->perfmon.smvid);
++	if (smvid < SMVID_V2)
++		smpriv->sm_reg_offset = SM_V1_OFFSET;
++	else
++		smpriv->sm_reg_offset = SM_V2_OFFSET;
++
+ 	/*
+ 	 * Collect configuration limit data for reference
+ 	 * This batch comes from the partition data/vid registers in perfmon
+@@ -997,7 +1048,7 @@ int caam_sm_startup(struct platform_device *pdev)
+ 			    & SMPART_MAX_NUMPG_MASK) >>
+ 			    SMPART_MAX_NUMPG_SHIFT) + 1;
+ 	smpriv->top_partition = ((rd_reg32(&ctrlpriv->ctrl->perfmon.smpart)
+-				& SMPART_MAX_PNUM_MASK) >>
++				  & SMPART_MAX_PNUM_MASK) >>
+ 				SMPART_MAX_PNUM_SHIFT) + 1;
+ 	smpriv->top_page =  ((rd_reg32(&ctrlpriv->ctrl->perfmon.smpart)
+ 			    & SMPART_MAX_PG_MASK) >> SMPART_MAX_PG_SHIFT) + 1;
+@@ -1027,6 +1078,7 @@ int caam_sm_startup(struct platform_device *pdev)
+ 	smpriv->smringdev = caam_jr_alloc();
+ 	jrpriv = dev_get_drvdata(smpriv->smringdev);
+ 	lpagect = 0;
++	pgstat = 0;
+ 	lpagedesc = kzalloc(sizeof(struct sm_page_descriptor)
+ 			    * smpriv->max_pages, GFP_KERNEL);
+ 	if (lpagedesc == NULL) {
+@@ -1035,10 +1087,13 @@ int caam_sm_startup(struct platform_device *pdev)
+ 	}
+ 
+ 	for (page = 0; page < smpriv->max_pages; page++) {
+-		wr_reg32(&jrpriv->rregs->sm_cmd,
+-			 ((page << SMC_PAGE_SHIFT) & SMC_PAGE_MASK) |
+-			 (SMC_CMD_PAGE_INQUIRY & SMC_CMD_MASK));
+-		pgstat = rd_reg32(&jrpriv->rregs->sm_status);
++		if (sm_set_cmd_reg(smpriv, jrpriv,
++				   ((page << SMC_PAGE_SHIFT) & SMC_PAGE_MASK) |
++				   (SMC_CMD_PAGE_INQUIRY & SMC_CMD_MASK)))
++			return -EINVAL;
++		if (sm_get_status_reg(smpriv, jrpriv, &pgstat))
++			return -EINVAL;
++
+ 		if (((pgstat & SMCS_PGWON_MASK) >> SMCS_PGOWN_SHIFT)
+ 		    == SMCS_PGOWN_OWNED) { /* our page? */
+ 			lpagedesc[page].phys_pagenum =
+-- 
+1.7.9.5
+

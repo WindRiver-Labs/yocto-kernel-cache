@@ -1,0 +1,284 @@
+From 07edf033c413af2623125a99b100a45bfbb683b7 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Mon, 26 Feb 2018 16:16:19 +0200
+Subject: [PATCH 3414/5242] MLK-17634-18: drm: imx: dcss: optimize context
+ loading and DDR bus load
+
+commit  ce9b8a8df234ddb0e84b35502edec91a00fc429f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This will lower the amount of ctxld entries sent, if configuration has
+not changed much. Also, disable channel 0 if alpha is 0 and global alpha
+is used. This will lower the DDR load, depending on graphics channel
+resolution.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-plane.c |   33 ++++++++++++++++++++++++++++++---
+ drivers/gpu/imx/dcss/dcss-ctxld.c     |    2 +-
+ drivers/gpu/imx/dcss/dcss-dpr.c       |   10 +++++++---
+ drivers/gpu/imx/dcss/dcss-dtg.c       |   14 ++++++++++----
+ drivers/gpu/imx/dcss/dcss-dtrc.c      |   28 +++++++++++++++-------------
+ drivers/gpu/imx/dcss/dcss-scaler.c    |   22 +++++++++++++++++-----
+ 6 files changed, 80 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.c b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+index 7c928fe..9746cfd 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+@@ -356,6 +356,19 @@ static void dcss_plane_adjust(struct drm_rect *dis_rect,
+ 	*src = new_src;
+ }
+ 
++static bool dcss_plane_format_has_alpha_channel(u32 pix_format)
++{
++	return pix_format == DRM_FORMAT_ARGB8888 ||
++	       pix_format == DRM_FORMAT_ABGR8888 ||
++	       pix_format == DRM_FORMAT_RGBA8888 ||
++	       pix_format == DRM_FORMAT_BGRA8888 ||
++	       pix_format == DRM_FORMAT_BGRA8888 ||
++	       pix_format == DRM_FORMAT_ARGB2101010 ||
++	       pix_format == DRM_FORMAT_ABGR2101010 ||
++	       pix_format == DRM_FORMAT_RGBA1010102 ||
++	       pix_format == DRM_FORMAT_BGRA1010102;
++}
++
+ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 				     struct drm_plane_state *old_state)
+ {
+@@ -369,6 +382,7 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 	struct drm_rect disp, crtc, src, old_src;
+ 	u32 scaler_w, scaler_h;
+ 	struct dcss_hdr10_pipe_cfg ipipe_cfg, opipe_cfg;
++	bool enable = true;
+ 
+ 	if (!state->fb)
+ 		return;
+@@ -482,9 +496,22 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 		WARN_ON(1);
+ 		break;
+ 	}
+-	dcss_dpr_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+-	dcss_scaler_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
+-	dcss_dtg_ch_enable(dcss_plane->dcss, dcss_plane->ch_num, true);
++
++	if (!dcss_plane->ch_num &&
++	    ((dcss_plane->alpha_val == 0 &&
++	    !dcss_plane_format_has_alpha_channel(pixel_format)) ||
++	    (dcss_plane->alpha_val == 0 && dcss_plane->use_global_val &&
++	     dcss_plane_format_has_alpha_channel(pixel_format))))
++		enable = false;
++
++	dcss_dpr_enable(dcss_plane->dcss, dcss_plane->ch_num, enable);
++	dcss_scaler_enable(dcss_plane->dcss, dcss_plane->ch_num, enable);
++
++	if (!enable)
++		dcss_dtg_plane_pos_set(dcss_plane->dcss, dcss_plane->ch_num,
++				       0, 0, 0, 0);
++
++	dcss_dtg_ch_enable(dcss_plane->dcss, dcss_plane->ch_num, enable);
+ }
+ 
+ static void dcss_plane_atomic_disable(struct drm_plane *plane,
+diff --git a/drivers/gpu/imx/dcss/dcss-ctxld.c b/drivers/gpu/imx/dcss/dcss-ctxld.c
+index 850059a..9ff1416 100644
+--- a/drivers/gpu/imx/dcss/dcss-ctxld.c
++++ b/drivers/gpu/imx/dcss/dcss-ctxld.c
+@@ -203,7 +203,7 @@ void dcss_ctxld_hw_cfg(struct dcss_soc *dcss)
+ {
+ 	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
+ 
+-	dcss_writel(RD_ERR_EN | DB_COMP_EN | SB_HP_COMP_EN | SB_LP_COMP_EN |
++	dcss_writel(RD_ERR_EN | SB_HP_COMP_EN |
+ 		    DB_PEND_SB_REC_EN | AHB_ERR_EN | RD_ERR | AHB_ERR,
+ 		    ctxld->ctxld_reg + DCSS_CTXLD_CONTROL_STATUS);
+ }
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index c2c70e5..76c05fb 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -418,9 +418,9 @@ void dcss_dpr_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ {
+ 	struct dcss_dpr_priv *dpr = dcss->dpr_priv;
+ 	struct dcss_dpr_ch *ch = &dpr->ch[ch_num];
++	u32 sys_ctrl;
+ 
+-	ch->sys_ctrl &= ~(REPEAT_EN | RUN_EN);
+-	ch->sys_ctrl |= (en ? REPEAT_EN | RUN_EN : 0);
++	sys_ctrl = (en ? REPEAT_EN | RUN_EN : 0);
+ 
+ 	if (en) {
+ 		dcss_dpr_write(dpr, ch_num, ch->mode_ctrl, DCSS_DPR_MODE_CTRL0);
+@@ -430,7 +430,11 @@ void dcss_dpr_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ 			       DCSS_DPR_RTRAM_CTRL0);
+ 	}
+ 
+-	dcss_dpr_write(dpr, ch_num, ch->sys_ctrl, DCSS_DPR_SYSTEM_CTRL0);
++	if (ch->sys_ctrl != sys_ctrl)
++		dcss_dpr_write(dpr, ch_num, sys_ctrl,
++			       DCSS_DPR_SYSTEM_CTRL0);
++
++	ch->sys_ctrl = sys_ctrl;
+ }
+ EXPORT_SYMBOL(dcss_dpr_enable);
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 4a94d99..9bab8ff 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -255,7 +255,9 @@ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm)
+ 	 * time to load the DB context. This happens with LCD panels which have
+ 	 * small vfront_porch, vback_porch and/or vsync_len.
+ 	 */
+-	dcss_dtg_write(dtg, dis_ulc_y < 50 ? 50 : dis_ulc_y, DCSS_DTG_TC_CTXLD);
++	dcss_dtg_write(dtg, ((0 << TC_CTXLD_SB_Y_POS) & TC_CTXLD_SB_Y_MASK) |
++			(dis_ulc_y < 50 ? 50 : dis_ulc_y),
++			DCSS_DTG_TC_CTXLD);
+ }
+ EXPORT_SYMBOL(dcss_dtg_sync_set);
+ 
+@@ -403,11 +405,15 @@ void dcss_dtg_ch_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ {
+ 	struct dcss_dtg_priv *dtg = dcss->dtg_priv;
+ 	u32 ch_en_map[] = {CH1_EN, CH2_EN, CH3_EN};
++	u32 control_status;
+ 
+-	dtg->control_status &= ~ch_en_map[ch_num];
+-	dtg->control_status |= en ? ch_en_map[ch_num] : 0;
++	control_status = dtg->control_status & ~ch_en_map[ch_num];
++	control_status |= en ? ch_en_map[ch_num] : 0;
+ 
+-	dcss_dtg_write(dtg, dtg->control_status, DCSS_DTG_TC_CONTROL_STATUS);
++	if (dtg->control_status != control_status)
++		dcss_dtg_write(dtg, control_status, DCSS_DTG_TC_CONTROL_STATUS);
++
++	dtg->control_status = control_status;
+ }
+ EXPORT_SYMBOL(dcss_dtg_ch_enable);
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-dtrc.c b/drivers/gpu/imx/dcss/dcss-dtrc.c
+index 02e218c..a414fa7 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtrc.c
++++ b/drivers/gpu/imx/dcss/dcss-dtrc.c
+@@ -303,17 +303,19 @@ void dcss_dtrc_addr_set(struct dcss_soc *dcss, int ch_num, u32 p1_ba, u32 p2_ba,
+ 	dcss_dtrc_write(dtrc, ch_num, p1_ba, DTRC_F1_OFS + DCSS_DTRC_DYDSADDR);
+ 	dcss_dtrc_write(dtrc, ch_num, p2_ba, DTRC_F1_OFS + DCSS_DTRC_DCDSADDR);
+ 
+-	ch->y_dec_ofs = dec_table_ofs & 0xFFFFFFFF;
+-	ch->uv_dec_ofs = dec_table_ofs >> 32;
+-
+-	dcss_dtrc_write(dtrc, ch_num,
+-		p1_ba + ch->y_dec_ofs, DCSS_DTRC_DYTSADDR);
+-	dcss_dtrc_write(dtrc, ch_num,
+-		p1_ba + ch->uv_dec_ofs, DCSS_DTRC_DCTSADDR);
+-	dcss_dtrc_write(dtrc, ch_num,
+-		p1_ba + ch->y_dec_ofs, DTRC_F1_OFS + DCSS_DTRC_DYTSADDR);
+-	dcss_dtrc_write(dtrc, ch_num,
+-		p1_ba + ch->uv_dec_ofs, DTRC_F1_OFS + DCSS_DTRC_DCTSADDR);
++	if (ch->format_modifier == DRM_FORMAT_MOD_VSI_G2_TILED_COMPRESSED) {
++		ch->y_dec_ofs = dec_table_ofs & 0xFFFFFFFF;
++		ch->uv_dec_ofs = dec_table_ofs >> 32;
++
++		dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->y_dec_ofs,
++				DCSS_DTRC_DYTSADDR);
++		dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->uv_dec_ofs,
++				DCSS_DTRC_DCTSADDR);
++		dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->y_dec_ofs,
++				DTRC_F1_OFS + DCSS_DTRC_DYTSADDR);
++		dcss_dtrc_write(dtrc, ch_num, p1_ba + ch->uv_dec_ofs,
++				DTRC_F1_OFS + DCSS_DTRC_DCTSADDR);
++	}
+ 
+ 	dtrc->ch[ch_num].bypass = false;
+ }
+@@ -481,9 +483,9 @@ void dcss_dtrc_enable(struct dcss_soc *dcss, int ch_num, bool enable)
+ 		fdctl |= COMPRESSION_DIS;
+ 
+ 	dcss_dtrc_write(dtrc, ch_num, fdctl,
+-			(curr_frame ^ 1) * DTRC_F1_OFS + DCSS_DTRC_DCTL);
+-	dcss_dtrc_write(dtrc, ch_num, fdctl | (enable ? CONFIG_READY : 0),
+ 			curr_frame * DTRC_F1_OFS + DCSS_DTRC_DCTL);
++	dcss_dtrc_write(dtrc, ch_num, fdctl | (enable ? CONFIG_READY : 0),
++			(curr_frame ^ 1) * DTRC_F1_OFS + DCSS_DTRC_DCTL);
+ 
+ 	ch->curr_frame = curr_frame;
+ 	ch->dctl = fdctl;
+diff --git a/drivers/gpu/imx/dcss/dcss-scaler.c b/drivers/gpu/imx/dcss/dcss-scaler.c
+index 3069c53..53fa0bb 100644
+--- a/drivers/gpu/imx/dcss/dcss-scaler.c
++++ b/drivers/gpu/imx/dcss/dcss-scaler.c
+@@ -105,6 +105,9 @@ struct dcss_scaler_ch {
+ 	u32 ctx_id;
+ 
+ 	u32 sdata_ctrl;
++	u32 scaler_ctrl;
++
++	u32 pix_format;
+ };
+ 
+ struct dcss_scaler_priv {
+@@ -212,17 +215,21 @@ void dcss_scaler_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ 			dcss_rdsrc_enable(dcss, false);
+ 
+ 			scaler->ch_using_wrscl = -1;
++			scaler_ctrl = 0;
+ 		}
+ 	} else {
+-		scaler_ctrl = SCALER_EN | REPEAT_EN;
++		scaler_ctrl = en ? SCALER_EN | REPEAT_EN : 0;
+ 	}
+ 
+ 	if (en)
+ 		dcss_scaler_write(dcss->scaler_priv, ch_num, ch->sdata_ctrl,
+ 				  DCSS_SCALER_SDATA_CTRL);
+ 
+-	dcss_scaler_write(dcss->scaler_priv, ch_num, en ? scaler_ctrl : 0,
+-			  DCSS_SCALER_CTRL);
++	if (ch->scaler_ctrl != scaler_ctrl)
++		dcss_scaler_write(dcss->scaler_priv, ch_num, scaler_ctrl,
++				  DCSS_SCALER_CTRL);
++
++	ch->scaler_ctrl = scaler_ctrl;
+ }
+ EXPORT_SYMBOL(dcss_scaler_enable);
+ 
+@@ -587,6 +594,7 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 		       int src_xres, int src_yres, int dst_xres, int dst_yres,
+ 		       u32 vrefresh_hz)
+ {
++	struct dcss_scaler_ch *ch = &dcss->scaler_priv->ch[ch_num];
+ 	enum dcss_color_space dcss_cs;
+ 	int planes;
+ 	const struct drm_format_info *format;
+@@ -614,7 +622,8 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 			src_format = BUF_FMT_YUV422;
+ 		}
+ 
+-		dcss_scaler_yuv_coef_set(dcss, ch_num);
++		if (pix_format != ch->pix_format)
++			dcss_scaler_yuv_coef_set(dcss, ch_num);
+ 
+ 		if (pix_format == DRM_FORMAT_P010)
+ 			pixel_depth = 30;
+@@ -625,7 +634,8 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 		format = drm_format_info(pix_format);
+ 		pixel_depth = format->depth;
+ 
+-		dcss_scaler_rgb_coef_set(dcss, ch_num);
++		if (pix_format != ch->pix_format)
++			dcss_scaler_rgb_coef_set(dcss, ch_num);
+ 	}
+ 
+ 	dcss_scaler_rtr_8lines_enable(dcss, ch_num, rtr_8line_en);
+@@ -640,5 +650,7 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 
+ 	dcss_scaler_setup_path(dcss, ch_num, pix_format, dst_xres,
+ 			       dst_yres, vrefresh_hz, wrscl_needed);
++
++	ch->pix_format = pix_format;
+ }
+ EXPORT_SYMBOL(dcss_scaler_setup);
+-- 
+1.7.9.5
+

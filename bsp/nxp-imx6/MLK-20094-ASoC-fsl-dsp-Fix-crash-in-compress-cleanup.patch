@@ -1,0 +1,130 @@
+From a293603624929495767fbdfc62bf94e6d1a7b43f Mon Sep 17 00:00:00 2001
+From: Daniel Baluta <daniel.baluta@nxp.com>
+Date: Fri, 2 Nov 2018 17:20:53 +0200
+Subject: [PATCH 5015/5242] MLK-20094: ASoC: fsl: dsp: Fix crash in compress
+ cleanup path
+
+commit  8964b2b0e50f18b4383a2010dfc034f1da894e0f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+We must find a way to no longer touch resources after they are
+cleand up.
+
+Now, after a stress test we get the following crash:
+
+[ 2156.863772] fsl-dsp 596e8000.dsp: xf_pool_alloc failed
+[ 2156.869337] Unable to handle kernel NULL pointer dereference at
+virtual address 00000060
+[ 2157.148594] [<ffff000008d8839c>] _raw_spin_lock+0x14/0x48
+[ 2157.153995] [<ffff000008b3e0b8>] xf_cmd_send_recv_complete+0x40/0xf0
+[ 2157.160354] [<ffff000008b3e470>] xf_close+0x40/0x88
+[ 2157.165239] [<ffff000008b3f7a4>] xaf_comp_delete+0x5c/0x70
+[ 2157.170730] [<ffff000008b40530>] dsp_platform_compr_free+0xa0/0xe8
+[ 2157.176917] [<ffff000008b287fc>] soc_compr_free_fe+0x144/0x1a0
+[ 2157.182754] [<ffff000008b11b24>] snd_compr_free+0x64/0x98
+
+This happens because:
+
+	1) dsp_platform_process work handler waits in a loop for
+	   messages to arrive.
+	2) when cplay process finishes it cleans up most of the
+	   resources.
+	3) when another cplay process starts it reinitializes the
+	  resources including queues for example.
+	4) a message will be generated and kernel will crash because
+	   dsp_platform_process uses the older queues.
+
+A solution for this is to make sure dsp_platform_process work loop
+is stopped at cleanup time.
+
+We use is_active state and signal dsp_platform_process handler to
+finish because we are on the cleanup path.
+
+While at it replace cancel_work with cancel_work sync to be sure
+that work handler ends before going on with the rest of the cleanup.
+
+Reviewed-by: Cosmin-Gabriel Samoila <cosmin.samoila@nxp.com>
+Signed-off-by: Daniel Baluta <daniel.baluta@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_dsp.c                   |    1 +
+ sound/soc/fsl/fsl_dsp_platform_compress.c |    8 +++++---
+ sound/soc/fsl/fsl_dsp_proxy.c             |    5 +++--
+ sound/soc/fsl/fsl_dsp_proxy.h             |    2 +-
+ 4 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_dsp.c b/sound/soc/fsl/fsl_dsp.c
+index 3ea7e75..1bb646a 100644
+--- a/sound/soc/fsl/fsl_dsp.c
++++ b/sound/soc/fsl/fsl_dsp.c
+@@ -370,6 +370,7 @@ int fsl_dsp_open_func(struct fsl_dsp *dsp_priv, struct xf_client *client)
+ 
+ 	client->global = (void *)dsp_priv;
+ 	dsp_priv->proxy.is_loaded = 0;
++	dsp_priv->proxy.is_active = 1;
+ 
+ 	pm_runtime_get_sync(dev);
+ 
+diff --git a/sound/soc/fsl/fsl_dsp_platform_compress.c b/sound/soc/fsl/fsl_dsp_platform_compress.c
+index 0309c68..7e84b1e 100644
+--- a/sound/soc/fsl/fsl_dsp_platform_compress.c
++++ b/sound/soc/fsl/fsl_dsp_platform_compress.c
+@@ -28,9 +28,9 @@ void dsp_platform_process(struct work_struct *w)
+ 
+ 	while (1) {
+ 		rmsg = xf_cmd_recv(proxy, &client->wait, &client->queue, 1);
+-		if (IS_ERR(rmsg)) {
++
++		if (!proxy->is_active || IS_ERR(rmsg))
+ 			return;
+-		}
+ 		if (rmsg->opcode == XF_EMPTY_THIS_BUFFER) {
+ 			client->consume_bytes += rmsg->length;
+ 			snd_compr_fragment_elapsed(client->cstream);
+@@ -101,7 +101,9 @@ static int dsp_platform_compr_free(struct snd_compr_stream *cstream)
+ 
+ 	cpu_dai->driver->ops->shutdown(NULL, cpu_dai);
+ 
+-	ret = cancel_work(&drv->client->work);
++	drv->client->proxy->is_active = 0;
++	wake_up(&drv->client->wait);
++	cancel_work_sync(&drv->client->work);
+ 
+ 	fsl_dsp_close_func(drv->client);
+ 
+diff --git a/sound/soc/fsl/fsl_dsp_proxy.c b/sound/soc/fsl/fsl_dsp_proxy.c
+index fba1c6c..74fb2c9 100644
+--- a/sound/soc/fsl/fsl_dsp_proxy.c
++++ b/sound/soc/fsl/fsl_dsp_proxy.c
+@@ -558,12 +558,13 @@ struct xf_message *xf_cmd_recv(struct xf_proxy *proxy,
+ 						  struct xf_msg_queue *queue,
+ 						  int wait)
+ {
+-	struct xf_message *m;
++	struct xf_message *m = NULL;
+ 	int ret;
+ 
+ 	/* ...wait for message reception (take lock on success) */
+ 	ret = wait_event_interruptible(*wq,
+-			(m = xf_msg_received(proxy, queue)) != NULL || !wait);
++			(m = xf_msg_received(proxy, queue)) != NULL || !wait
++			|| !proxy->is_active);
+ 	if (ret)
+ 		return ERR_PTR(-EINTR);
+ 
+diff --git a/sound/soc/fsl/fsl_dsp_proxy.h b/sound/soc/fsl/fsl_dsp_proxy.h
+index 8df703e..c80412a 100644
+--- a/sound/soc/fsl/fsl_dsp_proxy.h
++++ b/sound/soc/fsl/fsl_dsp_proxy.h
+@@ -300,7 +300,7 @@ struct xf_proxy {
+ 	struct completion	cmd_complete;
+ 	int			is_ready;
+ 	int			is_loaded;
+-
++	int			is_active;
+ 	/* ...internal lock */
+ 	spinlock_t              lock;
+ 
+-- 
+1.7.9.5
+

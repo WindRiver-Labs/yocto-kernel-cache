@@ -1,0 +1,269 @@
+From 0918d4e8320bac5690839f7676b74218703694d5 Mon Sep 17 00:00:00 2001
+From: Anson Huang <Anson.Huang@nxp.com>
+Date: Mon, 9 Jan 2017 17:34:29 +0800
+Subject: [PATCH 1495/5242] MLK-13733-2 ARM: imx: add pm rpmsg for i.mx7ulp
+
+commit  69d34d1d5cf4b9bc3a45a0981114de5481089ae6 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add PM RPMSG for i.MX7ULP power management, currently
+it handles heart beat function which will notify M4
+that linux is alive every 30 seconds, and when system
+enters/exit VLLS mode, it will notify M4 for proper
+power management.
+
+Signed-off-by: Anson Huang <Anson.Huang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm/mach-imx/Makefile     |    2 +-
+ arch/arm/mach-imx/common.h     |    3 +
+ arch/arm/mach-imx/pm-imx7ulp.c |    3 +
+ arch/arm/mach-imx/pm-rpmsg.c   |  169 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 176 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/mach-imx/pm-rpmsg.c
+
+diff --git a/arch/arm/mach-imx/Makefile b/arch/arm/mach-imx/Makefile
+index 8692be1..9e95a77 100644
+--- a/arch/arm/mach-imx/Makefile
++++ b/arch/arm/mach-imx/Makefile
+@@ -107,7 +107,7 @@ obj-$(CONFIG_SOC_IMX6SX) += mach-imx6sx.o ddr3_freq_imx6sx.o \
+ obj-$(CONFIG_SOC_IMX6UL) += mach-imx6ul.o ddr3_freq_imx6sx.o \
+ 			    lpddr2_freq_imx6sx.o
+ obj-$(CONFIG_SOC_IMX7D) += mach-imx7d.o
+-obj-$(CONFIG_SOC_IMX7ULP) += mach-imx7ulp.o pm-imx7ulp.o
++obj-$(CONFIG_SOC_IMX7ULP) += mach-imx7ulp.o pm-imx7ulp.o pm-rpmsg.o
+ 
+ ifeq ($(CONFIG_SUSPEND),y)
+ AFLAGS_suspend-imx6.o :=-Wa,-march=armv7-a
+diff --git a/arch/arm/mach-imx/common.h b/arch/arm/mach-imx/common.h
+index 28ab41a..e059b1a 100644
+--- a/arch/arm/mach-imx/common.h
++++ b/arch/arm/mach-imx/common.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2004-2016 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2017 NXP
+  */
+ 
+ /*
+@@ -191,6 +192,7 @@ static void imx_gpcv2_add_m4_wake_up_irq(u32 hwirq, bool enable) {}
+ void imx6_suspend(void __iomem *ocram_vbase);
+ void imx7_suspend(void __iomem *ocram_vbase);
+ void imx7ulp_suspend(void __iomem *ocram_vbase);
++void pm_vlls_notify_m4(bool enter);
+ #else
+ static inline void v7_cpu_resume(void) {}
+ static inline void ca7_cpu_resume(void) {}
+@@ -200,6 +202,7 @@ static inline void imx7ulp_cpu_resume(void) {}
+ static inline void imx6_suspend(void __iomem *ocram_vbase) {}
+ static inline void imx7_suspend(void __iomem *ocram_vbase) {}
+ static inline void imx7ulp_suspend(void __iomem *ocram_vbase) {}
++void pm_vlls_notify_m4(bool enter) {}
+ #endif
+ 
+ void imx6_pm_ccm_init(const char *ccm_compat);
+diff --git a/arch/arm/mach-imx/pm-imx7ulp.c b/arch/arm/mach-imx/pm-imx7ulp.c
+index eb58f5f..bef6d93 100644
+--- a/arch/arm/mach-imx/pm-imx7ulp.c
++++ b/arch/arm/mach-imx/pm-imx7ulp.c
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ * Copyright 2017 NXP
+  *
+  * The code contained herein is licensed under the GNU General Public
+  * License. You may obtain a copy of the GNU General Public License
+@@ -450,6 +451,7 @@ static int imx7ulp_pm_enter(suspend_state_t state)
+ 		imx7ulp_set_lpm(RUN);
+ 		break;
+ 	case PM_SUSPEND_MEM:
++		pm_vlls_notify_m4(true);
+ 		imx7ulp_gpio_save();
+ 		imx7ulp_scg1_save();
+ 		imx7ulp_pcc2_save();
+@@ -470,6 +472,7 @@ static int imx7ulp_pm_enter(suspend_state_t state)
+ 		imx7ulp_tpm_restore();
+ 		imx7ulp_iomuxc_restore();
+ 		imx7ulp_set_lpm(RUN);
++		pm_vlls_notify_m4(false);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/arch/arm/mach-imx/pm-rpmsg.c b/arch/arm/mach-imx/pm-rpmsg.c
+new file mode 100644
+index 0000000..680f213
+--- /dev/null
++++ b/arch/arm/mach-imx/pm-rpmsg.c
+@@ -0,0 +1,169 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pm_qos.h>
++#include <linux/rpmsg.h>
++#include <linux/uaccess.h>
++#include <linux/virtio.h>
++
++#define RPMSG_TIMEOUT 1000
++
++#define PM_RPMSG_LIFE_CYCLE	1
++#define PM_RPMSG_VERSION	1
++#define PM_RPMSG_TYPE		2
++
++enum pm_rpmsg_cmd {
++	PM_RPMSG_MODE,
++	PM_RPMSG_HEART_BEAT,
++};
++
++enum pm_rpmsg_power_mode {
++	PM_RPMSG_HSRUN,
++	PM_RPMSG_RUN,
++	PM_RPMSG_VLPR,
++	PM_RPMSG_WAIT,
++	PM_RPMSG_VLPS,
++	PM_RPMSG_VLLS,
++};
++
++struct pm_rpmsg_info {
++	struct rpmsg_device *rpdev;
++	struct device *dev;
++	struct pm_rpmsg_data *msg;
++	struct pm_qos_request pm_qos_req;
++};
++
++static struct pm_rpmsg_info pm_rpmsg;
++
++static struct delayed_work heart_beat_work;
++
++struct pm_rpmsg_data {
++	u8 cmd;
++	u8 type;
++	u8 version;
++	u8 cat;
++	u32 data;
++};
++
++static int pm_send_message(struct pm_rpmsg_data *msg,
++			struct pm_rpmsg_info *info)
++{
++	int err;
++
++	if (!info->rpdev) {
++		dev_dbg(info->dev,
++			"rpmsg channel not ready, m4 image ready?\n");
++		return -EINVAL;
++	}
++
++	pm_qos_add_request(&info->pm_qos_req,
++		PM_QOS_CPU_DMA_LATENCY, 0);
++
++	err = rpmsg_send(info->rpdev->ept, (void *)msg,
++			    sizeof(struct pm_rpmsg_data));
++
++	pm_qos_remove_request(&info->pm_qos_req);
++
++	return err;
++}
++
++void pm_vlls_notify_m4(bool enter)
++{
++	struct pm_rpmsg_data msg;
++
++	msg.cat = PM_RPMSG_LIFE_CYCLE;
++	msg.version = PM_RPMSG_VERSION;
++	msg.type = PM_RPMSG_TYPE;
++	msg.cmd = PM_RPMSG_MODE;
++	msg.data = enter ? PM_RPMSG_VLLS : PM_RPMSG_RUN;
++
++	pm_send_message(&msg, &pm_rpmsg);
++}
++
++static void pm_heart_beat_work_handler(struct work_struct *work)
++{
++	struct pm_rpmsg_data msg;
++
++	msg.cat = PM_RPMSG_LIFE_CYCLE;
++	msg.version = PM_RPMSG_VERSION;
++	msg.type = PM_RPMSG_TYPE;
++	msg.cmd = PM_RPMSG_HEART_BEAT;
++	msg.data = 0;
++
++	pm_send_message(&msg, &pm_rpmsg);
++
++	schedule_delayed_work(&heart_beat_work,
++		msecs_to_jiffies(30000));
++}
++
++static int pm_rpmsg_probe(struct rpmsg_device *rpdev)
++{
++	pm_rpmsg.rpdev = rpdev;
++
++	dev_info(&rpdev->dev, "new channel: 0x%x -> 0x%x!\n",
++			rpdev->src, rpdev->dst);
++
++	INIT_DELAYED_WORK(&heart_beat_work,
++		pm_heart_beat_work_handler);
++
++	schedule_delayed_work(&heart_beat_work,
++		msecs_to_jiffies(10000));
++
++	pm_vlls_notify_m4(false);
++
++	return 0;
++}
++
++static int pm_rpmsg_cb(struct rpmsg_device *rpdev, void *data, int len,
++			void *priv, u32 src)
++{
++	return 0;
++}
++
++static void pm_rpmsg_remove(struct rpmsg_device *rpdev)
++{
++	dev_info(&rpdev->dev, "pm rpmsg driver is removed\n");
++}
++
++static struct rpmsg_device_id pm_rpmsg_id_table[] = {
++	{ .name	= "rpmsg-life-cycle-channel" },
++	{ },
++};
++
++static struct rpmsg_driver pm_rpmsg_driver = {
++	.drv.name	= "pm_rpmsg",
++	.drv.owner	= THIS_MODULE,
++	.id_table	= pm_rpmsg_id_table,
++	.probe		= pm_rpmsg_probe,
++	.callback	= pm_rpmsg_cb,
++	.remove		= pm_rpmsg_remove,
++};
++
++static int __init pm_rpmsg_init(void)
++{
++	return register_rpmsg_driver(&pm_rpmsg_driver);
++}
++
++module_init(pm_rpmsg_init);
++
++MODULE_DESCRIPTION("Freescale PM rpmsg driver");
++MODULE_AUTHOR("Anson Huang <Anson.Huang@nxp.com>");
++MODULE_LICENSE("GPL");
+-- 
+1.7.9.5
+

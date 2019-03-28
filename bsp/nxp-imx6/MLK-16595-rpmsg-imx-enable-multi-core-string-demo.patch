@@ -1,0 +1,195 @@
+From dc6227b0beadeeb48543da9aa89068ae8981bd16 Mon Sep 17 00:00:00 2001
+From: Richard Zhu <hongxing.zhu@nxp.com>
+Date: Tue, 17 Oct 2017 14:23:40 +0800
+Subject: [PATCH 2655/5242] MLK-16595 rpmsg: imx: enable multi-core string
+ demo
+
+commit  7297a35987b82d6e2fefee741d8bd1c0bb1069f8 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Because that there are two M4 cores on iMX8QM.
+Enable the multi-core string echo support.
+
+BuildInfo:
+- SCFW a6fd9a48, IMX-MKIMAGE 0, ATF 0
+- U-Boot 2017.03-imx_v2017.03_4.9.11_imx8_alpha+g258936c
+
+Reviewed-by: Frank Li <frank.li@nxp.com>
+Signed-off-by: Richard Zhu <hongxing.zhu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/rpmsg/imx_rpmsg_tty.c |   93 ++++++++++++++++++++++++-----------------
+ 1 file changed, 54 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/rpmsg/imx_rpmsg_tty.c b/drivers/rpmsg/imx_rpmsg_tty.c
+index 42b245d..db200e0 100644
+--- a/drivers/rpmsg/imx_rpmsg_tty.c
++++ b/drivers/rpmsg/imx_rpmsg_tty.c
+@@ -22,6 +22,10 @@
+ #include <linux/tty_flip.h>
+ #include <linux/virtio.h>
+ 
++/* this needs to be less then (RPMSG_BUF_SIZE - sizeof(struct rpmsg_hdr)) */
++#define RPMSG_MAX_SIZE		256
++#define MSG		"hello world!"
++
+ /*
+  * struct rpmsgtty_port - Wrapper struct for imx rpmsg tty port.
+  * @port:		TTY port data
+@@ -30,20 +34,15 @@ struct rpmsgtty_port {
+ 	struct tty_port		port;
+ 	spinlock_t		rx_lock;
+ 	struct rpmsg_device	*rpdev;
++	struct tty_driver	*rpmsgtty_driver;
+ };
+ 
+-static struct rpmsgtty_port rpmsg_tty_port;
+-
+-/* this needs to be less then (RPMSG_BUF_SIZE - sizeof(struct rpmsg_hdr)) */
+-#define RPMSG_MAX_SIZE		256
+-#define MSG		"hello world!"
+-
+ static int rpmsg_tty_cb(struct rpmsg_device *rpdev, void *data, int len,
+ 						void *priv, u32 src)
+ {
+ 	int space;
+ 	unsigned char *cbuf;
+-	struct rpmsgtty_port *cport = &rpmsg_tty_port;
++	struct rpmsgtty_port *cport = dev_get_drvdata(&rpdev->dev);
+ 
+ 	/* flush the recv-ed none-zero data to tty node */
+ 	if (len == 0)
+@@ -73,7 +72,9 @@ static int rpmsg_tty_cb(struct rpmsg_device *rpdev, void *data, int len,
+ 
+ static int rpmsgtty_install(struct tty_driver *driver, struct tty_struct *tty)
+ {
+-	return tty_port_install(&rpmsg_tty_port.port, driver, tty);
++	struct rpmsgtty_port *cport = driver->driver_state;
++
++	return tty_port_install(&cport->port, driver, tty);
+ }
+ 
+ static int rpmsgtty_open(struct tty_struct *tty, struct file *filp)
+@@ -136,34 +137,31 @@ static int rpmsgtty_write_room(struct tty_struct *tty)
+ 	.write_room		= rpmsgtty_write_room,
+ };
+ 
+-static struct tty_driver *rpmsgtty_driver;
+-
+ static int rpmsg_tty_probe(struct rpmsg_device *rpdev)
+ {
+-	int err;
+-	struct rpmsgtty_port *cport = &rpmsg_tty_port;
++	int ret;
++	char name[80];
++	struct rpmsgtty_port *cport;
++	struct tty_driver *rpmsgtty_driver;
+ 
+ 	dev_info(&rpdev->dev, "new channel: 0x%x -> 0x%x!\n",
+ 			rpdev->src, rpdev->dst);
+ 
+-	/*
+-	 * send a message to our remote processor, and tell remote
+-	 * processor about this channel
+-	 */
+-	err = rpmsg_send(rpdev->ept, MSG, strlen(MSG));
+-	if (err) {
+-		dev_err(&rpdev->dev, "rpmsg_send failed: %d\n", err);
+-		return err;
+-	}
++	cport = devm_kzalloc(&rpdev->dev, sizeof(*cport), GFP_KERNEL);
++	if (!cport)
++		return -ENOMEM;
+ 
+ 	rpmsgtty_driver = tty_alloc_driver(1, TTY_DRIVER_UNNUMBERED_NODE);
+-	if (IS_ERR(rpmsgtty_driver))
++	if (IS_ERR(rpmsgtty_driver)) {
++		kfree(cport);
+ 		return PTR_ERR(rpmsgtty_driver);
++	}
+ 
+ 	rpmsgtty_driver->driver_name = "rpmsg_tty";
+-	rpmsgtty_driver->name = "ttyRPMSG";
+-	rpmsgtty_driver->major = TTYAUX_MAJOR;
+-	rpmsgtty_driver->minor_start = 3;
++	sprintf(name, "ttyRPMSG%d", rpdev->dst);
++	rpmsgtty_driver->name = name;
++	rpmsgtty_driver->major = UNNAMED_MAJOR;
++	rpmsgtty_driver->minor_start = 0;
+ 	rpmsgtty_driver->type = TTY_DRIVER_TYPE_CONSOLE;
+ 	rpmsgtty_driver->init_termios = tty_std_termios;
+ 
+@@ -173,39 +171,56 @@ static int rpmsg_tty_probe(struct rpmsg_device *rpdev)
+ 	cport->port.ops = &rpmsgtty_port_ops;
+ 	spin_lock_init(&cport->rx_lock);
+ 	cport->port.low_latency = cport->port.flags | ASYNC_LOW_LATENCY;
++	cport->rpdev = rpdev;
++	dev_set_drvdata(&rpdev->dev, cport);
++	rpmsgtty_driver->driver_state = cport;
++	cport->rpmsgtty_driver = rpmsgtty_driver;
++
++	ret = tty_register_driver(cport->rpmsgtty_driver);
++	if (ret < 0) {
++		pr_err("Couldn't install rpmsg tty driver: ret %d\n", ret);
++		goto error1;
++	} else {
++		pr_info("Install rpmsg tty driver!\n");
++	}
+ 
+-	err = tty_register_driver(rpmsgtty_driver);
+-	if (err < 0) {
+-		pr_err("Couldn't install rpmsg tty driver: err %d\n", err);
++	/*
++	 * send a message to our remote processor, and tell remote
++	 * processor about this channel
++	 */
++	ret = rpmsg_send(rpdev->ept, MSG, strlen(MSG));
++	if (ret) {
++		dev_err(&rpdev->dev, "rpmsg_send failed: %d\n", ret);
+ 		goto error;
+-	} else
+-		pr_info("Install rpmsg tty driver!\n");
+-	cport->rpdev = rpdev;
++	}
+ 
+ 	return 0;
+ 
+ error:
+-	tty_unregister_driver(rpmsgtty_driver);
+-	put_tty_driver(rpmsgtty_driver);
++	tty_unregister_driver(cport->rpmsgtty_driver);
++error1:
++	put_tty_driver(cport->rpmsgtty_driver);
+ 	tty_port_destroy(&cport->port);
+-	rpmsgtty_driver = NULL;
++	cport->rpmsgtty_driver = NULL;
++	kfree(cport);
+ 
+-	return err;
++	return ret;
+ }
+ 
+ static void rpmsg_tty_remove(struct rpmsg_device *rpdev)
+ {
+-	struct rpmsgtty_port *cport = &rpmsg_tty_port;
++	struct rpmsgtty_port *cport = dev_get_drvdata(&rpdev->dev);
+ 
+ 	dev_info(&rpdev->dev, "rpmsg tty driver is removed\n");
+ 
+-	tty_unregister_driver(rpmsgtty_driver);
+-	put_tty_driver(rpmsgtty_driver);
++	tty_unregister_driver(cport->rpmsgtty_driver);
++	put_tty_driver(cport->rpmsgtty_driver);
+ 	tty_port_destroy(&cport->port);
+-	rpmsgtty_driver = NULL;
++	cport->rpmsgtty_driver = NULL;
+ }
+ 
+ static struct rpmsg_device_id rpmsg_driver_tty_id_table[] = {
++	{ .name	= "rpmsg-virtual-tty-channel-1" },
+ 	{ .name	= "rpmsg-virtual-tty-channel" },
+ 	{ .name = "rpmsg-openamp-demo-channel" },
+ 	{ },
+-- 
+1.7.9.5
+

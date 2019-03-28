@@ -1,0 +1,349 @@
+From 3a9a0af72117d6ef08fae6de52c32f767b4125cc Mon Sep 17 00:00:00 2001
+From: Fugang Duan <fugang.duan@nxp.com>
+Date: Sat, 13 May 2017 19:19:29 +0800
+Subject: [PATCH 1819/5242] MLK-14978 irqchip: irqsteer: add NXP imx8 irq
+ steer controller support
+
+commit  eca6919a4cfdc32bcab4c7ad6f9634c010e766ed from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The IrqSteer module redirects/steers the incoming interrupts to output
+interrupts of a selected/designated channel as specified by a set of
+configuration registers.
+
+NXP i.MX8x chips integrate IrqSteer controller for some DSC to share irq
+line for all modules in the subsystem which can reduce the IRQ lines
+connected to the parent interrupt controller GIC, so IrqSteer irqchip
+acts as the second irq domain in the system.
+
+Signed-off-by: Fugang Duan <fugang.duan@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../interrupt-controller/nxp,imx-irqsteer.txt      |   43 ++++
+ drivers/irqchip/Kconfig                            |    6 +
+ drivers/irqchip/Makefile                           |    1 +
+ drivers/irqchip/irq-imx-irqsteer.c                 |  233 ++++++++++++++++++++
+ 4 files changed, 283 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/interrupt-controller/nxp,imx-irqsteer.txt
+ create mode 100644 drivers/irqchip/irq-imx-irqsteer.c
+
+diff --git a/Documentation/devicetree/bindings/interrupt-controller/nxp,imx-irqsteer.txt b/Documentation/devicetree/bindings/interrupt-controller/nxp,imx-irqsteer.txt
+new file mode 100644
+index 0000000..8e33f10
+--- /dev/null
++++ b/Documentation/devicetree/bindings/interrupt-controller/nxp,imx-irqsteer.txt
+@@ -0,0 +1,43 @@
++* NXP i.MX8QM/i.MX8QXP IRQSteer Interrupt Controllers
++
++Required properties:
++- compatible: "nxp,imx-irqsteer".
++- reg: should contain IC registers location and length.
++- interrupts: an interrupt to the parent interrupt controller.
++- interrupt-controller: identifies the node as an interrupt controller.
++- interrupt-parent: gic interrupt controller, link to parent
++- #interrupt-cells: the number of cells to define an interrupt, should be 2.
++  The first cell is the IRQ number, the second cell is used to specify
++  one of the supported IRQ types:
++      IRQ_TYPE_EDGE_RISING = low-to-high edge triggered,
++      IRQ_TYPE_EDGE_FALLING = high-to-low edge triggered,
++      IRQ_TYPE_LEVEL_HIGH = active high level-sensitive,
++      IRQ_TYPE_LEVEL_LOW = active low level-sensitive.
++
++Optional properties:
++- nxp,irqsteer_chans: specify the interrupt channel number, default is 1.
++
++Examples:
++
++	irqsteer_hdmi: irqsteer@56260000 {
++		compatible = "nxp,imx-irqsteer";
++		reg = <0x0 0x56260000 0x0 0x1000>;
++		interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-controller;
++		interrupt-parent = <&gic>;
++		#interrupt-cells = <2>;
++		power-domains = <&pd_hdmi_i2c0>;
++	};
++
++	i2c0_hdmi: i2c@56266000 {
++		compatible = "fsl,imx8qm-lpi2c";
++		reg = <0x0 0x56266000 0x0 0x1000>;
++		interrupts = <8 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-parent = <&irqsteer_hdmi>;
++		clocks = <&clk IMX8QM_HDMI_I2C0_CLK>;
++		clock-names = "per";
++		assigned-clocks = <&clk IMX8QM_HDMI_I2C0_CLK>;
++		assigned-clock-rates = <24000000>;
++		power-domains = <&pd_hdmi_i2c0>;
++		status = "disabled";
++	};
+diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index e9233db..96755b0 100644
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -287,6 +287,12 @@ config IMX_GPCV2
+ 	help
+ 	  Enables the wakeup IRQs for IMX platforms with GPCv2 block
+ 
++config IMX_IRQSTEER
++	def_bool y if ARCH_MXC_ARM64
++	select IRQ_DOMAIN
++	help
++	  Enables the IRQ Steer for NXP IMX platforms
++
+ config IRQ_MXS
+ 	def_bool y if MACH_ASM9260 || ARCH_MXS
+ 	select IRQ_DOMAIN
+diff --git a/drivers/irqchip/Makefile b/drivers/irqchip/Makefile
+index 15f268f..d417e91 100644
+--- a/drivers/irqchip/Makefile
++++ b/drivers/irqchip/Makefile
+@@ -70,6 +70,7 @@ obj-$(CONFIG_RENESAS_H8S_INTC)		+= irq-renesas-h8s.o
+ obj-$(CONFIG_ARCH_SA1100)		+= irq-sa11x0.o
+ obj-$(CONFIG_INGENIC_IRQ)		+= irq-ingenic.o
+ obj-$(CONFIG_IMX_GPCV2)			+= irq-imx-gpcv2.o
++obj-$(CONFIG_IMX_IRQSTEER)			+= irq-imx-irqsteer.o
+ obj-$(CONFIG_PIC32_EVIC)		+= irq-pic32-evic.o
+ obj-$(CONFIG_MSCC_OCELOT_IRQ)		+= irq-mscc-ocelot.o
+ obj-$(CONFIG_MVEBU_GICP)		+= irq-mvebu-gicp.o
+diff --git a/drivers/irqchip/irq-imx-irqsteer.c b/drivers/irqchip/irq-imx-irqsteer.c
+new file mode 100644
+index 0000000..f2affac
+--- /dev/null
++++ b/drivers/irqchip/irq-imx-irqsteer.c
+@@ -0,0 +1,233 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqchip/chained_irq.h>
++#include <linux/irqdomain.h>
++#include <linux/of_platform.h>
++#include <linux/spinlock.h>
++
++#define CHANREG_OFF	(irqsteer_data->channum * 4)
++#define CHANCTRL	0x0
++#define CHANMASK(n)	(0x4 + 0x4 * n)
++#define CHANSET(n)	(0x4 + (0x4 * n) + CHANREG_OFF)
++#define CHANSTATUS(n)	(0x4 + (0x4 * n) + (CHANREG_OFF * 2))
++#define CHAN_MINTDIS	(0x4 + (CHANREG_OFF * 3))
++#define CHAN_MASTRSTAT	(CHAN_MINTDIS + 0x4)
++
++struct irqsteer_irqchip_data {
++	spinlock_t lock;
++	struct platform_device	*pdev;
++	void __iomem *regs;
++	int irq;
++	int channum;
++	struct irq_domain *domain;
++	unsigned long irqstat[];
++};
++
++static void imx_irqsteer_irq_unmask(struct irq_data *d)
++{
++	struct irqsteer_irqchip_data *irqsteer_data = d->chip_data;
++	void __iomem *reg;
++	u32 val, idx;
++
++	spin_lock(&irqsteer_data->lock);
++	idx = d->hwirq / 32;
++	reg = irqsteer_data->regs + CHANMASK(idx);
++	val = readl_relaxed(reg);
++	val |= 1 << (d->hwirq % 32);
++	writel_relaxed(val, reg);
++	spin_unlock(&irqsteer_data->lock);
++}
++
++static void imx_irqsteer_irq_mask(struct irq_data *d)
++{
++	struct irqsteer_irqchip_data *irqsteer_data = d->chip_data;
++	void __iomem *reg;
++	u32 val, idx;
++
++	spin_lock(&irqsteer_data->lock);
++	idx = d->hwirq / 32;
++	reg = irqsteer_data->regs + CHANMASK(idx);
++	val = readl_relaxed(reg);
++	val &= ~(1 << (d->hwirq % 32));
++	writel_relaxed(val, reg);
++	spin_unlock(&irqsteer_data->lock);
++}
++
++static void imx_irqsteer_irq_ack(struct irq_data *d)
++{
++	/* the irqchip has no ack */
++}
++
++static struct irq_chip imx_irqsteer_irq_chip = {
++	.name		= "irqsteer",
++	.irq_eoi	= irq_chip_eoi_parent,
++	.irq_mask	= imx_irqsteer_irq_mask,
++	.irq_unmask	= imx_irqsteer_irq_unmask,
++	.irq_ack	= imx_irqsteer_irq_ack,
++};
++
++static int imx_irqsteer_irq_map(struct irq_domain *h, unsigned int irq,
++				irq_hw_number_t hwirq)
++{
++	irq_set_chip_data(irq, h->host_data);
++	irq_set_chip_and_handler(irq, &imx_irqsteer_irq_chip, handle_edge_irq);
++
++	return 0;
++}
++
++static const struct irq_domain_ops imx_irqsteer_domain_ops = {
++	.map		= imx_irqsteer_irq_map,
++	.xlate		= irq_domain_xlate_twocell,
++};
++
++static void imx_irqsteer_init(struct irqsteer_irqchip_data *irqsteer_data)
++{
++	/* enable channel 1 in default */
++	writel_relaxed(1, irqsteer_data->regs + CHANCTRL);
++}
++
++static void imx_irqsteer_update_irqstat(struct irqsteer_irqchip_data *irqsteer_data)
++{
++	int i;
++
++	/*
++	 * From irq steering doc, there have one mapping:
++	 * word[0] bit 31 -> irq 31 ...  word[0] bit 0 -> irq 0
++	 * word[1] bit 31 -> irq 63 ...  word[1] bit 0 -> irq 32
++	 * ......
++	 * word[15] bit 31 -> irq 511 ...  word[15] bit 0 -> irq 480
++	 */
++	for (i = 0; i < irqsteer_data->channum; i++)
++		irqsteer_data->irqstat[i] = readl_relaxed(irqsteer_data->regs +
++						CHANSTATUS(i));
++}
++
++static void imx_irqsteer_irq_handler(struct irq_desc *desc)
++{
++	struct irqsteer_irqchip_data *irqsteer_data = irq_desc_get_handler_data(desc);
++	unsigned long val;
++	int irqnum;
++	int pos, virq;
++
++	chained_irq_enter(irq_desc_get_chip(desc), desc);
++
++	val = readl_relaxed(irqsteer_data->regs + CHAN_MASTRSTAT);
++	if (!val)
++		goto out;
++
++	imx_irqsteer_update_irqstat(irqsteer_data);
++
++	irqnum = irqsteer_data->channum * 32;
++	for_each_set_bit(pos, irqsteer_data->irqstat, irqnum) {
++		virq = irq_find_mapping(irqsteer_data->domain, pos);
++		if (virq)
++			generic_handle_irq(virq);
++	}
++
++out:
++	chained_irq_exit(irq_desc_get_chip(desc), desc);
++}
++
++static int imx_irqsteer_probe(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct irqsteer_irqchip_data *irqsteer_data;
++	struct resource *res;
++	int channum;
++	int ret;
++
++	ret = of_property_read_u32(np, "nxp,irqsteer_chans", &channum);
++	if (ret)
++		channum = 1;
++
++	irqsteer_data = devm_kzalloc(&pdev->dev, sizeof(*irqsteer_data) +
++				     channum * 4,
++				     GFP_KERNEL);
++	if (!irqsteer_data)
++		return -ENOMEM;
++
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	irqsteer_data->regs = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(irqsteer_data->regs)) {
++		dev_err(&pdev->dev, "failed to initialize reg\n");
++		return PTR_ERR(irqsteer_data->regs);
++	}
++
++	irqsteer_data->irq = platform_get_irq(pdev, 0);
++	if (irqsteer_data->irq <= 0) {
++		dev_err(&pdev->dev, "failed to get irq\n");
++		return -ENODEV;
++	}
++
++	irqsteer_data->channum = channum;
++	irqsteer_data->pdev = pdev;
++	spin_lock_init(&irqsteer_data->lock);
++
++	imx_irqsteer_init(irqsteer_data);
++
++	irqsteer_data->domain = irq_domain_add_linear(np,
++						 irqsteer_data->channum * 32,
++						 &imx_irqsteer_domain_ops,
++						 irqsteer_data);
++	if (!irqsteer_data->domain) {
++		dev_err(&irqsteer_data->pdev->dev,
++			"failed to create IRQ domain\n");
++		return -ENOMEM;
++	}
++
++	irq_set_chained_handler_and_data(irqsteer_data->irq,
++					 imx_irqsteer_irq_handler,
++					 irqsteer_data);
++
++	platform_set_drvdata(pdev, irqsteer_data);
++
++	return 0;
++}
++
++static int imx_irqsteer_remove(struct platform_device *pdev)
++{
++	struct irqsteer_irqchip_data *irqsteer_data = platform_get_drvdata(pdev);
++
++	irq_set_chained_handler_and_data(irqsteer_data->irq, NULL, NULL);
++
++	irq_domain_remove(irqsteer_data->domain);
++
++	platform_set_drvdata(pdev, NULL);
++
++	return 0;
++}
++
++static const struct of_device_id imx_irqsteer_id[] = {
++	{ .compatible = "nxp,imx-irqsteer", },
++	{},
++};
++
++static struct platform_driver imx_irqsteer_driver = {
++	.driver = {
++		.name = "imx-irqsteer",
++		.of_match_table = imx_irqsteer_id,
++	},
++	.probe = imx_irqsteer_probe,
++	.remove = imx_irqsteer_remove,
++};
++
++static int __init irq_imx_irqsteer_init(void)
++{
++	return platform_driver_register(&imx_irqsteer_driver);
++}
++arch_initcall(irq_imx_irqsteer_init);
++
++MODULE_AUTHOR("NXP Semiconductor");
++MODULE_DESCRIPTION("NXP i.MX8 irq steering driver");
++MODULE_LICENSE("GPL v2");
+-- 
+1.7.9.5
+

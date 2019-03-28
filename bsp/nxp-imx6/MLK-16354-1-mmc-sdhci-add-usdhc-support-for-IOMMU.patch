@@ -1,0 +1,103 @@
+From 68e8fff22dca8751ae52a1d8dc6474d1d52c63a1 Mon Sep 17 00:00:00 2001
+From: Haibo Chen <haibo.chen@nxp.com>
+Date: Fri, 1 Sep 2017 17:05:26 +0800
+Subject: [PATCH 2514/5242] MLK-16354-1 mmc: sdhci: add usdhc support for
+ IOMMU
+
+commit  0656c8563493e1f4da914b77d44c4202e473fbf9 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The default max segment size of IOMMU is 64KB, which exceed the ADMA
+limitation. ADMA only support max to 65535, 64KB - 1Byte. IOMMU will
+optimize the segments it received, merge the little segment into one
+big segment. If we use the default IOMMU config, then ADMA will get
+some segments which it's size is 64KB. Then ADMA error will shows up.
+
+Currently, when use standard tuning, driver default disable DMA. But
+on i.MX usdhc, this is not enough. Need also clear DMA_SEL. If not,
+once the DMA_SEL select AMDA2, even dma already disabled, when send
+tuning command, usdhc will still prefetch the ADMA script from wrong
+DMA address, then we will see IOMMU report some error which show
+lack of TLB mapping.
+
+This patch fix these two issue, make sure usdhc can work well by
+operate data through IOMMU.
+
+Signed-off-by: Haibo Chen <haibo.chen@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/mmc/host/sdhci.c |   28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/sdhci.c b/drivers/mmc/host/sdhci.c
+index 91cbebf..1b951d7 100644
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -2184,6 +2184,7 @@ static void sdhci_send_tuning(struct sdhci_host *host, u32 opcode)
+ 	struct mmc_request mrq = {};
+ 	unsigned long flags;
+ 	u32 b = host->sdma_boundary;
++	u8 ctrl;
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+ 
+@@ -2211,6 +2212,17 @@ static void sdhci_send_tuning(struct sdhci_host *host, u32 opcode)
+ 	 */
+ 	sdhci_writew(host, SDHCI_TRNS_READ, SDHCI_TRANSFER_MODE);
+ 
++	/*
++	 * DMA already disabled, so clear the DMA Select here.
++	 * Otherwise, if use ADMA2, even disable DMA, some
++	 * controllers like i.MX usdhc will still prefetch the
++	 * ADMA script when send tuning command, which will cause
++	 * IOMMU report lack of TLB mapping error
++	 */
++	ctrl = sdhci_readb(host, SDHCI_HOST_CONTROL);
++	ctrl &= ~SDHCI_CTRL_DMA_MASK;
++	sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
++
+ 	sdhci_send_command(host, &cmd);
+ 
+ 	host->cmd = NULL;
+@@ -3498,6 +3510,7 @@ static int sdhci_allocate_bounce_buffer(struct sdhci_host *host)
+ int sdhci_setup_host(struct sdhci_host *host)
+ {
+ 	struct mmc_host *mmc;
++	struct device *dev;
+ 	u32 max_current_caps;
+ 	unsigned int ocr_avail;
+ 	unsigned int override_timeout_clk;
+@@ -3509,6 +3522,7 @@ int sdhci_setup_host(struct sdhci_host *host)
+ 		return -EINVAL;
+ 
+ 	mmc = host->mmc;
++	dev = mmc_dev(mmc);
+ 
+ 	/*
+ 	 * If there are external regulators, get them. Note this must be done
+@@ -3980,10 +3994,20 @@ int sdhci_setup_host(struct sdhci_host *host)
+ 	 * be larger than 64 KiB though.
+ 	 */
+ 	if (host->flags & SDHCI_USE_ADMA) {
+-		if (host->quirks & SDHCI_QUIRK_BROKEN_ADMA_ZEROLEN_DESC)
++		if (host->quirks & SDHCI_QUIRK_BROKEN_ADMA_ZEROLEN_DESC) {
+ 			mmc->max_seg_size = 65535;
+-		else
++
++			/*
++			 * send the ADMA limitation to IOMMU. In default,
++			 * the max segment size of IOMMU is 64KB, this exceed
++			 * the ADMA max segment limitation, which is 65535.
++			 */
++			dev->dma_parms = devm_kzalloc(dev,
++					sizeof(*dev->dma_parms), GFP_KERNEL);
++			dma_set_max_seg_size(dev, SZ_64K - 1);
++		} else {
+ 			mmc->max_seg_size = 65536;
++		}
+ 	} else {
+ 		mmc->max_seg_size = mmc->max_req_size;
+ 	}
+-- 
+1.7.9.5
+

@@ -1,0 +1,282 @@
+From 7c485b460f2849d757be08bf50245e024437f879 Mon Sep 17 00:00:00 2001
+From: "Guoniu.Zhou" <guoniu.zhou@nxp.com>
+Date: Fri, 29 Jun 2018 11:12:01 +0800
+Subject: [PATCH 4359/5242] MLK-18517-2: CSI: simplified mipi and parallel csi
+ suspend/resume implementation
+
+commit  2a6b2edf61bec538d4ef58923fbaa21c6c02b314 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+1. Delete power state maintenance of mipi and parallel csi.
+This can simplified driver's resume/suspend implementation.
+
+2. parallel_csi_power_control is a helper function which is
+used to turn on/ff power domain of CI_PI. CI_PI will restore
+its default parent clock for pixel clock after system resume
+and can't be changed when its power is on. This issue is fixed
+in scfw, more detail, please refer to "SCF-76". So remove it
+in driver.
+
+Signed-off-by: Guoniu.Zhou <guoniu.zhou@nxp.com>
+Reviewed-by: Robby.Cai <robby.cai@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/mxc-isi-cap.c      |    1 -
+ drivers/media/platform/imx8/mxc-mipi-csi2.c    |   87 +++++-------------------
+ drivers/media/platform/imx8/mxc-parallel-csi.c |   77 +--------------------
+ 3 files changed, 17 insertions(+), 148 deletions(-)
+
+diff --git a/drivers/media/platform/imx8/mxc-isi-cap.c b/drivers/media/platform/imx8/mxc-isi-cap.c
+index c7ec894..4556bcf 100644
+--- a/drivers/media/platform/imx8/mxc-isi-cap.c
++++ b/drivers/media/platform/imx8/mxc-isi-cap.c
+@@ -580,7 +580,6 @@ static int mxc_isi_capture_open(struct file *file)
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s, ISI%d\n", __func__, mxc_isi->id);
+ 
+-
+ 	/* Get remote source pad */
+ 	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
+ 	if (source_pad == NULL) {
+diff --git a/drivers/media/platform/imx8/mxc-mipi-csi2.c b/drivers/media/platform/imx8/mxc-mipi-csi2.c
+index a5c420d..3fcad08 100644
+--- a/drivers/media/platform/imx8/mxc-mipi-csi2.c
++++ b/drivers/media/platform/imx8/mxc-mipi-csi2.c
+@@ -526,6 +526,7 @@ static int mipi_csi2_s_stream(struct v4l2_subdev *sd, int enable)
+ 
+ 		if (csi2dev->running)
+ 			mxc_mipi_csi2_disable(csi2dev);
++
+ 		csi2dev->running--;
+ 		pm_runtime_put(dev);
+ 	}
+@@ -733,19 +734,11 @@ static int mipi_csi2_probe(struct platform_device *pdev)
+ 	mipi_sc_fw_init(csi2dev, 1);
+ 
+ 	csi2dev->running = 0;
+-	csi2dev->flags = MXC_MIPI_CSI2_PM_POWERED;
+ 
+-	pm_runtime_set_active(dev);
+ 	pm_runtime_enable(dev);
+-	pm_runtime_get_sync(dev);
+-
+-	ret = mipi_csi2_clk_enable(csi2dev);
+-	if (ret < 0)
+-		goto e_clkdis;
+ 
+-	dev_info(&pdev->dev, "lanes: %d, name: %s\n",
++	dev_dbg(&pdev->dev, "lanes: %d, name: %s\n",
+ 		 csi2dev->num_lanes, csi2dev->sd.name);
+-	pm_runtime_put_sync(dev);
+ 
+ 	return 0;
+ 
+@@ -759,90 +752,42 @@ static int mipi_csi2_remove(struct platform_device *pdev)
+ 	struct v4l2_subdev *sd = platform_get_drvdata(pdev);
+ 	struct mxc_mipi_csi2_dev *csi2dev = sd_to_mxc_mipi_csi2_dev(sd);
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+ 	mipi_sc_fw_init(csi2dev, 0);
+ 	media_entity_cleanup(&csi2dev->sd.entity);
+-	pm_runtime_put_sync(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 
+ 	return 0;
+ }
+ 
+-static int mipi_csi2_suspend(struct device *dev, bool runtime)
+-{
+-	struct mxc_mipi_csi2_dev *csi2dev = dev_get_drvdata(dev);
+-	struct v4l2_subdev *sd = &csi2dev->sd;
+-
+-	mutex_lock(&csi2dev->lock);
+-	if (csi2dev->flags & MXC_MIPI_CSI2_PM_POWERED) {
+-		if (csi2dev->running)
+-			mipi_csi2_s_stream(sd, false);
+-
+-		mipi_csi2_clk_disable(csi2dev);
+-		csi2dev->flags &= ~MXC_MIPI_CSI2_PM_POWERED;
+-
+-		if (runtime)
+-			csi2dev->flags |= MXC_MIPI_CSI2_RUNTIME_SUSPENDED;
+-		else
+-			csi2dev->flags |= MXC_MIPI_CSI2_PM_SUSPENDED;
+-	}
+-	mutex_unlock(&csi2dev->lock);
+-	return 0;
+-}
+-
+-static int mipi_csi2_resume(struct device *dev, bool runtime)
+-{
+-	struct mxc_mipi_csi2_dev *csi2dev = dev_get_drvdata(dev);
+-	struct v4l2_subdev *sd = &csi2dev->sd;
+-	int ret;
+-
+-	mutex_lock(&csi2dev->lock);
+-	if (!(csi2dev->flags & MXC_MIPI_CSI2_RUNTIME_SUSPENDED) &&
+-		!(csi2dev->flags & MXC_MIPI_CSI2_PM_SUSPENDED)) {
+-		mutex_unlock(&csi2dev->lock);
+-		return 0;
+-	}
+-
+-	if (!(csi2dev->flags & MXC_MIPI_CSI2_PM_POWERED)) {
+-		ret = mipi_csi2_clk_enable(csi2dev);
+-		if (ret < 0) {
+-			mutex_unlock(&csi2dev->lock);
+-			dev_err(dev, "%s:%d fail\n", __func__, __LINE__);
+-			return -EAGAIN;
+-		}
+-
+-		if (csi2dev->running)
+-			mipi_csi2_s_stream(sd, true);
+-
+-		csi2dev->flags |= MXC_MIPI_CSI2_PM_POWERED;
+-		if (runtime)
+-			csi2dev->flags &= ~MXC_MIPI_CSI2_RUNTIME_SUSPENDED;
+-		else
+-			csi2dev->flags &= ~MXC_MIPI_CSI2_PM_SUSPENDED;
+-	}
+-	mutex_unlock(&csi2dev->lock);
+-	return 0;
+-}
+-
+ #ifdef CONFIG_PM_SLEEP
+ static int  mipi_csi2_pm_suspend(struct device *dev)
+ {
+-	return mipi_csi2_suspend(dev, false);
++	return pm_runtime_force_suspend(dev);
+ }
+ 
+ static int  mipi_csi2_pm_resume(struct device *dev)
+ {
+-	return mipi_csi2_resume(dev, false);
++	return pm_runtime_force_resume(dev);
+ }
+ #endif
+ 
+ static int  mipi_csi2_runtime_suspend(struct device *dev)
+ {
+-	return mipi_csi2_suspend(dev, true);
++	struct mxc_mipi_csi2_dev *csi2dev = dev_get_drvdata(dev);
++
++	mipi_csi2_clk_disable(csi2dev);
++	return 0;
+ }
+ static int  mipi_csi2_runtime_resume(struct device *dev)
+ {
+-	return mipi_csi2_resume(dev, true);
++	struct mxc_mipi_csi2_dev *csi2dev = dev_get_drvdata(dev);
++	int ret;
++
++	ret = mipi_csi2_clk_enable(csi2dev);
++	if (ret)
++		return ret;
++
++	return 0;
+ }
+ 
+ static const struct dev_pm_ops mipi_csi_pm_ops = {
+diff --git a/drivers/media/platform/imx8/mxc-parallel-csi.c b/drivers/media/platform/imx8/mxc-parallel-csi.c
+index c821717..135e2e2 100644
+--- a/drivers/media/platform/imx8/mxc-parallel-csi.c
++++ b/drivers/media/platform/imx8/mxc-parallel-csi.c
+@@ -580,43 +580,12 @@ static int mxc_parallel_csi_remove(struct platform_device *pdev)
+ 	struct mxc_parallel_csi_dev *pcsidev =
+ 			(struct mxc_parallel_csi_dev *)platform_get_drvdata(pdev);
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+ 	media_entity_cleanup(&pcsidev->sd.entity);
+-	mxc_pcsi_clk_disable(pcsidev);
+-	pm_runtime_put(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 
+ 	return 0;
+ }
+ 
+-static void parallel_csi_power_control(sc_pm_power_mode_t mode)
+-{
+-	sc_ipc_t ipcHndl;
+-	sc_err_t sciErr;
+-	uint32_t mu_id;
+-
+-	sciErr = sc_ipc_getMuID(&mu_id);
+-	if (sciErr != SC_ERR_NONE) {
+-		pr_err("Cannot obtain MU ID\n");
+-		return;
+-	}
+-
+-	sciErr = sc_ipc_open(&ipcHndl, mu_id);
+-	if (sciErr != SC_ERR_NONE) {
+-		pr_err("sc_ipc_open failed! (sciError = %d)\n", sciErr);
+-		return;
+-	}
+-
+-	sc_pm_set_resource_power_mode(ipcHndl, SC_R_PI_0, mode);
+-
+-	if (sciErr != SC_ERR_NONE)
+-		pr_err("Set CI_PI resouce power mode failed! (sciError = %d)\n", sciErr);
+-
+-	msleep(10);
+-
+-	sc_ipc_close(mu_id);
+-}
+-
+ static int parallel_csi_pm_suspend(struct device *dev)
+ {
+ 	return pm_runtime_force_suspend(dev);
+@@ -624,51 +593,7 @@ static int parallel_csi_pm_suspend(struct device *dev)
+ 
+ static int parallel_csi_pm_resume(struct device *dev)
+ {
+-	struct mxc_parallel_csi_dev *pcsidev = dev_get_drvdata(dev);
+-	int ret;
+-
+-	/* Power off CI_PI before set clock parent */
+-	parallel_csi_power_control(SC_PM_PW_MODE_OFF);
+-
+-	pcsidev->clk_div = devm_clk_get(dev, "div");
+-	if (IS_ERR(pcsidev->clk_div)) {
+-		dev_err(dev, "%s: Get div clk fail\n", __func__);
+-		return PTR_ERR(pcsidev->clk_div);
+-	}
+-
+-	pcsidev->clk_sel = devm_clk_get(dev, "sel");
+-	if (IS_ERR(pcsidev->clk_sel)) {
+-		dev_err(dev, "%s: Get sel clk fail\n", __func__);
+-		return PTR_ERR(pcsidev->clk_sel);
+-	}
+-
+-	pcsidev->clk_dpll = devm_clk_get(dev, "dpll");
+-	if (IS_ERR(pcsidev->clk_dpll)) {
+-		dev_err(dev, "%s: Get DPLL clk fail\n", __func__);
+-		return PTR_ERR(pcsidev->clk_dpll);
+-	}
+-
+-	ret = clk_set_parent(pcsidev->clk_sel, pcsidev->clk_dpll);
+-	if (ret < 0) {
+-		dev_err(dev, "sel clk set parent fail\n");
+-		return ret;
+-	}
+-
+-	/* 160MHz for pixel and per clock */
+-	ret = clk_set_rate(pcsidev->clk_div, 160000000);
+-	if (ret < 0) {
+-		dev_err(dev, "div clk set rate fail\n");
+-		return ret;
+-	}
+-
+-	/* Release parent clocks */
+-	devm_clk_put(dev, pcsidev->clk_dpll);
+-	devm_clk_put(dev, pcsidev->clk_sel);
+-	devm_clk_put(dev, pcsidev->clk_div);
+-
+-	pm_runtime_enable(dev);
+-
+-	return 0;
++	return pm_runtime_force_resume(dev);
+ }
+ 
+ static int parallel_csi_runtime_suspend(struct device *dev)
+-- 
+1.7.9.5
+

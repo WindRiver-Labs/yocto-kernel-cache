@@ -1,0 +1,158 @@
+From ac2331de94235d5f9f404146b827ad33bfad6e15 Mon Sep 17 00:00:00 2001
+From: Peter Chen <peter.chen@nxp.com>
+Date: Mon, 25 Jun 2018 17:41:30 +0800
+Subject: [PATCH 4143/5242] MLK-18609-5 usb: cdns3: gadget: implement setup
+ status completion properly
+
+commit  ffdb7a0aacc16fd42d2c0479b9a3e3c3409d0b16 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+For CDNS3 gadget, there is NO setup status completion interrupt, but
+software has related request and completion handler for EP0 setup
+status. In previous design, it executes ->completion before .ep0_queue
+back, and causes cdev->setup_pending and cdev->os_desc_pending
+incorrect, the dequeue is executed wrongly.
+
+In this commit, we postpone ->comletion to workqueue or the next
+EP0 interrupt, it makes sure the ->completion is executed after
+.ep0_queue.
+
+[  220.785184] android_work: did not send uevent (0 0           (null))
+[  220.792651] Bad mode in Error handler detected on CPU2, code 0xbf000002 -- SError
+06-28 02:47:13.145  3946  3946 I zygote64: Deoptimizing void com.android.systemui.statusbar.stack.NotificationStackScrollLayout.updateContentHeight() due to JIT inline cache
+[  220.815371] Internal error: Oops - bad mode: 0 [#1] PREEMPT SMP
+[  220.821312] Modules linked in:
+[  220.824389] CPU: 2 PID: 1 Comm: init Not tainted 4.9.105-644221-ga78d348 #8
+[  220.831362] Hardware name: Freescale i.MX8QXP MEK (DT)
+[  220.836504] task: ffff80083a0e0000 task.stack: ffff80083a0e8000
+[  220.842431] PC is at 0x4ec908
+[  220.845398] LR is at 0x454a30
+[  220.848363] pc : [<00000000004ec908>] lr : [<0000000000454a30>] pstate: 40000000
+[  220.855762] sp : 0000ffffe0c35ca0
+[  220.859072] x29: 0000ffffe0c35cc0 x28: 00000000ffffffff
+[  220.864397] x27: 00000000ffffffff x26: 0000000000000001
+[  220.869722] x25: 0000ffff7f6446a9 x24: 000000000057da40
+[  220.875047] x23: 0000000000088241 x22: 0000ffff7f6446c0
+[  220.880373] x21: 0000ffff7f6446c1 x20: 0000000000000009
+[  220.885698] x19: 0000000000000004 x18: 00000000020f06cc
+[  220.891024] x17: aaaaaaaaaaaaaaab x16: 0000000000000000
+[  220.896349] x15: 000000000000005c x14: 0000000000000000
+[  220.901675] x13: 4344552f31672f74 x12: 0000ffffe0c35c88
+[  220.907000] x11: 0000ffffe0c35cd0 x10: 0000000000000004
+[  220.912325] x9 : 0000000000000000 x8 : 0000000000000040
+[  220.917651] x7 : 7f7f7f7f7f7f7f7f x6 : 655e666d68736860
+[  220.922976] x5 : 0000000000000000 x4 : 0000000000000000
+[  220.928302] x3 : 0000000000000180 x2 : 0000000000000004
+[  220.933627] x1 : 0000ffff7f6446c1 x0 : 0000000000000004
+[  220.938952]
+[  220.940440] Process init (pid: 1, stack limit = 0xffff80083a0e8000)
+
+Reported-by: Andy Tian <yang.tian@nxp.com>
+Signed-off-by: Peter Chen <peter.chen@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/usb/cdns3/gadget.c |   37 +++++++++++++++++++++++++++++++++++--
+ drivers/usb/cdns3/gadget.h |    3 +++
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/cdns3/gadget.c b/drivers/usb/cdns3/gadget.c
+index 9e3e011..a4e390d 100644
+--- a/drivers/usb/cdns3/gadget.c
++++ b/drivers/usb/cdns3/gadget.c
+@@ -101,6 +101,7 @@ static int usb_ss_gadget_udc_start(struct usb_gadget *gadget,
+ static void cdns_prepare_setup_packet(struct usb_ss_dev *usb_ss);
+ static void cdns_ep_config(struct usb_ss_endpoint *usb_ss_ep);
+ static void cdns_enable_l1(struct usb_ss_dev *usb_ss, int enable);
++static void __pending_setup_status_handler(struct usb_ss_dev *usb_ss);
+ 
+ static struct usb_endpoint_descriptor cdns3_gadget_ep0_desc = {
+ 	.bLength	= USB_DT_ENDPOINT_SIZE,
+@@ -1057,6 +1058,8 @@ static void cdns_check_ep0_interrupt_proceed(struct usb_ss_dev *usb_ss, int dir)
+ 
+ 	dev_dbg(&usb_ss->dev, "EP_STS: %08X\n", ep_sts_reg);
+ 
++	__pending_setup_status_handler(usb_ss);
++
+ 	if ((ep_sts_reg & EP_STS__SETUP__MASK) && (dir == 0)) {
+ 		dev_dbg(&usb_ss->dev, "SETUP(%02X)\n", 0x00);
+ 
+@@ -1338,6 +1341,27 @@ static int usb_ss_gadget_ep0_set_halt(struct usb_ep *ep, int value)
+ 	return 0;
+ }
+ 
++static void __pending_setup_status_handler(struct usb_ss_dev *usb_ss)
++{
++	struct usb_request *request = usb_ss->pending_status_request;
++
++	if (usb_ss->status_completion_no_call && request && request->complete) {
++		request->complete(usb_ss->gadget.ep0, request);
++		usb_ss->status_completion_no_call = 0;
++	}
++}
++
++static void pending_setup_status_handler(struct work_struct *work)
++{
++	struct usb_ss_dev *usb_ss = container_of(work, struct usb_ss_dev,
++			pending_status_wq);
++	unsigned long flags;
++
++	spin_lock_irqsave(&usb_ss->lock, flags);
++	__pending_setup_status_handler(usb_ss);
++	spin_unlock_irqrestore(&usb_ss->lock, flags);
++}
++
+ /**
+  * usb_ss_gadget_ep0_queue Transfer data on endpoint zero
+  * @ep: pointer to endpoint zero object
+@@ -1390,9 +1414,17 @@ static int usb_ss_gadget_ep0_queue(struct usb_ep *ep,
+ 		if (!erdy_sent)
+ 			gadget_writel(usb_ss, &usb_ss->regs->ep_cmd,
+ 			EP_CMD__ERDY__MASK | EP_CMD__REQ_CMPL__MASK);
+-		if (request->complete)
+-			request->complete(usb_ss->gadget.ep0, request);
++
++		request->actual = 0;
++		usb_ss->status_completion_no_call = true;
++		usb_ss->pending_status_request = request;
+ 		spin_unlock_irqrestore(&usb_ss->lock, flags);
++		/*
++		 * Since there is no completion interrupt for status stage,
++		 * it needs to call ->completion in software after
++		 * ep0_queue is back.
++		 */
++		queue_work(system_freezable_wq, &usb_ss->pending_status_wq);
+ 		return 0;
+ 	}
+ 
+@@ -2256,6 +2288,7 @@ static int __cdns3_gadget_init(struct cdns3 *cdns)
+ 	usb_ss->gadget.sg_supported = 1;
+ 	usb_ss->is_connected = 0;
+ 	spin_lock_init(&usb_ss->lock);
++	INIT_WORK(&usb_ss->pending_status_wq, pending_setup_status_handler);
+ 
+ 	usb_ss->in_standby_mode = 1;
+ 
+diff --git a/drivers/usb/cdns3/gadget.h b/drivers/usb/cdns3/gadget.h
+index b435e01..f0a576d 100644
+--- a/drivers/usb/cdns3/gadget.h
++++ b/drivers/usb/cdns3/gadget.h
+@@ -207,6 +207,7 @@ struct usb_ss_dev {
+ 
+ 	unsigned is_connected:1;
+ 	unsigned in_standby_mode:1;
++	unsigned status_completion_no_call:1;
+ 
+ 	u32 usb_ien;
+ 	u32 ep_ien;
+@@ -217,6 +218,8 @@ struct usb_ss_dev {
+ 	int onchip_mem_allocated_size; /* KB */
+ 	/* Memory is allocated for OUT */
+ 	int out_mem_is_allocated:1;
++	struct work_struct pending_status_wq;
++	struct usb_request *pending_status_request;
+ };
+ 
+ #endif /* __DRIVERS_CDNS3_GADGET */
+-- 
+1.7.9.5
+

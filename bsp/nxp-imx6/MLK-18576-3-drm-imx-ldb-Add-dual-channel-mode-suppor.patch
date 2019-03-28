@@ -1,0 +1,731 @@
+From de5d810a93dd43a5e5056b0877be471e03524548 Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Tue, 12 Jun 2018 15:32:18 +0800
+Subject: [PATCH 3965/5242] MLK-18576-3 drm/imx: ldb: Add dual channel mode
+ support for i.MX8dx/dxp/qxp
+
+commit  92147b1bc14480b0053f93f7b52d60af266f96d9 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+i.MX8dx/dxp/qxp use two LDBs(one primary, one auxiliary) to support
+dual channel mode.  This patch adds the dual channel mode support
+for i.MX8dx/dxp/qxp.  Note that the drivers contain specific sequence
+needed by this mode - LDB VSYNC polarity and channel selection settings
+should be configured into the register a bit earlier in ->atomic_mode_set
+instead of in ->enable, and DC subsystem pixel link enablement is moved
+from the DPU driver to the LDB driver to make sure it happens later
+than LDB clocks enablement in ->enable.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-crtc.c |    9 +-
+ drivers/gpu/drm/imx/imx-ldb.c      |  265 ++++++++++++++++++++++++++++++++----
+ drivers/gpu/imx/dpu/dpu-common.c   |    3 +
+ drivers/gpu/imx/dpu/dpu-framegen.c |   13 +-
+ drivers/gpu/imx/dpu/dpu-prv.h      |    1 +
+ include/video/dpu.h                |    2 +-
+ 6 files changed, 262 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.c b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+index dd7aed1..ded240f 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-crtc.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+@@ -505,6 +505,7 @@ static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 	unsigned long encoder_types = 0;
+ 	u32 encoder_mask;
+ 	bool encoder_type_has_tmds = false;
++	bool encoder_type_has_lvds = false;
+ 
+ 	dev_dbg(dpu_crtc->dev, "%s: mode->hdisplay: %d\n", __func__,
+ 			mode->hdisplay);
+@@ -525,7 +526,13 @@ static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 		dev_dbg(dpu_crtc->dev, "%s: encoder type has TMDS\n", __func__);
+ 	}
+ 
+-	framegen_cfg_videomode(dpu_crtc->fg, mode, encoder_type_has_tmds);
++	if (encoder_types & BIT(DRM_MODE_ENCODER_LVDS)) {
++		encoder_type_has_lvds = true;
++		dev_dbg(dpu_crtc->dev, "%s: encoder type has LVDS\n", __func__);
++	}
++
++	framegen_cfg_videomode(dpu_crtc->fg, mode,
++			encoder_type_has_tmds, encoder_type_has_lvds);
+ 	framegen_displaymode(dpu_crtc->fg, FGDM__SEC_ON_TOP);
+ 
+ 	framegen_panic_displaymode(dpu_crtc->fg, FGDM__TEST);
+diff --git a/drivers/gpu/drm/imx/imx-ldb.c b/drivers/gpu/drm/imx/imx-ldb.c
+index d669a48..e71dab0 100644
+--- a/drivers/gpu/drm/imx/imx-ldb.c
++++ b/drivers/gpu/drm/imx/imx-ldb.c
+@@ -74,6 +74,7 @@ struct imx_ldb_channel {
+ 	struct drm_bridge *bridge;
+ 
+ 	struct phy *phy;
++	struct phy *aux_phy;
+ 	bool phy_is_on;
+ 
+ 	struct device_node *child;
+@@ -110,12 +111,14 @@ struct devtype {
+ 	bool visible_phy;
+ 	bool has_mux;
+ 	bool has_ch_sel;
++	bool has_aux_ldb;
+ 	bool is_imx8;
+ 	bool use_mixel_phy;
+ 	bool use_mixel_combo_phy;
+ 	bool padding_quirks;
+ 	bool pixel_link_init_quirks;
+ 	bool pixel_link_valid_quirks;
++	bool pixel_link_enable_quirks;
+ 
+ 	/* pixel rate in KHz */
+ 	unsigned int max_prate_single_mode;
+@@ -124,6 +127,7 @@ struct devtype {
+ 
+ struct imx_ldb {
+ 	struct regmap *regmap;
++	struct regmap *aux_regmap;
+ 	struct device *dev;
+ 	struct imx_ldb_channel channel[2];
+ 	struct clk *clk[2]; /* our own clock */
+@@ -132,6 +136,8 @@ struct imx_ldb {
+ 	struct clk *clk_pll[2]; /* upstream clock we can adjust */
+ 	struct clk *clk_pixel;
+ 	struct clk *clk_bypass;
++	struct clk *clk_aux_pixel;
++	struct clk *clk_aux_bypass;
+ 	u32 ldb_ctrl_reg;
+ 	u32 ldb_ctrl;
+ 	const struct bus_mux *lvds_mux;
+@@ -139,12 +145,14 @@ struct imx_ldb {
+ 	bool visible_phy;
+ 	bool has_mux;
+ 	bool has_ch_sel;
++	bool has_aux_ldb;
+ 	bool is_imx8;
+ 	bool use_mixel_phy;
+ 	bool use_mixel_combo_phy;
+ 	bool padding_quirks;
+ 	bool pixel_link_init_quirks;
+ 	bool pixel_link_valid_quirks;
++	bool pixel_link_enable_quirks;
+ 
+ 	/* pixel rate in KHz */
+ 	unsigned int max_prate_single_mode;
+@@ -248,6 +256,7 @@ static struct drm_encoder *imx_ldb_connector_best_encoder(
+ static void imx_ldb_set_clock(struct imx_ldb *ldb, int mux, int chno,
+ 		unsigned long serial_clk, unsigned long di_clk)
+ {
++	int dual = ldb->ldb_ctrl & LDB_SPLIT_MODE_EN;
+ 	int ret;
+ 
+ 	if (ldb->is_imx8) {
+@@ -262,6 +271,13 @@ static void imx_ldb_set_clock(struct imx_ldb *ldb, int mux, int chno,
+ 		clk_get_rate(ldb->clk_pixel);
+ 		clk_set_rate(ldb->clk_bypass, di_clk);
+ 		clk_set_rate(ldb->clk_pixel, di_clk);
++
++		if (dual && ldb->has_aux_ldb) {
++			clk_get_rate(ldb->clk_aux_bypass);
++			clk_get_rate(ldb->clk_aux_pixel);
++			clk_set_rate(ldb->clk_aux_bypass, di_clk);
++			clk_set_rate(ldb->clk_aux_pixel, di_clk);
++		}
+ 		return;
+ 	}
+ 
+@@ -291,6 +307,8 @@ static void imx_ldb_set_clock(struct imx_ldb *ldb, int mux, int chno,
+ #ifndef CONFIG_HAVE_IMX8_SOC
+ static void dpu_pixel_link_validate(int dpu_id, int stream_id) {}
+ static void dpu_pixel_link_invalidate(int dpu_id, int stream_id) {}
++static void dpu_pixel_link_enable(int dpu_id, int stream_id) {}
++static void dpu_pixel_link_disable(int dpu_id, int stream_id) {}
+ #else
+ /* FIXME: validate pixel link in a proper manner */
+ static void dpu_pixel_link_validate(int dpu_id, int stream_id)
+@@ -380,6 +398,74 @@ static void dpu_pixel_link_invalidate(int dpu_id, int stream_id)
+ 
+ 	sc_ipc_close(mu_id);
+ }
++
++/* FIXME: enable pixel link in a proper manner */
++static void dpu_pixel_link_enable(int dpu_id, int stream_id)
++{
++	sc_err_t sciErr;
++	sc_ipc_t ipcHndl = 0;
++	u32 mu_id;
++
++	sciErr = sc_ipc_getMuID(&mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("Cannot obtain MU ID\n");
++		return;
++	}
++
++	sciErr = sc_ipc_open(&ipcHndl, mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("sc_ipc_open failed! (sciError = %d)\n", sciErr);
++		return;
++	}
++
++	if (dpu_id == 0) {
++		sciErr = sc_misc_set_control(ipcHndl, SC_R_DC_0,
++			stream_id ? SC_C_PXL_LINK_MST2_ENB : SC_C_PXL_LINK_MST1_ENB, 1);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_DC_0:SC_C_PXL_LINK_MST%d_ENB sc_misc_set_control failed! (sciError = %d)\n", stream_id + 1, sciErr);
++	} else if (dpu_id == 1) {
++		sciErr = sc_misc_set_control(ipcHndl, SC_R_DC_1,
++			stream_id ? SC_C_PXL_LINK_MST2_ENB : SC_C_PXL_LINK_MST1_ENB, 1);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_DC_1:SC_C_PXL_LINK_MST%d_ENB sc_misc_set_control failed! (sciError = %d)\n", stream_id + 1, sciErr);
++	}
++
++	sc_ipc_close(mu_id);
++}
++
++/* FIXME: disable pixel link in a proper manner */
++static void dpu_pixel_link_disable(int dpu_id, int stream_id)
++{
++	sc_err_t sciErr;
++	sc_ipc_t ipcHndl = 0;
++	u32 mu_id;
++
++	sciErr = sc_ipc_getMuID(&mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("Cannot obtain MU ID\n");
++		return;
++	}
++
++	sciErr = sc_ipc_open(&ipcHndl, mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("sc_ipc_open failed! (sciError = %d)\n", sciErr);
++		return;
++	}
++
++	if (dpu_id == 0) {
++		sciErr = sc_misc_set_control(ipcHndl, SC_R_DC_0,
++			stream_id ? SC_C_PXL_LINK_MST2_ENB : SC_C_PXL_LINK_MST1_ENB, 0);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_DC_0:SC_C_PXL_LINK_MST%d_ENB sc_misc_set_control failed! (sciError = %d)\n", stream_id + 1, sciErr);
++	} else if (dpu_id == 1) {
++		sciErr = sc_misc_set_control(ipcHndl, SC_R_DC_1,
++			stream_id ? SC_C_PXL_LINK_MST2_ENB : SC_C_PXL_LINK_MST1_ENB, 0);
++		if (sciErr != SC_ERR_NONE)
++			pr_err("SC_R_DC_1:SC_C_PXL_LINK_MST%d_ENB sc_misc_set_control failed! (sciError = %d)\n", stream_id + 1, sciErr);
++	}
++
++	sc_ipc_close(mu_id);
++}
+ #endif
+ 
+ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+@@ -394,6 +480,11 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 	if (ldb->is_imx8) {
+ 		clk_prepare_enable(ldb->clk_pixel);
+ 		clk_prepare_enable(ldb->clk_bypass);
++
++		if (dual && ldb->has_aux_ldb) {
++			clk_prepare_enable(ldb->clk_aux_pixel);
++			clk_prepare_enable(ldb->clk_aux_bypass);
++		}
+ 	}
+ 
+ 	if (ldb->has_mux) {
+@@ -409,6 +500,14 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 		}
+ 	}
+ 
++	/*
++	 * LDB frontend doesn't know if the auxiliary LDB is used or not.
++	 * Enable pixel link after dual or single LDB clocks are enabled
++	 * so that the dual LDBs are synchronized.
++	 */
++	if (ldb->has_aux_ldb && ldb->pixel_link_enable_quirks)
++		dpu_pixel_link_enable(0, ldb->id);
++
+ 	if (imx_ldb_ch == &ldb->channel[0] || dual) {
+ 		ldb->ldb_ctrl &= ~LDB_CH0_MODE_EN_MASK;
+ 		if (mux == 0 || ldb->lvds_mux)
+@@ -437,13 +536,20 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 	}
+ 
+ 	regmap_write(ldb->regmap, ldb->ldb_ctrl_reg, ldb->ldb_ctrl);
++	if (dual && ldb->has_aux_ldb)
++		regmap_write(ldb->aux_regmap, ldb->ldb_ctrl_reg,
++						ldb->ldb_ctrl | LDB_CH_SEL);
+ 
+ 	if (dual) {
+ 		phy_power_on(ldb->channel[0].phy);
+-		phy_power_on(ldb->channel[1].phy);
++		if (ldb->has_aux_ldb)
++			phy_power_on(ldb->channel[0].aux_phy);
++		else
++			phy_power_on(ldb->channel[1].phy);
+ 
+ 		ldb->channel[0].phy_is_on = true;
+-		ldb->channel[1].phy_is_on = true;
++		if (!ldb->has_aux_ldb)
++			ldb->channel[1].phy_is_on = true;
+ 	} else {
+ 		phy_power_on(imx_ldb_ch->phy);
+ 
+@@ -498,6 +604,8 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 		} else if (ldb->use_mixel_combo_phy) {
+ 			mixel_phy_combo_lvds_set_phy_speed(ldb->channel[0].phy,
+ 						     di_clk / 2);
++			mixel_phy_combo_lvds_set_phy_speed(ldb->channel[0].aux_phy,
++						     di_clk / 2);
+ 		}
+ 	} else {
+ 		serial_clk = 7000UL * mode->clock;
+@@ -532,6 +640,13 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 			ldb->ldb_ctrl &= ~LDB_DI1_VS_POL_ACT_LOW;
+ 	}
+ 
++	/* settle vsync polarity and channel selection down early */
++	if (dual && ldb->has_aux_ldb) {
++		regmap_write(ldb->regmap, ldb->ldb_ctrl_reg, ldb->ldb_ctrl);
++		regmap_write(ldb->aux_regmap, ldb->ldb_ctrl_reg,
++						ldb->ldb_ctrl | LDB_CH_SEL);
++	}
++
+ 	if (dual) {
+ 		if (ldb->use_mixel_phy) {
+ 			/* VSYNC */
+@@ -560,19 +675,29 @@ static void imx_ldb_encoder_enable(struct drm_encoder *encoder)
+ 			}
+ 		} else if (ldb->use_mixel_combo_phy) {
+ 			/* VSYNC */
+-			if (mode->flags & DRM_MODE_FLAG_NVSYNC)
++			if (mode->flags & DRM_MODE_FLAG_NVSYNC) {
+ 				mixel_phy_combo_lvds_set_vsync_pol(
+ 					ldb->channel[0].phy, false);
+-			else
++				mixel_phy_combo_lvds_set_vsync_pol(
++					ldb->channel[0].aux_phy, false);
++			} else {
+ 				mixel_phy_combo_lvds_set_vsync_pol(
+ 					ldb->channel[0].phy, true);
++				mixel_phy_combo_lvds_set_vsync_pol(
++					ldb->channel[0].aux_phy, true);
++			}
+ 			/* HSYNC */
+-			if (mode->flags & DRM_MODE_FLAG_NHSYNC)
++			if (mode->flags & DRM_MODE_FLAG_NHSYNC) {
+ 				mixel_phy_combo_lvds_set_hsync_pol(
+ 					ldb->channel[0].phy, false);
+-			else
++				mixel_phy_combo_lvds_set_hsync_pol(
++					ldb->channel[0].aux_phy, false);
++			} else {
+ 				mixel_phy_combo_lvds_set_hsync_pol(
+ 					ldb->channel[0].phy, true);
++				mixel_phy_combo_lvds_set_hsync_pol(
++					ldb->channel[0].aux_phy, true);
++			}
+ 		}
+ 	} else {
+ 		if (ldb->use_mixel_phy) {
+@@ -640,10 +765,14 @@ static void imx_ldb_encoder_disable(struct drm_encoder *encoder)
+ 
+ 	if (dual) {
+ 		phy_power_off(ldb->channel[0].phy);
+-		phy_power_off(ldb->channel[1].phy);
++		if (ldb->has_aux_ldb)
++			phy_power_off(ldb->channel[0].aux_phy);
++		else
++			phy_power_off(ldb->channel[1].phy);
+ 
+ 		ldb->channel[0].phy_is_on = false;
+-		ldb->channel[1].phy_is_on = false;
++		if (!ldb->has_aux_ldb)
++			ldb->channel[1].phy_is_on = false;
+ 	} else {
+ 		phy_power_off(imx_ldb_ch->phy);
+ 
+@@ -656,10 +785,17 @@ static void imx_ldb_encoder_disable(struct drm_encoder *encoder)
+ 		ldb->ldb_ctrl &= ~LDB_CH1_MODE_EN_MASK;
+ 
+ 	regmap_write(ldb->regmap, ldb->ldb_ctrl_reg, ldb->ldb_ctrl);
++	if (dual && ldb->has_aux_ldb)
++		regmap_write(ldb->aux_regmap, ldb->ldb_ctrl_reg, ldb->ldb_ctrl);
+ 
+ 	if (ldb->is_imx8) {
+ 		clk_disable_unprepare(ldb->clk_bypass);
+ 		clk_disable_unprepare(ldb->clk_pixel);
++
++		if (dual && ldb->has_aux_ldb) {
++			clk_disable_unprepare(ldb->clk_aux_bypass);
++			clk_disable_unprepare(ldb->clk_aux_pixel);
++		}
+ 	} else {
+ 		if (ldb->ldb_ctrl & LDB_SPLIT_MODE_EN) {
+ 			clk_disable_unprepare(ldb->clk[0]);
+@@ -667,6 +803,9 @@ static void imx_ldb_encoder_disable(struct drm_encoder *encoder)
+ 		}
+ 	}
+ 
++	if (ldb->has_aux_ldb && ldb->pixel_link_enable_quirks)
++		dpu_pixel_link_disable(0, ldb->id);
++
+ 	if (!ldb->has_mux)
+ 		goto unprepare_panel;
+ 
+@@ -943,11 +1082,13 @@ static u32 of_get_bus_format(struct device *dev, struct imx_ldb *ldb,
+ 	.bus_mux = NULL,
+ 	.visible_phy = true,
+ 	.has_ch_sel = true,
++	.has_aux_ldb = true,
+ 	.is_imx8 = true,
+ 	.use_mixel_combo_phy = true,
+ 	.padding_quirks = true,
+ 	.pixel_link_init_quirks = true,
+ 	.pixel_link_valid_quirks = true,
++	.pixel_link_enable_quirks = true,
+ 	.max_prate_single_mode = 150000,
+ 	.max_prate_dual_mode = 300000,
+ };
+@@ -1009,13 +1150,14 @@ static int imx_ldb_panel_ddc(struct device *dev,
+ }
+ 
+ #ifndef CONFIG_HAVE_IMX8_SOC
+-static void ldb_pixel_link_init(int id) {}
++static void ldb_pixel_link_init(int id, bool dual) {}
+ #else
+-static void ldb_pixel_link_init(int id)
++static void ldb_pixel_link_init(int id, bool dual)
+ {
+ 	sc_err_t sciErr;
+ 	sc_ipc_t ipcHndl = 0;
+ 	u32 mu_id;
++	bool is_aux = false;
+ 
+ 	sciErr = sc_ipc_getMuID(&mu_id);
+ 	if (sciErr != SC_ERR_NONE) {
+@@ -1029,28 +1171,35 @@ static void ldb_pixel_link_init(int id)
+ 		return;
+ 	}
+ 
++again:
+ 	if (id == 0) {
+ 		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_MODE, 1);
+ 		if (sciErr != SC_ERR_NONE)
+ 			pr_err("SC_R_MIPI_%d MODE failed %d!\n", id, sciErr);
+-		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_DUAL_MODE, 0);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_DUAL_MODE, is_aux);
+ 		if (sciErr != SC_ERR_NONE)
+ 			pr_err("SC_R_MIPI_%d DUAL_MODE failed %d!\n", id, sciErr);
+-		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_PXL_LINK_SEL, 0);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_0, SC_C_PXL_LINK_SEL, is_aux);
+ 		if (sciErr != SC_ERR_NONE)
+ 			pr_err("SC_R_MIPI_%d PXL_LINK_SEL failed %d!\n", id, sciErr);
+ 	} else {
+ 		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_MODE, 1);
+ 		if (sciErr != SC_ERR_NONE)
+ 			pr_err("SC_R_MIPI_%d MODE failed %d!\n", id, sciErr);
+-		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_DUAL_MODE, 0);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_DUAL_MODE, is_aux);
+ 		if (sciErr != SC_ERR_NONE)
+ 			pr_err("SC_R_MIPI_%d DUAL_MODE failed %d!\n", id, sciErr);
+-		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_PXL_LINK_SEL, 0);
++		sc_misc_set_control(ipcHndl, SC_R_MIPI_1, SC_C_PXL_LINK_SEL, is_aux);
+ 		if (sciErr != SC_ERR_NONE)
+ 			pr_err("SC_R_MIPI_%d PXL_LINK_SEL failed %d!\n", id, sciErr);
+ 	}
+ 
++	if (dual && !is_aux) {
++		id ^= 1;
++		is_aux = true;
++		goto again;
++	}
++
+ 	sc_ipc_close(mu_id);
+ }
+ #endif
+@@ -1085,22 +1234,28 @@ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ 	imx_ldb->visible_phy = devtype->visible_phy;
+ 	imx_ldb->has_mux = devtype->has_mux;
+ 	imx_ldb->has_ch_sel = devtype->has_ch_sel;
++	imx_ldb->has_aux_ldb = devtype->has_aux_ldb;
+ 	imx_ldb->is_imx8 = devtype->is_imx8;
+ 	imx_ldb->use_mixel_phy = devtype->use_mixel_phy;
+ 	imx_ldb->use_mixel_combo_phy = devtype->use_mixel_combo_phy;
+ 	imx_ldb->padding_quirks = devtype->padding_quirks;
+ 	imx_ldb->pixel_link_init_quirks = devtype->pixel_link_init_quirks;
+ 	imx_ldb->pixel_link_valid_quirks = devtype->pixel_link_valid_quirks;
++	imx_ldb->pixel_link_enable_quirks = devtype->pixel_link_enable_quirks;
+ 	imx_ldb->max_prate_single_mode = devtype->max_prate_single_mode;
+ 	imx_ldb->max_prate_dual_mode = devtype->max_prate_dual_mode;
+ 
+ 	dual = of_property_read_bool(np, "fsl,dual-channel");
+-	if (dual) {
+-		if (imx_ldb->has_ch_sel) {
+-			dev_info(dev, "do not suppurt dual channel mode\n");
+-			return -EINVAL;
+-		}
++	if (dual)
+ 		imx_ldb->ldb_ctrl |= LDB_SPLIT_MODE_EN;
++
++	if (dual && imx_ldb->has_aux_ldb) {
++		imx_ldb->aux_regmap =
++				syscon_regmap_lookup_by_phandle(np, "aux-gpr");
++		if (IS_ERR(imx_ldb->aux_regmap)) {
++			dev_err(dev, "failed to get parent auxiliary regmap\n");
++			return PTR_ERR(imx_ldb->aux_regmap);
++		}
+ 	}
+ 
+ 	if (imx_ldb->is_imx8) {
+@@ -1111,6 +1266,18 @@ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ 		imx_ldb->clk_bypass = devm_clk_get(imx_ldb->dev, "bypass");
+ 		if (IS_ERR(imx_ldb->clk_bypass))
+ 			return PTR_ERR(imx_ldb->clk_bypass);
++
++		if (dual && imx_ldb->has_aux_ldb) {
++			imx_ldb->clk_aux_pixel =
++					devm_clk_get(imx_ldb->dev, "aux_pixel");
++			if (IS_ERR(imx_ldb->clk_aux_pixel))
++				return PTR_ERR(imx_ldb->clk_aux_pixel);
++
++			imx_ldb->clk_aux_bypass =
++					devm_clk_get(imx_ldb->dev, "aux_bypass");
++			if (IS_ERR(imx_ldb->clk_aux_bypass))
++				return PTR_ERR(imx_ldb->clk_aux_bypass);
++		}
+ 	}
+ 
+ 	if (imx_ldb->has_mux) {
+@@ -1232,6 +1399,30 @@ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ 				return ret;
+ 			}
+ 
++			if (dual && imx_ldb->has_aux_ldb) {
++				channel->aux_phy =
++					devm_of_phy_get(dev, child, "aux_ldb_phy");
++				if (IS_ERR(channel->aux_phy)) {
++					ret = PTR_ERR(channel->aux_phy);
++					if (ret == -EPROBE_DEFER) {
++						return ret;
++					} else {
++						dev_err(dev,
++							"can't get channel%d aux phy: %d\n",
++							channel->chno, ret);
++						return ret;
++					}
++				}
++
++				ret = phy_init(channel->aux_phy);
++				if (ret < 0) {
++					dev_err(dev,
++						"failed to initialize channel%d aux phy: %d\n",
++						channel->chno, ret);
++					return ret;
++				}
++			}
++
+ 			if (auxiliary_ch)
+ 				continue;
+ 		}
+@@ -1248,7 +1439,7 @@ static int imx_ldb_bind(struct device *dev, struct device *master, void *data)
+ 		imx_ldb->id = of_alias_get_id(np, "ldb");
+ 
+ 	if (imx_ldb->pixel_link_init_quirks)
+-		ldb_pixel_link_init(imx_ldb->id);
++		ldb_pixel_link_init(imx_ldb->id, dual);
+ 
+ 	return 0;
+ }
+@@ -1257,15 +1448,21 @@ static void imx_ldb_unbind(struct device *dev, struct device *master,
+ 	void *data)
+ {
+ 	struct imx_ldb *imx_ldb = dev_get_drvdata(dev);
++	int dual = imx_ldb->ldb_ctrl & LDB_SPLIT_MODE_EN;
+ 	int i;
+ 
+ 	for (i = 0; i < 2; i++) {
+ 		struct imx_ldb_channel *channel = &imx_ldb->channel[i];
+ 
+-		if (channel->phy_is_on)
++		if (channel->phy_is_on) {
+ 			phy_power_off(channel->phy);
++			if (dual && imx_ldb->has_aux_ldb)
++				phy_power_off(channel->aux_phy);
++		}
+ 
+ 		phy_exit(channel->phy);
++		if (dual && imx_ldb->has_aux_ldb && i == 0)
++			phy_exit(channel->aux_phy);
+ 
+ 		if (channel->panel)
+ 			drm_panel_detach(channel->panel);
+@@ -1298,11 +1495,13 @@ static int imx_ldb_suspend(struct device *dev)
+ {
+ 	struct imx_ldb *imx_ldb = dev_get_drvdata(dev);
+ 	struct imx_ldb_channel *channel;
+-	int i;
++	int i, dual;
+ 
+ 	if (imx_ldb == NULL)
+ 		return 0;
+ 
++	dual = imx_ldb->ldb_ctrl & LDB_SPLIT_MODE_EN;
++
+ 	for (i = 0; i < 2; i++) {
+ 		channel = &imx_ldb->channel[i];
+ 
+@@ -1310,6 +1509,13 @@ static int imx_ldb_suspend(struct device *dev)
+ 			phy_power_off(channel->phy);
+ 
+ 		phy_exit(channel->phy);
++
++		if (dual && imx_ldb->has_aux_ldb && i == 0) {
++			if (channel->phy_is_on)
++				phy_power_off(channel->aux_phy);
++
++			phy_exit(channel->aux_phy);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -1318,17 +1524,24 @@ static int imx_ldb_suspend(struct device *dev)
+ static int imx_ldb_resume(struct device *dev)
+ {
+ 	struct imx_ldb *imx_ldb = dev_get_drvdata(dev);
+-	int i;
++	int i, dual;
+ 
+ 	if (imx_ldb == NULL)
+ 		return 0;
+ 
+-	if (imx_ldb->visible_phy)
+-		for (i = 0; i < 2; i++)
++	dual = imx_ldb->ldb_ctrl & LDB_SPLIT_MODE_EN;
++
++	if (imx_ldb->visible_phy) {
++		for (i = 0; i < 2; i++) {
+ 			phy_init(imx_ldb->channel[i].phy);
+ 
++			if (dual && imx_ldb->has_aux_ldb && i == 0)
++				phy_init(imx_ldb->channel[i].aux_phy);
++		}
++	}
++
+ 	if (imx_ldb->pixel_link_init_quirks)
+-		ldb_pixel_link_init(imx_ldb->id);
++		ldb_pixel_link_init(imx_ldb->id, dual);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/imx/dpu/dpu-common.c b/drivers/gpu/imx/dpu/dpu-common.c
+index 8cd60b7..2cf7a50 100644
+--- a/drivers/gpu/imx/dpu/dpu-common.c
++++ b/drivers/gpu/imx/dpu/dpu-common.c
+@@ -544,6 +544,7 @@ static inline void dpu_cm_write(struct dpu_soc *dpu, u32 value,
+ 	.has_prefetch = false,
+ 	.has_prefetch_fixup = false,
+ 	.has_disp_sel_clk = false,
++	.has_dual_ldb = false,
+ 	.pixel_link_quirks = false,
+ 	.pixel_link_nhvsync = false,
+ 	.version = DPU_V1,
+@@ -574,6 +575,7 @@ static inline void dpu_cm_write(struct dpu_soc *dpu, u32 value,
+ 	.has_prefetch = true,
+ 	.has_prefetch_fixup = false,
+ 	.has_disp_sel_clk = true,
++	.has_dual_ldb = false,
+ 	.pixel_link_quirks = true,
+ 	.pixel_link_nhvsync = true,
+ 	.version = DPU_V2,
+@@ -604,6 +606,7 @@ static inline void dpu_cm_write(struct dpu_soc *dpu, u32 value,
+ 	.has_prefetch = true,
+ 	.has_prefetch_fixup = true,
+ 	.has_disp_sel_clk = false,
++	.has_dual_ldb = true,
+ 	.pixel_link_quirks = true,
+ 	.pixel_link_nhvsync = true,
+ 	.version = DPU_V2,
+diff --git a/drivers/gpu/imx/dpu/dpu-framegen.c b/drivers/gpu/imx/dpu/dpu-framegen.c
+index f956da7..bb75bf8 100644
+--- a/drivers/gpu/imx/dpu/dpu-framegen.c
++++ b/drivers/gpu/imx/dpu/dpu-framegen.c
+@@ -109,6 +109,7 @@ struct dpu_framegen {
+ 	int id;
+ 	bool inuse;
+ 	bool use_bypass_clk;
++	bool encoder_type_has_lvds;
+ 	struct dpu_soc *dpu;
+ };
+ 
+@@ -194,20 +195,24 @@ static void dpu_pixel_link_disable(int dpu_id, int stream_id)
+ void framegen_enable(struct dpu_framegen *fg)
+ {
+ 	struct dpu_soc *dpu = fg->dpu;
++	const struct dpu_devtype *devtype = dpu->devtype;
+ 
+ 	mutex_lock(&fg->mutex);
+ 	dpu_fg_write(fg, FGEN, FGENABLE);
+ 	mutex_unlock(&fg->mutex);
+ 
+-	dpu_pixel_link_enable(dpu->id, fg->id);
++	if (!(devtype->has_dual_ldb && fg->encoder_type_has_lvds))
++		dpu_pixel_link_enable(dpu->id, fg->id);
+ }
+ EXPORT_SYMBOL_GPL(framegen_enable);
+ 
+ void framegen_disable(struct dpu_framegen *fg)
+ {
+ 	struct dpu_soc *dpu = fg->dpu;
++	const struct dpu_devtype *devtype = dpu->devtype;
+ 
+-	dpu_pixel_link_disable(dpu->id, fg->id);
++	if (!(devtype->has_dual_ldb && fg->encoder_type_has_lvds))
++		dpu_pixel_link_disable(dpu->id, fg->id);
+ 
+ 	mutex_lock(&fg->mutex);
+ 	dpu_fg_write(fg, 0, FGENABLE);
+@@ -225,7 +230,7 @@ void framegen_shdtokgen(struct dpu_framegen *fg)
+ 
+ void
+ framegen_cfg_videomode(struct dpu_framegen *fg, struct drm_display_mode *m,
+-		       bool encoder_type_has_tmds)
++		       bool encoder_type_has_tmds, bool encoder_type_has_lvds)
+ {
+ 	const struct dpu_devtype *devtype = fg->dpu->devtype;
+ 	u32 hact, htotal, hsync, hsbp;
+@@ -234,6 +239,8 @@ void framegen_shdtokgen(struct dpu_framegen *fg)
+ 	unsigned long disp_clock_rate, pll_clock_rate = 0;
+ 	int div = 0;
+ 
++	fg->encoder_type_has_lvds = encoder_type_has_lvds;
++
+ 	hact = m->crtc_hdisplay;
+ 	htotal = m->crtc_htotal;
+ 	hsync = m->crtc_hsync_end - m->crtc_hsync_start;
+diff --git a/drivers/gpu/imx/dpu/dpu-prv.h b/drivers/gpu/imx/dpu/dpu-prv.h
+index e03b962..ff10390 100644
+--- a/drivers/gpu/imx/dpu/dpu-prv.h
++++ b/drivers/gpu/imx/dpu/dpu-prv.h
+@@ -209,6 +209,7 @@ struct dpu_devtype {
+ 	bool has_prefetch;
+ 	bool has_prefetch_fixup;
+ 	bool has_disp_sel_clk;
++	bool has_dual_ldb;
+ 	bool pixel_link_quirks;
+ 	bool pixel_link_nhvsync;	/* HSYNC and VSYNC high active */
+ 	unsigned int version;
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index 88c123a..19d5bba 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -593,7 +593,7 @@ void fetchwarp_rgb_constantcolor(struct dpu_fetchunit *fu,
+ void framegen_shdtokgen(struct dpu_framegen *fg);
+ void
+ framegen_cfg_videomode(struct dpu_framegen *fg, struct drm_display_mode *m,
+-		       bool encoder_type_has_tmds);
++		       bool encoder_type_has_tmds, bool encoder_type_has_lvds);
+ void framegen_pkickconfig(struct dpu_framegen *fg, bool enable);
+ void framegen_sacfg(struct dpu_framegen *fg, unsigned int x, unsigned int y);
+ void framegen_displaymode(struct dpu_framegen *fg, fgdm_t mode);
+-- 
+1.7.9.5
+

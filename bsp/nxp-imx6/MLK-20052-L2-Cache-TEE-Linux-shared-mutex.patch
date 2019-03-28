@@ -1,0 +1,537 @@
+From 655aeebb483ca33786bdf3b280be4dc959d6c300 Mon Sep 17 00:00:00 2001
+From: Cedric Neveux <cedric.neveux@nxp.com>
+Date: Tue, 23 Oct 2018 13:52:54 +0200
+Subject: [PATCH 5130/5242] MLK-20052 L2 Cache TEE/Linux shared mutex
+
+commit  a5b3a6a114da7f79bbf61d7d57c080792fda177b from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+   Modification of the L2 Cache operations to use
+   a TEE/Linux Shared mutex
+
+Signed-off-by: Cedric Neveux <cedric.neveux@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm/include/asm/outercache.h |   23 ++++++
+ arch/arm/mm/cache-l2x0.c          |  146 +++++++++++++++++++++++++++++--------
+ drivers/tee/optee/core.c          |   79 ++++++++++++++++++++
+ drivers/tee/optee/optee_smc.h     |   43 +++++++++++
+ 4 files changed, 261 insertions(+), 30 deletions(-)
+
+diff --git a/arch/arm/include/asm/outercache.h b/arch/arm/include/asm/outercache.h
+index c2bf24f..405ec8d 100644
+--- a/arch/arm/include/asm/outercache.h
++++ b/arch/arm/include/asm/outercache.h
+@@ -39,6 +39,11 @@ struct outer_cache_fns {
+ 	/* This is an ARM L2C thing */
+ 	void (*write_sec)(unsigned long, unsigned);
+ 	void (*configure)(const struct l2x0_regs *);
++
++#ifdef CONFIG_OPTEE
++	/* Set a mutex with OPTEE for maintenance */
++	int (*set_mutex)(void *mutex);
++#endif
+ };
+ 
+ extern struct outer_cache_fns outer_cache;
+@@ -115,6 +120,24 @@ static inline void outer_resume(void)
+ 		outer_cache.resume();
+ }
+ 
++#ifdef CONFIG_OPTEE
++/**
++ * @brief  Setup the Cache Mutex
++ *
++ * @param[in] Reference to the Mutex object
++ *
++ * @retval  0       Success
++ * @retval -EINVAL  Invalid value
++ */
++static inline int outer_mutex(void *mutex)
++{
++	if (outer_cache.set_mutex)
++		return outer_cache.set_mutex(mutex);
++
++	return -EINVAL;
++}
++#endif
++
+ #else
+ 
+ static inline void outer_inv_range(phys_addr_t start, phys_addr_t end)
+diff --git a/arch/arm/mm/cache-l2x0.c b/arch/arm/mm/cache-l2x0.c
+index 05d4d3c..7a6fe87 100644
+--- a/arch/arm/mm/cache-l2x0.c
++++ b/arch/arm/mm/cache-l2x0.c
+@@ -50,7 +50,6 @@ struct l2c_init_data {
+ 
+ static void __iomem *l2x0_base;
+ static const struct l2c_init_data *l2x0_data;
+-static DEFINE_RAW_SPINLOCK(l2x0_lock);
+ static u32 l2x0_way_mask;	/* Bitmask of active ways */
+ static u32 l2x0_size;
+ static unsigned long sync_reg_offset = L2X0_CACHE_SYNC;
+@@ -60,6 +59,90 @@ struct l2c_init_data {
+ static bool l2x0_bresp_disable;
+ static bool l2x0_flz_disable;
+ 
++#ifdef CONFIG_OPTEE
++struct l2x0_mutex {
++	arch_rwlock_t *mutex;
++	arch_rwlock_t nomutex;
++};
++
++static struct l2x0_mutex l2x0_lock;
++
++
++#define l2x0_spin_lock(lock, flags) \
++	do { \
++		flags = local_lock(lock); \
++	} while (0)
++
++#define l2x0_spin_unlock(lock, flags) local_unlock(lock, flags)
++
++#define l2x0_spin_lock_init(lock) spinlock_init(lock)
++
++
++static void spinlock_init(struct l2x0_mutex *spinlock)
++{
++	spinlock->mutex        = NULL;
++	spinlock->nomutex.lock = 0;
++}
++
++static unsigned long local_lock(struct l2x0_mutex *spinlock)
++{
++	unsigned long flags;
++	arch_rwlock_t *lock = spinlock->mutex;
++
++	if (!lock)
++		lock = &spinlock->nomutex;
++
++	local_irq_save(flags);
++	preempt_disable();
++	arch_write_lock(lock);
++
++	return flags;
++}
++
++static void local_unlock(struct l2x0_mutex *spinlock, unsigned long flags)
++{
++	arch_rwlock_t *lock = spinlock->mutex;
++
++	if (!lock)
++		lock = &spinlock->nomutex;
++
++	arch_write_unlock(lock);
++	local_irq_restore(flags);
++	preempt_enable();
++}
++
++static int l2c_set_mutex(void *mutex)
++{
++	unsigned long flags;
++
++	if (l2x0_lock.mutex != NULL)
++		return -EINVAL;
++
++	/* Ensure the no mutex is released */
++	l2x0_spin_lock(&l2x0_lock, flags);
++	l2x0_lock.mutex = mutex;
++
++	arch_write_unlock(&l2x0_lock.nomutex);
++	local_irq_restore(flags);
++	preempt_enable();
++
++	return 0;
++}
++
++#else
++static DEFINE_RAW_SPINLOCK(l2x0_lock);
++
++#define l2x0_spin_lock(lock, flags) raw_spin_lock_irqsave(lock, flags)
++#define l2x0_spin_unlock(lock, flags) raw_spin_unlock_irqrestore(lock, flags)
++
++#define l2x0_spin_lock_init(lock)
++static int l2c_set_mutex(void *mutex)
++{
++	return -EINVAL;
++}
++
++#endif
++
+ /*
+  * Common code for all cache controllers.
+  */
+@@ -287,17 +370,15 @@ static void l2c220_op_way(void __iomem *base, unsigned reg)
+ {
+ 	unsigned long flags;
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	__l2c_op_way(base + reg);
+ 	__l2c220_cache_sync(base);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static unsigned long l2c220_op_pa_range(void __iomem *reg, unsigned long start,
+ 	unsigned long end, unsigned long flags)
+ {
+-	raw_spinlock_t *lock = &l2x0_lock;
+-
+ 	while (start < end) {
+ 		unsigned long blk_end = start + min(end - start, 4096UL);
+ 
+@@ -308,8 +389,8 @@ static unsigned long l2c220_op_pa_range(void __iomem *reg, unsigned long start,
+ 		}
+ 
+ 		if (blk_end < end) {
+-			raw_spin_unlock_irqrestore(lock, flags);
+-			raw_spin_lock_irqsave(lock, flags);
++			l2x0_spin_unlock(&l2x0_lock, flags);
++			l2x0_spin_lock(&l2x0_lock, flags);
+ 		}
+ 	}
+ 
+@@ -321,7 +402,7 @@ static void l2c220_inv_range(unsigned long start, unsigned long end)
+ 	void __iomem *base = l2x0_base;
+ 	unsigned long flags;
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	if ((start | end) & (CACHE_LINE_SIZE - 1)) {
+ 		if (start & (CACHE_LINE_SIZE - 1)) {
+ 			start &= ~(CACHE_LINE_SIZE - 1);
+@@ -340,7 +421,7 @@ static void l2c220_inv_range(unsigned long start, unsigned long end)
+ 				   start, end, flags);
+ 	l2c_wait_mask(base + L2X0_INV_LINE_PA, 1);
+ 	__l2c220_cache_sync(base);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static void l2c220_clean_range(unsigned long start, unsigned long end)
+@@ -354,12 +435,12 @@ static void l2c220_clean_range(unsigned long start, unsigned long end)
+ 		return;
+ 	}
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	flags = l2c220_op_pa_range(base + L2X0_CLEAN_LINE_PA,
+ 				   start, end, flags);
+ 	l2c_wait_mask(base + L2X0_CLEAN_INV_LINE_PA, 1);
+ 	__l2c220_cache_sync(base);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static void l2c220_flush_range(unsigned long start, unsigned long end)
+@@ -373,12 +454,12 @@ static void l2c220_flush_range(unsigned long start, unsigned long end)
+ 		return;
+ 	}
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	flags = l2c220_op_pa_range(base + L2X0_CLEAN_INV_LINE_PA,
+ 				   start, end, flags);
+ 	l2c_wait_mask(base + L2X0_CLEAN_INV_LINE_PA, 1);
+ 	__l2c220_cache_sync(base);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static void l2c220_flush_all(void)
+@@ -390,9 +471,9 @@ static void l2c220_sync(void)
+ {
+ 	unsigned long flags;
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	__l2c220_cache_sync(l2x0_base);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static void l2c220_enable(void __iomem *base, unsigned num_lock)
+@@ -484,7 +565,7 @@ static void l2c310_inv_range_erratum(unsigned long start, unsigned long end)
+ 		unsigned long flags;
+ 
+ 		/* Erratum 588369 for both clean+invalidate operations */
+-		raw_spin_lock_irqsave(&l2x0_lock, flags);
++		l2x0_spin_lock(&l2x0_lock, flags);
+ 		l2c_set_debug(base, 0x03);
+ 
+ 		if (start & (CACHE_LINE_SIZE - 1)) {
+@@ -501,7 +582,7 @@ static void l2c310_inv_range_erratum(unsigned long start, unsigned long end)
+ 		}
+ 
+ 		l2c_set_debug(base, 0x00);
+-		raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++		l2x0_spin_unlock(&l2x0_lock, flags);
+ 	}
+ 
+ 	__l2c210_op_pa_range(base + L2X0_INV_LINE_PA, start, end);
+@@ -510,11 +591,10 @@ static void l2c310_inv_range_erratum(unsigned long start, unsigned long end)
+ 
+ static void l2c310_flush_range_erratum(unsigned long start, unsigned long end)
+ {
+-	raw_spinlock_t *lock = &l2x0_lock;
+ 	unsigned long flags;
+ 	void __iomem *base = l2x0_base;
+ 
+-	raw_spin_lock_irqsave(lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	while (start < end) {
+ 		unsigned long blk_end = start + min(end - start, 4096UL);
+ 
+@@ -527,11 +607,11 @@ static void l2c310_flush_range_erratum(unsigned long start, unsigned long end)
+ 		l2c_set_debug(base, 0x00);
+ 
+ 		if (blk_end < end) {
+-			raw_spin_unlock_irqrestore(lock, flags);
+-			raw_spin_lock_irqsave(lock, flags);
++			l2x0_spin_unlock(&l2x0_lock, flags);
++			l2x0_spin_lock(&l2x0_lock, flags);
+ 		}
+ 	}
+-	raw_spin_unlock_irqrestore(lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ 	__l2c210_cache_sync(base);
+ }
+ 
+@@ -540,12 +620,12 @@ static void l2c310_flush_all_erratum(void)
+ 	void __iomem *base = l2x0_base;
+ 	unsigned long flags;
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	l2c_set_debug(base, 0x03);
+ 	__l2c_op_way(base + L2X0_CLEAN_INV_WAY);
+ 	l2c_set_debug(base, 0x00);
+ 	__l2c210_cache_sync(base);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static void __init l2c310_save(void __iomem *base)
+@@ -871,6 +951,10 @@ static int __init __l2c_init(const struct l2c_init_data *data,
+ 		fns.sync = NULL;
+ 	}
+ 
++#ifdef CONFIG_OPTEE
++	fns.set_mutex = l2c_set_mutex;
++#endif
++
+ 	/*
+ 	 * Check if l2x0 controller is already enabled.  If we are booting
+ 	 * in non-secure mode accessing the below registers will fault.
+@@ -1400,10 +1484,10 @@ static void aurora_pa_range(unsigned long start, unsigned long end,
+ 	while (start < end) {
+ 		range_end = aurora_range_end(start, end);
+ 
+-		raw_spin_lock_irqsave(&l2x0_lock, flags);
++		l2x0_spin_lock(&l2x0_lock, flags);
+ 		writel_relaxed(start, base + AURORA_RANGE_BASE_ADDR_REG);
+ 		writel_relaxed(range_end - CACHE_LINE_SIZE, base + offset);
+-		raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++		l2x0_spin_unlock(&l2x0_lock, flags);
+ 
+ 		writel_relaxed(0, base + AURORA_SYNC_REG);
+ 		start = range_end;
+@@ -1438,9 +1522,9 @@ static void aurora_flush_all(void)
+ 	unsigned long flags;
+ 
+ 	/* clean all ways */
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	__l2c_op_way(base + L2X0_CLEAN_INV_WAY);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ 
+ 	writel_relaxed(0, base + AURORA_SYNC_REG);
+ }
+@@ -1455,12 +1539,12 @@ static void aurora_disable(void)
+ 	void __iomem *base = l2x0_base;
+ 	unsigned long flags;
+ 
+-	raw_spin_lock_irqsave(&l2x0_lock, flags);
++	l2x0_spin_lock(&l2x0_lock, flags);
+ 	__l2c_op_way(base + L2X0_CLEAN_INV_WAY);
+ 	writel_relaxed(0, base + AURORA_SYNC_REG);
+ 	l2c_write_sec(0, base, L2X0_CTRL);
+ 	dsb(st);
+-	raw_spin_unlock_irqrestore(&l2x0_lock, flags);
++	l2x0_spin_unlock(&l2x0_lock, flags);
+ }
+ 
+ static void aurora_save(void __iomem *base)
+@@ -1817,6 +1901,8 @@ int __init l2x0_of_init(u32 aux_val, u32 aux_mask)
+ 	else
+ 		cache_id = readl_relaxed(l2x0_base + L2X0_CACHE_ID);
+ 
++	l2x0_spin_lock_init(&l2x0_lock);
++
+ 	return __l2c_init(data, aux_val, aux_mask, cache_id, nosync);
+ }
+ #endif
+diff --git a/drivers/tee/optee/core.c b/drivers/tee/optee/core.c
+index e5fd5ed..962fd2b 100644
+--- a/drivers/tee/optee/core.c
++++ b/drivers/tee/optee/core.c
+@@ -30,6 +30,10 @@
+ #include "optee_smc.h"
+ #include "shm_pool.h"
+ 
++#ifdef CONFIG_OUTER_CACHE
++#include <asm/outercache.h>
++#endif
++
+ #define DRIVER_NAME "optee"
+ 
+ #define OPTEE_SHM_NUM_PRIV_PAGES	1
+@@ -510,6 +514,70 @@ static bool optee_msg_exchange_capabilities(optee_invoke_fn *invoke_fn,
+ 	return rc;
+ }
+ 
++#ifdef CONFIG_OUTER_CACHE
++/**
++ * @brief   Call the TEE to get a shared mutex between TEE and Linux to
++ *          do Outer Cache maintenance
++ *
++ * @param[in] invoke_fn  Reference to the SMC call function
++ *
++ * @retval 0         Success
++ * @retval -EINVAL   Invalid value
++ * @retval -ENOMEM   Not enought memory
++ */
++static int optee_outercache_mutex(optee_invoke_fn *invoke_fn)
++{
++	struct arm_smccc_res res;
++
++	int         ret    = -EINVAL;
++	void        *vaddr = NULL;
++	phys_addr_t paddr  = 0;
++
++	/* Get the Physical Address of the mutex allocated in the SHM */
++	invoke_fn(OPTEE_SMC_L2CC_MUTEX,
++			OPTEE_SMC_L2CC_MUTEX_GET_ADDR, 0, 0, 0, 0, 0, 0, &res);
++
++	if (res.a0 != OPTEE_SMC_RETURN_OK) {
++		pr_warn("no TZ l2cc mutex service supported\n");
++		goto out;
++	}
++
++	paddr = (unsigned long)reg_pair_to_ptr(res.a2, res.a3);
++	pr_debug("outer cache shared mutex paddr 0x%lx\n", (unsigned long)paddr);
++
++	/* Remap the Mutex into a cacheable area */
++	vaddr = memremap(paddr, sizeof(u32), MEMREMAP_WB);
++	if (vaddr == NULL) {
++		pr_warn("TZ l2cc mutex: ioremap failed\n");
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	pr_debug("outer cache shared mutex vaddr %p\n", vaddr);
++
++	if (outer_mutex(vaddr)) {
++		pr_warn("TZ l2cc mutex: outer cache refused\n");
++		goto out;
++	}
++
++	invoke_fn(OPTEE_SMC_L2CC_MUTEX,
++			OPTEE_SMC_L2CC_MUTEX_ENABLE, 0, 0, 0, 0, 0, 0, &res);
++
++	if (res.a0 != OPTEE_SMC_RETURN_OK) {
++		pr_warn("TZ l2cc mutex disabled: TZ enable failed\n");
++		goto out;
++	}
++
++	ret = 0;
++
++out:
++	pr_info("teetz outer mutex: ret=%d pa=0x%lx va=0x%p\n",
++		ret, (unsigned long)paddr, vaddr);
++
++	return ret;
++}
++#endif
++
+ /* Simple wrapper functions to be able to use a function pointer */
+ static void optee_smccc_smc(unsigned long a0, unsigned long a1,
+ 			    unsigned long a2, unsigned long a3,
+@@ -591,6 +659,17 @@ static struct optee *optee_probe(struct device_node *np)
+ 	if (IS_ERR(pool))
+ 		return (void *)pool;
+ 
++#ifdef CONFIG_OUTER_CACHE
++
++	/* Try to get a Share Mutex to do L2 Cache maintenance */
++	if (of_find_compatible_node(NULL, NULL, "arm,pl310-cache")) {
++		rc = optee_outercache_mutex(invoke_fn);
++		if (rc)
++			goto err;
++	}
++
++#endif
++
+ 	optee = kzalloc(sizeof(*optee), GFP_KERNEL);
+ 	if (!optee) {
+ 		rc = -ENOMEM;
+diff --git a/drivers/tee/optee/optee_smc.h b/drivers/tee/optee/optee_smc.h
+index bbf0cf0..90af246 100644
+--- a/drivers/tee/optee/optee_smc.h
++++ b/drivers/tee/optee/optee_smc.h
+@@ -206,6 +206,49 @@ struct optee_smc_get_shm_config_result {
+ };
+ 
+ /*
++ * Configures L2CC mutex
++ *
++ * Disables, enables usage of L2CC mutex. Returns or sets physical address
++ * of L2CC mutex.
++ *
++ * Call register usage:
++ * a0	SMC Function ID, OPTEE_SMC_L2CC_MUTEX
++ * a1	OPTEE_SMC_L2CC_MUTEX_GET_ADDR	Get physical address of mutex
++ *	    OPTEE_SMC_L2CC_MUTEX_SET_ADDR	Set physical address of mutex
++ *	    OPTEE_SMC_L2CC_MUTEX_ENABLE		Enable usage of mutex
++ *	    OPTEE_SMC_L2CC_MUTEX_DISABLE	Disable usage of mutex
++ * a2	if a1 == OPTEE_SMC_L2CC_MUTEX_SET_ADDR, upper 32bit of a 64bit
++ *      physical address of mutex
++ * a3	if a1 == OPTEE_SMC_L2CC_MUTEX_SET_ADDR, lower 32bit of a 64bit
++ *      physical address of mutex
++ * a3-6	Not used
++ * a7	Hypervisor Client ID register
++ *
++ * Have config return register usage:
++ * a0	OPTEE_SMC_RETURN_OK
++ * a1	Preserved
++ * a2	if a1 == OPTEE_SMC_L2CC_MUTEX_GET_ADDR, upper 32bit of a 64bit
++ *      physical address of mutex
++ * a3	if a1 == OPTEE_SMC_L2CC_MUTEX_GET_ADDR, lower 32bit of a 64bit
++ *      physical address of mutex
++ * a3-7	Preserved
++ *
++ * Error return register usage:
++ * a0	OPTEE_SMC_RETURN_ENOTAVAIL	Physical address not available
++ *	OPTEE_SMC_RETURN_EBADADDR	Bad supplied physical address
++ *	OPTEE_SMC_RETURN_EBADCMD	Unsupported value in a1
++ * a1-7	Preserved
++ */
++#define OPTEE_SMC_L2CC_MUTEX_GET_ADDR	0
++#define OPTEE_SMC_L2CC_MUTEX_SET_ADDR	1
++#define OPTEE_SMC_L2CC_MUTEX_ENABLE		2
++#define OPTEE_SMC_L2CC_MUTEX_DISABLE	3
++
++#define OPTEE_SMC_FUNCID_L2CC_MUTEX	8
++#define OPTEE_SMC_L2CC_MUTEX \
++	OPTEE_SMC_FAST_CALL_VAL(OPTEE_SMC_FUNCID_L2CC_MUTEX)
++
++/*
+  * Exchanges capabilities between normal world and secure world
+  *
+  * Call register usage:
+-- 
+1.7.9.5
+

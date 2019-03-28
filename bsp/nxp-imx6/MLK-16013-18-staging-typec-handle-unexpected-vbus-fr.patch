@@ -1,0 +1,137 @@
+From f5c773a0c47fb01fb5bdc9d3ef0b3a5a78904b56 Mon Sep 17 00:00:00 2001
+From: Li Jun <jun.li@nxp.com>
+Date: Thu, 27 Jul 2017 20:58:54 +0800
+Subject: [PATCH 2297/5242] MLK-16013-18 staging: typec: handle unexpected
+ vbus from sink
+
+commit  0b7b017eb79436171bb2845e2369db6bebb49e0f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Power source detected the attachment of sink, will firstly check
+the vbus level to make sure power sink isn't sourcing vbus(< 600mv)
+before going forward, otherwise it will terminate the session and
+go to SRC_UNATTACHED state, this is required by PD compliance.
+
+Reviewed-by: Peter Chen <peter.chen@nxp.com>
+Signed-off-by: Li Jun <jun.li@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/staging/typec/tcpci.c |   16 ++++++++++++++++
+ drivers/staging/typec/tcpci.h |    5 +++++
+ drivers/usb/typec/tcpm.c      |   18 ++++++++++++++++--
+ include/linux/usb/tcpm.h      |    5 +++++
+ 4 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/typec/tcpci.c b/drivers/staging/typec/tcpci.c
+index 854bdd2..ae0aaf4 100644
+--- a/drivers/staging/typec/tcpci.c
++++ b/drivers/staging/typec/tcpci.c
+@@ -337,6 +337,21 @@ static int tcpci_get_vbus(struct tcpc_dev *tcpc)
+ 	return !!(reg & TCPC_POWER_STATUS_VBUS_PRES);
+ }
+ 
++static unsigned int tcpci_get_vbus_vol(struct tcpc_dev *tcpc)
++{
++	struct tcpci *tcpci = tcpc_to_tcpci(tcpc);
++	unsigned int reg, ret = 0;
++
++	ret = regmap_read(tcpci->regmap, TCPC_VBUS_VOLTAGE, &reg);
++
++	/* Convert it to be the vol number(mv) */
++	ret = ((reg & TCPC_VBUS_VOL_MASK) <<
++		((reg & TCPC_VBUS_VOL_SCALE_FACTOR_MASK) >>
++		TCPC_VBUS_VOL_SCALE_FACTOR_SHIFT)) * TCPC_VBUS_VOL_MV_UNIT;
++
++	return ret;
++}
++
+ static int tcpci_set_vbus(struct tcpc_dev *tcpc, bool source, bool sink)
+ {
+ 	struct tcpci *tcpci = tcpc_to_tcpci(tcpc);
+@@ -620,6 +635,7 @@ struct tcpci *tcpci_register_port(struct device *dev, struct tcpci_data *data)
+ 	tcpci->tcpc.start_drp_toggling = tcpci_start_drp_toggling;
+ 	tcpci->tcpc.vbus_detect = tcpci_vbus_detect;
+ 	tcpci->tcpc.vbus_discharge = tcpci_vbus_force_discharge;
++	tcpci->tcpc.get_vbus_vol = tcpci_get_vbus_vol;
+ 
+ 	tcpci->tcpc.set_pd_rx = tcpci_set_pd_rx;
+ 	tcpci->tcpc.set_roles = tcpci_set_roles;
+diff --git a/drivers/staging/typec/tcpci.h b/drivers/staging/typec/tcpci.h
+index b0fac19..835138d 100644
+--- a/drivers/staging/typec/tcpci.h
++++ b/drivers/staging/typec/tcpci.h
+@@ -119,6 +119,11 @@
+ #define TCPC_TX_DATA			0x54 /* through 0x6f */
+ 
+ #define TCPC_VBUS_VOLTAGE			0x70
++#define TCPC_VBUS_VOL_MASK			0x3ff
++#define TCPC_VBUS_VOL_SCALE_FACTOR_MASK		0xc00
++#define TCPC_VBUS_VOL_SCALE_FACTOR_SHIFT	10
++#define TCPC_VBUS_VOL_MV_UNIT			25
++
+ #define TCPC_VBUS_SINK_DISCONNECT_THRESH	0x72
+ #define TCPC_VBUS_STOP_DISCHARGE_THRESH		0x74
+ #define TCPC_VBUS_VOLTAGE_ALARM_HI_CFG		0x76
+diff --git a/drivers/usb/typec/tcpm.c b/drivers/usb/typec/tcpm.c
+index 10718de..db9023f 100644
+--- a/drivers/usb/typec/tcpm.c
++++ b/drivers/usb/typec/tcpm.c
+@@ -2464,6 +2464,15 @@ static bool tcpm_start_drp_toggling(struct tcpm_port *port)
+ 	return false;
+ }
+ 
++static bool tcpm_vbus_is_low(struct tcpm_port *port)
++{
++	if (port->tcpc->get_vbus_vol &&
++		port->tcpc->get_vbus_vol(port->tcpc) > TCPM_VBUS_PRESENT_LEVEL)
++		return false;
++	else
++		return true;
++}
++
+ static void tcpm_set_cc(struct tcpm_port *port, enum typec_cc_status cc)
+ {
+ 	tcpm_log(port, "cc:=%d", cc);
+@@ -2851,9 +2860,14 @@ static void run_state_machine(struct tcpm_port *port)
+ 		break;
+ 
+ 	case SRC_ATTACHED:
+-		ret = tcpm_src_attach(port);
+-		tcpm_set_state(port, SRC_UNATTACHED,
++		if (tcpm_vbus_is_low(port)) {
++			ret = tcpm_src_attach(port);
++			tcpm_set_state(port, SRC_UNATTACHED,
+ 			       ret < 0 ? 0 : PD_T_PS_SOURCE_ON);
++		} else {
++			tcpm_log(port, "Sink shouldn't provide vbus!");
++			tcpm_set_state(port, SRC_UNATTACHED, 10);
++		}
+ 		break;
+ 	case SRC_STARTUP:
+ 		opmode =  tcpm_get_pwr_opmode(tcpm_rp_cc(port));
+diff --git a/include/linux/usb/tcpm.h b/include/linux/usb/tcpm.h
+index e2311ba..bb2717f 100644
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -19,6 +19,9 @@
+ #include <linux/usb/typec.h>
+ #include "pd.h"
+ 
++/* VBUS off level should be lower than it */
++#define TCPM_VBUS_PRESENT_LEVEL		600
++
+ enum typec_cc_status {
+ 	TYPEC_CC_OPEN,
+ 	TYPEC_CC_RA,
+@@ -142,6 +145,8 @@ struct tcpc_dev {
+ 	int (*init)(struct tcpc_dev *dev);
+ 	int (*get_vbus)(struct tcpc_dev *dev);
+ 	int (*get_current_limit)(struct tcpc_dev *dev);
++	/* Optional, get the vbus voltage(mv) */
++	unsigned int (*get_vbus_vol)(struct tcpc_dev *dev);
+ 	int (*set_cc)(struct tcpc_dev *dev, enum typec_cc_status cc);
+ 	int (*get_cc)(struct tcpc_dev *dev, enum typec_cc_status *cc1,
+ 		      enum typec_cc_status *cc2);
+-- 
+1.7.9.5
+

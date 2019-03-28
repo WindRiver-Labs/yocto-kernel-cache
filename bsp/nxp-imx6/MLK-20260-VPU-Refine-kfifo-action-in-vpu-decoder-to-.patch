@@ -1,0 +1,129 @@
+From aa1b177876c24d2c6659ce9fcadbad28f1c0d90b Mon Sep 17 00:00:00 2001
+From: Huang Chaofan <chaofan.huang@nxp.com>
+Date: Wed, 7 Nov 2018 16:05:59 +0800
+Subject: [PATCH 5061/5242] MLK-20260 VPU: Refine kfifo action in vpu decoder
+ to remove redundant data copy
+
+commit  39ca83c24e6f5ff34f0af0970382d376a0d64ab3 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Refine kfifo action in vpu decoder to remove redundant data copy
+
+Signed-off-by: Huang Chaofan <chaofan.huang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/mxc/vpu-decoder-b0/mediasys_types.h |    1 +
+ drivers/mxc/vpu-decoder-b0/vpu_b0.c         |   38 +++++++++++++++++++++------
+ drivers/mxc/vpu-decoder-b0/vpu_b0.h         |    5 ----
+ 3 files changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/mxc/vpu-decoder-b0/mediasys_types.h b/drivers/mxc/vpu-decoder-b0/mediasys_types.h
+index 921d79e..e2f2440 100644
+--- a/drivers/mxc/vpu-decoder-b0/mediasys_types.h
++++ b/drivers/mxc/vpu-decoder-b0/mediasys_types.h
+@@ -75,6 +75,7 @@
+ #define MEDIAIP_MAX_NUM_TIMER_IRQ_SLOTS 4
+ #define VID_API_COMMAND_LIMIT    64
+ #define VID_API_MESSAGE_LIMIT    256
++#define MSG_WORD_LENGTH 3
+ 
+ #define API_CMD_AVAILABLE            0x0
+ #define API_CMD_INCOMPLETE           0x1
+diff --git a/drivers/mxc/vpu-decoder-b0/vpu_b0.c b/drivers/mxc/vpu-decoder-b0/vpu_b0.c
+index ac9fb13..6c6ec3a 100644
+--- a/drivers/mxc/vpu-decoder-b0/vpu_b0.c
++++ b/drivers/mxc/vpu-decoder-b0/vpu_b0.c
+@@ -2195,8 +2195,8 @@ static void send_msg_queue(struct vpu_ctx *ctx, struct event_msg *msg)
+ {
+ 	u_int32 ret;
+ 
+-	ret = kfifo_in(&ctx->msg_fifo, msg, sizeof(struct event_msg));
+-	if (ret != sizeof(struct event_msg))
++	ret = kfifo_in(&ctx->msg_fifo, msg, sizeof(u_int32) * (MSG_WORD_LENGTH + msg->msgnum));
++	if (ret != sizeof(u_int32) * (MSG_WORD_LENGTH + msg->msgnum))
+ 		vpu_dbg(LVL_ERR, "There is no memory for msg fifo, ret=%d\n", ret);
+ }
+ 
+@@ -2204,13 +2204,25 @@ static bool receive_msg_queue(struct vpu_ctx *ctx, struct event_msg *msg)
+ {
+ 	u_int32 ret;
+ 
+-	if (kfifo_len(&ctx->msg_fifo) >= sizeof(*msg)) {
+-		ret = kfifo_out(&ctx->msg_fifo, msg, sizeof(*msg));
+-		if (ret != sizeof(*msg)) {
+-			vpu_dbg(LVL_ERR, "kfifo_out has error, ret=%d\n", ret);
++	if (kfifo_len(&ctx->msg_fifo) >= sizeof(u_int32) * MSG_WORD_LENGTH) {
++		ret = kfifo_out(&ctx->msg_fifo, msg, sizeof(u_int32) * MSG_WORD_LENGTH);
++		if (ret != sizeof(u_int32) * MSG_WORD_LENGTH) {
++			vpu_dbg(LVL_ERR, "kfifo_out msg word has error, ret=%d\n", ret);
+ 			return false;
+-		} else
+-			return true;
++		} else {
++			if (msg->msgnum > 0) {
++				if (kfifo_len(&ctx->msg_fifo) >= sizeof(u_int32) * msg->msgnum) {
++					ret = kfifo_out(&ctx->msg_fifo, msg->msgdata, sizeof(u_int32) * msg->msgnum);
++					if (ret != sizeof(u_int32) * msg->msgnum) {
++						vpu_dbg(LVL_ERR, "kfifo_out msg data has error, ret=%d\n", ret);
++						return false;
++					} else
++						return true;
++				} else
++					return false;
++			} else
++				return true;
++		}
+ 	} else
+ 		return false;
+ }
+@@ -2223,6 +2235,11 @@ static void vpu_msg_run_work(struct work_struct *work)
+ 	struct event_msg msg;
+ 	struct shared_addr *This = &dev->shared_mem;
+ 
++	if (!dev || !This)
++		return;
++
++	memset(&msg, 0, sizeof(struct event_msg));
++
+ 	while (rpc_MediaIPFW_Video_message_check(This) == API_MSG_AVAILABLE) {
+ 		rpc_receive_msg_buf(This, &msg);
+ 		mutex_lock(&dev->dev_mutex);
+@@ -2245,6 +2262,11 @@ static void vpu_msg_instance_work(struct work_struct *work)
+ 	struct vpu_ctx *ctx = container_of(work, struct vpu_ctx, instance_work);
+ 	struct event_msg msg;
+ 
++	if (!ctx)
++		return;
++
++	memset(&msg, 0, sizeof(struct event_msg));
++
+ 	while (receive_msg_queue(ctx, &msg))
+ 		vpu_api_event_handler(ctx, msg.idx, msg.msgid, msg.msgdata);
+ }
+diff --git a/drivers/mxc/vpu-decoder-b0/vpu_b0.h b/drivers/mxc/vpu-decoder-b0/vpu_b0.h
+index 9d037bb..6af7aeb 100644
+--- a/drivers/mxc/vpu-decoder-b0/vpu_b0.h
++++ b/drivers/mxc/vpu-decoder-b0/vpu_b0.h
+@@ -44,7 +44,6 @@
+ 
+ #define MIN_SPACE (4096+64)
+ 
+-#define VPU_MAX_FORMATS 4
+ #define VPU_MAX_BUFFER 32
+ #define M0FW_FILENAME "vpu/vpu_fw_imx8_dec.bin"
+ #define MMAP_BUF_TYPE_SHIFT 28
+@@ -58,11 +57,7 @@
+ #define MAX_DCP_NUM 2
+ #define MAX_MBI_NUM 18 // same with MEDIA_PLAYER_MAX_MBI_UNIT defined in firmware
+ #define MAX_TIMEOUT_COUNT 10
+-#ifdef CM4
+-#define VPU_REG_BASE 0x2c000000
+-#else
+ #define VPU_REG_BASE 0x40000000
+-#endif
+ 
+ #define V4L2_MAX_CTRLS 12
+ #define V4L2_PIX_FMT_NV12_10BIT    v4l2_fourcc('N', 'T', '1', '2') /*  Y/CbCr 4:2:0 for 10bit  */
+-- 
+1.7.9.5
+

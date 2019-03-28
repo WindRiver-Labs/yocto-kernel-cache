@@ -1,0 +1,243 @@
+From e64a97ac17454ddcd18f0642757daa47a00ead4f Mon Sep 17 00:00:00 2001
+From: Anson Huang <Anson.Huang@nxp.com>
+Date: Wed, 23 Aug 2017 13:00:47 +0800
+Subject: [PATCH 2441/5242] MLK-16244-2 cpufreq: imx8: add SIP cpu-freq
+ support
+
+commit  5999a377170a4272be9f93b5f2080f6e716d9fa4 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add SIP cpu-freq support, the CPU hardware frequency
+scale will be performed by ARM Trusted Firmware,
+and add cpu-freq suspend support, MAX frequency will
+be used during suspend.
+
+Signed-off-by: Anson Huang <Anson.Huang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/cpufreq/imx8-cpufreq.c |  106 ++++++++++++++++++++++++++++++++++++----
+ include/soc/imx/fsl_sip.h      |    4 ++
+ 2 files changed, 100 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/cpufreq/imx8-cpufreq.c b/drivers/cpufreq/imx8-cpufreq.c
+index 46f1800..5f9a50a 100644
+--- a/drivers/cpufreq/imx8-cpufreq.c
++++ b/drivers/cpufreq/imx8-cpufreq.c
+@@ -6,6 +6,7 @@
+  * published by the Free Software Foundation.
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/cpu.h>
+ #include <linux/cpufreq.h>
+@@ -15,9 +16,12 @@
+ #include <linux/pm_opp.h>
+ #include <linux/platform_device.h>
+ #include <linux/regulator/consumer.h>
++#include <soc/imx/fsl_sip.h>
+ 
+ #define MAX_CLUSTER_NUM	2
+ 
++static DEFINE_SPINLOCK(cpufreq_psci_lock);
++
+ struct imx8_cpufreq {
+ 	struct clk	*cpu_clk;
+ };
+@@ -25,9 +29,37 @@ struct imx8_cpufreq {
+ struct imx8_cpufreq cluster_freq[MAX_CLUSTER_NUM];
+ static struct cpufreq_frequency_table *freq_table[MAX_CLUSTER_NUM];
+ static unsigned int transition_latency[MAX_CLUSTER_NUM];
++static unsigned int suspend_freq[MAX_CLUSTER_NUM];
++static bool free_opp;
++struct device *cpu_dev;
+ 
+ static int imx8_set_target(struct cpufreq_policy *policy, unsigned int index)
+ {
++	struct arm_smccc_res res;
++	unsigned int old_freq, new_freq;
++	unsigned int cluster_id = topology_physical_package_id(policy->cpu);
++
++	new_freq = freq_table[cluster_id][index].frequency;
++	old_freq = policy->cur;
++
++	dev_dbg(cpu_dev, "%u MHz --> %u MHz\n",
++		old_freq / 1000, new_freq / 1000);
++
++	spin_lock(&cpufreq_psci_lock);
++	arm_smccc_smc(FSL_SIP_CPUFREQ, FSL_SIP_SET_CPUFREQ,
++		cluster_id, new_freq * 1000, 0, 0, 0, 0, &res);
++	spin_unlock(&cpufreq_psci_lock);
++
++	/*
++	 * As we can only set CPU clock rate in ATF, clock
++	 * framework does NOT know CPU clock rate is changed,
++	 * so here do clk_get_rate once to update CPU clock
++	 * rate, otherwise cat /sys/kernel/debug/clk/xxx/clk_rate
++	 * will return incorrect rate as it does NOT do a
++	 * recalculation.
++	 */
++	clk_get_rate(cluster_freq[cluster_id].cpu_clk);
++
+ 	return 0;
+ }
+ 
+@@ -38,6 +70,7 @@ static int imx8_cpufreq_init(struct cpufreq_policy *policy)
+ 
+ 	policy->clk = cluster_freq[cluster_id].cpu_clk;
+ 	policy->cur = clk_get_rate(cluster_freq[cluster_id].cpu_clk) / 1000;
++	policy->suspend_freq = suspend_freq[cluster_id];
+ 
+ 	pr_info("%s: cluster %d running at freq %d MHz\n",
+ 		__func__, cluster_id, policy->cur / 1000);
+@@ -66,13 +99,15 @@ static int imx8_cpufreq_init(struct cpufreq_policy *policy)
+ 	.init = imx8_cpufreq_init,
+ 	.name = "imx8-cpufreq",
+ 	.attr = cpufreq_generic_attr,
++#ifdef CONFIG_PM
++	.suspend = cpufreq_generic_suspend,
++#endif
+ };
+ 
+ static int imx8_cpufreq_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np;
+-	struct device *cpu_dev;
+-	int ret = 0;
++	int num, ret = 0;
+ 	int i, cluster_id;
+ 
+ 	cpu_dev = get_cpu_device(0);
+@@ -102,6 +137,30 @@ static int imx8_cpufreq_probe(struct platform_device *pdev)
+ 		goto put_node;
+ 	}
+ 
++	/*
++	 * We expect an OPP table supplied by platform.
++	 * Just, in case the platform did not supply the OPP
++	 * table, it will try to get it.
++	 */
++	num = dev_pm_opp_get_opp_count(cpu_dev);
++	if (num < 0) {
++		ret = dev_pm_opp_of_add_table(cpu_dev);
++		if (ret < 0) {
++			dev_err(cpu_dev, "failed to init OPP table: %d\n", ret);
++			goto put_node;
++		}
++
++		/* Because we have added the OPPs here, we must free them */
++		free_opp = true;
++
++		num = dev_pm_opp_get_opp_count(cpu_dev);
++		if (num < 0) {
++			ret = num;
++			dev_err(cpu_dev, "no OPP table is found: %d\n", ret);
++			goto out_free_opp;
++		}
++	}
++
+ 	ret = dev_pm_opp_init_cpufreq_table(cpu_dev, &freq_table[cluster_id]);
+ 	if (ret) {
+ 		dev_err(cpu_dev, "failed to init cpufreq table: %d\n", ret);
+@@ -111,6 +170,9 @@ static int imx8_cpufreq_probe(struct platform_device *pdev)
+ 	if (of_property_read_u32(np, "clock-latency", &transition_latency[cluster_id]))
+ 		transition_latency[cluster_id] = CPUFREQ_ETERNAL;
+ 
++	/* use MAX freq to suspend */
++	suspend_freq[cluster_id] = freq_table[cluster_id][num - 1].frequency;
++
+ 	/* init next cluster if there is */
+ 	for (i = 1; i < num_online_cpus(); i++) {
+ 		if (topology_physical_package_id(i) == topology_physical_package_id(0))
+@@ -128,28 +190,49 @@ static int imx8_cpufreq_probe(struct platform_device *pdev)
+ 			goto put_node;
+ 		}
+ 
+-		ret = dev_pm_opp_of_add_table(cpu_dev);
+-		if (ret < 0) {
+-			dev_err(cpu_dev, "failed to add OPP table for cpu %d\n", i);
+-			goto put_node;
+-		}
+-
+ 		cluster_id = topology_physical_package_id(i);
+ 		cluster_freq[cluster_id].cpu_clk = devm_clk_get(cpu_dev, NULL);
+ 		if (IS_ERR(cluster_freq[cluster_id].cpu_clk)) {
+ 			dev_err(cpu_dev, "failed to get cluster %d clock\n", cluster_id);
+ 			ret = -ENOENT;
+-			goto put_node;
++			goto out_free_opp;
++		}
++
++		/*
++		 * We expect an OPP table supplied by platform.
++		 * Just, in case the platform did not supply the OPP
++		 * table, it will try to get it.
++		 */
++		num = dev_pm_opp_get_opp_count(cpu_dev);
++		if (num < 0) {
++			ret = dev_pm_opp_of_add_table(cpu_dev);
++			if (ret < 0) {
++				dev_err(cpu_dev, "failed to init OPP table: %d\n", ret);
++				goto put_node;
++			}
++
++			/* Because we have added the OPPs here, we must free them */
++			free_opp = true;
++
++			num = dev_pm_opp_get_opp_count(cpu_dev);
++			if (num < 0) {
++				ret = num;
++				dev_err(cpu_dev, "no OPP table is found: %d\n", ret);
++				goto out_free_opp;
++			}
+ 		}
+ 
+ 		ret = dev_pm_opp_init_cpufreq_table(cpu_dev, &freq_table[cluster_id]);
+ 		if (ret) {
+ 			dev_err(cpu_dev, "failed to init cpufreq table: %d\n", ret);
+-			goto put_node;
++			goto out_free_opp;
+ 		}
+ 
+ 		if (of_property_read_u32(np, "clock-latency", &transition_latency[cluster_id]))
+ 			transition_latency[cluster_id] = CPUFREQ_ETERNAL;
++
++		/* use MAX freq to suspend */
++		suspend_freq[cluster_id] = freq_table[cluster_id][num - 1].frequency;
+ 		break;
+ 	}
+ 
+@@ -157,6 +240,9 @@ static int imx8_cpufreq_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		dev_err(cpu_dev, "failed register driver: %d\n", ret);
+ 
++out_free_opp:
++	if (free_opp)
++		dev_pm_opp_of_remove_table(cpu_dev);
+ put_node:
+ 	of_node_put(np);
+ 	return ret;
+diff --git a/include/soc/imx/fsl_sip.h b/include/soc/imx/fsl_sip.h
+index c3867a2..1d39f99 100644
+--- a/include/soc/imx/fsl_sip.h
++++ b/include/soc/imx/fsl_sip.h
+@@ -10,12 +10,16 @@
+ #ifndef __SOC_FSL_SIP_H
+ #define __SOC_FSL_SIP_H
+ 
++/* SIP 0xC2000000 - 0xC200FFFF */
+ #define FSL_SIP_GPC			0xC2000000
+ #define FSL_SIP_CONFIG_GPC_MASK		0x00
+ #define FSL_SIP_CONFIG_GPC_UNMASK	0x01
+ #define FSL_SIP_CONFIG_GPC_SET_WAKE	0x02
+ #define FSL_SIP_CONFIG_GPC_PM_DOMAIN	0x03
+ 
++#define FSL_SIP_CPUFREQ			0xC2000001
++#define FSL_SIP_SET_CPUFREQ		0x00
++
+ #define IMX8MQ_PD_MIPI		0
+ #define IMX8MQ_PD_PCIE1		1
+ #define IMX8MQ_PD_OTG1		2
+-- 
+1.7.9.5
+

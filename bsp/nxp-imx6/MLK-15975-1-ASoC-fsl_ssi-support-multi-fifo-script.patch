@@ -1,0 +1,119 @@
+From f28794e4a463d044ab1916b3fb47bd14edec3b6b Mon Sep 17 00:00:00 2001
+From: Shengjiu Wang <shengjiu.wang@nxp.com>
+Date: Fri, 28 Sep 2018 15:16:57 +0800
+Subject: [PATCH 4756/5242] MLK-15975-1: ASoC: fsl_ssi: support multi fifo
+ script
+
+commit  6630deaa501aabc2a87cef92d10934cf65a77171 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+With dual fifo enabled, the case recording mono sound
+in the background, playback sound twice in parallal,
+the second time playback sound may distort, the possible
+reason is using dual fifo to playback mono sound is not
+recommended.
+
+This patch is to provide a option to use multi fifo script,
+which can be dynamically configured as one fifo or two fifo
+mode.
+
+Signed-off-by: Shengjiu Wang <shengjiu.wang@nxp.com>
+(cherry picked from commit 9d71068cf7d1fc1ec36e5fb34a321c1bdbaad324)
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_ssi.c |   30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_ssi.c b/sound/soc/fsl/fsl_ssi.c
+index 6a5d70f..61eb24e 100644
+--- a/sound/soc/fsl/fsl_ssi.c
++++ b/sound/soc/fsl/fsl_ssi.c
+@@ -268,6 +268,7 @@ struct fsl_ssi {
+ 	bool synchronous;
+ 	bool use_dma;
+ 	bool use_dual_fifo;
++	bool use_dyna_fifo;
+ 	bool has_ipg_clk_name;
+ 	unsigned int fifo_depth;
+ 	unsigned int slot_width;
+@@ -648,7 +649,7 @@ static int fsl_ssi_startup(struct snd_pcm_substream *substream,
+ 	 * task from fifo0, fifo1 would be neglected at the end of each
+ 	 * period. But SSI would still access fifo1 with an invalid data.
+ 	 */
+-	if (ssi->use_dual_fifo)
++	if (ssi->use_dual_fifo || ssi->use_dyna_fifo)
+ 		snd_pcm_hw_constraint_step(substream->runtime, 0,
+ 					   SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 2);
+ 
+@@ -804,6 +805,7 @@ static int fsl_ssi_hw_params(struct snd_pcm_substream *substream,
+ 	unsigned int sample_size = params_width(hw_params);
+ 	u32 wl = SSI_SxCCR_WL(sample_size);
+ 	int ret;
++	struct fsl_ssi_regvals *vals = ssi->regvals;
+ 
+ 	/*
+ 	 * SSI is properly configured if it is enabled and running in
+@@ -853,6 +855,24 @@ static int fsl_ssi_hw_params(struct snd_pcm_substream *substream,
+ 	tx2 = tx || ssi->synchronous;
+ 	regmap_update_bits(regs, REG_SSI_SxCCR(tx2), SSI_SxCCR_WL_MASK, wl);
+ 
++	if (ssi->use_dyna_fifo) {
++		if (channels == 1) {
++			ssi->dma_params_tx.fifo_num  = 1;
++			ssi->dma_params_rx.fifo_num  = 1;
++			vals[RX].srcr &= ~SSI_SRCR_RFEN1;
++			vals[TX].stcr &= ~SSI_STCR_TFEN1;
++			vals[RX].scr  &= ~SSI_SCR_TCH_EN;
++			vals[TX].scr  &= ~SSI_SCR_TCH_EN;
++		} else {
++			ssi->dma_params_tx.fifo_num  = 2;
++			ssi->dma_params_rx.fifo_num  = 2;
++			vals[RX].srcr |= SSI_SRCR_RFEN1;
++			vals[TX].stcr |= SSI_STCR_TFEN1;
++			vals[RX].scr  |= SSI_SCR_TCH_EN;
++			vals[TX].scr  |= SSI_SCR_TCH_EN;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1302,6 +1322,7 @@ static int fsl_ssi_imx_probe(struct platform_device *pdev,
+ 			     struct fsl_ssi *ssi, void __iomem *iomem)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct device_node *np = pdev->dev.of_node;
+ 	int ret;
+ 	u32 buffer_size;
+ 
+@@ -1331,6 +1352,8 @@ static int fsl_ssi_imx_probe(struct platform_device *pdev,
+ 		dev_dbg(dev, "failed to get baud clock: %ld\n",
+ 			 PTR_ERR(ssi->baudclk));
+ 
++	ssi->dma_params_rx.chan_name = "rx";
++	ssi->dma_params_tx.chan_name = "tx";
+ 	ssi->dma_params_tx.maxburst = ssi->dma_maxburst;
+ 	ssi->dma_params_rx.maxburst = ssi->dma_maxburst;
+ 	ssi->dma_params_tx.addr = ssi->ssi_phys + REG_SSI_STX0;
+@@ -1359,7 +1382,7 @@ static int fsl_ssi_imx_probe(struct platform_device *pdev,
+ 		if (ret)
+ 			goto error_pcm;
+ 	} else {
+-		ret = imx_pcm_dma_init(pdev, buffer_size);
++		ret = imx_pcm_platform_register(&pdev->dev);
+ 		if (ret)
+ 			goto error_pcm;
+ 	}
+@@ -1440,6 +1463,9 @@ static int fsl_ssi_probe_from_dt(struct fsl_ssi *ssi)
+ 	if (ssi->use_dma && !ret && dmas[2] == IMX_DMATYPE_SSI_DUAL)
+ 		ssi->use_dual_fifo = true;
+ 
++	if (ssi->use_dma && !ret && dmas[2] == IMX_DMATYPE_MULTI_SAI)
++		ssi->use_dyna_fifo = true;
++
+ 	/*
+ 	 * Backward compatible for older bindings by manually triggering the
+ 	 * machine driver's probe(). Use /compatible property, including the
+-- 
+1.7.9.5
+

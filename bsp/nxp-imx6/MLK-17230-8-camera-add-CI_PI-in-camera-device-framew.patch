@@ -1,0 +1,937 @@
+From 250c71c2be20394e7f663060aa189e5d278fe21b Mon Sep 17 00:00:00 2001
+From: "Guoniu.Zhou" <guoniu.zhou@nxp.com>
+Date: Mon, 5 Feb 2018 16:26:38 +0800
+Subject: [PATCH 3500/5242] MLK-17230-8: camera: add CI_PI in camera device
+ framework
+
+commit  e0078d278f0a0dec18c5518b92b5f1d86dd114e2 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add CI_PI and ov5640 camera sensor support in camera device
+framework. The data flow is "ov5640->ci_pi->isi_ch0". Disable
+the other channels of ISI.
+
+Reviewed-by: Sandor.Yu <sandor.yu@nxp.com>
+Signed-off-by: Guoniu.Zhou <guoniu.zhou@nxp.com>
+(cherry picked from commit 37bc5d225e8a3eeb21fef5d94335d1edb2036988)
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/mxc-isi-cap.c   |  172 +++++++++++++++++++--------
+ drivers/media/platform/imx8/mxc-isi-core.c  |    4 +-
+ drivers/media/platform/imx8/mxc-isi-core.h  |   37 +++---
+ drivers/media/platform/imx8/mxc-isi-hw.c    |  137 +++++++++++++--------
+ drivers/media/platform/imx8/mxc-isi-hw.h    |   10 +-
+ drivers/media/platform/imx8/mxc-media-dev.c |  123 ++++++++++++++-----
+ drivers/media/platform/imx8/mxc-media-dev.h |    4 +
+ 7 files changed, 343 insertions(+), 144 deletions(-)
+
+diff --git a/drivers/media/platform/imx8/mxc-isi-cap.c b/drivers/media/platform/imx8/mxc-isi-cap.c
+index 1667da1..deb8803 100644
+--- a/drivers/media/platform/imx8/mxc-isi-cap.c
++++ b/drivers/media/platform/imx8/mxc-isi-cap.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  */
+ /*
+  * The code contained herein is licensed under the GNU General Public
+@@ -165,7 +165,8 @@ struct mxc_isi_fmt *mxc_isi_get_src_fmt(struct v4l2_subdev_format *sd_fmt)
+ 	u32 index;
+ 
+ 	/* two fmt RGB32 and YUV444 from pixellink */
+-	if (sd_fmt->format.code == MEDIA_BUS_FMT_YUYV8_1X16)
++	if (sd_fmt->format.code == MEDIA_BUS_FMT_YUYV8_1X16 ||
++		sd_fmt->format.code == MEDIA_BUS_FMT_YVYU8_2X8)
+ 		index = 1;
+ 	else
+ 		index = 0;
+@@ -526,14 +527,58 @@ void mxc_isi_ctrls_delete(struct mxc_isi_dev *mxc_isi)
+ 	}
+ }
+ 
++static struct media_pad *mxc_isi_get_remote_source_pad(struct mxc_isi_dev *mxc_isi)
++{
++	struct mxc_isi_cap_dev *isi_cap = &mxc_isi->isi_cap;
++	struct v4l2_subdev *subdev = &isi_cap->sd;
++	struct media_pad *sink_pad, *source_pad;
++	int i;
++
++	while (1) {
++		source_pad = NULL;
++		for (i = 0; i < subdev->entity.num_pads; i++) {
++			sink_pad = &subdev->entity.pads[i];
++
++			if (sink_pad->flags & MEDIA_PAD_FL_SINK) {
++				source_pad = media_entity_remote_pad(sink_pad);
++				if (source_pad)
++					break;
++			}
++		}
++		/* return first pad point in the loop  */
++		return source_pad;
++	}
++
++	if (i == subdev->entity.num_pads)
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++
++	return NULL;
++}
++
+ static int mxc_isi_capture_open(struct file *file)
+ {
+ 	struct mxc_isi_dev *mxc_isi = video_drvdata(file);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sd;
+ 	struct device *dev = &mxc_isi->pdev->dev;
+ 	int ret = -EBUSY;
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s, ISI%d\n", __func__, mxc_isi->id);
+ 
++	/* Get remote source pad */
++	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
++	if (source_pad == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sd == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
+ 	pm_runtime_get_sync(dev);
+ 
+ 	mutex_lock(&mxc_isi->lock);
+@@ -541,22 +586,44 @@ static int mxc_isi_capture_open(struct file *file)
+ 	mutex_unlock(&mxc_isi->lock);
+ 
+ 	mxc_isi_channel_init(mxc_isi);
+-	return 0;
++	return v4l2_subdev_call(sd, core, s_power, 1);
+ }
+ 
+ static int mxc_isi_capture_release(struct file *file)
+ {
+ 	struct mxc_isi_dev *mxc_isi = video_drvdata(file);
++	struct media_pad *source_pad;
++	struct v4l2_subdev *sd;
+ 	struct device *dev = &mxc_isi->pdev->dev;
+ 	int ret;
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s\n", __func__);
+ 
++	/* Get remote source pad */
++	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
++	if (source_pad == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sd == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
+ 	mutex_lock(&mxc_isi->lock);
+ 	ret = _vb2_fop_release(file, NULL);
+ 	mutex_unlock(&mxc_isi->lock);
+ 	mxc_isi_channel_deinit(mxc_isi);
+ 
++	ret = v4l2_subdev_call(sd, core, s_power, 0);
++	if (ret < 0 && ret != -ENOIOCTLCMD) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s s_power fail\n", __func__);
++		return -EINVAL;
++	}
++
+ 	pm_runtime_put_sync(dev);
+ 
+ 	return ret;
+@@ -669,35 +736,6 @@ static int mxc_isi_cap_try_fmt_mplane(struct file *file, void *fh,
+ 	return 0;
+ }
+ 
+-
+-static struct media_pad *mxc_isi_get_remote_source_pad(struct mxc_isi_dev *mxc_isi)
+-{
+-	struct mxc_isi_cap_dev *isi_cap = &mxc_isi->isi_cap;
+-	struct v4l2_subdev *subdev = &isi_cap->sd;
+-	struct media_pad *sink_pad, *source_pad;
+-	int i;
+-
+-	while (1) {
+-		source_pad = NULL;
+-		for (i = 0; i < subdev->entity.num_pads; i++) {
+-			sink_pad = &subdev->entity.pads[i];
+-
+-			if (sink_pad->flags & MEDIA_PAD_FL_SINK) {
+-				source_pad = media_entity_remote_pad(sink_pad);
+-				if (source_pad)
+-					break;
+-			}
+-		}
+-		/* return first pad point in the loop  */
+-		return source_pad;
+-	}
+-
+-	if (i == subdev->entity.num_pads)
+-		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
+-
+-	return NULL;
+-}
+-
+ /* Update input frame size and formate  */
+ static int mxc_isi_source_fmt_init(struct mxc_isi_dev *mxc_isi)
+ {
+@@ -973,13 +1011,20 @@ static int mxc_isi_cap_g_parm(struct file *file, void *fh,
+ 			struct v4l2_streamparm *a)
+ {
+ 	struct mxc_isi_dev *mxc_isi = video_drvdata(file);
+-	struct v4l2_device *v4l2_dev = mxc_isi->isi_cap.sd.v4l2_dev;
+ 	struct v4l2_subdev *sd;
++	struct media_pad *source_pad;
+ 
+-	sd = mxc_isi_get_subdev_by_name(v4l2_dev, "max9286_mipi");
++	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
++	if (source_pad == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sd = media_entity_to_v4l2_subdev(source_pad->entity);
+ 	if (sd == NULL) {
+-		v4l2_err(&mxc_isi->isi_cap.sd, "Can't find subdev\n");
+-		return -ENODEV;
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
+ 	}
+ 	return v4l2_subdev_call(sd, video, g_parm, a);
+ }
+@@ -988,13 +1033,20 @@ static int mxc_isi_cap_s_parm(struct file *file, void *fh,
+ 			struct v4l2_streamparm *a)
+ {
+ 	struct mxc_isi_dev *mxc_isi = video_drvdata(file);
+-	struct v4l2_device *v4l2_dev = mxc_isi->isi_cap.sd.v4l2_dev;
+ 	struct v4l2_subdev *sd;
++	struct media_pad *source_pad;
+ 
+-	sd = mxc_isi_get_subdev_by_name(v4l2_dev, "max9286_mipi");
++	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
++	if (source_pad == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sd = media_entity_to_v4l2_subdev(source_pad->entity);
+ 	if (sd == NULL) {
+-		v4l2_err(&mxc_isi->isi_cap.sd, "Can't find subdev\n");
+-		return -ENODEV;
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
+ 	}
+ 	return v4l2_subdev_call(sd, video, s_parm, a);
+ }
+@@ -1003,9 +1055,9 @@ static int mxc_isi_cap_enum_framesizes(struct file *file, void *priv,
+ 					 struct v4l2_frmsizeenum *fsize)
+ {
+ 	struct mxc_isi_dev *mxc_isi = video_drvdata(file);
+-	struct v4l2_device *v4l2_dev = mxc_isi->isi_cap.sd.v4l2_dev;
+ 	struct v4l2_subdev *sd;
+ 	struct mxc_isi_fmt *fmt;
++	struct media_pad *source_pad;
+ 	struct v4l2_subdev_frame_size_enum fse = {
+ 		.index = fsize->index,
+ 		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+@@ -1017,7 +1069,19 @@ static int mxc_isi_cap_enum_framesizes(struct file *file, void *priv,
+ 		return -EINVAL;
+ 	fse.code = fmt->mbus_code;
+ 
+-	sd = mxc_isi_get_subdev_by_name(v4l2_dev, "max9286_mipi");
++	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
++	if (source_pad == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sd = media_entity_to_v4l2_subdev(source_pad->entity);
++	if (sd == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
++	}
++
+ 	if (sd == NULL) {
+ 		v4l2_err(&mxc_isi->isi_cap.sd, "Can't find subdev\n");
+ 		return -ENODEV;
+@@ -1050,9 +1114,9 @@ static int mxc_isi_cap_enum_frameintervals(struct file *file, void *fh,
+ 					  struct v4l2_frmivalenum *interval)
+ {
+ 	struct mxc_isi_dev *mxc_isi = video_drvdata(file);
+-	struct v4l2_device *v4l2_dev = mxc_isi->isi_cap.sd.v4l2_dev;
+ 	struct v4l2_subdev *sd;
+ 	struct mxc_isi_fmt *fmt;
++	struct media_pad *source_pad;
+ 	struct v4l2_subdev_frame_interval_enum fie = {
+ 		.index = interval->index,
+ 		.width = interval->width,
+@@ -1066,10 +1130,17 @@ static int mxc_isi_cap_enum_frameintervals(struct file *file, void *fh,
+ 		return -EINVAL;
+ 	fie.code = fmt->mbus_code;
+ 
+-	sd = mxc_isi_get_subdev_by_name(v4l2_dev, "max9286_mipi");
++	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
++	if (source_pad == NULL) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
++		return -EINVAL;
++	}
++
++	/* Get remote source pad subdev */
++	sd = media_entity_to_v4l2_subdev(source_pad->entity);
+ 	if (sd == NULL) {
+-		v4l2_err(&mxc_isi->isi_cap.sd, "Can't find subdev\n");
+-		return -ENODEV;
++		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
++		return -EINVAL;
+ 	}
+ 
+ 	ret = v4l2_subdev_call(sd, pad, enum_frame_interval, NULL, &fie);
+@@ -1134,8 +1205,10 @@ static int mxc_isi_link_setup(struct media_entity *entity,
+ 		case MXC_ISI_SD_PAD_SOURCE_DC1:
+ 			break;
+ 		case MXC_ISI_SD_PAD_SOURCE_MEM:
++			break;
+ 		default:
+-			return 0;
++			dev_err(&mxc_isi->pdev->dev, "%s invalid source pad\n", __func__);
++			return -EINVAL;
+ 		}
+ 	} else if (local->flags & MEDIA_PAD_FL_SINK) {
+ 		switch (local->index) {
+@@ -1151,7 +1224,11 @@ static int mxc_isi_link_setup(struct media_entity *entity,
+ 		case MXC_ISI_SD_PAD_SINK_DC0:
+ 		case MXC_ISI_SD_PAD_SINK_DC1:
+ 		case MXC_ISI_SD_PAD_SINK_MEM:
++		case MXC_ISI_SD_PAD_SINK_PARALLEL_CSI:
+ 			break;
++		default:
++			dev_err(&mxc_isi->pdev->dev, "%s invalid sink pad\n", __func__);
++			return -EINVAL;
+ 		}
+ 	}
+ 
+@@ -1506,6 +1583,7 @@ int mxc_isi_initialize_capture_subdev(struct mxc_isi_dev *mxc_isi)
+ 	mxc_isi->isi_cap.sd_pads[MXC_ISI_SD_PAD_SINK_DC1].flags = MEDIA_PAD_FL_SINK;
+ 	mxc_isi->isi_cap.sd_pads[MXC_ISI_SD_PAD_SINK_HDMI].flags = MEDIA_PAD_FL_SINK;
+ 	mxc_isi->isi_cap.sd_pads[MXC_ISI_SD_PAD_SINK_MEM].flags = MEDIA_PAD_FL_SINK;
++	mxc_isi->isi_cap.sd_pads[MXC_ISI_SD_PAD_SINK_PARALLEL_CSI].flags = MEDIA_PAD_FL_SINK;
+ 
+ 	/* ISI source pads */
+ 	mxc_isi->isi_cap.sd_pads[MXC_ISI_SD_PAD_SOURCE_MEM].flags = MEDIA_PAD_FL_SOURCE;
+diff --git a/drivers/media/platform/imx8/mxc-isi-core.c b/drivers/media/platform/imx8/mxc-isi-core.c
+index 29a1999..66ed18e 100644
+--- a/drivers/media/platform/imx8/mxc-isi-core.c
++++ b/drivers/media/platform/imx8/mxc-isi-core.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  */
+ /*
+  * The code contained herein is licensed under the GNU General Public
+@@ -98,6 +98,8 @@ static int mxc_isi_parse_dt(struct mxc_isi_dev *mxc_isi)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	mxc_isi->parallel_csi = of_property_read_bool(node, "parallel_csi");
++
+ 	dev_dbg(dev, "%s, isi_%d,interface(%d, %d, %d)\n", __func__, mxc_isi->id,
+ 			mxc_isi->interface[0], mxc_isi->interface[1], mxc_isi->interface[2]);
+ 	return 0;
+diff --git a/drivers/media/platform/imx8/mxc-isi-core.h b/drivers/media/platform/imx8/mxc-isi-core.h
+index 0c6b11d..f77227f 100644
+--- a/drivers/media/platform/imx8/mxc-isi-core.h
++++ b/drivers/media/platform/imx8/mxc-isi-core.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  */
+ /*
+  * The code contained herein is licensed under the GNU General Public
+@@ -24,26 +24,27 @@
+ 
+ #define ISI_OF_NODE_NAME	"isi"
+ 
+-#define MXC_ISI_SD_PAD_SINK_MIPI0_VC0	0
+-#define MXC_ISI_SD_PAD_SINK_MIPI0_VC1	1
+-#define MXC_ISI_SD_PAD_SINK_MIPI0_VC2	2
+-#define MXC_ISI_SD_PAD_SINK_MIPI0_VC3	3
+-#define MXC_ISI_SD_PAD_SINK_MIPI1_VC0	4
+-#define MXC_ISI_SD_PAD_SINK_MIPI1_VC1	5
+-#define MXC_ISI_SD_PAD_SINK_MIPI1_VC2	6
+-#define MXC_ISI_SD_PAD_SINK_MIPI1_VC3	7
++#define MXC_ISI_SD_PAD_SINK_MIPI0_VC0		0
++#define MXC_ISI_SD_PAD_SINK_MIPI0_VC1		1
++#define MXC_ISI_SD_PAD_SINK_MIPI0_VC2		2
++#define MXC_ISI_SD_PAD_SINK_MIPI0_VC3		3
++#define MXC_ISI_SD_PAD_SINK_MIPI1_VC0		4
++#define MXC_ISI_SD_PAD_SINK_MIPI1_VC1		5
++#define MXC_ISI_SD_PAD_SINK_MIPI1_VC2		6
++#define MXC_ISI_SD_PAD_SINK_MIPI1_VC3		7
+ #if 0
+ #define MXC_ISI_SD_PAD_SINK_MIPI_CSI0	0
+ #define MXC_ISI_SD_PAD_SINK_MIPI_CSI1	1
+ #endif
+-#define MXC_ISI_SD_PAD_SINK_DC0			8
+-#define MXC_ISI_SD_PAD_SINK_DC1			9
+-#define MXC_ISI_SD_PAD_SINK_HDMI		10
+-#define MXC_ISI_SD_PAD_SINK_MEM			11
+-#define MXC_ISI_SD_PAD_SOURCE_MEM		12
+-#define MXC_ISI_SD_PAD_SOURCE_DC0		13
+-#define MXC_ISI_SD_PAD_SOURCE_DC1		14
+-#define MXC_ISI_SD_PADS_NUM				15
++#define MXC_ISI_SD_PAD_SINK_DC0				8
++#define MXC_ISI_SD_PAD_SINK_DC1				9
++#define MXC_ISI_SD_PAD_SINK_HDMI			10
++#define MXC_ISI_SD_PAD_SINK_MEM				11
++#define MXC_ISI_SD_PAD_SOURCE_MEM			12
++#define MXC_ISI_SD_PAD_SOURCE_DC0			13
++#define MXC_ISI_SD_PAD_SOURCE_DC1			14
++#define MXC_ISI_SD_PAD_SINK_PARALLEL_CSI	15
++#define MXC_ISI_SD_PADS_NUM					16
+ 
+ #define MXC_MAX_PLANES		3
+ 
+@@ -54,6 +55,7 @@ enum isi_input_interface {
+ 	ISI_INPUT_INTERFACE_MIPI1_CSI2,
+ 	ISI_INPUT_INTERFACE_HDMI,
+ 	ISI_INPUT_INTERFACE_MEM,
++	ISI_INPUT_INTERFACE_PARALLEL_CSI,
+ 	ISI_INPUT_INTERFACE_MAX,
+ };
+ 
+@@ -290,6 +292,7 @@ struct mxc_isi_dev {
+ 	unsigned int		alphaen:1;
+ 	unsigned int		crop:1;
+ 	unsigned int		deinterlace:1;
++	unsigned int		parallel_csi:1;
+ 
+ 	struct mxc_isi_ctrls ctrls;
+ 	u8			alpha;		/* goable alpha */
+diff --git a/drivers/media/platform/imx8/mxc-isi-hw.c b/drivers/media/platform/imx8/mxc-isi-hw.c
+index 0f06362..54e168b 100644
+--- a/drivers/media/platform/imx8/mxc-isi-hw.c
++++ b/drivers/media/platform/imx8/mxc-isi-hw.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  */
+ /*
+  * The code contained herein is licensed under the GNU General Public
+@@ -9,56 +9,59 @@
+  * http://www.opensource.org/licenses/gpl-license.html
+  * http://www.gnu.org/copyleft/gpl.html
+  */
++#include <soc/imx8/sc/sci.h>
++#include <dt-bindings/pinctrl/pads-imx8qxp.h>
+ 
+ #include "mxc-isi-hw.h"
+-
+ #define	ISI_DOWNSCALE_THRESHOLD		0x4000
+ 
+-#ifdef debug
+-static void dump_isi_regs(struct mxc_isi_dev *mxc_isi)
++#ifdef DEBUG
++void dump_isi_regs(struct mxc_isi_dev *mxc_isi)
+ {
+-	printk("ISI CHNLC register dump, isi%d\n", mxc_isi->id);
+-	printk("CHNL_CTRL              0x0h  = 0x%x\n", readl(mxc_isi->regs + 0x0));
+-	printk("CHNL_IMG_CTRL          0x4h  = 0x%x\n", readl(mxc_isi->regs + 0x4));
+-	printk("CHNL_OUT_BUF_CTRL      0x8h  = 0x%x\n", readl(mxc_isi->regs + 0x8));
+-	printk("CHNL_IMG_CFG           0xCh  = 0x%x\n", readl(mxc_isi->regs + 0xC));
+-	printk("CHNL_IER               0x10h = 0x%x\n", readl(mxc_isi->regs + 0x10));
+-	printk("CHNL_STS               0x14h = 0x%x\n", readl(mxc_isi->regs + 0x14));
+-	printk("CHNL_SCALE_FACTOR      0x18h = 0x%x\n", readl(mxc_isi->regs + 0x18));
+-	printk("CHNL_SCALE_OFFSET      0x1Ch = 0x%x\n", readl(mxc_isi->regs + 0x1C));
+-	printk("CHNL_CROP_ULC          0x20h = 0x%x\n", readl(mxc_isi->regs + 0x20));
+-	printk("CHNL_CROP_LRC          0x24h = 0x%x\n", readl(mxc_isi->regs + 0x24));
+-	printk("CHNL_CSC_COEFF0        0x28h = 0x%x\n", readl(mxc_isi->regs + 0x28));
+-	printk("CHNL_CSC_COEFF1        0x2Ch = 0x%x\n", readl(mxc_isi->regs + 0x2C));
+-	printk("CHNL_CSC_COEFF2        0x30h = 0x%x\n", readl(mxc_isi->regs + 0x30));
+-	printk("CHNL_CSC_COEFF3        0x34h = 0x%x\n", readl(mxc_isi->regs + 0x34));
+-	printk("CHNL_CSC_COEFF4        0x38h = 0x%x\n", readl(mxc_isi->regs + 0x38));
+-	printk("CHNL_CSC_COEFF5        0x3Ch = 0x%x\n", readl(mxc_isi->regs + 0x3C));
+-	printk("CHNL_ROI_0_ALPHA       0x40h = 0x%x\n", readl(mxc_isi->regs + 0x40));
+-	printk("CHNL_ROI_0_ULC         0x44h = 0x%x\n", readl(mxc_isi->regs + 0x44));
+-	printk("CHNL_ROI_0_LRC         0x48h = 0x%x\n", readl(mxc_isi->regs + 0x48));
+-	printk("CHNL_ROI_1_ALPHA       0x4Ch = 0x%x\n", readl(mxc_isi->regs + 0x4C));
+-	printk("CHNL_ROI_1_ULC         0x50h = 0x%x\n", readl(mxc_isi->regs + 0x50));
+-	printk("CHNL_ROI_1_LRC         0x54h = 0x%x\n", readl(mxc_isi->regs + 0x54));
+-	printk("CHNL_ROI_2_ALPHA       0x58h = 0x%x\n", readl(mxc_isi->regs + 0x58));
+-	printk("CHNL_ROI_2_ULC         0x5Ch = 0x%x\n", readl(mxc_isi->regs + 0x5C));
+-	printk("CHNL_ROI_2_LRC         0x60h = 0x%x\n", readl(mxc_isi->regs + 0x60));
+-	printk("CHNL_ROI_3_ALPHA       0x64h = 0x%x\n", readl(mxc_isi->regs + 0x64));
+-	printk("CHNL_ROI_3_ULC         0x68h = 0x%x\n", readl(mxc_isi->regs + 0x68));
+-	printk("CHNL_ROI_3_LRC         0x6Ch = 0x%x\n", readl(mxc_isi->regs + 0x6C));
+-	printk("CHNL_OUT_BUF1_ADDR_Y   0x70h = 0x%x\n", readl(mxc_isi->regs + 0x70));
+-	printk("CHNL_OUT_BUF1_ADDR_U   0x74h = 0x%x\n", readl(mxc_isi->regs + 0x74));
+-	printk("CHNL_OUT_BUF1_ADDR_V   0x78h = 0x%x\n", readl(mxc_isi->regs + 0x78));
+-	printk("CHNL_OUT_BUF_PITCH     0x7Ch = 0x%x\n", readl(mxc_isi->regs + 0x7C));
+-	printk("CHNL_IN_BUF_ADDR       0x80h = 0x%x\n", readl(mxc_isi->regs + 0x80));
+-	printk("CHNL_IN_BUF_PITCH      0x84h = 0x%x\n", readl(mxc_isi->regs + 0x84));
+-	printk("CHNL_MEM_RD_CTRL       0x88h = 0x%x\n", readl(mxc_isi->regs + 0x88));
+-	printk("CHNL_OUT_BUF2_ADDR_Y   0x8Ch = 0x%x\n", readl(mxc_isi->regs + 0x8C));
+-	printk("CHNL_OUT_BUF2_ADDR_U   0x90h = 0x%x\n", readl(mxc_isi->regs + 0x90));
+-	printk("CHNL_OUT_BUF2_ADDR_V   0x94h = 0x%x\n", readl(mxc_isi->regs + 0x94));
++	struct device *dev = &mxc_isi->pdev->dev;
++
++	dev_dbg(dev, "ISI CHNLC register dump, isi%d\n", mxc_isi->id);
++	dev_dbg(dev, "CHNL_CTRL              0x0h  = 0x%x\n", readl(mxc_isi->regs + 0x0));
++	dev_dbg(dev, "CHNL_IMG_CTRL          0x4h  = 0x%x\n", readl(mxc_isi->regs + 0x4));
++	dev_dbg(dev, "CHNL_OUT_BUF_CTRL      0x8h  = 0x%x\n", readl(mxc_isi->regs + 0x8));
++	dev_dbg(dev, "CHNL_IMG_CFG           0xCh  = 0x%x\n", readl(mxc_isi->regs + 0xC));
++	dev_dbg(dev, "CHNL_IER               0x10h = 0x%x\n", readl(mxc_isi->regs + 0x10));
++	dev_dbg(dev, "CHNL_STS               0x14h = 0x%x\n", readl(mxc_isi->regs + 0x14));
++	dev_dbg(dev, "CHNL_SCALE_FACTOR      0x18h = 0x%x\n", readl(mxc_isi->regs + 0x18));
++	dev_dbg(dev, "CHNL_SCALE_OFFSET      0x1Ch = 0x%x\n", readl(mxc_isi->regs + 0x1C));
++	dev_dbg(dev, "CHNL_CROP_ULC          0x20h = 0x%x\n", readl(mxc_isi->regs + 0x20));
++	dev_dbg(dev, "CHNL_CROP_LRC          0x24h = 0x%x\n", readl(mxc_isi->regs + 0x24));
++	dev_dbg(dev, "CHNL_CSC_COEFF0        0x28h = 0x%x\n", readl(mxc_isi->regs + 0x28));
++	dev_dbg(dev, "CHNL_CSC_COEFF1        0x2Ch = 0x%x\n", readl(mxc_isi->regs + 0x2C));
++	dev_dbg(dev, "CHNL_CSC_COEFF2        0x30h = 0x%x\n", readl(mxc_isi->regs + 0x30));
++	dev_dbg(dev, "CHNL_CSC_COEFF3        0x34h = 0x%x\n", readl(mxc_isi->regs + 0x34));
++	dev_dbg(dev, "CHNL_CSC_COEFF4        0x38h = 0x%x\n", readl(mxc_isi->regs + 0x38));
++	dev_dbg(dev, "CHNL_CSC_COEFF5        0x3Ch = 0x%x\n", readl(mxc_isi->regs + 0x3C));
++	dev_dbg(dev, "CHNL_ROI_0_ALPHA       0x40h = 0x%x\n", readl(mxc_isi->regs + 0x40));
++	dev_dbg(dev, "CHNL_ROI_0_ULC         0x44h = 0x%x\n", readl(mxc_isi->regs + 0x44));
++	dev_dbg(dev, "CHNL_ROI_0_LRC         0x48h = 0x%x\n", readl(mxc_isi->regs + 0x48));
++	dev_dbg(dev, "CHNL_ROI_1_ALPHA       0x4Ch = 0x%x\n", readl(mxc_isi->regs + 0x4C));
++	dev_dbg(dev, "CHNL_ROI_1_ULC         0x50h = 0x%x\n", readl(mxc_isi->regs + 0x50));
++	dev_dbg(dev, "CHNL_ROI_1_LRC         0x54h = 0x%x\n", readl(mxc_isi->regs + 0x54));
++	dev_dbg(dev, "CHNL_ROI_2_ALPHA       0x58h = 0x%x\n", readl(mxc_isi->regs + 0x58));
++	dev_dbg(dev, "CHNL_ROI_2_ULC         0x5Ch = 0x%x\n", readl(mxc_isi->regs + 0x5C));
++	dev_dbg(dev, "CHNL_ROI_2_LRC         0x60h = 0x%x\n", readl(mxc_isi->regs + 0x60));
++	dev_dbg(dev, "CHNL_ROI_3_ALPHA       0x64h = 0x%x\n", readl(mxc_isi->regs + 0x64));
++	dev_dbg(dev, "CHNL_ROI_3_ULC         0x68h = 0x%x\n", readl(mxc_isi->regs + 0x68));
++	dev_dbg(dev, "CHNL_ROI_3_LRC         0x6Ch = 0x%x\n", readl(mxc_isi->regs + 0x6C));
++	dev_dbg(dev, "CHNL_OUT_BUF1_ADDR_Y   0x70h = 0x%x\n", readl(mxc_isi->regs + 0x70));
++	dev_dbg(dev, "CHNL_OUT_BUF1_ADDR_U   0x74h = 0x%x\n", readl(mxc_isi->regs + 0x74));
++	dev_dbg(dev, "CHNL_OUT_BUF1_ADDR_V   0x78h = 0x%x\n", readl(mxc_isi->regs + 0x78));
++	dev_dbg(dev, "CHNL_OUT_BUF_PITCH     0x7Ch = 0x%x\n", readl(mxc_isi->regs + 0x7C));
++	dev_dbg(dev, "CHNL_IN_BUF_ADDR       0x80h = 0x%x\n", readl(mxc_isi->regs + 0x80));
++	dev_dbg(dev, "CHNL_IN_BUF_PITCH      0x84h = 0x%x\n", readl(mxc_isi->regs + 0x84));
++	dev_dbg(dev, "CHNL_MEM_RD_CTRL       0x88h = 0x%x\n", readl(mxc_isi->regs + 0x88));
++	dev_dbg(dev, "CHNL_OUT_BUF2_ADDR_Y   0x8Ch = 0x%x\n", readl(mxc_isi->regs + 0x8C));
++	dev_dbg(dev, "CHNL_OUT_BUF2_ADDR_U   0x90h = 0x%x\n", readl(mxc_isi->regs + 0x90));
++	dev_dbg(dev, "CHNL_OUT_BUF2_ADDR_V   0x94h = 0x%x\n", readl(mxc_isi->regs + 0x94));
+ }
+ #else
+-static void dump_isi_regs(struct mxc_isi_dev *mxc_isi)
++void dump_isi_regs(struct mxc_isi_dev *mxc_isi)
+ {
+ }
+ #endif
+@@ -131,6 +134,36 @@ void mxc_isi_channel_set_outbuf(struct mxc_isi_dev *mxc_isi, struct mxc_isi_buff
+ 	writel(val,	mxc_isi->regs + CHNL_OUT_BUF_CTRL);
+ }
+ 
++void mxc_isi_channel_hw_reset(struct mxc_isi_dev *mxc_isi)
++{
++	sc_ipc_t ipcHndl;
++	sc_err_t sciErr;
++	uint32_t mu_id;
++
++	sciErr = sc_ipc_getMuID(&mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("Cannot obtain MU ID\n");
++		return;
++	}
++
++	sciErr = sc_ipc_open(&ipcHndl, mu_id);
++	if (sciErr != SC_ERR_NONE) {
++		pr_err("sc_ipc_open failed! (sciError = %d)\n", sciErr);
++		return;
++	}
++
++	sciErr = sc_pm_set_resource_power_mode(ipcHndl, SC_R_ISI_CH0, SC_PM_PW_MODE_OFF);
++	if (sciErr != SC_ERR_NONE)
++		pr_err("sc_misc_MIPI reset failed! (sciError = %d)\n", sciErr);
++
++	sciErr = sc_pm_set_resource_power_mode(ipcHndl, SC_R_ISI_CH0, SC_PM_PW_MODE_ON);
++	if (sciErr != SC_ERR_NONE)
++		pr_err("sc_misc_MIPI reset failed! (sciError = %d)\n", sciErr);
++
++	msleep(10);
++
++	sc_ipc_close(mu_id);
++}
+ 
+ void mxc_isi_channel_sw_reset(struct mxc_isi_dev *mxc_isi)
+ {
+@@ -174,6 +207,9 @@ void mxc_isi_channel_source_config(struct mxc_isi_dev *mxc_isi)
+ 	case ISI_INPUT_INTERFACE_HDMI:
+ 		val |= CHNL_CTRL_SRC_INPUT_HDMI;
+ 		break;
++	case ISI_INPUT_INTERFACE_PARALLEL_CSI:
++		val |= CHNL_CTRL_SRC_INPUT_CSI;
++		break;
+ 	case ISI_INPUT_INTERFACE_MEM:
+ 		val |= CHNL_CTRL_SRC_INPUT_MEMORY;
+ 		val |= (CHNL_CTRL_SRC_TYPE_MEMORY << CHNL_CTRL_SRC_TYPE_OFFSET);
+@@ -362,11 +398,12 @@ void mxc_isi_channel_set_scaling(struct mxc_isi_dev *mxc_isi)
+ 	if (dst_f->height == src_f->height ||
+ 			dst_f->width == src_f->width) {
+ 		mxc_isi->scale = 0;
++		dev_dbg(&mxc_isi->pdev->dev, "%s: no scale\n", __func__);
+ 		return;
+ 	}
+ 
+ 	dev_info(&mxc_isi->pdev->dev, "input_size(%d,%d), output_size(%d,%d)\n",
+-			src_f->height, src_f->width, dst_f->height, dst_f->width);
++			src_f->width, src_f->height, dst_f->width, dst_f->height);
+ 
+ 	mxc_isi->scale = 1;
+ 
+@@ -429,13 +466,16 @@ void mxc_isi_channel_init(struct mxc_isi_dev *mxc_isi)
+ {
+ 	u32 val;
+ 
++	/* hw reset */
++	mxc_isi_channel_hw_reset(mxc_isi);
++
++	/* sw reset */
++	mxc_isi_channel_sw_reset(mxc_isi);
++
+ 	/* Init channel clk first */
+ 	val = readl(mxc_isi->regs + CHNL_CTRL);
+ 	val |= (CHNL_CTRL_CLK_EN_ENABLE << CHNL_CTRL_CLK_EN_OFFSET);
+ 	writel(val, mxc_isi->regs + CHNL_CTRL);
+-
+-	/* sw reset */
+-	mxc_isi_channel_sw_reset(mxc_isi);
+ }
+ 
+ void mxc_isi_channel_deinit(struct mxc_isi_dev *mxc_isi)
+@@ -503,6 +543,7 @@ void mxc_isi_channel_enable(struct mxc_isi_dev *mxc_isi)
+ 	writel(val, mxc_isi->regs + CHNL_CTRL);
+ 
+ 	mxc_isi_enable_irq(mxc_isi);
++	msleep(300);
+ 	dump_isi_regs(mxc_isi);
+ }
+ 
+diff --git a/drivers/media/platform/imx8/mxc-isi-hw.h b/drivers/media/platform/imx8/mxc-isi-hw.h
+index ea363ca..77e7469 100644
+--- a/drivers/media/platform/imx8/mxc-isi-hw.h
++++ b/drivers/media/platform/imx8/mxc-isi-hw.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  */
+ /*
+  * The code contained herein is licensed under the GNU General Public
+@@ -41,8 +41,8 @@
+ #define  CHNL_CTRL_CHAIN_BUF_NO_CHAIN	0
+ #define  CHNL_CTRL_CHAIN_BUF_2_CHAIN	1
+ #define  CHNL_CTRL_SW_RST_OFFSET		24
+-#define  CHNL_CTRL_SW_RST_MASK			0x100000
+-#define  CHNL_CTRL_SW_RST				0x100000
++#define  CHNL_CTRL_SW_RST_MASK			0x1000000
++#define  CHNL_CTRL_SW_RST				0x1000000
+ #define  CHNL_CTRL_BLANK_PXL_OFFSET		16
+ #define  CHNL_CTRL_MIPI_VC_ID_OFFSET	6
+ #define  CHNL_CTRL_MIPI_VC_ID_MASK		0xc0
+@@ -61,6 +61,7 @@
+ #define  CHNL_CTRL_SRC_INPUT_MIPI0		2
+ #define  CHNL_CTRL_SRC_INPUT_MIPI1		3
+ #define  CHNL_CTRL_SRC_INPUT_HDMI		4
++#define  CHNL_CTRL_SRC_INPUT_CSI		4
+ #define  CHNL_CTRL_SRC_INPUT_MEMORY		5
+ 
+ /* Channel Image Control Register */
+@@ -451,6 +452,7 @@ enum isi_csi_coeff {
+ 	RGB2YUV,
+ };
+ 
++
+ void mxc_isi_channel_init(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_deinit(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_config(struct mxc_isi_dev *mxc_isi);
+@@ -461,6 +463,7 @@ enum isi_csi_coeff {
+ void mxc_isi_frame_read_done(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_set_deinterlace(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_sw_reset(struct mxc_isi_dev *mxc_isi);
++void mxc_isi_channel_hw_reset(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_source_config(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_set_flip(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_channel_set_csc(struct mxc_isi_dev *mxc_isi);
+@@ -477,4 +480,5 @@ enum isi_csi_coeff {
+ void mxc_isi_enable_irq(struct mxc_isi_dev *mxc_isi);
+ void mxc_isi_disable_irq(struct mxc_isi_dev *mxc_isi);
+ 
++void dump_isi_regs(struct mxc_isi_dev *mxc_isi);
+ #endif /* MXC_ISI_HW_H_ */
+diff --git a/drivers/media/platform/imx8/mxc-media-dev.c b/drivers/media/platform/imx8/mxc-media-dev.c
+index 9dea927..7917a60 100644
+--- a/drivers/media/platform/imx8/mxc-media-dev.c
++++ b/drivers/media/platform/imx8/mxc-media-dev.c
+@@ -35,6 +35,7 @@
+ #include "mxc-media-dev.h"
+ #include "mxc-isi-core.h"
+ #include "mxc-mipi-csi2.h"
++#include "mxc-parallel-csi.h"
+ 
+ /*create default links between registered entities  */
+ static int mxc_md_create_links(struct mxc_md *mxc_md)
+@@ -43,6 +44,7 @@ static int mxc_md_create_links(struct mxc_md *mxc_md)
+ 	struct mxc_isi_dev *mxc_isi;
+ 	struct mxc_sensor_info *sensor;
+ 	struct mxc_mipi_csi2_dev *mipi_csi2;
++	struct mxc_parallel_csi_dev *pcsidev;
+ 	int i, j, ret = 0;
+ 	u16  source_pad, sink_pad;
+ 	u32 flags;
+@@ -150,6 +152,13 @@ static int mxc_md_create_links(struct mxc_md *mxc_md)
+ 				break;
+ 			}
+ 			break;
++		case ISI_INPUT_INTERFACE_PARALLEL_CSI:
++			if (mxc_md->pcsidev == NULL)
++				continue;
++			source = &mxc_md->pcsidev->sd.entity;
++			source_pad = MXC_PARALLEL_CSI_PAD_SOURCE;
++			sink_pad = MXC_ISI_SD_PAD_SINK_PARALLEL_CSI;
++			break;
+ 
+ 		case ISI_INPUT_INTERFACE_HDMI:
+ 		case ISI_INPUT_INTERFACE_DC0:
+@@ -163,7 +172,7 @@ static int mxc_md_create_links(struct mxc_md *mxc_md)
+ 		/* Create link MIPI/HDMI to ISI */
+ 		ret = media_create_pad_link(source, source_pad, sink, sink_pad, flags);
+ 		if (ret) {
+-			v4l2_err(&mxc_md->v4l2_dev, "created link [%s] %c> [%s]\n",
++			v4l2_err(&mxc_md->v4l2_dev, "created link [%s] %c> [%s] fail\n",
+ 			  source->name, flags ? '=' : '-', sink->name);
+ 			break;
+ 		}
+@@ -190,46 +199,72 @@ static int mxc_md_create_links(struct mxc_md *mxc_md)
+ 		if (sensor == NULL || sensor->sd == NULL)
+ 			continue;
+ 
+-		mipi_csi2 = mxc_md->mipi_csi2[sensor->id];
+-		if (mipi_csi2 ==  NULL)
+-			continue;
+-
+-		source = &sensor->sd->entity;
+-		sink = &mipi_csi2->sd.entity;
+-
+-		source_pad = 0;  //sensor source pad: MIPI_CSI2_SENS_VC0_PAD_SOURCE
+-		sink_pad = source_pad;  //mipi sink pad: MXC_MIPI_CSI2_VC0_PAD_SINK;
++		if (mxc_md->parallel_csi) {
++			pcsidev = mxc_md->pcsidev;
++			if (pcsidev == NULL)
++				continue;
++			source = &sensor->sd->entity;
++			sink = &pcsidev->sd.entity;
+ 
+-		if (mipi_csi2->vchannel == true)
+-			mipi_vc = 4;
+-		else
+-			mipi_vc = 0;
++			source_pad = 0;
++			sink_pad = MXC_PARALLEL_CSI_PAD_SINK;
+ 
+-		for (j = 0; j < mipi_vc; j++) {
+-			ret = media_create_pad_link(source, source_pad + j, sink, sink_pad + j,
+-				      MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++			ret = media_create_pad_link(source, source_pad, sink, sink_pad,
++						  MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
+ 			if (ret)
+ 				return ret;
+ 
+ 			/* Notify MIPI subdev entity */
+-			ret = media_entity_call(sink, link_setup, &sink->pads[sink_pad + j],
+-						&source->pads[source_pad + j], 0);
++			ret = media_entity_call(sink, link_setup, &sink->pads[sink_pad],
++						&source->pads[source_pad], 0);
+ 			if (ret)
+ 				return ret;
+ 
+ 			/* Notify MIPI sensor subdev entity */
+-			ret = media_entity_call(source, link_setup, &source->pads[source_pad + j],
+-						&sink->pads[sink_pad + j], 0);
++			ret = media_entity_call(source, link_setup, &source->pads[source_pad],
++						&sink->pads[sink_pad], 0);
+ 			if (ret)
+ 				return ret;
++			v4l2_info(&mxc_md->v4l2_dev, "created link [%s] => [%s]\n",
++						sensor->sd->entity.name, pcsidev->sd.entity.name);
++		} else {
++			mipi_csi2 = mxc_md->mipi_csi2[sensor->id];
++			if (mipi_csi2 ==  NULL)
++				continue;
++			source = &sensor->sd->entity;
++			sink = &mipi_csi2->sd.entity;
++
++			source_pad = 0;  //sensor source pad: MIPI_CSI2_SENS_VC0_PAD_SOURCE
++			sink_pad = source_pad;  //mipi sink pad: MXC_MIPI_CSI2_VC0_PAD_SINK;
++
++			if (mipi_csi2->vchannel == true)
++				mipi_vc = 4;
++			else
++				mipi_vc = 0;
++
++			for (j = 0; j < mipi_vc; j++) {
++				ret = media_create_pad_link(source, source_pad + j, sink, sink_pad + j,
++						  MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED);
++				if (ret)
++					return ret;
++
++				/* Notify MIPI subdev entity */
++				ret = media_entity_call(sink, link_setup, &sink->pads[sink_pad + j],
++							&source->pads[source_pad + j], 0);
++				if (ret)
++					return ret;
++
++				/* Notify MIPI sensor subdev entity */
++				ret = media_entity_call(source, link_setup, &source->pads[source_pad + j],
++							&sink->pads[sink_pad + j], 0);
++				if (ret)
++					return ret;
++			}
++			v4l2_info(&mxc_md->v4l2_dev, "created link [%s] => [%s]\n",
++				  sensor->sd->entity.name, mipi_csi2->sd.entity.name);
+ 		}
+-
+-		v4l2_info(&mxc_md->v4l2_dev, "created link [%s] => [%s]\n",
+-			  sensor->sd->entity.name, mipi_csi2->sd.entity.name);
+ 	}
+-
+-	/* TODO */
+-	/* Notify HDMI IN / DC0 / DC1 subdev entity */
++	dev_info(&mxc_md->pdev->dev, "%s\n", __func__);
+ 	return 0;
+ }
+ 
+@@ -309,7 +344,11 @@ static int register_sensor_entities(struct mxc_md *mxc_md)
+ 	for_each_available_child_of_node(parent, node) {
+ 		struct device_node *port;
+ 
+-		if (of_node_cmp(node->name, "csi"))
++		if (of_node_cmp(node->name, "csi") &&
++			of_node_cmp(node->name, "pcsi")) {
++			continue;
++		}
++		if (!of_device_is_available(node))
+ 			continue;
+ 		/* csi2 node have only port */
+ 		port = of_get_next_child(node, NULL);
+@@ -388,6 +427,22 @@ static int register_mipi_csi2_entity(struct mxc_md *mxc_md,
+ 	return ret;
+ }
+ 
++static int register_parallel_csi_entity(struct mxc_md *mxc_md,
++				struct mxc_parallel_csi_dev *pcsidev)
++{
++	struct v4l2_subdev *sd = &pcsidev->sd;
++	int ret;
++
++	sd->grp_id = GRP_ID_MXC_PARALLEL_CSI;
++	ret = v4l2_device_register_subdev(&mxc_md->v4l2_dev, sd);
++	if (!ret)
++		mxc_md->pcsidev = pcsidev;
++	else
++		v4l2_err(&mxc_md->v4l2_dev,
++			 "Failed to register PARALLEL CSI ret=(%d)\n", ret);
++	return ret;
++}
++
+ static int mxc_md_register_platform_entity(struct mxc_md *mxc_md,
+ 					    struct platform_device *pdev,
+ 					    int plat_entity)
+@@ -412,6 +467,9 @@ static int mxc_md_register_platform_entity(struct mxc_md *mxc_md,
+ 		case IDX_MIPI_CSI2:
+ 			ret = register_mipi_csi2_entity(mxc_md, drvdata);
+ 			break;
++		case IDX_PARALLEL_CSI:
++			ret = register_parallel_csi_entity(mxc_md, drvdata);
++			break;
+ 		default:
+ 			ret = -ENODEV;
+ 		}
+@@ -450,6 +508,8 @@ static int mxc_md_register_platform_entities(struct mxc_md *mxc_md,
+ 			plat_entity = IDX_ISI;
+ 		else if (!strcmp(node->name, MIPI_CSI2_OF_NODE_NAME))
+ 			plat_entity = IDX_MIPI_CSI2;
++		else if (!strcmp(node->name, PARALLEL_CSI_OF_NODE_NAME))
++			plat_entity = IDX_PARALLEL_CSI;
+ 
+ 		if (plat_entity >= 0)
+ 			ret = mxc_md_register_platform_entity(mxc_md, pdev,
+@@ -480,6 +540,11 @@ static void mxc_md_unregister_entities(struct mxc_md *mxc_md)
+ 		mxc_md->mipi_csi2[i] = NULL;
+ 	}
+ 
++	if (mxc_md->pcsidev) {
++		v4l2_device_unregister_subdev(&mxc_md->pcsidev->sd);
++		mxc_md->pcsidev = NULL;
++	}
++
+ 	v4l2_info(&mxc_md->v4l2_dev, "Unregistered all entities\n");
+ }
+ 
+@@ -508,6 +573,8 @@ static int mxc_md_probe(struct platform_device *pdev)
+ 	mxc_md->pdev = pdev;
+ 	platform_set_drvdata(pdev, mxc_md);
+ 
++	mxc_md->parallel_csi = of_property_read_bool(dev->of_node, "parallel_csi");
++
+ 	/* register media device  */
+ 	strlcpy(mxc_md->media_dev.model, "FSL Capture Media Deivce",
+ 		sizeof(mxc_md->media_dev.model));
+diff --git a/drivers/media/platform/imx8/mxc-media-dev.h b/drivers/media/platform/imx8/mxc-media-dev.h
+index a066559..5d71698 100644
+--- a/drivers/media/platform/imx8/mxc-media-dev.h
++++ b/drivers/media/platform/imx8/mxc-media-dev.h
+@@ -55,6 +55,7 @@
+ #define GRP_ID_MXC_HDMI_IN		(1 << 12)
+ #define GRP_ID_MXC_MJPEG_DEC	(1 << 13)
+ #define GRP_ID_MXC_MJPEG_ENC	(1 << 14)
++#define GRP_ID_MXC_PARALLEL_CSI (1 << 15)
+ 
+ enum mxc_subdev_index {
+ 	IDX_SENSOR,
+@@ -63,6 +64,7 @@ enum mxc_subdev_index {
+ 	IDX_HDMI_IN,
+ 	IDX_MJPEG_ENC,
+ 	IDX_MJPEG_DEC,
++	IDX_PARALLEL_CSI,
+ 	IDX_MAX,
+ };
+ 
+@@ -86,12 +88,14 @@ struct mxc_mjpeg_enc{
+ struct mxc_md {
+ 	struct mxc_isi_dev *mxc_isi[MXC_ISI_MAX_DEVS];
+ 	struct mxc_hdmi_in_dev *hdmi_in;
++	struct mxc_parallel_csi_dev *pcsidev;
+ 	struct mxc_mipi_csi2_dev *mipi_csi2[MXC_MIPI_CSI2_MAX_DEVS];
+ 	struct mxc_sensor_info sensor[MXC_MAX_MIPI_SENSORS];
+ 	struct mxc_mjpeg_dec  *mjpeg_dec;
+ 	struct mxc_mjpeg_enc  *mjpeg_enc;
+ 
+ 	int num_sensors;
++	bool parallel_csi;
+ 
+ 	struct media_device media_dev;
+ 	struct v4l2_device v4l2_dev;
+-- 
+1.7.9.5
+

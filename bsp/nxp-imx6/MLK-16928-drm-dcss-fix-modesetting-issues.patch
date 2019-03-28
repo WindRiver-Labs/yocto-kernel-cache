@@ -1,0 +1,131 @@
+From dc018a90600f0b83037753ae110387b8fb55e333 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Tue, 21 Nov 2017 15:00:28 +0200
+Subject: [PATCH 2857/5242] MLK-16928: drm: dcss: fix modesetting issues
+
+commit  b62804e39a7e438421f26775db8570eb480729f2 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+DTG needs to be completely stopped before changing the display
+resolution through modesetting. If DTG is not stopped, any change in
+resolution could result in unpredictable results, like split screen,
+etc.
+
+This patch fixes that by introducing a completion signaling mechanism so
+that we can signal the DRM CRTC when DCSS core is done stopping DTG.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-crtc.c |   11 +++++++++--
+ drivers/gpu/imx/dcss/dcss-dtg.c      |   14 +++++++++++++-
+ include/video/imx-dcss.h             |    3 ++-
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.c b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+index 763e285..9fb35fc 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-crtc.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+@@ -35,6 +35,8 @@ struct dcss_crtc {
+ 	int			irq;
+ 
+ 	struct drm_property *alpha;
++
++	struct completion disable_completion;
+ };
+ 
+ static void dcss_crtc_reset(struct drm_crtc *crtc)
+@@ -173,7 +175,7 @@ static void dcss_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	pm_runtime_get_sync(dcss_crtc->dev->parent);
+ 
+ 	dcss_ss_enable(dcss, true);
+-	dcss_dtg_enable(dcss, true);
++	dcss_dtg_enable(dcss, true, NULL);
+ 	dcss_ctxld_enable(dcss);
+ 
+ 	crtc->enabled = true;
+@@ -198,11 +200,14 @@ static void dcss_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	drm_crtc_vblank_off(crtc);
+ 
+ 	dcss_ss_enable(dcss, false);
+-	dcss_dtg_enable(dcss, false);
++	dcss_dtg_enable(dcss, false, &dcss_crtc->disable_completion);
+ 	dcss_ctxld_enable(dcss);
+ 
+ 	crtc->enabled = false;
+ 
++	wait_for_completion_timeout(&dcss_crtc->disable_completion,
++				    msecs_to_jiffies(100));
++
+ 	pm_runtime_mark_last_busy(dcss_crtc->dev->parent);
+ 	pm_runtime_put_autosuspend(dcss_crtc->dev->parent);
+ }
+@@ -275,6 +280,8 @@ static int dcss_crtc_init(struct dcss_crtc *crtc,
+ 		return crtc->irq;
+ 	}
+ 
++	init_completion(&crtc->disable_completion);
++
+ 	ret = devm_request_irq(crtc->dev, crtc->irq, dcss_crtc_irq_handler,
+ 			       IRQF_TRIGGER_RISING, "dcss_drm", crtc);
+ 	if (ret) {
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 2f88063..8b3a915 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -133,6 +133,13 @@ struct dcss_dtg_priv {
+ 
+ 	u32 control_status;
+ 	u32 alpha;
++
++	/*
++	 * This will be passed on by DRM CRTC so that we can signal when DTG has
++	 * been successfully stopped. Otherwise, any modesetting while DTG is
++	 * still on may result in unpredictable behavior.
++	 */
++	struct completion *dis_completion;
+ };
+ 
+ static void dcss_dtg_write(struct dcss_dtg_priv *dtg, u32 val, u32 ofs)
+@@ -333,18 +340,23 @@ static void dcss_dtg_disable_callback(void *data)
+ 		    dtg->base_reg + DCSS_DTG_TC_CONTROL_STATUS);
+ 
+ 	dtg->in_use = false;
++
++	complete(dtg->dis_completion);
+ }
+ 
+-void dcss_dtg_enable(struct dcss_soc *dcss, bool en)
++void dcss_dtg_enable(struct dcss_soc *dcss, bool en,
++		     struct completion *dis_completion)
+ {
+ 	struct dcss_dtg_priv *dtg = dcss->dtg_priv;
+ 
+ 	if (!en) {
+ 		dcss->dcss_disable_callback = dcss_dtg_disable_callback;
++		dtg->dis_completion = dis_completion;
+ 		return;
+ 	}
+ 
+ 	dcss->dcss_disable_callback = NULL;
++	dtg->dis_completion = NULL;
+ 
+ 	dtg->control_status |= DTG_START;
+ 
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 690da53..fb1f6ae 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -58,7 +58,8 @@ void dcss_dpr_addr_set(struct dcss_soc *dcss, int ch_num, u32 luma_base_addr,
+ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm);
+ void dcss_dtg_plane_pos_set(struct dcss_soc *dcss, int ch_num,
+ 			    int px, int py, int pw, int ph);
+-void dcss_dtg_enable(struct dcss_soc *dcss, bool en);
++void dcss_dtg_enable(struct dcss_soc *dcss, bool en,
++		     struct completion *dis_completion);
+ bool dcss_dtg_is_enabled(struct dcss_soc *dcss);
+ void dcss_dtg_ch_enable(struct dcss_soc *dcss, int ch_num, bool en);
+ void dcss_dtg_plane_alpha_set(struct dcss_soc *dcss, int ch_num,
+-- 
+1.7.9.5
+

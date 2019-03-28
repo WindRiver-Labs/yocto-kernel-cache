@@ -1,0 +1,603 @@
+From 6d1905f24bd1dec50ae2d1800741aa83b4872e84 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Wed, 14 Feb 2018 14:06:41 +0200
+Subject: [PATCH 3400/5242] MLK-17634-14: drm: imx: dcss: Add basic HDR10
+ support
+
+commit  2ccd87278ff395dabf332cf5dd9739f04b25b51f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch adds basic HDR10 support. However, full support depends on
+subsequent patches.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-crtc.c  |   69 +++++++++++++++++++++
+ drivers/gpu/drm/imx/dcss/dcss-crtc.h  |   12 ++++
+ drivers/gpu/drm/imx/dcss/dcss-kms.c   |   28 +++++++++
+ drivers/gpu/drm/imx/dcss/dcss-plane.c |   10 +--
+ drivers/gpu/drm/imx/hdp/imx-hdmi.c    |    2 +-
+ drivers/gpu/drm/imx/hdp/imx-hdp.c     |  107 ++++++++++++++++++++++-----------
+ drivers/gpu/drm/imx/hdp/imx-hdp.h     |    5 ++
+ drivers/gpu/imx/dcss/dcss-dtg.c       |   17 +++++-
+ drivers/gpu/imx/dcss/dcss-hdr10.c     |    8 +--
+ drivers/gpu/imx/dcss/dcss-ss.c        |   23 +++++--
+ drivers/mxc/hdp/API_AVI.c             |    5 +-
+ include/video/imx-dcss.h              |    2 +
+ 12 files changed, 237 insertions(+), 51 deletions(-)
+ create mode 100644 drivers/gpu/drm/imx/dcss/dcss-crtc.h
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.c b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+index f6d8dc0..9176606 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-crtc.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+@@ -18,6 +18,7 @@
+ #include <linux/component.h>
+ #include <linux/pm_runtime.h>
+ #include <drm/drmP.h>
++#include <drm/drm_atomic.h>
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <video/imx-dcss.h>
+@@ -25,6 +26,7 @@
+ #include "dcss-kms.h"
+ #include "dcss-plane.h"
+ #include "imx-drm.h"
++#include "dcss-crtc.h"
+ 
+ struct dcss_crtc {
+ 	struct device *dev;
+@@ -41,6 +43,11 @@ struct dcss_crtc {
+ 	struct completion disable_completion;
+ 	struct drm_pending_vblank_event *event;
+ 	int vblank_cnt;
++
++	enum dcss_hdr10_nonlinearity opipe_nl;
++	enum dcss_hdr10_gamut opipe_g;
++	enum dcss_hdr10_pixel_range opipe_pr;
++	u32 opipe_pix_format;
+ };
+ 
+ static void dcss_crtc_reset(struct drm_crtc *crtc)
+@@ -157,6 +164,64 @@ static void dcss_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		dcss_ctxld_enable(dcss);
+ }
+ 
++void dcss_crtc_setup_opipe(struct drm_crtc *crtc, struct drm_connector *conn,
++			   u32 colorimetry, u32 eotf,
++			   enum hdmi_quantization_range qr)
++{
++	struct dcss_crtc *dcss_crtc = container_of(crtc, struct dcss_crtc,
++						   base);
++	int vic;
++
++	if ((colorimetry & HDMI_EXTENDED_COLORIMETRY_BT2020) ||
++	    (colorimetry & HDMI_EXTENDED_COLORIMETRY_BT2020_CONST_LUM))
++		dcss_crtc->opipe_g = G_REC2020;
++	else if (colorimetry & HDMI_EXTENDED_COLORIMETRY_ADOBE_RGB)
++		dcss_crtc->opipe_g = G_ADOBE_ARGB;
++	else if (colorimetry & HDMI_EXTENDED_COLORIMETRY_XV_YCC_709)
++		dcss_crtc->opipe_g = G_REC709;
++	else
++		dcss_crtc->opipe_g = G_REC601_PAL;
++
++	if (eotf & (1 << 3))
++		dcss_crtc->opipe_nl = NL_2100HLG;
++	else if (eotf & (1 << 2))
++		dcss_crtc->opipe_nl = NL_REC2084;
++	else
++		dcss_crtc->opipe_nl = NL_REC709;
++
++	if (qr == HDMI_QUANTIZATION_RANGE_FULL)
++		dcss_crtc->opipe_pr = PR_FULL;
++	else
++		dcss_crtc->opipe_pr = PR_LIMITED;
++
++	vic = drm_match_cea_mode(&crtc->state->adjusted_mode);
++
++	/* FIXME: we should get the connector colorspace some other way */
++	if (vic == 97 && conn->state->hdr_source_metadata_blob_ptr &&
++	    conn->state->hdr_source_metadata_blob_ptr->length)
++		dcss_crtc->opipe_pix_format = DRM_FORMAT_P010;
++	else
++		dcss_crtc->opipe_pix_format = DRM_FORMAT_ARGB8888;
++
++	DRM_INFO("OPIPE_CFG: gamut = %d, nl = %d, pr = %d, pix_format = %d\n",
++		 dcss_crtc->opipe_g, dcss_crtc->opipe_nl,
++		 dcss_crtc->opipe_pr, dcss_crtc->opipe_pix_format);
++}
++
++int dcss_crtc_get_opipe_cfg(struct drm_crtc *crtc,
++			    struct dcss_hdr10_pipe_cfg *opipe_cfg)
++{
++	struct dcss_crtc *dcss_crtc = container_of(crtc, struct dcss_crtc,
++						   base);
++
++	opipe_cfg->pixel_format = dcss_crtc->opipe_pix_format;
++	opipe_cfg->g = dcss_crtc->opipe_g;
++	opipe_cfg->nl = dcss_crtc->opipe_nl;
++	opipe_cfg->pr = dcss_crtc->opipe_pr;
++
++	return 0;
++}
++
+ static void dcss_crtc_atomic_enable(struct drm_crtc *crtc,
+ 				    struct drm_crtc_state *old_crtc_state)
+ {
+@@ -171,9 +236,13 @@ static void dcss_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	pm_runtime_get_sync(dcss_crtc->dev->parent);
+ 
+ 	dcss_dtg_sync_set(dcss, &vm);
++
++	dcss_ss_subsam_set(dcss, dcss_crtc->opipe_pix_format);
+ 	dcss_ss_sync_set(dcss, &vm, mode->flags & DRM_MODE_FLAG_PHSYNC,
+ 			 mode->flags & DRM_MODE_FLAG_PVSYNC);
+ 
++	dcss_dtg_css_set(dcss, dcss_crtc->opipe_pix_format);
++
+ 	dcss_ss_enable(dcss, true);
+ 	dcss_dtg_enable(dcss, true, NULL);
+ 	dcss_ctxld_enable(dcss);
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.h b/drivers/gpu/drm/imx/dcss/dcss-crtc.h
+new file mode 100644
+index 0000000..fabf1e5
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.h
+@@ -0,0 +1,12 @@
++#ifndef _DCSS_CRTC_H
++#include <linux/hdmi.h>
++#include <video/imx-dcss.h>
++
++void dcss_crtc_setup_opipe(struct drm_crtc *crtc, struct drm_connector *conn,
++			   u32 colorimetry, u32 eotf,
++			   enum hdmi_quantization_range qr);
++
++int dcss_crtc_get_opipe_cfg(struct drm_crtc *crtc,
++			    struct dcss_hdr10_pipe_cfg *opipe_cfg);
++
++#endif
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-kms.c b/drivers/gpu/drm/imx/dcss/dcss-kms.c
+index 6b3f0c4..dce1858 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-kms.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-kms.c
+@@ -22,6 +22,7 @@
+ #include <linux/reservation.h>
+ 
+ #include "imx-drm.h"
++#include "dcss-crtc.h"
+ 
+ static void dcss_drm_output_poll_changed(struct drm_device *drm)
+ {
+@@ -77,12 +78,39 @@ static int dcss_drm_atomic_commit(struct drm_device *drm,
+ 	return drm_atomic_helper_commit(drm, state, nonblock);
+ }
+ 
++static void dcss_kms_setup_output_pipe(struct drm_atomic_state *state)
++{
++	struct drm_crtc *crtc;
++	struct drm_connector *connector;
++	struct drm_connector_state *conn_state;
++	struct drm_display_info *di;
++	int i;
++
++	for_each_connector_in_state(state, connector, conn_state, i) {
++		if (!connector->state->best_encoder)
++			continue;
++
++		if (!connector->state->crtc->state->active ||
++		    !drm_atomic_crtc_needs_modeset(connector->state->crtc->state))
++			continue;
++
++		crtc = connector->state->crtc;
++		di = &connector->display_info;
++
++		dcss_crtc_setup_opipe(crtc, connector, di->hdmi.colorimetry,
++				      di->hdmi.hdr_panel_metadata.eotf,
++				      HDMI_QUANTIZATION_RANGE_FULL);
++	}
++}
++
+ static void dcss_drm_atomic_commit_tail(struct drm_atomic_state *state)
+ {
+ 	struct drm_device *dev = state->dev;
+ 
+ 	drm_atomic_helper_commit_modeset_disables(dev, state);
+ 
++	dcss_kms_setup_output_pipe(state);
++
+ 	drm_atomic_helper_commit_modeset_enables(dev, state);
+ 
+ 	drm_atomic_helper_commit_planes(dev, state,
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.c b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+index d1f2f3b..6a986c8 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+@@ -21,6 +21,7 @@
+ 
+ #include "video/imx-dcss.h"
+ #include "dcss-plane.h"
++#include "dcss-crtc.h"
+ 
+ static const u32 dcss_common_formats[] = {
+ 	/* RGB */
+@@ -53,6 +54,7 @@
+ 	/* YUV420 */
+ 	DRM_FORMAT_NV12,
+ 	DRM_FORMAT_NV21,
++	DRM_FORMAT_P010,
+ };
+ 
+ static const u64 dcss_video_format_modifiers[] = {
+@@ -444,14 +446,14 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	ipipe_cfg.pixel_format = pixel_format;
+ 	ipipe_cfg.nl = NL_REC709;
+-	ipipe_cfg.pr = PR_LIMITED;
++	ipipe_cfg.pr = PR_FULL;
+ 	ipipe_cfg.g = G_REC709;
+ 
+-	/* FIXME: where do I get the output pipe pixel format? */
++	dcss_crtc_get_opipe_cfg(state->crtc, &opipe_cfg);
+ 
+-	opipe_cfg.pixel_format = DRM_FORMAT_ARGB8888;
++	/* apparently the other settins that are read from connector are not good,
++	 * so hardcode */
+ 	opipe_cfg.nl = NL_REC709;
+-	opipe_cfg.pr = PR_LIMITED;
+ 	opipe_cfg.g = G_REC2020;
+ 
+ 	dcss_hdr10_setup(dcss_plane->dcss, dcss_plane->ch_num,
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdmi.c b/drivers/gpu/drm/imx/hdp/imx-hdmi.c
+index 3541fda..2db6873 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdmi.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdmi.c
+@@ -193,7 +193,7 @@ void hdmi_mode_set_t28hpc(state_struct *state, int vic, int format, int color_de
+ 	int ret;
+ 
+ 	/*  B/W Balance Type: 0 no data, 1 IT601, 2 ITU709 */
+-	BT_TYPE bw_type = 0;
++	BT_TYPE bw_type = 2;
+ 
+ 	/* Set HDMI TX Mode */
+ 	/* Mode = 0 - DVI, 1 - HDMI1.4, 2 HDMI 2.0 */
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.c b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+index c99152c..f6826a1 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+@@ -493,18 +493,47 @@ static void imx_hdp_mode_setup(struct imx_hdp *hdp, struct drm_display_mode *mod
+ 	imx_hdp_call(hdp, pixel_link_mux, &hdp->state, mode);
+ 
+ 	hdp->link_rate = imx_hdp_link_rate(mode);
++
+ 	/* mode set */
+-	ret = imx_hdp_call(hdp, phy_init, &hdp->state, dp_vic, 1, 8);
++	ret = imx_hdp_call(hdp, phy_init, &hdp->state, dp_vic, hdp->format, hdp->bpc);
+ 	if (ret < 0) {
+ 		DRM_ERROR("Failed to initialise HDP PHY\n");
+ 		return;
+ 	}
+-	imx_hdp_call(hdp, mode_set, &hdp->state, dp_vic, 1, 8, hdp->link_rate);
++	imx_hdp_call(hdp, mode_set, &hdp->state, dp_vic,
++		     hdp->format, hdp->bpc, hdp->link_rate);
+ 
+ 	/* Get vic of CEA-861 */
+ 	hdp->vic = drm_match_cea_mode(mode);
+ }
+ 
++bool imx_hdp_bridge_mode_fixup(struct drm_bridge *bridge,
++			       const struct drm_display_mode *mode,
++			       struct drm_display_mode *adjusted_mode)
++{
++	struct imx_hdp *hdp = bridge->driver_private;
++	struct drm_display_info *di = &hdp->connector.display_info;
++	int vic = imx_get_vic_index((struct drm_display_mode *)mode);
++
++	if (vic < 0)
++		return false;
++
++	if (vic == VIC_MODE_97_60Hz &&
++	    (di->color_formats & DRM_COLOR_FORMAT_YCRCB420) &&
++	     di->bpc >= 10) {
++		hdp->bpc = 10;
++		hdp->format = YCBCR_4_2_0;
++		hdp->hdr_mode = true; /* attempt HDR */
++		return true;
++	}
++
++	hdp->bpc = 8;
++	hdp->format = PXL_RGB;
++	hdp->hdr_mode = false;
++
++	return true;
++}
++
+ static void imx_hdp_bridge_mode_set(struct drm_bridge *bridge,
+ 				    struct drm_display_mode *orig_mode,
+ 				    struct drm_display_mode *mode)
+@@ -659,54 +688,44 @@ static void imx_hdp_connector_force(struct drm_connector *connector)
+ 	.enable = imx_hdp_bridge_enable,
+ 	.disable = imx_hdp_bridge_disable,
+ 	.mode_set = imx_hdp_bridge_mode_set,
++	.mode_fixup = imx_hdp_bridge_mode_fixup,
+ };
+ 
+-
+ static void imx_hdp_imx_encoder_disable(struct drm_encoder *encoder)
+ {
+ }
+ 
+ static void imx_hdp_imx_encoder_enable(struct drm_encoder *encoder)
+ {
+-}
+-
+-static int imx_hdp_imx_encoder_atomic_check(struct drm_encoder *encoder,
+-				    struct drm_crtc_state *crtc_state,
+-				    struct drm_connector_state *conn_state)
+-{
+-	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc_state);
+-
+-	imx_crtc_state->bus_format = MEDIA_BUS_FMT_RGB101010_1X30;
+-
+-	if (conn_state->hdr_metadata_changed)
+-		crtc_state->mode_changed = true;
+-
+-	return 0;
+-}
+-
+-static void imx_hdp_imx_encoder_atomic_modeset(struct drm_encoder *encoder,
+-					     struct drm_crtc_state *crtc_state,
+-					struct drm_connector_state *conn_state)
+-{
+ 	struct imx_hdp *hdp = container_of(encoder, struct imx_hdp, encoder);
+ 	union hdmi_infoframe frame;
+ 	struct hdr_static_metadata *hdr_metadata;
+-	int ret;
++	struct drm_connector_state *conn_state = hdp->connector.state;
++	int ret = 0;
+ 
+ 	if (!hdp->ops->write_hdr_metadata)
+ 		return;
+ 
+-	if (!conn_state->hdr_source_metadata_blob_ptr ||
+-	    conn_state->hdr_source_metadata_blob_ptr->length == 0)
+-		return;
++	if (hdp->hdr_mode && hdp->hdr_metadata_present) {
++		hdr_metadata = (struct hdr_static_metadata *)
++				conn_state->hdr_source_metadata_blob_ptr->data;
+ 
+-	if (!conn_state->hdr_metadata_changed)
+-		return;
++		ret = drm_hdmi_infoframe_set_hdr_metadata(&frame.drm,
++							  hdr_metadata);
++	} else {
++		hdr_metadata = devm_kzalloc(hdp->dev,
++					    sizeof(struct hdr_static_metadata),
++					    GFP_KERNEL);
++		hdr_metadata->eotf = 0;
+ 
+-	hdr_metadata = (struct hdr_static_metadata *)
+-			conn_state->hdr_source_metadata_blob_ptr->data;
++		ret = drm_hdmi_infoframe_set_hdr_metadata(&frame.drm,
++							  hdr_metadata);
++
++		devm_kfree(hdp->dev, hdr_metadata);
++
++		hdp->hdr_mode = false;
++	}
+ 
+-	ret = drm_hdmi_infoframe_set_hdr_metadata(&frame.drm, hdr_metadata);
+ 	if (ret < 0) {
+ 		DRM_ERROR("could not set HDR metadata in infoframe\n");
+ 		return;
+@@ -715,11 +734,27 @@ static void imx_hdp_imx_encoder_atomic_modeset(struct drm_encoder *encoder,
+ 	hdp->ops->write_hdr_metadata(&hdp->state, &frame);
+ }
+ 
++static int imx_hdp_imx_encoder_atomic_check(struct drm_encoder *encoder,
++				    struct drm_crtc_state *crtc_state,
++				    struct drm_connector_state *conn_state)
++{
++	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc_state);
++	struct imx_hdp *hdp = container_of(encoder, struct imx_hdp, encoder);
++
++	imx_crtc_state->bus_format = MEDIA_BUS_FMT_RGB101010_1X30;
++
++	if (conn_state->hdr_metadata_changed &&
++	    conn_state->hdr_source_metadata_blob_ptr &&
++	    conn_state->hdr_source_metadata_blob_ptr->length)
++		hdp->hdr_metadata_present = true;
++
++	return 0;
++}
++
+ static const struct drm_encoder_helper_funcs imx_hdp_imx_encoder_helper_funcs = {
+ 	.enable     = imx_hdp_imx_encoder_enable,
+ 	.disable    = imx_hdp_imx_encoder_disable,
+ 	.atomic_check = imx_hdp_imx_encoder_atomic_check,
+-	.atomic_mode_set = imx_hdp_imx_encoder_atomic_modeset,
+ };
+ 
+ static const struct drm_encoder_funcs imx_hdp_imx_encoder_funcs = {
+@@ -1000,6 +1035,8 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 	hdp->audio_type = devtype->audio_type;
+ 	hdp->ops = devtype->ops;
+ 	hdp->rw = devtype->rw;
++	hdp->bpc = 8;
++	hdp->format = PXL_RGB;
+ 
+ 	/* HDP controller init */
+ 	imx_hdp_state_init(hdp);
+@@ -1043,7 +1080,8 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 	/* Pixel Format - 1 RGB, 2 YCbCr 444, 3 YCbCr 420 */
+ 	/* bpp (bits per subpixel) - 8 24bpp, 10 30bpp, 12 36bpp, 16 48bpp */
+ 	/* default set hdmi to 1080p60 mode */
+-	ret = imx_hdp_call(hdp, phy_init, &hdp->state, 2, 1, 8);
++	ret = imx_hdp_call(hdp, phy_init, &hdp->state, 2,
++			   hdp->format, hdp->bpc);
+ 	if (ret < 0) {
+ 		DRM_ERROR("Failed to initialise HDP PHY\n");
+ 		return ret;
+@@ -1077,6 +1115,7 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 
+ 	encoder->bridge = bridge;
+ 	hdp->connector.polled = DRM_CONNECTOR_POLL_HPD;
++	hdp->connector.ycbcr_420_allowed = true;
+ 
+ 	/* connector */
+ 	drm_connector_helper_add(connector,
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.h b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+index 26bef6b..d177658 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.h
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+@@ -226,6 +226,11 @@ struct imx_hdp {
+ 	struct delayed_work hotplug_work;
+ 
+ 	struct imx_cec_dev cec;
++
++	int bpc;
++	VIC_PXL_ENCODING_FORMAT format;
++	bool hdr_metadata_present;
++	bool hdr_mode;
+ };
+ 
+ void imx_hdp_register_audio_driver(struct device *dev);
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 163bbb4..561e298 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -194,8 +194,7 @@ int dcss_dtg_init(struct dcss_soc *dcss, unsigned long dtg_base)
+ 	dtg->alpha = 255;
+ 	dtg->use_global = 0;
+ 
+-	dtg->control_status |= OVL_DATA_MODE | BLENDER_VIDEO_ALPHA_SEL |
+-		((0x5 << CSS_PIX_COMP_SWAP_POS) & CSS_PIX_COMP_SWAP_MASK) |
++	dtg->control_status |= BLENDER_VIDEO_ALPHA_SEL |
+ 		((dtg->alpha << DEFAULT_FG_ALPHA_POS) & DEFAULT_FG_ALPHA_MASK);
+ 
+ 	return 0;
+@@ -343,6 +342,20 @@ void dcss_dtg_plane_alpha_set(struct dcss_soc *dcss, int ch_num,
+ }
+ EXPORT_SYMBOL(dcss_dtg_plane_alpha_set);
+ 
++void dcss_dtg_css_set(struct dcss_soc *dcss, u32 pix_format)
++{
++	struct dcss_dtg_priv *dtg = dcss->dtg_priv;
++
++	if (pix_format == DRM_FORMAT_P010) {
++		dtg->control_status &= ~CSS_PIX_COMP_SWAP_MASK;
++		return;
++	}
++
++	dtg->control_status |=
++			(0x5 << CSS_PIX_COMP_SWAP_POS) & CSS_PIX_COMP_SWAP_MASK;
++}
++EXPORT_SYMBOL(dcss_dtg_css_set);
++
+ static void dcss_dtg_disable_callback(void *data)
+ {
+ 	struct dcss_dtg_priv *dtg = data;
+diff --git a/drivers/gpu/imx/dcss/dcss-hdr10.c b/drivers/gpu/imx/dcss/dcss-hdr10.c
+index de704dd..843a781 100644
+--- a/drivers/gpu/imx/dcss/dcss-hdr10.c
++++ b/drivers/gpu/imx/dcss/dcss-hdr10.c
+@@ -115,11 +115,11 @@
+ /* Pipe type */
+ #define HDR10_PT_OUTPUT			BIT(3)
+ /* Output pipe config descriptor */
+-#define HDR10_OPIPE_DESC_POS		4
+-#define HDR10_OPIPE_DESC_MASK		GENMASK(19, 4)
++#define HDR10_IPIPE_DESC_POS		4
++#define HDR10_IPIPE_DESC_MASK		GENMASK(19, 4)
+ /* Input pipe config descriptor */
+-#define HDR10_IPIPE_DESC_POS		20
+-#define HDR10_IPIPE_DESC_MASK		GENMASK(35, 20)
++#define HDR10_OPIPE_DESC_POS		20
++#define HDR10_OPIPE_DESC_MASK		GENMASK(35, 20)
+ 
+ /* config invalid */
+ #define HDR10_DESC_INVALID		BIT(63)
+diff --git a/drivers/gpu/imx/dcss/dcss-ss.c b/drivers/gpu/imx/dcss/dcss-ss.c
+index 1ef04e8..f44fb60 100644
+--- a/drivers/gpu/imx/dcss/dcss-ss.c
++++ b/drivers/gpu/imx/dcss/dcss-ss.c
+@@ -16,6 +16,7 @@
+ #include <linux/bitops.h>
+ #include <linux/io.h>
+ #include <video/videomode.h>
++#include <drm/drm_fourcc.h>
+ 
+ #include <video/imx-dcss.h>
+ #include "dcss-prv.h"
+@@ -146,11 +147,6 @@ int dcss_ss_init(struct dcss_soc *dcss, unsigned long ss_base)
+ 	ss->ctx_id = CTX_SB_HP;
+ #endif
+ 
+-	/* TODO: should these be hardcoded? */
+-	dcss_ss_write(dcss->ss_priv, 0x41614161, DCSS_SS_COEFF);
+-	dcss_ss_write(dcss->ss_priv, 0x03ff0000, DCSS_SS_CLIP_CB);
+-	dcss_ss_write(dcss->ss_priv, 0x03ff0000, DCSS_SS_CLIP_CR);
+-
+ 	return 0;
+ }
+ 
+@@ -159,6 +155,23 @@ void dcss_ss_exit(struct dcss_soc *dcss)
+ 	dcss_writel(0, dcss->ss_priv->base_reg + DCSS_SS_SYS_CTRL);
+ }
+ 
++void dcss_ss_subsam_set(struct dcss_soc *dcss, u32 pix_format)
++{
++	if (pix_format == DRM_FORMAT_P010) {
++		dcss_ss_write(dcss->ss_priv, 0x21612161, DCSS_SS_COEFF);
++		dcss_ss_write(dcss->ss_priv, 2, DCSS_SS_MODE);
++		dcss_ss_write(dcss->ss_priv, 0x03c00040, DCSS_SS_CLIP_CB);
++		dcss_ss_write(dcss->ss_priv, 0x03c00040, DCSS_SS_CLIP_CR);
++
++		return;
++	}
++
++	dcss_ss_write(dcss->ss_priv, 0x41614161, DCSS_SS_COEFF);
++	dcss_ss_write(dcss->ss_priv, 0, DCSS_SS_MODE);
++	dcss_ss_write(dcss->ss_priv, 0x03ff0000, DCSS_SS_CLIP_CB);
++	dcss_ss_write(dcss->ss_priv, 0x03ff0000, DCSS_SS_CLIP_CR);
++}
++
+ void dcss_ss_sync_set(struct dcss_soc *dcss, struct videomode *vm,
+ 		      bool phsync, bool pvsync)
+ {
+diff --git a/drivers/mxc/hdp/API_AVI.c b/drivers/mxc/hdp/API_AVI.c
+index eceb9e1..91f1659 100644
+--- a/drivers/mxc/hdp/API_AVI.c
++++ b/drivers/mxc/hdp/API_AVI.c
+@@ -131,7 +131,10 @@ CDN_API_STATUS CDN_API_Set_AVI(state_struct *state, VIC_MODES vicMode,
+ 		packet_C = 1;
+ 	else if (ITUver == BT_709)
+ 		packet_C = 2;
+-	else
++	else if (ITUver == 2) {
++		packet_C = 0;
++		packet_EC = 0;
++	} else
+ 		packet_C = 0;
+ 
+ 	packet_HB0 = packet_type;
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index a8fd32a..29cd3e1 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -72,10 +72,12 @@ void dcss_dtg_plane_alpha_set(struct dcss_soc *dcss, int ch_num,
+ bool dcss_dtg_global_alpha_changed(struct dcss_soc *dcss, int ch_num,
+ 				   u32 pix_format, int alpha,
+ 				   int use_global_alpha);
++void dcss_dtg_css_set(struct dcss_soc *dcss, u32 pix_format);
+ 
+ /* SUBSAM */
+ void dcss_ss_sync_set(struct dcss_soc *dcss, struct videomode *vm,
+ 		      bool phsync, bool pvsync);
++void dcss_ss_subsam_set(struct dcss_soc *dcss, u32 pix_format);
+ void dcss_ss_enable(struct dcss_soc *dcss, bool en);
+ 
+ /* SCALER */
+-- 
+1.7.9.5
+

@@ -1,0 +1,433 @@
+From 3c6f68a1959067dffa703c12a9510dd5290c6f0c Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Mon, 4 Jun 2018 14:47:36 +0300
+Subject: [PATCH 3990/5242] MLK-17925: drm: imx: dcss: fix tearing
+
+commit  b5a495ce2cae6b84eea14f9313e353f9f287baaa from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The video tearing appeared only when the application used 2 buffers.
+That's because, sometimes, the context loader could be armed after the
+DB event came in the frame trace. That made a buffer submitted in frame
+N end up on screen in frame N+2 because the context loader waits for the
+next DB event. Since vblank events are sent at the end of the frame, by
+the time the buffer lands on screen, the application will reuse it while
+it's being displayed, hence the tearing effect.
+
+This patch moves the CTXLD trigger moment all the way to the end of the
+frame trace, just before DB event arrives. This will leave the
+application plenty of time to submit new buffers.
+
+In the event that the trigger moment is missed (application submits a
+buffer right at the end of a frame trace), then we're not signalling the
+next VBLANK event to application. This way, application will know that
+the buffer is still needed and will not submit a new one.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi |    6 +-
+ drivers/gpu/drm/imx/dcss/dcss-crtc.c          |    3 +-
+ drivers/gpu/imx/dcss/dcss-ctxld.c             |   48 ++++++++++------
+ drivers/gpu/imx/dcss/dcss-dpr.c               |   21 ++++++-
+ drivers/gpu/imx/dcss/dcss-dtg.c               |   74 +++++++++++++++++++++----
+ drivers/gpu/imx/dcss/dcss-prv.h               |    3 +
+ drivers/gpu/imx/dcss/dcss-scaler.c            |   21 ++++++-
+ include/video/imx-dcss.h                      |    1 +
+ 8 files changed, 142 insertions(+), 35 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi b/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi
+index 38d102f..57d0dd9 100755
+--- a/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi
++++ b/arch/arm64/boot/dts/freescale/fsl-imx8mq.dtsi
+@@ -532,12 +532,14 @@
+ 			     <4 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <5 IRQ_TYPE_LEVEL_HIGH>,
+ 			     <6 IRQ_TYPE_LEVEL_HIGH>,
+-			     <8 IRQ_TYPE_EDGE_RISING>;
++			     <8 IRQ_TYPE_EDGE_RISING>,
++				 <9 IRQ_TYPE_LEVEL_HIGH>;
+ 		interrupt-names = "dpr_dc_ch0",
+ 				  "dpr_dc_ch1",
+ 				  "dpr_dc_ch2",
+ 				  "ctx_ld",
+-				  "dtg_prg1";
++				  "dtg_prg1",
++				  "ctxld_kick";
+ 		interrupt-parent = <&irqsteer_dcss>;
+ 		clocks = <&clk IMX8MQ_CLK_DISP_APB_ROOT>,
+ 			 <&clk IMX8MQ_CLK_DISP_AXI_ROOT>,
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-crtc.c b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+index 84ed044..6a23f06 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-crtc.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-crtc.c
+@@ -286,7 +286,8 @@ static irqreturn_t dcss_crtc_irq_handler(int irq, void *dev_id)
+ 	struct dcss_crtc *dcss_crtc = dev_id;
+ 	struct dcss_soc *dcss = dev_get_drvdata(dcss_crtc->dev->parent);
+ 
+-	drm_crtc_handle_vblank(&dcss_crtc->base);
++	if (dcss_ctxld_is_flushed(dcss))
++		drm_crtc_handle_vblank(&dcss_crtc->base);
+ 
+ 	dcss_vblank_irq_clear(dcss);
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-ctxld.c b/drivers/gpu/imx/dcss/dcss-ctxld.c
+index c6c4eb3..a42a969 100644
+--- a/drivers/gpu/imx/dcss/dcss-ctxld.c
++++ b/drivers/gpu/imx/dcss/dcss-ctxld.c
+@@ -106,7 +106,7 @@ struct dcss_ctxld_priv {
+ 	u8 current_ctx;
+ 
+ 	bool in_use;
+-	bool run_again;
++	bool armed;
+ 
+ 	spinlock_t lock; /* protects concurent access to private data */
+ };
+@@ -141,11 +141,6 @@ static irqreturn_t dcss_ctxld_irq_handler(int irq, void *data)
+ 	    !(irq_status & CTXLD_ENABLE) && priv->in_use) {
+ 		priv->in_use = false;
+ 
+-		if (priv->run_again) {
+-			priv->run_again = false;
+-			__dcss_ctxld_enable(priv);
+-			goto exit;
+-		}
+ 
+ 		if (priv->dcss->dcss_disable_callback) {
+ 			struct dcss_dtg_priv *dtg = priv->dcss->dtg_priv;
+@@ -165,9 +160,8 @@ static irqreturn_t dcss_ctxld_irq_handler(int irq, void *data)
+ 			priv->ctx_size[priv->current_ctx ^ 1][CTX_SB_LP]);
+ 	}
+ 
+-exit:
+ 	dcss_clr(irq_status & (CTXLD_IRQ_ERROR | CTXLD_IRQ_COMPLETION),
+-		priv->ctxld_reg + DCSS_CTXLD_CONTROL_STATUS);
++		 priv->ctxld_reg + DCSS_CTXLD_CONTROL_STATUS);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -291,10 +285,13 @@ static int __dcss_ctxld_enable(struct dcss_ctxld_priv *ctxld)
+ 	u32 db_base, sb_base, sb_count;
+ 	u32 sb_hp_cnt, sb_lp_cnt, db_cnt;
+ 
++	dcss_dpr_write_sysctrl(ctxld->dcss);
++	dcss_scaler_write_sclctrl(ctxld->dcss);
++
+ 	if (dcss_dtrc_is_running(ctxld->dcss, 1) ||
+ 	    dcss_dtrc_is_running(ctxld->dcss, 2)) {
+ 		dcss_dtrc_switch_banks(ctxld->dcss);
+-		ctxld->run_again = true;
++		ctxld->armed = true;
+ 	}
+ 
+ 	sb_hp_cnt = ctxld->ctx_size[curr_ctx][CTX_SB_HP];
+@@ -360,20 +357,27 @@ int dcss_ctxld_enable(struct dcss_soc *dcss)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&ctxld->lock, flags);
+-	if (ctxld->in_use) {
+-		ctxld->run_again = true;
+-		spin_unlock_irqrestore(&ctxld->lock, flags);
+-		return 0;
+-	}
+-
+-	__dcss_ctxld_enable(ctxld);
+-
++	ctxld->armed = true;
+ 	spin_unlock_irqrestore(&ctxld->lock, flags);
+ 
+ 	return 0;
+ }
+ EXPORT_SYMBOL(dcss_ctxld_enable);
+ 
++void dcss_ctxld_kick(struct dcss_soc *dcss)
++{
++	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctxld->lock, flags);
++	if (ctxld->armed) {
++		ctxld->armed = false;
++		__dcss_ctxld_enable(dcss->ctxld_priv);
++	}
++	spin_unlock_irqrestore(&ctxld->lock, flags);
++}
++EXPORT_SYMBOL(dcss_ctxld_kick);
++
+ void dcss_ctxld_write_irqsafe(struct dcss_soc *dcss, u32 ctx_id, u32 val,
+ 			      u32 reg_ofs)
+ {
+@@ -404,6 +408,16 @@ void dcss_ctxld_write(struct dcss_soc *dcss, u32 ctx_id, u32 val, u32 reg_ofs)
+ 	spin_unlock_irqrestore(&ctxld->lock, flags);
+ }
+ 
++bool dcss_ctxld_is_flushed(struct dcss_soc *dcss)
++{
++	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
++
++	return ctxld->ctx_size[ctxld->current_ctx][CTX_DB] == 0 &&
++		ctxld->ctx_size[ctxld->current_ctx][CTX_SB_HP] == 0 &&
++		ctxld->ctx_size[ctxld->current_ctx][CTX_SB_LP] == 0;
++}
++EXPORT_SYMBOL(dcss_ctxld_is_flushed);
++
+ int dcss_ctxld_resume(struct dcss_soc *dcss)
+ {
+ 	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index 10f6814..50bb921 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -111,6 +111,8 @@ struct dcss_dpr_ch {
+ 	u32 sys_ctrl;
+ 	u32 rtram_ctrl;
+ 
++	bool sys_ctrl_chgd;
++
+ 	u32 pitch;
+ 
+ 	bool use_dtrc;
+@@ -431,8 +433,7 @@ void dcss_dpr_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ 	}
+ 
+ 	if (ch->sys_ctrl != sys_ctrl)
+-		dcss_dpr_write(dpr, ch_num, sys_ctrl,
+-			       DCSS_DPR_SYSTEM_CTRL0);
++		ch->sys_ctrl_chgd = true;
+ 
+ 	ch->sys_ctrl = sys_ctrl;
+ }
+@@ -651,3 +652,19 @@ void dcss_dpr_format_set(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 	dcss_dpr_rtram_set(dcss, ch_num, pix_format);
+ }
+ EXPORT_SYMBOL(dcss_dpr_format_set);
++
++void dcss_dpr_write_sysctrl(struct dcss_soc *dcss)
++{
++	int chnum;
++
++	for (chnum = 0; chnum < 3; chnum++) {
++		struct dcss_dpr_ch *ch = &dcss->dpr_priv->ch[chnum];
++
++		if (ch->sys_ctrl_chgd) {
++			dcss_ctxld_write_irqsafe(dcss, ch->ctx_id, ch->sys_ctrl,
++						 ch->base_ofs +
++						 DCSS_DPR_SYSTEM_CTRL0);
++			ch->sys_ctrl_chgd = false;
++		}
++	}
++}
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index c939256..9b85c53 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -17,6 +17,8 @@
+ #include <linux/io.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/platform_device.h>
++#include <linux/interrupt.h>
+ #include <drm/drm_fourcc.h>
+ 
+ #include <video/imx-dcss.h>
+@@ -136,6 +138,8 @@ struct dcss_dtg_priv {
+ 	u32 alpha;
+ 	u32 use_global;
+ 
++	int ctxld_kick_irq;
++
+ 	/*
+ 	 * This will be passed on by DRM CRTC so that we can signal when DTG has
+ 	 * been successfully stopped. Otherwise, any modesetting while DTG is
+@@ -169,6 +173,44 @@ void dcss_dtg_dump_regs(struct seq_file *s, void *data)
+ }
+ #endif
+ 
++static irqreturn_t dcss_dtg_irq_handler(int irq, void *data)
++{
++	struct dcss_dtg_priv *dtg = data;
++	u32 status;
++
++	status = dcss_readl(dtg->base_reg + DCSS_DTG_INT_STATUS);
++
++	dcss_ctxld_kick(dtg->dcss);
++
++	dcss_writel(status & LINE1_IRQ, dtg->base_reg + DCSS_DTG_INT_CONTROL);
++
++	return IRQ_HANDLED;
++}
++
++static int dcss_dtg_irq_config(struct dcss_dtg_priv *dtg)
++{
++	struct dcss_soc *dcss = dtg->dcss;
++	struct platform_device *pdev = to_platform_device(dcss->dev);
++	int ret;
++
++	dtg->ctxld_kick_irq = platform_get_irq_byname(pdev, "ctxld_kick");
++	if (dtg->ctxld_kick_irq < 0) {
++		dev_err(dcss->dev, "dtg: can't get line2 irq number\n");
++		return dtg->ctxld_kick_irq;
++	}
++
++	ret = devm_request_irq(dcss->dev, dtg->ctxld_kick_irq,
++			       dcss_dtg_irq_handler,
++			       IRQF_TRIGGER_HIGH,
++			       "dcss_ctxld_kick", dtg);
++	if (ret) {
++		dev_err(dcss->dev, "dtg: irq request failed.\n");
++		return ret;
++	}
++
++	return 0;
++}
++
+ int dcss_dtg_init(struct dcss_soc *dcss, unsigned long dtg_base)
+ {
+ 	struct dcss_dtg_priv *dtg;
+@@ -198,7 +240,7 @@ int dcss_dtg_init(struct dcss_soc *dcss, unsigned long dtg_base)
+ 	dtg->control_status |= OVL_DATA_MODE | BLENDER_VIDEO_ALPHA_SEL |
+ 		((dtg->alpha << DEFAULT_FG_ALPHA_POS) & DEFAULT_FG_ALPHA_MASK);
+ 
+-	return 0;
++	return dcss_dtg_irq_config(dtg);
+ }
+ 
+ void dcss_dtg_exit(struct dcss_soc *dcss)
+@@ -215,6 +257,7 @@ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm)
+ 	u16 dtg_lrc_x, dtg_lrc_y;
+ 	u16 dis_ulc_x, dis_ulc_y;
+ 	u16 dis_lrc_x, dis_lrc_y;
++	u32 sb_ctxld_trig, db_ctxld_trig;
+ 
+ 	dev_dbg(dcss->dev, "hfront_porch = %d\n", vm->hfront_porch);
+ 	dev_dbg(dcss->dev, "hback_porch = %d\n", vm->hback_porch);
+@@ -253,14 +296,18 @@ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm)
+ 	dtg->dis_ulc_x = dis_ulc_x;
+ 	dtg->dis_ulc_y = dis_ulc_y;
+ 
+-	/*
+-	 * If the dis_ulc_y is too small, then the context loader will not have
+-	 * time to load the DB context. This happens with LCD panels which have
+-	 * small vfront_porch, vback_porch and/or vsync_len.
+-	 */
+-	dcss_dtg_write(dtg, ((0 << TC_CTXLD_SB_Y_POS) & TC_CTXLD_SB_Y_MASK) |
+-			(dis_ulc_y < 50 ? 50 : dis_ulc_y),
+-			DCSS_DTG_TC_CTXLD);
++	sb_ctxld_trig = ((0 * dis_lrc_y / 100) << TC_CTXLD_SB_Y_POS) &
++							TC_CTXLD_SB_Y_MASK;
++	db_ctxld_trig = ((99 * dis_lrc_y / 100) << TC_CTXLD_DB_Y_POS) &
++							TC_CTXLD_DB_Y_MASK;
++
++	dcss_dtg_write(dtg, sb_ctxld_trig | db_ctxld_trig, DCSS_DTG_TC_CTXLD);
++
++	/* vblank trigger */
++	dcss_dtg_write(dtg, 0, DCSS_DTG_LINE0_INT);
++
++	/* CTXLD trigger */
++	dcss_dtg_write(dtg, ((98 * dis_lrc_y) / 100) << 16, DCSS_DTG_LINE1_INT);
+ }
+ EXPORT_SYMBOL(dcss_dtg_sync_set);
+ 
+@@ -424,11 +471,16 @@ void dcss_dtg_vblank_irq_enable(struct dcss_soc *dcss, bool en)
+ {
+ 	void __iomem *reg;
+ 	struct dcss_dtg_priv *dtg = dcss->dtg_priv;
+-	u32 val = en ? LINE0_IRQ : 0;
++	u32 val = en ? (LINE0_IRQ | LINE1_IRQ) : 0;
++
++	/* need to keep the CTXLD kick interrupt ON if DTRC is used */
++	if (!en && (dcss_dtrc_is_running(dcss, 1) ||
++		    dcss_dtrc_is_running(dcss, 2)))
++		val |= LINE1_IRQ;
+ 
+ 	reg = dtg->base_reg + DCSS_DTG_INT_MASK;
+ 
+-	dcss_update(val, LINE0_IRQ, reg);
++	dcss_update(val, LINE0_IRQ | LINE1_IRQ, reg);
+ }
+ 
+ void dcss_dtg_vblank_irq_clear(struct dcss_soc *dcss)
+diff --git a/drivers/gpu/imx/dcss/dcss-prv.h b/drivers/gpu/imx/dcss/dcss-prv.h
+index ae9551a..1911076 100644
+--- a/drivers/gpu/imx/dcss/dcss-prv.h
++++ b/drivers/gpu/imx/dcss/dcss-prv.h
+@@ -80,10 +80,12 @@ void dcss_ctxld_update(struct dcss_soc *dcss, u32 ctx_id, u32 val, u32 mask,
+ int dcss_ctxld_suspend(struct dcss_soc *dcss);
+ void dcss_ctxld_write_irqsafe(struct dcss_soc *dcss, u32 ctx_id, u32 val,
+ 			      u32 reg_ofs);
++void dcss_ctxld_kick(struct dcss_soc *dcss);
+ 
+ /* DPR */
+ int dcss_dpr_init(struct dcss_soc *dcss, unsigned long dpr_base);
+ void dcss_dpr_exit(struct dcss_soc *dcss);
++void dcss_dpr_write_sysctrl(struct dcss_soc *dcss);
+ 
+ /* DTG */
+ int dcss_dtg_init(struct dcss_soc *dcss, unsigned long dtg_base);
+@@ -103,6 +105,7 @@ void dcss_ctxld_write_irqsafe(struct dcss_soc *dcss, u32 ctx_id, u32 val,
+ /* SCALER */
+ int dcss_scaler_init(struct dcss_soc *dcss, unsigned long scaler_base);
+ void dcss_scaler_exit(struct dcss_soc *dcss);
++void dcss_scaler_write_sclctrl(struct dcss_soc *dcss);
+ 
+ /* DTRC */
+ int dcss_dtrc_init(struct dcss_soc *dcss, unsigned long dtrc_base);
+diff --git a/drivers/gpu/imx/dcss/dcss-scaler.c b/drivers/gpu/imx/dcss/dcss-scaler.c
+index ee9f69d..2ca9c04 100644
+--- a/drivers/gpu/imx/dcss/dcss-scaler.c
++++ b/drivers/gpu/imx/dcss/dcss-scaler.c
+@@ -107,6 +107,8 @@ struct dcss_scaler_ch {
+ 	u32 sdata_ctrl;
+ 	u32 scaler_ctrl;
+ 
++	bool scaler_ctrl_chgd;
++
+ 	u32 c_vstart;
+ 	u32 c_hstart;
+ };
+@@ -397,8 +399,7 @@ void dcss_scaler_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ 				  DCSS_SCALER_SDATA_CTRL);
+ 
+ 	if (ch->scaler_ctrl != scaler_ctrl)
+-		dcss_scaler_write(dcss->scaler_priv, ch_num, scaler_ctrl,
+-				  DCSS_SCALER_CTRL);
++		ch->scaler_ctrl_chgd = true;
+ 
+ 	ch->scaler_ctrl = scaler_ctrl;
+ }
+@@ -977,3 +978,19 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 			       dst_yres, vrefresh_hz, wrscl_needed);
+ }
+ EXPORT_SYMBOL(dcss_scaler_setup);
++
++void dcss_scaler_write_sclctrl(struct dcss_soc *dcss)
++{
++	int chnum;
++
++	for (chnum = 0; chnum < 3; chnum++) {
++		struct dcss_scaler_ch *ch = &dcss->scaler_priv->ch[chnum];
++
++		if (ch->scaler_ctrl_chgd) {
++			dcss_ctxld_write_irqsafe(dcss, ch->ctx_id,
++						 ch->scaler_ctrl,
++					ch->base_ofs + DCSS_SCALER_CTRL);
++			ch->scaler_ctrl_chgd = false;
++		}
++	}
++}
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 2b63cbc..c0d5dd8 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -106,6 +106,7 @@ bool dcss_scaler_can_scale(struct dcss_soc *dcss, int ch_num,
+ 
+ /* CTXLD */
+ int dcss_ctxld_enable(struct dcss_soc *dcss);
++bool dcss_ctxld_is_flushed(struct dcss_soc *dcss);
+ 
+ /* HDR10 */
+ enum dcss_hdr10_nonlinearity {
+-- 
+1.7.9.5
+

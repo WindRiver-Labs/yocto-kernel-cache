@@ -1,0 +1,418 @@
+From 14e20e0307adc5c5d39db05fcafc6083f05251b3 Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Mon, 9 Apr 2018 18:15:33 +0800
+Subject: [PATCH 3587/5242] MLK-17991-7 drm/imx: dpu: kms: Add basic
+ fetchwarp2 support
+
+commit  e1e8c9f7ff51cdf58bc4cb9d7f9284624c868968 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch adds the first subsidiary layer0(out of layer0 to layer7)
+support for the fetchwarp2 fetch unit to be the backend of DRM plane.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-crtc.c  |   21 ++++++++++++-
+ drivers/gpu/drm/imx/dpu/dpu-kms.c   |   13 ++++++++
+ drivers/gpu/drm/imx/dpu/dpu-plane.c |   57 +++++++++++++++++++++++++++--------
+ drivers/gpu/drm/imx/dpu/dpu-plane.h |    6 +++-
+ drivers/gpu/imx/dpu/dpu-common.c    |   16 ++++++++--
+ drivers/gpu/imx/dpu/dpu-prv.h       |    4 +--
+ include/video/dpu.h                 |    6 ++--
+ 7 files changed, 102 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.c b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+index 01332be..5abdf60 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-crtc.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+@@ -342,6 +342,7 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		struct dpu_plane_res *res;
+ 		struct dpu_fetchdecode *fd = NULL;
+ 		struct dpu_fetchlayer *fl = NULL;
++		struct dpu_fetchwarp *fw = NULL;
+ 		struct dpu_fetcheco *fe = NULL;
+ 		struct dpu_hscaler *hs = NULL;
+ 		struct dpu_vscaler *vs = NULL;
+@@ -371,6 +372,9 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		case DPU_PLANE_SRC_FL:
+ 			fl = res->fl[fu_id];
+ 			break;
++		case DPU_PLANE_SRC_FW:
++			fw = res->fw[fu_id];
++			break;
+ 		default:
+ 			WARN_ON(1);
+ 			return;
+@@ -409,8 +413,11 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 				fetchdecode_pin_off(fd);
+ 				if (fetcheco_is_enabled(fe))
+ 					fetcheco_pin_off(fe);
+-			} else if (fl)
++			} else if (fl) {
+ 				fetchlayer_pin_off(fl);
++			} else if (fw) {
++				fetchwarp_pin_off(fw);
++			}
+ 		} else {
+ 			if (fd) {
+ 				fetchdecode_source_buffer_disable(fd);
+@@ -422,6 +429,9 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 			} else if (fl) {
+ 				fetchlayer_source_buffer_disable(fl, 0);
+ 				fetchlayer_unpin_off(fl);
++			} else if (fw) {
++				fetchwarp_source_buffer_disable(fw, 0);
++				fetchwarp_unpin_off(fw);
+ 			}
+ 		}
+ 	}
+@@ -477,6 +487,7 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		struct dpu_plane_res *res;
+ 		struct dpu_fetchdecode *fd = NULL;
+ 		struct dpu_fetchlayer *fl = NULL;
++		struct dpu_fetchwarp *fw = NULL;
+ 		struct dpu_fetcheco *fe;
+ 		struct dpu_hscaler *hs;
+ 		struct dpu_vscaler *vs;
+@@ -502,6 +513,9 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 		case DPU_PLANE_SRC_FL:
+ 			fl = res->fl[fu_id];
+ 			break;
++		case DPU_PLANE_SRC_FW:
++			fw = res->fw[fu_id];
++			break;
+ 		default:
+ 			WARN_ON(1);
+ 			return;
+@@ -533,6 +547,11 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 			     fetchlayer_is_pinned_off(fl))
+ 				fetchlayer_set_stream_id(fl,
+ 							DPU_PLANE_SRC_DISABLED);
++		} else if (fw) {
++			if (!fetchwarp_is_enabled(fw, 0) ||
++			     fetchwarp_is_pinned_off(fw))
++				fetchwarp_set_stream_id(fw,
++							DPU_PLANE_SRC_DISABLED);
+ 		}
+ 	}
+ }
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-kms.c b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+index 02aee21..a4fabef 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-kms.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+@@ -136,6 +136,7 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 	struct dpu_fetchdecode *fd;
+ 	struct dpu_fetcheco *fe;
+ 	struct dpu_fetchlayer *fl;
++	struct dpu_fetchwarp *fw;
+ 	struct dpu_hscaler *hs;
+ 	struct dpu_vscaler *vs;
+ 	unsigned int sid, src_sid;
+@@ -193,6 +194,18 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 				if (src_sid && src_sid != BIT(sid))
+ 					goto next;
+ 				break;
++			case DPU_PLANE_SRC_FW:
++				fw = grp->res.fw[fu_id];
++
++				if (fmt_is_yuv || need_fetcheco ||
++				    need_hscaler || need_vscaler)
++					goto next;
++
++				/* avoid on-the-fly/hot migration */
++				src_sid = fetchwarp_get_stream_id(fw);
++				if (src_sid && src_sid != BIT(sid))
++					goto next;
++				break;
+ 			case DPU_PLANE_SRC_FD:
+ 				fd = grp->res.fd[fu_id];
+ 
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.c b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+index 47a4fd2..270b917 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+@@ -197,6 +197,7 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	struct drm_framebuffer *fb = state->fb;
+ 	struct dpu_fetchdecode *fd = NULL;
+ 	struct dpu_fetchlayer *fl = NULL;
++	struct dpu_fetchwarp *fw = NULL;
+ 	dma_addr_t baseaddr, uv_baseaddr = 0;
+ 	u32 src_w = state->src_w >> 16, src_h = state->src_h >> 16,
+ 	    src_x = state->src_x >> 16, src_y = state->src_y >> 16;
+@@ -306,14 +307,17 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	case DPU_PLANE_SRC_FL:
+ 		fl = res->fl[fu_id];
+ 		break;
++	case DPU_PLANE_SRC_FW:
++		fw = res->fw[fu_id];
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 
+-	if (fetchunit_has_prefetch(fd, fl, NULL) &&
+-	    fetchunit_prefetch_format_supported(fd, fl, NULL, fb->format->format,
++	if (fetchunit_has_prefetch(fd, fl, fw) &&
++	    fetchunit_prefetch_format_supported(fd, fl, fw, fb->format->format,
+ 						fb->modifier) &&
+-	    fetchunit_prefetch_stride_supported(fd, fl, NULL, fb->pitches[0],
++	    fetchunit_prefetch_stride_supported(fd, fl, fw, fb->pitches[0],
+ 						fb->pitches[1],
+ 						src_w,
+ 						fb->format->format))
+@@ -364,8 +368,7 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	}
+ 
+ 	if (dpstate->use_prefetch &&
+-	    !fetchunit_prefetch_stride_double_check(fd, fl, NULL,
+-						    fb->pitches[0],
++	    !fetchunit_prefetch_stride_double_check(fd, fl, fw, fb->pitches[0],
+ 						    fb->pitches[1],
+ 						    src_w, fb->format->format,
+ 						    baseaddr, uv_baseaddr)) {
+@@ -394,6 +397,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	struct dpu_plane_res *res = &dplane->grp->res;
+ 	struct dpu_fetchdecode *fd = NULL;
+ 	struct dpu_fetchlayer *fl = NULL;
++	struct dpu_fetchwarp *fw = NULL;
+ 	struct dpu_fetcheco *fe = NULL;
+ 	struct dpu_hscaler *hs = NULL;
+ 	struct dpu_vscaler *vs = NULL;
+@@ -408,7 +412,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	unsigned int src_w, src_h, src_x, src_y;
+ 	int bpp, fu_id, lb_id, fu_type;
+ 	bool need_fetcheco = false, need_hscaler = false, need_vscaler = false;
+-	bool need_fetchdecode = false, need_fetchlayer = false;
++	bool need_fetchdecode = false, need_fetchlayer = false,
++	     need_fetchwarp = false;
+ 	bool prefetch_start = false, aux_prefetch_start = false;
+ 	bool need_modeset;
+ 	bool is_overlay = plane->type == DRM_PLANE_TYPE_OVERLAY;
+@@ -436,6 +441,10 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 		need_fetchlayer = true;
+ 		fl = res->fl[fu_id];
+ 		break;
++	case DPU_PLANE_SRC_FW:
++		need_fetchwarp = true;
++		fw = res->fw[fu_id];
++		break;
+ 	default:
+ 		WARN_ON(1);
+ 		return;
+@@ -503,6 +512,11 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 		    (fetchlayer_get_stream_id(fl) == DPU_PLANE_SRC_DISABLED ||
+ 		     need_modeset))
+ 			prefetch_start = true;
++
++		if (need_fetchwarp &&
++		    (fetchwarp_get_stream_id(fw) == DPU_PLANE_SRC_DISABLED ||
++		     need_modeset))
++			prefetch_start = true;
+ 	}
+ 
+ 	if (need_fetchdecode) {
+@@ -544,6 +558,25 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 					plane->base.id, plane->name, fu_id);
+ 	}
+ 
++	if (need_fetchwarp) {
++		fetchwarp_set_burstlength(fw, baseaddr, dpstate->use_prefetch);
++		fetchwarp_source_bpp(fw, 0, bpp);
++		fetchwarp_source_stride(fw, 0, src_w, bpp, fb->pitches[0],
++					baseaddr, dpstate->use_prefetch);
++		fetchwarp_src_buf_dimensions(fw, 0, src_w, src_h);
++		fetchwarp_set_fmt(fw, 0, fb->format->format);
++		fetchwarp_source_buffer_enable(fw, 0);
++		fetchwarp_framedimensions(fw, src_w, src_h);
++		fetchwarp_baseaddress(fw, 0, baseaddr);
++		fetchwarp_set_stream_id(fw, dplane->stream_id ?
++						DPU_PLANE_SRC_TO_DISP_STREAM1 :
++						DPU_PLANE_SRC_TO_DISP_STREAM0);
++		fetchwarp_unpin_off(fw);
++
++		dev_dbg(dev, "[PLANE:%d:%s] fetchwarp-0x%02x\n",
++					plane->base.id, plane->name, fu_id);
++	}
++
+ 	if (need_fetcheco) {
+ 		fe_id = fetcheco_get_block_id(fe);
+ 		if (fe_id == ID_NONE)
+@@ -630,7 +663,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	}
+ 
+ 	if (dpstate->use_prefetch) {
+-		fetchunit_configure_prefetch(fd, fl, NULL, dplane->stream_id,
++		fetchunit_configure_prefetch(fd, fl, fw, dplane->stream_id,
+ 					     src_w, src_h, src_x, src_y,
+ 					     fb->pitches[0], fb->format->format,
+ 					     fb->modifier,
+@@ -638,12 +671,12 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 					     prefetch_start,
+ 					     aux_prefetch_start);
+ 		if (prefetch_start || aux_prefetch_start)
+-			fetchunit_enable_prefetch(fd, fl, NULL);
++			fetchunit_enable_prefetch(fd, fl, fw);
+ 
+-		fetchunit_reg_update_prefetch(fd, fl, NULL);
++		fetchunit_reg_update_prefetch(fd, fl, fw);
+ 
+ 		if (prefetch_start || aux_prefetch_start) {
+-			fetchunit_prefetch_first_frame_handle(fd, fl, NULL);
++			fetchunit_prefetch_first_frame_handle(fd, fl, fw);
+ 
+ 			if (!need_modeset && is_overlay)
+ 				framegen_wait_for_frame_counter_moving(fg);
+@@ -651,8 +684,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 
+ 		dev_dbg(dev, "[PLANE:%d:%s] use prefetch\n",
+ 					plane->base.id, plane->name);
+-	} else if (fetchunit_has_prefetch(fd, fl, NULL)) {
+-		fetchunit_disable_prefetch(fd, fl, NULL);
++	} else if (fetchunit_has_prefetch(fd, fl, fw)) {
++		fetchunit_disable_prefetch(fd, fl, fw);
+ 
+ 		dev_dbg(dev, "[PLANE:%d:%s] bypass prefetch\n",
+ 					plane->base.id, plane->name);
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.h b/drivers/gpu/drm/imx/dpu/dpu-plane.h
+index 9854672..fef5e6b 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.h
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.h
+@@ -59,6 +59,7 @@ struct dpu_plane_state {
+ /* FIXME: Correct the source entries for subsidiary layers. */
+ static const lb_sec_sel_t sources[] = {LB_SEC_SEL__FETCHLAYER0,
+ 				       LB_SEC_SEL__FETCHLAYER1,
++				       LB_SEC_SEL__FETCHWARP2,
+ 				       LB_SEC_SEL__FETCHDECODE0,
+ 				       LB_SEC_SEL__FETCHDECODE1,
+ 				       LB_SEC_SEL__FETCHDECODE2,
+@@ -84,6 +85,8 @@ static inline int source_to_type(lb_sec_sel_t source)
+ 	case LB_SEC_SEL__FETCHLAYER0:
+ 	case LB_SEC_SEL__FETCHLAYER1:
+ 		return DPU_PLANE_SRC_FL;
++	case LB_SEC_SEL__FETCHWARP2:
++		return DPU_PLANE_SRC_FW;
+ 	case LB_SEC_SEL__FETCHDECODE0:
+ 	case LB_SEC_SEL__FETCHDECODE1:
+ 	case LB_SEC_SEL__FETCHDECODE2:
+@@ -104,7 +107,8 @@ static inline int source_to_id(lb_sec_sel_t source)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(sources); i++) {
+ 		if (source == sources[i]) {
+-			if (type == DPU_PLANE_SRC_FD) {
++			if (type == DPU_PLANE_SRC_FD ||
++			    type == DPU_PLANE_SRC_FW) {
+ 				while (offset < ARRAY_SIZE(sources)) {
+ 					if (source_to_type(sources[offset]) ==
+ 					    type)
+diff --git a/drivers/gpu/imx/dpu/dpu-common.c b/drivers/gpu/imx/dpu/dpu-common.c
+index b9328c5..1b621ee 100644
+--- a/drivers/gpu/imx/dpu/dpu-common.c
++++ b/drivers/gpu/imx/dpu/dpu-common.c
+@@ -539,7 +539,7 @@ static inline void dpu_cm_write(struct dpu_soc *dpu, u32 value,
+ 	.intsteer_map = intsteer_map_v1,
+ 	.intsteer_map_size = ARRAY_SIZE(intsteer_map_v1),
+ 	.unused_irq = unused_irq_v1,
+-	.plane_src_na_mask = 0xffffffc0,
++	.plane_src_na_mask = 0xffffff80,
+ 	.has_capture = true,
+ 	.has_prefetch = false,
+ 	.pixel_link_quirks = false,
+@@ -567,7 +567,7 @@ static inline void dpu_cm_write(struct dpu_soc *dpu, u32 value,
+ 	.unused_irq = unused_irq_v2,
+ 	.sw2hw_irq_map = sw2hw_irq_map_v2,
+ 	.sw2hw_block_id_map = sw2hw_block_id_map_v2,
+-	.plane_src_na_mask = 0xffffffc2,
++	.plane_src_na_mask = 0xffffffe2,
+ 	.has_capture = false,
+ 	.has_prefetch = true,
+ 	.pixel_link_quirks = true,
+@@ -1118,6 +1118,7 @@ static int dpu_get_plane_resource(struct dpu_soc *dpu,
+ {
+ 	const struct dpu_unit *fds = dpu->devtype->fds;
+ 	const struct dpu_unit *fls = dpu->devtype->fls;
++	const struct dpu_unit *fws = dpu->devtype->fws;
+ 	const struct dpu_unit *lbs = dpu->devtype->lbs;
+ 	struct dpu_plane_grp *grp = plane_res_to_grp(res);
+ 	int i;
+@@ -1148,6 +1149,11 @@ static int dpu_get_plane_resource(struct dpu_soc *dpu,
+ 		if (IS_ERR(res->fl[i]))
+ 			return PTR_ERR(res->fl[i]);
+ 	}
++	for (i = 0; i < fws->num; i++) {
++		res->fw[i] = dpu_fw_get(dpu, fw_ids[i]);
++		if (IS_ERR(res->fw[i]))
++			return PTR_ERR(res->fw[i]);
++	}
+ 	/* HScaler could be shared with capture. */
+ 	if (display_plane_video_proc) {
+ 		for (i = 0; i < ARRAY_SIZE(res->hs); i++) {
+@@ -1172,7 +1178,7 @@ static int dpu_get_plane_resource(struct dpu_soc *dpu,
+ 		grp->hw_plane_vscaler_num = ARRAY_SIZE(res->vs);
+ 	}
+ 
+-	grp->hw_plane_num = fds->num + fls->num;
++	grp->hw_plane_num = fds->num + fls->num + fws->num;
+ 
+ 	return 0;
+ }
+@@ -1202,6 +1208,10 @@ static void dpu_put_plane_resource(struct dpu_plane_res *res)
+ 		if (!IS_ERR_OR_NULL(res->fl[i]))
+ 			dpu_fl_put(res->fl[i]);
+ 	}
++	for (i = 0; i < ARRAY_SIZE(res->fw); i++) {
++		if (!IS_ERR_OR_NULL(res->fw[i]))
++			dpu_fw_put(res->fw[i]);
++	}
+ 	for (i = 0; i < ARRAY_SIZE(res->hs); i++) {
+ 		if (!IS_ERR_OR_NULL(res->hs[i]))
+ 			dpu_hs_put(res->hs[i]);
+diff --git a/drivers/gpu/imx/dpu/dpu-prv.h b/drivers/gpu/imx/dpu/dpu-prv.h
+index 48fcf9f..b1305de 100644
+--- a/drivers/gpu/imx/dpu/dpu-prv.h
++++ b/drivers/gpu/imx/dpu/dpu-prv.h
+@@ -200,8 +200,8 @@ struct dpu_devtype {
+ 	const unsigned int *sw2hw_irq_map;	/* NULL means linear */
+ 	const unsigned int *sw2hw_block_id_map;	/* NULL means linear */
+ 	/*
+-	 * index:     0         1       2   3   4   5
+-	 * source: fl0(sub0) fl1(sub0) fd0 fd1 fd2 fd3
++	 * index:     0         1         2       3   4   5   6
++	 * source: fl0(sub0) fl1(sub0) fw2(sub0) fd0 fd1 fd2 fd3
+ 	 */
+ 	const u32 plane_src_na_mask;
+ 	bool has_capture;
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index 5da768d..6038e07 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -878,6 +878,7 @@ void  dpu_be_configure_prefetch(struct dpu_bliteng *dpu_be,
+ 
+ #define MAX_FD_NUM	4
+ #define MAX_FL_NUM	2
++#define MAX_FW_NUM	1
+ #define MAX_LB_NUM	7
+ struct dpu_plane_res {
+ 	struct dpu_constframe	*cf[2];
+@@ -885,6 +886,7 @@ struct dpu_plane_res {
+ 	struct dpu_fetchdecode	*fd[MAX_FD_NUM];
+ 	struct dpu_fetcheco	*fe[2];
+ 	struct dpu_fetchlayer	*fl[MAX_FL_NUM];
++	struct dpu_fetchwarp	*fw[MAX_FW_NUM];
+ 	struct dpu_framegen	*fg[2];
+ 	struct dpu_hscaler	*hs[2];
+ 	struct dpu_layerblend	*lb[MAX_LB_NUM];
+@@ -905,8 +907,8 @@ struct dpu_plane_grp {
+ 	bool			has_vproc;
+ 	/*
+ 	 * used when assigning plane source
+-	 * index:     0         1       2   3   4   5
+-	 * source: fl0(sub0) fl1(sub0) fd0 fd1 fd2 fd3
++	 * index:     0         1         2       3   4   5   6
++	 * source: fl0(sub0) fl1(sub0) fw2(sub0) fd0 fd1 fd2 fd3
+ 	 */
+ 	struct mutex		mutex;
+ 	u32			src_a_mask;
+-- 
+1.7.9.5
+

@@ -1,0 +1,176 @@
+From b1e3d2f93d5966dacb383119e71724985d6b32d2 Mon Sep 17 00:00:00 2001
+From: Peter Chen <peter.chen@nxp.com>
+Date: Mon, 30 Oct 2017 13:43:52 +0800
+Subject: [PATCH 2737/5242] MLK-16727-1 usb: cdns3: needs to handle
+ disconnection at device mode
+
+commit  13a9557db01f1e64088c162e726bf8a5da3b57eb from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The IP has some issues to detect vbus status correctly, we have to
+force vbus status accordingly, so we need a status to indicate
+vbus disconnection, and add some code to let control know vbus
+removal, in that case, the controller's state mechine can be correct.
+
+In this commit, we increase one role 'CDNS3_ROLE_END' to for
+this status.
+
+BuildInfo:
+- SCFW 8dcff26, IMX-MKIMAGE ea027c4b, ATF
+- U-Boot 2017.03-imx_v2017.03_4.9.51_imx8_beta1+g6dc7b0f
+
+Acked-by: Li Jun <jun.li@nxp.com>
+Signed-off-by: Peter Chen <peter.chen@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/usb/cdns3/core.c |   32 +++++++++++++++++++++++++++-----
+ drivers/usb/cdns3/core.h |   12 ++++++++++--
+ 2 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/usb/cdns3/core.c b/drivers/usb/cdns3/core.c
+index 1fb086b..3524909 100644
+--- a/drivers/usb/cdns3/core.c
++++ b/drivers/usb/cdns3/core.c
+@@ -130,6 +130,9 @@ static void cdns_set_role(struct cdns3 *cdns, enum cdns3_roles role)
+ 	u32 value;
+ 	int timeout_us = 100000;
+ 
++	if (role == CDNS3_ROLE_END)
++		return;
++
+ 	/* Wait clk value */
+ 	value = readl(cdns->none_core_regs + USB3_SSPHY_STATUS);
+ 	writel(value, cdns->none_core_regs + USB3_SSPHY_STATUS);
+@@ -223,8 +226,10 @@ static enum cdns3_roles cdns3_get_role(struct cdns3 *cdns)
+ 	if (cdns->roles[CDNS3_ROLE_HOST] && cdns->roles[CDNS3_ROLE_GADGET]) {
+ 		if (extcon_get_state(cdns->extcon, EXTCON_USB_HOST))
+ 			return CDNS3_ROLE_HOST;
+-		else
++		else if (extcon_get_state(cdns->extcon, EXTCON_USB))
+ 			return CDNS3_ROLE_GADGET;
++		else
++			return CDNS3_ROLE_END;
+ 	} else {
+ 		return cdns->roles[CDNS3_ROLE_HOST]
+ 			? CDNS3_ROLE_HOST
+@@ -243,7 +248,7 @@ static int cdns3_core_init_role(struct cdns3 *cdns)
+ 	struct device *dev = cdns->dev;
+ 	enum usb_dr_mode dr_mode = usb_get_dr_mode(dev);
+ 
+-	cdns->role = CDNS3_ROLE_GADGET;
++	cdns->role = CDNS3_ROLE_END;
+ 	if (dr_mode == USB_DR_MODE_UNKNOWN)
+ 		dr_mode = USB_DR_MODE_OTG;
+ 
+@@ -276,9 +281,13 @@ static int cdns3_core_init_role(struct cdns3 *cdns)
+ static irqreturn_t cdns3_irq(int irq, void *data)
+ {
+ 	struct cdns3 *cdns = data;
++	irqreturn_t ret = IRQ_NONE;
+ 
+ 	/* Handle device/host interrupt */
+-	return cdns3_role(cdns)->irq(cdns);
++	if (cdns->role != CDNS3_ROLE_END)
++		ret = cdns3_role(cdns)->irq(cdns);
++
++	return ret;
+ }
+ 
+ static int cdns3_get_clks(struct device *dev)
+@@ -375,6 +384,9 @@ static int cdsn3_do_role_switch(struct cdns3 *cdns, enum cdns3_roles role)
+ 
+ 	current_role = cdns->role;
+ 	cdns3_role_stop(cdns);
++	if (role == CDNS3_ROLE_END)
++		return 0;
++
+ 	cdns_set_role(cdns, role);
+ 	ret = cdns3_role_start(cdns, role);
+ 	if (ret) {
+@@ -398,14 +410,17 @@ static void cdns3_role_switch(struct work_struct *work)
+ {
+ 	struct cdns3 *cdns = container_of(work, struct cdns3,
+ 			role_switch_wq);
+-	bool host;
++	bool device, host;
+ 
+ 	host = extcon_get_state(cdns->extcon, EXTCON_USB_HOST);
++	device = extcon_get_state(cdns->extcon, EXTCON_USB);
+ 
+ 	if (host)
+ 		cdsn3_do_role_switch(cdns, CDNS3_ROLE_HOST);
+-	else
++	else if (device)
+ 		cdsn3_do_role_switch(cdns, CDNS3_ROLE_GADGET);
++	else
++		cdsn3_do_role_switch(cdns, CDNS3_ROLE_END);
+ }
+ 
+ static int cdns3_extcon_notifier(struct notifier_block *nb, unsigned long event,
+@@ -436,6 +451,13 @@ static int cdns3_register_extcon(struct cdns3 *cdns)
+ 			return ret;
+ 		}
+ 
++		ret = devm_extcon_register_notifier(dev, extcon,
++			EXTCON_USB, &cdns->extcon_nb);
++		if (ret < 0) {
++			dev_err(dev, "register Device Connector failed\n");
++			return ret;
++		}
++
+ 		cdns->extcon = extcon;
+ 		cdns->extcon_nb.notifier_call = cdns3_extcon_notifier;
+ 	}
+diff --git a/drivers/usb/cdns3/core.h b/drivers/usb/cdns3/core.h
+index 5a37de4..d2c2ffe 100644
+--- a/drivers/usb/cdns3/core.h
++++ b/drivers/usb/cdns3/core.h
+@@ -25,6 +25,7 @@
+ enum cdns3_roles {
+ 	CDNS3_ROLE_HOST = 0,
+ 	CDNS3_ROLE_GADGET,
++	CDNS3_ROLE_END,
+ };
+ 
+ /**
+@@ -68,7 +69,7 @@ struct cdns3 {
+ 	struct usbss_dev_register_block_type __iomem *dev_regs;
+ 	void __iomem *none_core_regs;
+ 	int irq;
+-	struct cdns3_role_driver *roles[CDNS3_ROLE_GADGET + 1];
++	struct cdns3_role_driver *roles[CDNS3_ROLE_END];
+ 	enum cdns3_roles role;
+ 	struct device *host_dev;
+ 	struct device *gadget_dev;
+@@ -82,12 +83,15 @@ struct cdns3 {
+ 
+ static inline struct cdns3_role_driver *cdns3_role(struct cdns3 *cdns)
+ {
+-	WARN_ON(!cdns->roles[cdns->role]);
++	WARN_ON(cdns->role >= CDNS3_ROLE_END || !cdns->roles[cdns->role]);
+ 	return cdns->roles[cdns->role];
+ }
+ 
+ static inline int cdns3_role_start(struct cdns3 *cdns, enum cdns3_roles role)
+ {
++	if (role >= CDNS3_ROLE_END)
++		return 0;
++
+ 	if (!cdns->roles[role])
+ 		return -ENXIO;
+ 
+@@ -99,7 +103,11 @@ static inline void cdns3_role_stop(struct cdns3 *cdns)
+ {
+ 	enum cdns3_roles role = cdns->role;
+ 
++	if (role == CDNS3_ROLE_END)
++		return;
++
+ 	cdns->roles[role]->stop(cdns);
++	cdns->role = CDNS3_ROLE_END;
+ }
+ 
+ #endif /* __DRIVERS_USB_CDNS3_CORE_H */
+-- 
+1.7.9.5
+

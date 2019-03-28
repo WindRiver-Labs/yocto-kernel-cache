@@ -1,0 +1,173 @@
+From c057e7134ce71ca5d48c8474ce3d910b786b5cbf Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Fri, 9 Nov 2018 08:49:28 +0200
+Subject: [PATCH 5117/5242] MLK-20304-1 drm/imx/hdp: add mode_fixup hook and
+ better handling of DC and CS
+
+commit  31d0619322a1e2775b2bf7510f751179e846ac59 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The HDMI sink may support different color depths for RGB and/or YUV
+colorspaces. Currently, for mscale, 10-bit YUV420 is used only for
+2160p@60. For the rest of modes 8-bit RGB is used.
+
+This patch will add a mode_fixup() hook in the hdp_ops struct, allowing
+each platform to perform a better handling of the various color depths
+and colorspaces.
+
+With the current patch, the RGB output will always be preferred to YUV
+colorspaces, given the same color depth, since YUV colorspaces perform
+UV subsampling, producing less quality. Also, whenever possible, better
+color depth will be preferred (12-bit, 10-bit and, lastly, 8-bit).
+
+The chosen colorspace and color depth will always be based on EDID's
+Capability Map Data Block and YUV420 Video Data Block, as well as on
+HDMI controller's known clock constraints.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/hdp/imx-hdmi.c |   44 ++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/imx/hdp/imx-hdmi.h |    3 +++
+ drivers/gpu/drm/imx/hdp/imx-hdp.c  |   15 +++---------
+ drivers/gpu/drm/imx/hdp/imx-hdp.h  |    9 +++++++-
+ 4 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdmi.c b/drivers/gpu/drm/imx/hdp/imx-hdmi.c
+index 6e48be0..b8b15a5 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdmi.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdmi.c
+@@ -432,6 +432,50 @@ void hdmi_mode_set_t28hpc(state_struct *state, struct drm_display_mode *mode, in
+ 	hdmi_mode_set_vswing(state);
+ }
+ 
++#define YUV_MODE		BIT(0)
++
++bool hdmi_mode_fixup_t28hpc(state_struct *state,
++			    const struct drm_display_mode *mode,
++			    struct drm_display_mode *adjusted_mode)
++{
++	struct imx_hdp *hdp = container_of(state, struct imx_hdp, state);
++	int vic = drm_match_cea_mode(mode);
++	struct drm_display_info *di = &hdp->connector.display_info;
++
++	hdp->bpc = 8;
++	hdp->format = PXL_RGB;
++
++	if ((vic == VIC_MODE_97_60Hz || vic == VIC_MODE_96_50Hz)) {
++		if (di->hdmi.y420_dc_modes & DRM_EDID_YCBCR420_DC_36)
++			hdp->bpc = 12;
++		else if (di->hdmi.y420_dc_modes & DRM_EDID_YCBCR420_DC_30)
++			hdp->bpc = 10;
++
++		if (drm_mode_is_420_only(di, mode) ||
++		    (drm_mode_is_420_also(di, mode) && hdp->bpc > 8)) {
++			hdp->format = YCBCR_4_2_0;
++
++			adjusted_mode->private_flags = YUV_MODE;
++		} else {
++			hdp->bpc = 8;
++		}
++
++		return true;
++	}
++
++	if (di->edid_hdmi_dc_modes & DRM_EDID_HDMI_DC_36)
++		hdp->bpc = 12;
++	else if (di->edid_hdmi_dc_modes & DRM_EDID_HDMI_DC_30)
++		hdp->bpc = 10;
++
++	/* 10-bit color depth for the following modes is not supported */
++	if ((vic == VIC_MODE_95_30Hz || vic == VIC_MODE_94_25Hz ||
++	     vic == VIC_MODE_93_24Hz) && hdp->bpc == 10)
++		hdp->bpc = 8;
++
++	return true;
++}
++
+ int hdmi_get_edid_block(void *data, u8 *buf, u32 block, size_t len)
+ {
+ 	HDMITX_TRANS_DATA edidResp;
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdmi.h b/drivers/gpu/drm/imx/hdp/imx-hdmi.h
+index 09d9502..1ed5a65 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdmi.h
++++ b/drivers/gpu/drm/imx/hdp/imx-hdmi.h
+@@ -24,6 +24,9 @@ int hdmi_phy_init_t28hpc(state_struct *state,
+ 			struct drm_display_mode *mode, int format, int color_depth);
+ void hdmi_mode_set_t28hpc(state_struct *state,
+ 			struct drm_display_mode *mode, int format, int color_depth, int temp);
++bool hdmi_mode_fixup_t28hpc(state_struct *state,
++			    const struct drm_display_mode *mode,
++			    struct drm_display_mode *adjusted_mode);
+ int hdmi_get_edid_block(void *data, u8 *buf, u32 block, size_t len);
+ int hdmi_get_hpd_state(state_struct *state, u8 *hpd);
+ int hdmi_write_hdr_metadata(state_struct *state,
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.c b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+index e8201f0..573c138 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+@@ -685,23 +685,13 @@ bool imx_hdp_bridge_mode_fixup(struct drm_bridge *bridge,
+ 			       struct drm_display_mode *adjusted_mode)
+ {
+ 	struct imx_hdp *hdp = bridge->driver_private;
+-	struct drm_display_info *di = &hdp->connector.display_info;
+ 	int vic = drm_match_cea_mode(mode);
+ 
+ 	if (vic < 0)
+ 		return false;
+ 
+-	/* force output 10bit YUV420 if HDMI sink support HDR10 */
+-	if (vic == VIC_MODE_97_60Hz && cpu_is_imx8mq() &&
+-	    (di->color_formats & DRM_COLOR_FORMAT_YCRCB420) &&
+-	    (di->hdmi.y420_dc_modes & DRM_EDID_YCBCR420_DC_30)) {
+-		hdp->bpc = 10;
+-		hdp->format = YCBCR_4_2_0;
+-		return true;
+-	}
+-
+-	hdp->bpc = 8;
+-	hdp->format = PXL_RGB;
++	if (hdp && hdp->ops && hdp->ops->mode_fixup)
++		return hdp->ops->mode_fixup(&hdp->state, mode, adjusted_mode);
+ 
+ 	return true;
+ }
+@@ -1227,6 +1217,7 @@ static int imx8qm_hdp_swrite(struct hdp_mem *mem,
+ static struct hdp_ops imx8mq_ops = {
+ 	.phy_init = hdmi_phy_init_t28hpc,
+ 	.mode_set = hdmi_mode_set_t28hpc,
++	.mode_fixup = hdmi_mode_fixup_t28hpc,
+ 	.get_edid_block = hdmi_get_edid_block,
+ 	.get_hpd_state = hdmi_get_hpd_state,
+ 	.write_hdr_metadata = hdmi_write_hdr_metadata,
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.h b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+index cb8e09c..3bf130a9 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.h
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+@@ -62,8 +62,12 @@
+ 
+ #define HOTPLUG_DEBOUNCE_MS		200
+ 
+-#define VIC_MODE_96_50Hz 96
+ #define VIC_MODE_97_60Hz 97
++#define VIC_MODE_96_50Hz 96
++#define VIC_MODE_95_30Hz 95
++#define VIC_MODE_94_25Hz 94
++#define VIC_MODE_93_24Hz 93
++
+ /**
+  * imx_hdp_call - Calls a struct imx hdp_operations operation on
+  *	an entity
+@@ -95,6 +99,9 @@ struct hdp_ops {
+ 			int format, int color_depth);
+ 	void (*mode_set)(state_struct *state, struct drm_display_mode *mode,
+ 			 int format, int color_depth, int max_link);
++	bool (*mode_fixup)(state_struct *state,
++			   const struct drm_display_mode *mode,
++			   struct drm_display_mode *adjusted_mode);
+ 	int (*get_edid_block)(void *data, u8 *buf, u32 block, size_t len);
+ 	int (*get_hpd_state)(state_struct *state, u8 *hpd);
+ 	int (*write_hdr_metadata)(state_struct *state,
+-- 
+1.7.9.5
+

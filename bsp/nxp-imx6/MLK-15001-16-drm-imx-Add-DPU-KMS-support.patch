@@ -1,0 +1,1440 @@
+From 3c8e730d0606c615cb03246cf6ea53636d1f848d Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Wed, 28 Mar 2018 21:23:55 +0300
+Subject: [PATCH 1918/5242] MLK-15001-16 drm/imx: Add DPU KMS support
+
+commit  f3fac9fde18e1d4afcf12c10e8b5eb743062b985 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch adds i.MX DPU KMS support.
+Currently, only the DPU fetchdecodes are supported as DRM planes.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+
+Changes during imx_4.14.y rebase:
+ - Fix for imx_drm_crtc removal
+ - dpu_crtc_atomic_enable: rename from dpu_crtc_enable
+ - Replace GFP_TEMPORARY with GFP_KERNEL
+ - Fix for DRM_MODE_ROTATE_0 rename
+ - Fix for drm_atomic_helper_plane_set_property nuke
+ - Replace drm_fb_get_bpp_depth with drm_format_plane_cpp
+ - Add new argument to drm_universal_plane_init
+
+Signed-off-by: Leonard Crestez <leonard.crestez@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/Kconfig         |    5 +-
+ drivers/gpu/drm/imx/Makefile        |    1 +
+ drivers/gpu/drm/imx/dpu/Kconfig     |    6 +
+ drivers/gpu/drm/imx/dpu/Makefile    |    4 +
+ drivers/gpu/drm/imx/dpu/dpu-crtc.c  |  549 +++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/imx/dpu/dpu-kms.c   |  279 ++++++++++++++++++
+ drivers/gpu/drm/imx/dpu/dpu-kms.h   |   20 ++
+ drivers/gpu/drm/imx/dpu/dpu-plane.c |  325 +++++++++++++++++++++
+ drivers/gpu/drm/imx/dpu/dpu-plane.h |  102 +++++++
+ drivers/gpu/drm/imx/imx-drm-core.c  |    5 +
+ drivers/gpu/imx/dpu/Kconfig         |    2 +-
+ 11 files changed, 1295 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/imx/dpu/Kconfig
+ create mode 100644 drivers/gpu/drm/imx/dpu/Makefile
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-crtc.c
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-kms.c
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-kms.h
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-plane.c
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-plane.h
+
+diff --git a/drivers/gpu/drm/imx/Kconfig b/drivers/gpu/drm/imx/Kconfig
+index 70e3fa3..0dc43d8 100644
+--- a/drivers/gpu/drm/imx/Kconfig
++++ b/drivers/gpu/drm/imx/Kconfig
+@@ -4,8 +4,8 @@ config DRM_IMX
+ 	select VIDEOMODE_HELPERS
+ 	select DRM_GEM_CMA_HELPER
+ 	select DRM_KMS_CMA_HELPER
+-	depends on DRM && (ARCH_MXC || ARCH_MULTIPLATFORM)
+-	depends on IMX_IPUV3_CORE
++	depends on DRM
++	depends on IMX_IPUV3_CORE || IMX_DPU_CORE
+ 	help
+ 	  enable i.MX graphics support
+ 
+@@ -46,3 +46,4 @@ config DRM_IMX_HDMI
+ 	  Choose this if you want to use HDMI on i.MX6.
+ 
+ source "drivers/gpu/drm/imx/ipuv3/Kconfig"
++source "drivers/gpu/drm/imx/dpu/Kconfig"
+diff --git a/drivers/gpu/drm/imx/Makefile b/drivers/gpu/drm/imx/Makefile
+index f64243b..1f2d7b9 100644
+--- a/drivers/gpu/drm/imx/Makefile
++++ b/drivers/gpu/drm/imx/Makefile
+@@ -11,3 +11,4 @@ obj-$(CONFIG_DRM_IMX_LDB) += imx-ldb.o
+ obj-$(CONFIG_DRM_IMX_HDMI) += dw_hdmi-imx.o
+ 
+ obj-$(CONFIG_DRM_IMX_IPUV3) += ipuv3/
++obj-$(CONFIG_DRM_IMX_DPU) += dpu/
+diff --git a/drivers/gpu/drm/imx/dpu/Kconfig b/drivers/gpu/drm/imx/dpu/Kconfig
+new file mode 100644
+index 0000000..c5bd97f
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/Kconfig
+@@ -0,0 +1,6 @@
++config DRM_IMX_DPU
++	tristate
++	depends on DRM_IMX
++	depends on IMX_DPU_CORE
++	default y if DRM_IMX=y
++	default m if DRM_IMX=m
+diff --git a/drivers/gpu/drm/imx/dpu/Makefile b/drivers/gpu/drm/imx/dpu/Makefile
+new file mode 100644
+index 0000000..f29915f
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/Makefile
+@@ -0,0 +1,4 @@
++ccflags-y += -Idrivers/gpu/drm/imx
++
++imx-dpu-crtc-objs := dpu-crtc.o dpu-plane.o dpu-kms.o
++obj-$(CONFIG_DRM_IMX_DPU) += imx-dpu-crtc.o
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.c b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+new file mode 100644
+index 0000000..9288aff
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+@@ -0,0 +1,549 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include <drm/drmP.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_crtc_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++#include <linux/component.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <video/dpu.h>
++#include "dpu-kms.h"
++#include "dpu-plane.h"
++#include "imx-drm.h"
++
++struct dpu_crtc {
++	struct device		*dev;
++	struct drm_crtc		base;
++	struct imx_drm_crtc	*imx_crtc;
++	struct dpu_constframe	*cf;
++	struct dpu_disengcfg	*dec;
++	struct dpu_extdst	*ed;
++	struct dpu_framegen	*fg;
++	struct dpu_tcon		*tcon;
++	struct dpu_plane	**plane;
++	unsigned int		hw_plane_num;
++	unsigned int		stream_id;
++	int			irq;
++};
++
++struct dpu_crtc_state {
++	struct imx_crtc_state	imx_crtc_state;
++	struct dpu_plane_state	**dpu_plane_states;
++};
++
++static inline struct dpu_crtc_state *to_dpu_crtc_state(struct imx_crtc_state *s)
++{
++	return container_of(s, struct dpu_crtc_state, imx_crtc_state);
++}
++
++static inline struct dpu_crtc *to_dpu_crtc(struct drm_crtc *crtc)
++{
++	return container_of(crtc, struct dpu_crtc, base);
++}
++
++static inline struct dpu_plane_state **
++alloc_dpu_plane_states(struct dpu_crtc *dpu_crtc)
++{
++	struct dpu_plane_state **states;
++
++	states = kcalloc(dpu_crtc->hw_plane_num, sizeof(*states), GFP_KERNEL);
++	if (!states)
++		return ERR_PTR(-ENOMEM);
++
++	return states;
++}
++
++static void dpu_crtc_atomic_enable(struct drm_crtc *crtc,
++				   struct drm_crtc_state *old_crtc_state)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++
++	framegen_enable_clock(dpu_crtc->fg);
++	extdst_pixengcfg_sync_trigger(dpu_crtc->ed);
++	framegen_pkickconfig(dpu_crtc->fg, true);
++	framegen_shdtokgen(dpu_crtc->fg);
++	framegen_enable(dpu_crtc->fg);
++}
++
++static void dpu_crtc_disable(struct drm_crtc *crtc)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++
++	framegen_disable(dpu_crtc->fg);
++	framegen_pkickconfig(dpu_crtc->fg, false);
++	framegen_wait_done(dpu_crtc->fg);
++	framegen_disable_clock(dpu_crtc->fg);
++
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (crtc->state->event) {
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++	}
++	spin_unlock_irq(&crtc->dev->event_lock);
++
++	drm_crtc_vblank_off(crtc);
++}
++
++static void dpu_drm_crtc_reset(struct drm_crtc *crtc)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	struct imx_crtc_state *imx_crtc_state;
++	struct dpu_crtc_state *state;
++
++	if (crtc->state) {
++		__drm_atomic_helper_crtc_destroy_state(crtc->state);
++
++		imx_crtc_state = to_imx_crtc_state(crtc->state);
++		state = to_dpu_crtc_state(imx_crtc_state);
++		kfree(state->dpu_plane_states);
++		kfree(state);
++		crtc->state = NULL;
++	}
++
++	state = kzalloc(sizeof(*state), GFP_KERNEL);
++	if (state) {
++		crtc->state = &state->imx_crtc_state.base;
++		crtc->state->crtc = crtc;
++
++		state->dpu_plane_states = alloc_dpu_plane_states(dpu_crtc);
++		if (IS_ERR(state->dpu_plane_states))
++			kfree(state);
++	}
++}
++
++static struct drm_crtc_state *
++dpu_drm_crtc_duplicate_state(struct drm_crtc *crtc)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	struct dpu_crtc_state *state;
++
++	if (WARN_ON(!crtc->state))
++		return NULL;
++
++	state = kzalloc(sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return NULL;
++
++	state->dpu_plane_states = alloc_dpu_plane_states(dpu_crtc);
++	if (IS_ERR(state->dpu_plane_states)) {
++		kfree(state);
++		return NULL;
++	}
++
++	__drm_atomic_helper_crtc_duplicate_state(crtc,
++					&state->imx_crtc_state.base);
++
++	return &state->imx_crtc_state.base;
++}
++
++static void dpu_drm_crtc_destroy_state(struct drm_crtc *crtc,
++				       struct drm_crtc_state *state)
++{
++	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(state);
++	struct dpu_crtc_state *dcstate;
++
++	if (state) {
++		__drm_atomic_helper_crtc_destroy_state(state);
++		dcstate = to_dpu_crtc_state(imx_crtc_state);
++		kfree(dcstate->dpu_plane_states);
++		kfree(dcstate);
++	}
++}
++
++static int dpu_enable_vblank(struct drm_crtc *crtc)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++
++	enable_irq(dpu_crtc->irq);
++
++	return 0;
++}
++
++static void dpu_disable_vblank(struct drm_crtc *crtc)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++
++	disable_irq_nosync(dpu_crtc->irq);
++}
++
++static const struct drm_crtc_funcs dpu_crtc_funcs = {
++	.set_config = drm_atomic_helper_set_config,
++	.destroy = drm_crtc_cleanup,
++	.page_flip = drm_atomic_helper_page_flip,
++	.reset = dpu_drm_crtc_reset,
++	.atomic_duplicate_state = dpu_drm_crtc_duplicate_state,
++	.atomic_destroy_state = dpu_drm_crtc_destroy_state,
++	.enable_vblank = dpu_enable_vblank,
++	.disable_vblank = dpu_disable_vblank,
++};
++
++static irqreturn_t dpu_irq_handler(int irq, void *dev_id)
++{
++	struct dpu_crtc *dpu_crtc = dev_id;
++
++	drm_crtc_handle_vblank(&dpu_crtc->base);
++
++	return IRQ_HANDLED;
++}
++
++static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
++				 struct drm_crtc_state *crtc_state)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	struct dpu_plane_state *dpstate;
++	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc_state);
++	struct dpu_crtc_state *dcstate = to_dpu_crtc_state(imx_crtc_state);
++	int i = 0;
++
++	/*
++	 * cache the plane states so that the planes can be disabled in
++	 * ->atomic_begin.
++	 */
++	drm_for_each_plane_mask(plane, crtc->dev, crtc_state->plane_mask) {
++		plane_state =
++			drm_atomic_get_plane_state(crtc_state->state, plane);
++		if (IS_ERR(plane_state))
++			return PTR_ERR(plane_state);
++
++		dpstate = to_dpu_plane_state(plane_state);
++		dcstate->dpu_plane_states[i++] = dpstate;
++	}
++
++	return 0;
++}
++
++static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
++				  struct drm_crtc_state *old_crtc_state)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	struct imx_crtc_state *imx_crtc_state =
++					to_imx_crtc_state(old_crtc_state);
++	struct dpu_crtc_state *old_dcstate = to_dpu_crtc_state(imx_crtc_state);
++	int i;
++
++	drm_crtc_vblank_on(crtc);
++
++	spin_lock_irq(&crtc->dev->event_lock);
++	if (crtc->state->event) {
++		WARN_ON(drm_crtc_vblank_get(crtc));
++		drm_crtc_arm_vblank_event(crtc, crtc->state->event);
++		crtc->state->event = NULL;
++	}
++	spin_unlock_irq(&crtc->dev->event_lock);
++
++	/*
++	 * Disable all planes' resources in SHADOW only.
++	 * Whether any of them would be disabled or kept running depends
++	 * on new plane states' commit.
++	 */
++	for (i = 0; i < dpu_crtc->hw_plane_num; i++) {
++		struct dpu_plane_state *old_dpstate;
++		struct drm_plane_state *plane_state;
++		struct dpu_plane *dplane;
++		struct dpu_plane_res *res;
++		struct dpu_fetchdecode *fd;
++		struct dpu_layerblend *lb;
++		struct dpu_extdst *ed;
++		int fd_id, lb_id;
++
++		old_dpstate = old_dcstate->dpu_plane_states[i];
++		if (!old_dpstate)
++			continue;
++
++		plane_state = &old_dpstate->base;
++		dplane = to_dpu_plane(plane_state->plane);
++		res = &dplane->grp->res;
++
++		fd_id = source_to_id(old_dpstate->source);
++		if (fd_id < 0)
++			return;
++
++		lb_id = blend_to_id(old_dpstate->blend);
++		if (lb_id < 0)
++			return;
++
++		fd = res->fd[fd_id];
++		lb = res->lb[lb_id];
++
++		layerblend_pixengcfg_clken(lb, CLKEN__DISABLE);
++		fetchdecode_layerproperty(fd, false);
++		if (old_dpstate->is_top) {
++			ed = res->ed[dplane->stream_id];
++			extdst_pixengcfg_src_sel(ed, ED_SRC_DISABLE);
++		}
++	}
++}
++
++static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
++				  struct drm_crtc_state *old_crtc_state)
++{
++	struct dpu_plane *dplane = to_dpu_plane(crtc->primary);
++	struct dpu_plane_res *res = &dplane->grp->res;
++	struct dpu_extdst *ed = res->ed[dplane->stream_id];
++
++	if (!crtc->state->enable && !old_crtc_state->enable)
++		return;
++
++	extdst_pixengcfg_sync_trigger(ed);
++}
++
++static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
++{
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc->state);
++	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
++	extdst_src_sel_t ed_src;
++
++	dev_dbg(dpu_crtc->dev, "%s: mode->hdisplay: %d\n", __func__,
++			mode->hdisplay);
++	dev_dbg(dpu_crtc->dev, "%s: mode->vdisplay: %d\n", __func__,
++			mode->vdisplay);
++
++	framegen_cfg_videomode(dpu_crtc->fg, mode);
++	if (crtc->state->plane_mask)
++		framegen_displaymode(dpu_crtc->fg, FGDM__SEC_ON_TOP);
++	else
++		framegen_displaymode(dpu_crtc->fg, FGDM__PRIM);
++
++	framegen_panic_displaymode(dpu_crtc->fg, FGDM__TEST);
++
++	tcon_cfg_videomode(dpu_crtc->tcon, mode);
++	tcon_set_fmt(dpu_crtc->tcon, imx_crtc_state->bus_format);
++
++	disengcfg_polarity_ctrl(dpu_crtc->dec, mode->flags);
++
++	constframe_framedimensions(dpu_crtc->cf,
++					mode->crtc_hdisplay,
++					mode->crtc_vdisplay);
++	constframe_constantcolor(dpu_crtc->cf, 0, 0, 0, 0);
++
++	ed_src = dpu_crtc->stream_id ? ED_SRC_CONSTFRAME5 : ED_SRC_CONSTFRAME4;
++	extdst_pixengcfg_src_sel(dpu_crtc->ed, ed_src);
++}
++
++static const struct drm_crtc_helper_funcs dpu_helper_funcs = {
++	.mode_set_nofb = dpu_crtc_mode_set_nofb,
++	.atomic_check = dpu_crtc_atomic_check,
++	.atomic_begin = dpu_crtc_atomic_begin,
++	.atomic_flush = dpu_crtc_atomic_flush,
++	.atomic_enable = dpu_crtc_atomic_enable,
++	.disable = dpu_crtc_disable,
++};
++
++static void dpu_crtc_put_resources(struct dpu_crtc *dpu_crtc)
++{
++	if (!IS_ERR_OR_NULL(dpu_crtc->cf))
++		dpu_cf_put(dpu_crtc->cf);
++	if (!IS_ERR_OR_NULL(dpu_crtc->dec))
++		dpu_dec_put(dpu_crtc->dec);
++	if (!IS_ERR_OR_NULL(dpu_crtc->ed))
++		dpu_ed_put(dpu_crtc->ed);
++	if (!IS_ERR_OR_NULL(dpu_crtc->fg))
++		dpu_fg_put(dpu_crtc->fg);
++	if (!IS_ERR_OR_NULL(dpu_crtc->tcon))
++		dpu_tcon_put(dpu_crtc->tcon);
++}
++
++static int dpu_crtc_get_resources(struct dpu_crtc *dpu_crtc,
++				  unsigned int stream_id)
++{
++	struct dpu_soc *dpu = dev_get_drvdata(dpu_crtc->dev->parent);
++	int ret;
++
++	dpu_crtc->cf = dpu_cf_get(dpu, stream_id + 4);
++	if (IS_ERR(dpu_crtc->cf)) {
++		ret = PTR_ERR(dpu_crtc->cf);
++		goto err_out;
++	}
++
++	dpu_crtc->dec = dpu_dec_get(dpu, stream_id);
++	if (IS_ERR(dpu_crtc->dec)) {
++		ret = PTR_ERR(dpu_crtc->dec);
++		goto err_out;
++	}
++
++	dpu_crtc->ed = dpu_ed_get(dpu, stream_id + 4);
++	if (IS_ERR(dpu_crtc->ed)) {
++		ret = PTR_ERR(dpu_crtc->ed);
++		goto err_out;
++	}
++
++	dpu_crtc->fg = dpu_fg_get(dpu, stream_id);
++	if (IS_ERR(dpu_crtc->fg)) {
++		ret = PTR_ERR(dpu_crtc->fg);
++		goto err_out;
++	}
++
++	dpu_crtc->tcon = dpu_tcon_get(dpu, stream_id);
++	if (IS_ERR(dpu_crtc->tcon)) {
++		ret = PTR_ERR(dpu_crtc->tcon);
++		goto err_out;
++	}
++
++	return 0;
++err_out:
++	dpu_crtc_put_resources(dpu_crtc);
++
++	return ret;
++}
++
++static int dpu_crtc_init(struct dpu_crtc *dpu_crtc,
++	struct dpu_client_platformdata *pdata, struct drm_device *drm)
++{
++	struct dpu_soc *dpu = dev_get_drvdata(dpu_crtc->dev->parent);
++	struct device *dev = dpu_crtc->dev;
++	struct drm_crtc *crtc = &dpu_crtc->base;
++	struct dpu_plane_grp *plane_grp = pdata->plane_grp;
++	unsigned int stream_id = pdata->stream_id;
++	int i, ret;
++
++	dpu_crtc->stream_id = stream_id;
++	dpu_crtc->hw_plane_num = plane_grp->hw_plane_num;
++
++	dpu_crtc->plane = devm_kcalloc(dev, dpu_crtc->hw_plane_num,
++					sizeof(*dpu_crtc->plane), GFP_KERNEL);
++	if (!dpu_crtc->plane)
++		return -ENOMEM;
++
++	ret = dpu_crtc_get_resources(dpu_crtc, stream_id);
++	if (ret) {
++		dev_err(dev, "getting resources failed with %d.\n", ret);
++		return ret;
++	}
++
++	plane_grp->res.fg = dpu_crtc->fg;
++	dpu_crtc->plane[0] = dpu_plane_init(drm, 0, stream_id, plane_grp,
++					DRM_PLANE_TYPE_PRIMARY);
++	if (IS_ERR(dpu_crtc->plane[0])) {
++		ret = PTR_ERR(dpu_crtc->plane[0]);
++		dev_err(dev, "initializing plane0 failed with %d.\n", ret);
++		goto err_put_resources;
++	}
++
++	crtc->port = pdata->of_node;
++	drm_crtc_helper_add(crtc, &dpu_helper_funcs);
++	ret = drm_crtc_init_with_planes(drm, crtc, &dpu_crtc->plane[0]->base, NULL,
++			&dpu_crtc_funcs, NULL);
++	if (ret) {
++		dev_err(dev, "adding crtc failed with %d.\n", ret);
++		goto err_put_resources;
++	}
++
++	for (i = 1; i < dpu_crtc->hw_plane_num; i++) {
++		dpu_crtc->plane[i] = dpu_plane_init(drm,
++					drm_crtc_mask(&dpu_crtc->base),
++					stream_id, plane_grp,
++					DRM_PLANE_TYPE_OVERLAY);
++		if (IS_ERR(dpu_crtc->plane[i])) {
++			ret = PTR_ERR(dpu_crtc->plane[i]);
++			dev_err(dev, "initializing plane%d failed with %d.\n",
++								i, ret);
++			goto err_put_resources;
++		}
++	}
++
++	dpu_crtc->irq = dpu_map_irq(dpu, stream_id ?
++				IRQ_DISENGCFG_FRAMECOMPLETE1 :
++				IRQ_DISENGCFG_FRAMECOMPLETE0);
++	ret = devm_request_irq(dev, dpu_crtc->irq, dpu_irq_handler, 0,
++				"imx_drm", dpu_crtc);
++	if (ret < 0) {
++		dev_err(dev, "irq request failed with %d.\n", ret);
++		goto err_put_resources;
++	}
++	disable_irq(dpu_crtc->irq);
++
++	return 0;
++
++err_put_resources:
++	dpu_crtc_put_resources(dpu_crtc);
++
++	return ret;
++}
++
++static int dpu_crtc_bind(struct device *dev, struct device *master, void *data)
++{
++	struct dpu_client_platformdata *pdata = dev->platform_data;
++	struct drm_device *drm = data;
++	struct dpu_crtc *dpu_crtc;
++	int ret;
++
++	dpu_crtc = devm_kzalloc(dev, sizeof(*dpu_crtc), GFP_KERNEL);
++	if (!dpu_crtc)
++		return -ENOMEM;
++
++	dpu_crtc->dev = dev;
++
++	ret = dpu_crtc_init(dpu_crtc, pdata, drm);
++	if (ret)
++		return ret;
++
++	if (!drm->mode_config.funcs)
++		drm->mode_config.funcs = &dpu_drm_mode_config_funcs;
++
++	dev_set_drvdata(dev, dpu_crtc);
++
++	return 0;
++}
++
++static void dpu_crtc_unbind(struct device *dev, struct device *master,
++				void *data)
++{
++	struct dpu_crtc *dpu_crtc = dev_get_drvdata(dev);
++
++	dpu_crtc_put_resources(dpu_crtc);
++}
++
++static const struct component_ops dpu_crtc_ops = {
++	.bind = dpu_crtc_bind,
++	.unbind = dpu_crtc_unbind,
++};
++
++static int dpu_crtc_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++
++	if (!dev->platform_data)
++		return -EINVAL;
++
++	return component_add(dev, &dpu_crtc_ops);
++}
++
++static int dpu_crtc_remove(struct platform_device *pdev)
++{
++	component_del(&pdev->dev, &dpu_crtc_ops);
++	return 0;
++}
++
++static struct platform_driver dpu_crtc_driver = {
++	.driver = {
++		.name = "imx-dpu-crtc",
++	},
++	.probe = dpu_crtc_probe,
++	.remove = dpu_crtc_remove,
++};
++module_platform_driver(dpu_crtc_driver);
++
++MODULE_AUTHOR("NXP Semiconductor");
++MODULE_DESCRIPTION("i.MX DPU CRTC");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:imx-dpu-crtc");
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-kms.c b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+new file mode 100644
+index 0000000..c882471
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+@@ -0,0 +1,279 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include <drm/drmP.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++#include <linux/dma-buf.h>
++#include <linux/reservation.h>
++#include <linux/sort.h>
++#include <video/dpu.h>
++#include "dpu-plane.h"
++#include "imx-drm.h"
++
++static void dpu_drm_output_poll_changed(struct drm_device *dev)
++{
++	struct imx_drm_device *imxdrm = dev->dev_private;
++
++	drm_fbdev_cma_hotplug_event(imxdrm->fbhelper);
++}
++
++static struct drm_plane_state **
++dpu_atomic_alloc_tmp_planes_per_crtc(struct drm_device *dev)
++{
++	int total_planes = dev->mode_config.num_total_plane;
++	struct drm_plane_state **states;
++
++	states = kmalloc_array(total_planes, sizeof(*states), GFP_KERNEL);
++	if (!states)
++		return ERR_PTR(-ENOMEM);
++
++	return states;
++}
++
++static int zpos_cmp(const void *a, const void *b)
++{
++	const struct drm_plane_state *sa = *(struct drm_plane_state **)a;
++	const struct drm_plane_state *sb = *(struct drm_plane_state **)b;
++
++	return sa->normalized_zpos - sb->normalized_zpos;
++}
++
++static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
++					   struct drm_plane_state **states)
++{
++	struct drm_atomic_state *state = crtc_state->state;
++	struct drm_device *dev = state->dev;
++	struct drm_plane *plane;
++	int n = 0;
++
++	drm_for_each_plane_mask(plane, dev, crtc_state->plane_mask) {
++		struct drm_plane_state *plane_state =
++			drm_atomic_get_plane_state(state, plane);
++		if (IS_ERR(plane_state))
++			return PTR_ERR(plane_state);
++		states[n++] = plane_state;
++	}
++
++	sort(states, n, sizeof(*states), zpos_cmp, NULL);
++
++	return n;
++}
++
++static int
++dpu_atomic_compute_plane_base_per_crtc(struct drm_plane_state **states, int n)
++{
++	struct dpu_plane_state *dpstate;
++	int i, left, right, top, bottom, tmp;
++
++	/* compute the plane base */
++	left   = states[0]->crtc_x;
++	top    = states[0]->crtc_y;
++	right  = states[0]->crtc_x + states[0]->crtc_w;
++	bottom = states[0]->crtc_y + states[0]->crtc_h;
++
++	for (i = 1; i < n; i++) {
++		left = min(states[i]->crtc_x, left);
++		top =  min(states[i]->crtc_y, top);
++
++		tmp = states[i]->crtc_x + states[i]->crtc_w;
++		right = max(tmp, right);
++
++		tmp = states[i]->crtc_y + states[i]->crtc_h;
++		bottom = max(tmp, bottom);
++	}
++
++	/* BTW, be smart to compute the layer offset */
++	for (i = 0; i < n; i++) {
++		dpstate = to_dpu_plane_state(states[i]);
++		dpstate->layer_x = states[i]->crtc_x - left;
++		dpstate->layer_y = states[i]->crtc_y - top;
++	}
++
++	/* finally, store the base in plane state */
++	dpstate = to_dpu_plane_state(states[0]);
++	dpstate->base_x = left;
++	dpstate->base_y = top;
++	dpstate->base_w = right - left;
++	dpstate->base_h = bottom - top;
++
++	return 0;
++}
++
++static void
++dpu_atomic_set_top_plane_per_crtc(struct drm_plane_state **states, int n)
++{
++	struct dpu_plane_state *dpstate;
++	int i;
++
++	for (i = 0; i < n; i++) {
++		dpstate = to_dpu_plane_state(states[i]);
++		dpstate->is_top = (i == (n - 1)) ? true : false;
++	}
++}
++
++static void
++dpu_atomic_assign_plane_source_per_crtc(struct drm_plane_state **states, int n)
++{
++	struct dpu_plane_state *dpstate;
++	struct dpu_plane *dplane;
++	unsigned int sid;
++	int i, j;
++
++	/* for active planes only */
++	for (i = 0; i < n; i++) {
++		dpstate = to_dpu_plane_state(states[i]);
++		dplane = to_dpu_plane(states[i]->plane);
++		sid = dplane->stream_id;
++
++		if (sid) {
++			j = dplane->grp->hw_plane_num - (n - i);
++			dpstate->stage = i ? stages[j - 1] : cf_stages[sid];
++			dpstate->source = sources[j];
++			dpstate->blend = blends[j];
++		} else {
++			dpstate->stage = i ? stages[i - 1] : cf_stages[sid];
++			dpstate->source = sources[i];
++			dpstate->blend = blends[i];
++		}
++	}
++}
++
++static int dpu_drm_atomic_check(struct drm_device *dev,
++				struct drm_atomic_state *state)
++{
++	struct drm_crtc *crtc;
++	struct drm_crtc_state *crtc_state;
++	struct drm_plane *plane;
++	struct dpu_plane *dpu_plane;
++	struct dpu_plane_grp *grp[MAX_DPU_PLANE_GRP];
++	int ret, i, grp_id, active_plane[MAX_DPU_PLANE_GRP];
++
++	for (i = 0; i < MAX_DPU_PLANE_GRP; i++) {
++		active_plane[i] = 0;
++		grp[i] = NULL;
++	}
++
++	drm_for_each_crtc(crtc, dev) {
++		crtc_state = drm_atomic_get_crtc_state(state, crtc);
++		if (IS_ERR(crtc_state))
++			return PTR_ERR(crtc_state);
++
++		ret = drm_atomic_add_affected_planes(state, crtc);
++		if (ret)
++			return ret;
++
++		drm_atomic_crtc_state_for_each_plane(plane, crtc_state) {
++			dpu_plane = to_dpu_plane(plane);
++			grp_id = dpu_plane->grp->id;
++			active_plane[grp_id]++;
++
++			if (grp[grp_id] == NULL)
++				grp[grp_id] = dpu_plane->grp;
++		}
++	}
++
++	for (i = 0; i < MAX_DPU_PLANE_GRP; i++)
++		if (grp[i] && active_plane[i] > grp[i]->hw_plane_num)
++			return -EINVAL;
++
++	ret = drm_atomic_helper_check_modeset(dev, state);
++	if (ret)
++		return ret;
++
++	ret = drm_atomic_normalize_zpos(dev, state);
++	if (ret)
++		return ret;
++
++	for_each_crtc_in_state(state, crtc, crtc_state, i) {
++		struct drm_plane_state **states;
++		int n;
++
++		states = dpu_atomic_alloc_tmp_planes_per_crtc(dev);
++		if (IS_ERR(states))
++			return PTR_ERR(states);
++
++		n = dpu_atomic_sort_planes_per_crtc(crtc_state, states);
++		if (n < 0) {
++			kfree(states);
++			return n;
++		}
++
++		/* no active planes? */
++		if (n == 0) {
++			kfree(states);
++			continue;
++		}
++
++		/* 'zpos = 0' means primary plane */
++		if (states[0]->plane->type != DRM_PLANE_TYPE_PRIMARY) {
++			kfree(states);
++			return -EINVAL;
++		}
++
++		ret = dpu_atomic_compute_plane_base_per_crtc(states, n);
++		if (ret) {
++			kfree(states);
++			return ret;
++		}
++
++		dpu_atomic_set_top_plane_per_crtc(states, n);
++
++		dpu_atomic_assign_plane_source_per_crtc(states, n);
++
++		kfree(states);
++	}
++
++	ret = drm_atomic_helper_check_planes(dev, state);
++	if (ret)
++		return ret;
++
++	return ret;
++}
++
++static int dpu_drm_atomic_commit(struct drm_device *dev,
++				 struct drm_atomic_state *state,
++				 bool nonblock)
++{
++	struct drm_plane_state *plane_state;
++	struct drm_plane *plane;
++	struct dma_buf *dma_buf;
++	int i;
++
++	/*
++	 * If the plane fb has an dma-buf attached, fish out the exclusive
++	 * fence for the atomic helper to wait on.
++	 */
++	for_each_plane_in_state(state, plane, plane_state, i) {
++		if ((plane->state->fb != plane_state->fb) && plane_state->fb) {
++			dma_buf = drm_fb_cma_get_gem_obj(plane_state->fb,
++							 0)->base.dma_buf;
++			if (!dma_buf)
++				continue;
++			plane_state->fence =
++				reservation_object_get_excl_rcu(dma_buf->resv);
++		}
++	}
++
++	return drm_atomic_helper_commit(dev, state, nonblock);
++}
++
++const struct drm_mode_config_funcs dpu_drm_mode_config_funcs = {
++	.fb_create = drm_fb_cma_create,
++	.output_poll_changed = dpu_drm_output_poll_changed,
++	.atomic_check = dpu_drm_atomic_check,
++	.atomic_commit = dpu_drm_atomic_commit,
++};
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-kms.h b/drivers/gpu/drm/imx/dpu/dpu-kms.h
+new file mode 100644
+index 0000000..8c42abb
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-kms.h
+@@ -0,0 +1,20 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#ifndef _DPU_KMS_H_
++#define _DPU_KMS_H_
++
++extern const struct drm_mode_config_funcs dpu_drm_mode_config_funcs;
++
++#endif
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.c b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+new file mode 100644
+index 0000000..0db05f0
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+@@ -0,0 +1,325 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include <drm/drmP.h>
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++#include <drm/drm_plane_helper.h>
++#include <video/dpu.h>
++#include "dpu-plane.h"
++#include "imx-drm.h"
++
++/* RGB formats are widely supported by all fetch units */
++static const uint32_t dpu_common_formats[] = {
++	/* DRM_FORMAT_ARGB8888, */
++	DRM_FORMAT_XRGB8888,
++	/* DRM_FORMAT_ABGR8888, */
++	DRM_FORMAT_XBGR8888,
++	/* DRM_FORMAT_RGBA8888, */
++	DRM_FORMAT_RGBX8888,
++	/* DRM_FORMAT_BGRA8888, */
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_RGB888,
++	DRM_FORMAT_BGR888,
++	DRM_FORMAT_RGB565,
++};
++
++static void dpu_plane_destroy(struct drm_plane *plane)
++{
++	struct dpu_plane *dpu_plane = to_dpu_plane(plane);
++
++	drm_plane_cleanup(plane);
++	kfree(dpu_plane);
++}
++
++static void dpu_plane_reset(struct drm_plane *plane)
++{
++	struct dpu_plane_state *state;
++
++	if (plane->state) {
++		__drm_atomic_helper_plane_destroy_state(plane->state);
++		kfree(to_dpu_plane_state(plane->state));
++		plane->state = NULL;
++	}
++
++	state = kzalloc(sizeof(*state), GFP_KERNEL);
++	if (!state)
++		return;
++
++	state->base.zpos = plane->type == DRM_PLANE_TYPE_PRIMARY ? 0 : 1;
++
++	plane->state = &state->base;
++	plane->state->plane = plane;
++	plane->state->rotation = DRM_MODE_ROTATE_0;
++}
++
++static struct drm_plane_state *
++dpu_drm_atomic_plane_duplicate_state(struct drm_plane *plane)
++{
++	struct dpu_plane_state *state, *copy;
++
++	if (WARN_ON(!plane->state))
++		return NULL;
++
++	copy = kmalloc(sizeof(*state), GFP_KERNEL);
++	if (!copy)
++		return NULL;
++
++	__drm_atomic_helper_plane_duplicate_state(plane, &copy->base);
++	state = to_dpu_plane_state(plane->state);
++	copy->stage = state->stage;
++	copy->source = state->source;
++	copy->blend = state->blend;
++	copy->layer_x = state->layer_x;
++	copy->layer_y = state->layer_y;
++	copy->base_x = state->base_x;
++	copy->base_y = state->base_y;
++	copy->base_w = state->base_w;
++	copy->base_h = state->base_h;
++	copy->is_top = state->is_top;
++
++	return &copy->base;
++}
++
++static void dpu_drm_atomic_plane_destroy_state(struct drm_plane *plane,
++					       struct drm_plane_state *state)
++{
++	__drm_atomic_helper_plane_destroy_state(state);
++	kfree(to_dpu_plane_state(state));
++}
++
++static const struct drm_plane_funcs dpu_plane_funcs = {
++	.update_plane	= drm_atomic_helper_update_plane,
++	.disable_plane	= drm_atomic_helper_disable_plane,
++	.destroy	= dpu_plane_destroy,
++	.reset		= dpu_plane_reset,
++	.atomic_duplicate_state	= dpu_drm_atomic_plane_duplicate_state,
++	.atomic_destroy_state	= dpu_drm_atomic_plane_destroy_state,
++};
++
++static int dpu_plane_atomic_check(struct drm_plane *plane,
++				  struct drm_plane_state *state)
++{
++	struct dpu_plane_state *dpstate = to_dpu_plane_state(state);
++	struct drm_crtc_state *crtc_state;
++	struct drm_framebuffer *fb = state->fb;
++	struct drm_gem_cma_object *cma_obj;
++	int bpp;
++
++	/* pure software check */
++	if (plane->type != DRM_PLANE_TYPE_PRIMARY)
++		if (WARN_ON(dpstate->base_x || dpstate->base_y ||
++			    dpstate->base_w || dpstate->base_h))
++			return -EINVAL;
++
++	/* ok to disable */
++	if (!fb) {
++		dpstate->stage = LB_PRIM_SEL__DISABLE;
++		dpstate->source = LB_SEC_SEL__DISABLE;
++		dpstate->blend = ID_NONE;
++		dpstate->layer_x = 0;
++		dpstate->layer_y = 0;
++		dpstate->base_x = 0;
++		dpstate->base_y = 0;
++		dpstate->base_w = 0;
++		dpstate->base_h = 0;
++		dpstate->is_top = false;
++		return 0;
++	}
++
++	/* no scaling */
++	if (state->src_w >> 16 != state->crtc_w ||
++	    state->src_h >> 16 != state->crtc_h)
++		return -EINVAL;
++
++	/* no off screen */
++	if (state->crtc_x < 0 || state->crtc_y < 0)
++		return -EINVAL;
++	if (state->crtc) {
++		crtc_state =
++			drm_atomic_get_existing_crtc_state(state->state,
++							state->crtc);
++		if (WARN_ON(!crtc_state))
++			return -EINVAL;
++
++		if (state->crtc_x + state->crtc_w >
++		    crtc_state->adjusted_mode.hdisplay)
++			return -EINVAL;
++		if (state->crtc_y + state->crtc_h >
++		    crtc_state->adjusted_mode.vdisplay)
++			return -EINVAL;
++	}
++
++	/* base address alignment check */
++	cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
++	bpp = drm_format_plane_cpp(fb->format->format, 0) * 8;
++	switch (bpp) {
++	case 32:
++		if (cma_obj->paddr & 0x3)
++			return -EINVAL;
++		break;
++	case 16:
++		if (cma_obj->paddr & 0x1)
++			return -EINVAL;
++		break;
++	}
++
++	if (fb->pitches[0] > 0x10000)
++		return -EINVAL;
++
++	return 0;
++}
++
++static void dpu_plane_atomic_update(struct drm_plane *plane,
++				    struct drm_plane_state *old_state)
++{
++	struct dpu_plane *dplane = to_dpu_plane(plane);
++	struct drm_plane_state *state = plane->state;
++	struct dpu_plane_state *dpstate = to_dpu_plane_state(state);
++	struct drm_framebuffer *fb = state->fb;
++	struct dpu_plane_res *res = &dplane->grp->res;
++	struct dpu_fetchdecode *fd;
++	struct dpu_layerblend *lb;
++	struct dpu_constframe *cf;
++	struct dpu_extdst *ed;
++	struct drm_gem_cma_object *cma_obj;
++	struct device *dev = plane->dev->dev;
++	unsigned int src_x, src_y, src_w, src_h;
++	int bpp, fd_id, lb_id;
++
++	/*
++	 * Do nothing since the plane is disabled by
++	 * crtc_func->atomic_begin/flush.
++	 */
++	if (!fb)
++		return;
++
++	fd_id = source_to_id(dpstate->source);
++	if (fd_id < 0)
++		return;
++
++	lb_id = blend_to_id(dpstate->blend);
++	if (lb_id < 0)
++		return;
++
++	fd = res->fd[fd_id];
++	lb = res->lb[lb_id];
++
++	cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
++
++	src_x = state->src_x >> 16;
++	src_y = state->src_y >> 16;
++	src_w = state->src_w >> 16;
++	src_h = state->src_h >> 16;
++
++	bpp = drm_format_plane_cpp(fb->format->format, 0) * 8;
++
++	fetchdecode_source_bpp(fd, bpp);
++	fetchdecode_source_stride(fd, fb->pitches[0]);
++	fetchdecode_src_buf_dimensions(fd, src_w, src_h);
++	fetchdecode_set_fmt(fd, fb->format->format);
++	fetchdecode_clipoffset(fd, src_x, src_y);
++	fetchdecode_clipdimensions(fd, src_w, src_h);
++	fetchdecode_layerproperty(fd, true);
++	fetchdecode_framedimensions(fd, state->crtc_w, state->crtc_h);
++	fetchdecode_baseaddress(fd, cma_obj->paddr);
++
++	layerblend_pixengcfg_dynamic_prim_sel(lb, dpstate->stage);
++	layerblend_pixengcfg_dynamic_sec_sel(lb, dpstate->source);
++	layerblend_control(lb, BLEND);
++	layerblend_pixengcfg_clken(lb, CLKEN__AUTOMATIC);
++	layerblend_position(lb, dpstate->layer_x, dpstate->layer_y);
++
++	if (plane->type == DRM_PLANE_TYPE_PRIMARY) {
++		cf = res->cf[dplane->stream_id];
++		constframe_framedimensions(cf,
++					dpstate->base_w, dpstate->base_h);
++		constframe_constantcolor(cf, 0, 0, 0, 0);
++
++		if (state->crtc)
++			framegen_sacfg(res->fg,
++					dpstate->base_x, dpstate->base_y);
++	}
++
++	if (dpstate->is_top) {
++		ed = res->ed[dplane->stream_id];
++		extdst_pixengcfg_src_sel(ed, (extdst_src_sel_t)dpstate->blend);
++	}
++
++	dev_dbg(dev, "[PLANE:%d:%s] source-0x%02x stage-0x%02x blend-0x%02x\n",
++			plane->base.id, plane->name,
++			dpstate->source, dpstate->stage, dpstate->blend);
++}
++
++static const struct drm_plane_helper_funcs dpu_plane_helper_funcs = {
++	.atomic_check = dpu_plane_atomic_check,
++	.atomic_update = dpu_plane_atomic_update,
++};
++
++struct dpu_plane *dpu_plane_init(struct drm_device *drm,
++				 unsigned int possible_crtcs,
++				 unsigned int stream_id,
++				 struct dpu_plane_grp *grp,
++				 enum drm_plane_type type)
++{
++	struct dpu_plane *dpu_plane;
++	struct drm_plane *plane;
++	unsigned int ov_num;
++	int ret;
++
++	dpu_plane = kzalloc(sizeof(*dpu_plane), GFP_KERNEL);
++	if (!dpu_plane)
++		return ERR_PTR(-ENOMEM);
++
++	dpu_plane->stream_id = stream_id;
++	dpu_plane->grp = grp;
++
++	mutex_lock(&grp->lock);
++	list_add_tail(&dpu_plane->head, &grp->list);
++	mutex_unlock(&grp->lock);
++
++	plane = &dpu_plane->base;
++
++	ret = drm_universal_plane_init(drm, plane, possible_crtcs,
++				       &dpu_plane_funcs, dpu_common_formats,
++				       ARRAY_SIZE(dpu_common_formats), NULL,
++				       type, NULL);
++	if (ret) {
++		kfree(dpu_plane);
++		return ERR_PTR(ret);
++	}
++
++	drm_plane_helper_add(plane, &dpu_plane_helper_funcs);
++
++	switch (type) {
++	case DRM_PLANE_TYPE_PRIMARY:
++		ret = drm_plane_create_zpos_immutable_property(plane, 0);
++		break;
++	case DRM_PLANE_TYPE_OVERLAY:
++		/* filter out the primary plane */
++		ov_num = grp->hw_plane_num - 1;
++
++		ret = drm_plane_create_zpos_property(plane, 1, 1, ov_num);
++		break;
++	default:
++		ret = -EINVAL;
++	}
++
++	if (ret)
++		return ERR_PTR(ret);
++
++	return dpu_plane;
++}
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.h b/drivers/gpu/drm/imx/dpu/dpu-plane.h
+new file mode 100644
+index 0000000..913d96e
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.h
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#ifndef __DPU_PLANE_H__
++#define __DPU_PLANE_H__
++
++#include <video/dpu.h>
++#include "imx-drm.h"
++
++#define MAX_DPU_PLANE_GRP	(MAX_CRTC / 2)
++
++struct dpu_plane {
++	struct drm_plane	base;
++	struct dpu_plane_grp	*grp;
++	struct list_head	head;
++	unsigned int		stream_id;
++};
++
++struct dpu_plane_state {
++	struct drm_plane_state	base;
++	lb_prim_sel_t		stage;
++	lb_sec_sel_t		source;
++	dpu_block_id_t		blend;
++	unsigned int		layer_x;
++	unsigned int		layer_y;
++	unsigned int		base_x;
++	unsigned int		base_y;
++	unsigned int		base_w;
++	unsigned int		base_h;
++	bool			is_top;
++};
++
++static const lb_prim_sel_t cf_stages[] = {LB_PRIM_SEL__CONSTFRAME0,
++					  LB_PRIM_SEL__CONSTFRAME1};
++static const lb_prim_sel_t stages[] = {LB_PRIM_SEL__LAYERBLEND0,
++				       LB_PRIM_SEL__LAYERBLEND1,
++				       LB_PRIM_SEL__LAYERBLEND2,
++				       LB_PRIM_SEL__LAYERBLEND3,
++				       LB_PRIM_SEL__LAYERBLEND4,
++				       LB_PRIM_SEL__LAYERBLEND5};
++static const lb_sec_sel_t sources[] = {LB_SEC_SEL__FETCHDECODE0,
++				       LB_SEC_SEL__FETCHDECODE1,
++				       LB_SEC_SEL__FETCHDECODE2,
++				       LB_SEC_SEL__FETCHDECODE3};
++static const dpu_block_id_t blends[] = {ID_LAYERBLEND0, ID_LAYERBLEND1,
++					ID_LAYERBLEND2, ID_LAYERBLEND3,
++					ID_LAYERBLEND4, ID_LAYERBLEND5};
++
++static inline struct dpu_plane *to_dpu_plane(struct drm_plane *plane)
++{
++	return container_of(plane, struct dpu_plane, base);
++}
++
++static inline struct dpu_plane_state *
++to_dpu_plane_state(struct drm_plane_state *plane_state)
++{
++	return container_of(plane_state, struct dpu_plane_state, base);
++}
++
++static inline int source_to_id(lb_sec_sel_t source)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(sources); i++) {
++		if (source == sources[i])
++			return i;
++	}
++
++	WARN_ON(1);
++	return -EINVAL;
++}
++
++static inline int blend_to_id(dpu_block_id_t blend)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(blends); i++) {
++		if (blend == blends[i])
++			return i;
++	}
++
++	WARN_ON(1);
++	return -EINVAL;
++}
++
++struct dpu_plane *dpu_plane_init(struct drm_device *drm,
++				 unsigned int possible_crtcs,
++				 unsigned int stream_id,
++				 struct dpu_plane_grp *grp,
++				 enum drm_plane_type type);
++#endif
+diff --git a/drivers/gpu/drm/imx/imx-drm-core.c b/drivers/gpu/drm/imx/imx-drm-core.c
+index 5870aed..83034e4 100644
+--- a/drivers/gpu/drm/imx/imx-drm-core.c
++++ b/drivers/gpu/drm/imx/imx-drm-core.c
+@@ -28,6 +28,7 @@
+ #include <drm/drm_plane_helper.h>
+ #include <drm/drm_of.h>
+ #include <video/imx-ipu-v3.h>
++#include <video/dpu.h>
+ 
+ #include "imx-drm.h"
+ #include "ipuv3/ipuv3-plane.h"
+@@ -116,6 +117,10 @@ static int compare_of(struct device *dev, void *data)
+ 		struct ipu_client_platformdata *pdata = dev->platform_data;
+ 
+ 		return pdata->of_node == np;
++	} else if (strcmp(dev->driver->name, "imx-dpu-crtc") == 0) {
++		struct dpu_client_platformdata *pdata = dev->platform_data;
++
++		return pdata->of_node == np;
+ 	}
+ 
+ 	/* Special case for LDB, one device for two channels */
+diff --git a/drivers/gpu/imx/dpu/Kconfig b/drivers/gpu/imx/dpu/Kconfig
+index 1a1f5a9..d5f0e55 100644
+--- a/drivers/gpu/imx/dpu/Kconfig
++++ b/drivers/gpu/imx/dpu/Kconfig
+@@ -1,7 +1,7 @@
+ config IMX_DPU_CORE
+ 	tristate "i.MX DPU core support"
+ 	depends on ARCH_FSL_IMX8QM || ARCH_FSL_IMX8QXP
+-	depends on RESET_CONTROLLER
++	select RESET_CONTROLLER
+ 	select GENERIC_IRQ_CHIP
+ 	help
+ 	  Choose this if you have a Freescale i.MX8QM or i.MX8QXP system and
+-- 
+1.7.9.5
+

@@ -1,0 +1,231 @@
+From 1e716d0210385e46e65fff41e4754eaf5807bd26 Mon Sep 17 00:00:00 2001
+From: Xianzhong <xianzhong.li@nxp.com>
+Date: Mon, 22 Oct 2018 19:56:47 +0800
+Subject: [PATCH 4906/5242] MGS-4338-1 [#imx-1217] fix GPU probe delay to
+ query frequency
+
+commit  bb74c4fbb3325d02661bf3bcd2af299f1ffccf6b from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+it is not necessary to query frequency when hardware initialize,
+there are two cases which really need to query frequency,
+1. application query (such as openCL initialization) with ioctl,
+2. debugfs with "cat /sys/kernel/debug/gc/clk"
+
+removed the query from driver probe, no impact on real cases.
+
+Signed-off-by: Xianzhong <xianzhong.li@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../hal/kernel/arch/gc_hal_kernel_hardware.c       |   77 +++++++++++++++++++-
+ .../hal/kernel/arch/gc_hal_kernel_hardware.h       |    5 ++
+ drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel.c     |    3 +
+ .../hal/os/linux/kernel/gc_hal_kernel_device.c     |   34 ++++++---
+ 4 files changed, 106 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+index 8c0d2a3..eb21395 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+@@ -13949,7 +13949,7 @@
+     OUT gctUINT64 *ShStart
+     )
+ {
+-    gceSTATUS status;
++    gceSTATUS status = gcvSTATUS_OK;
+     gctUINT64 mcStart, shStart;
+ 
+     gcmkONERROR(gckOS_GetTime(&mcStart));
+@@ -13981,7 +13981,7 @@
+     OUT gctUINT32 *ShClk
+     )
+ {
+-    gceSTATUS status;
++    gceSTATUS status = gcvSTATUS_OK;
+     gctUINT64 mcEnd, shEnd;
+     gctUINT32 mcCycle, shCycle;
+     gctUINT64 mcFreq, shFreq = 0;
+@@ -14025,4 +14025,77 @@
+     return status;
+ }
+ 
++/*******************************************************************************
++**
++**  gckHARDWARE_QueryFrequency
++**
++**  Query current hardware frequency.
++**
++**  INPUT:
++**
++**      gckHARDWARE Hardware
++**          Pointer to an gckHARDWARE object.
++**
++*/
++gceSTATUS
++gckHARDWARE_QueryFrequency(
++    IN gckHARDWARE Hardware
++    )
++{
++    gctUINT64 mcStart, shStart;
++    gctUINT32 mcClk, shClk;
++    gceSTATUS status;
++    gctUINT32 powerManagement = 0;
++
++    gcmkHEADER_ARG("Hardware=0x%p", Hardware);
++
++    gcmkVERIFY_ARGUMENT(Hardware != NULL);
++
++    mcStart = shStart = 0;
++    mcClk   = shClk   = 0;
++
++    gckOS_QueryOption(Hardware->os, "powerManagement", &powerManagement);
++
++    if (powerManagement)
++    {
++        gcmkONERROR(gckHARDWARE_SetPowerManagement(
++            Hardware, gcvFALSE
++            ));
++    }
++
++    gcmkONERROR(gckHARDWARE_SetPowerManagementState(
++        Hardware, gcvPOWER_ON_AUTO
++        ));
++
++    gckHARDWARE_EnterQueryClock(Hardware, &mcStart, &shStart);
++
++    gcmkONERROR(gckOS_Delay(Hardware->os, 50));
++
++    if (mcStart)
++    {
++        gckHARDWARE_ExitQueryClock(Hardware,
++                                   mcStart, shStart,
++                                   &mcClk, &shClk);
++
++        Hardware->mcClk = mcClk;
++        Hardware->shClk = shClk;
++    }
++
++    if (powerManagement)
++    {
++        gcmkONERROR(gckHARDWARE_SetPowerManagement(
++            Hardware, gcvTRUE
++            ));
++    }
++
++    gcmkFOOTER_NO();
++
++    return gcvSTATUS_OK;
++
++OnError:
++    gcmkFOOTER();
++
++    return status;
++}
++
+ 
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h
+index e1e7de6..c1de85f 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h
++++ b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.h
+@@ -355,6 +355,11 @@ struct _gckHARDWARE
+     OUT gctUINT32 *ShClk
+     );
+ 
++gceSTATUS
++gckHARDWARE_QueryFrequency(
++    IN gckHARDWARE Hardware
++    );
++
+ #define gcmkWRITE_MEMORY(logical, data) \
+     do { \
+     gcmkVERIFY_OK(gckOS_WriteMemory(os, logical, data)); \
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel.c b/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel.c
+index a93a256..7ad5956 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/gc_hal_kernel.c
+@@ -2331,6 +2331,9 @@
+ 
+     case gcvHAL_QUERY_CHIP_FREQUENCY:
+         /* Query chip clock. */
++        gcmkONERROR(
++            gckHARDWARE_QueryFrequency(Kernel->hardware));
++
+         Interface->u.QueryChipFrequency.mcClk = Kernel->hardware->mcClk;
+         Interface->u.QueryChipFrequency.shClk = Kernel->hardware->shClk;
+         break;
+diff --git a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_device.c b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_device.c
+index d11b6dd..2fd668a 100644
+--- a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_device.c
++++ b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_device.c
+@@ -2097,6 +2097,13 @@ static irqreturn_t isrRoutineVG(int irq, void *ctxt)
+     return gcvSTATUS_OK;
+ }
+ 
++/*******************************************************************************
++**
++**  gckGALDEVICE_QueryFrequency
++**
++**  Query frequency for all the hardwares.
++**
++*/
+ gceSTATUS
+ gckGALDEVICE_QueryFrequency(
+     IN gckGALDEVICE Device
+@@ -2154,29 +2161,36 @@ static irqreturn_t isrRoutineVG(int irq, void *ctxt)
+         }
+ #endif
+ 
+-        if (Device->kernels[i] && mcStart[i])
++        if (Device->kernels[i])
+         {
+             hardware = Device->kernels[i]->hardware;
+ 
++            if (mcStart[i])
++            {
++                gckHARDWARE_ExitQueryClock(hardware,
++                                           mcStart[i], shStart[i],
++                                           &mcClk[i], &shClk[i]);
++            }
++
++            hardware->mcClk = mcClk[i];
++            hardware->shClk = shClk[i];
++
+             if (Device->args.powerManagement)
+             {
+                 gcmkONERROR(gckHARDWARE_SetPowerManagement(
+                     hardware, gcvTRUE
+                     ));
+             }
+-
+-            gckHARDWARE_ExitQueryClock(hardware,
+-                                       mcStart[i], shStart[i],
+-                                       &mcClk[i], &shClk[i]);
+-
+-            hardware->mcClk = mcClk[i];
+-            hardware->shClk = shClk[i];
+         }
+     }
+ 
+-OnError:
+     gcmkFOOTER_NO();
+ 
++    return gcvSTATUS_OK;
++
++OnError:
++    gcmkFOOTER();
++
+     return status;
+ }
+ 
+@@ -2214,8 +2228,6 @@ static irqreturn_t isrRoutineVG(int irq, void *ctxt)
+     /* Start the kernel thread. */
+     gcmkONERROR(gckGALDEVICE_Start_Threads(Device));
+ 
+-    gcmkONERROR(gckGALDEVICE_QueryFrequency(Device));
+-
+     for (i = 0; i < gcvCORE_COUNT; i++)
+     {
+         if (i == gcvCORE_VG)
+-- 
+1.7.9.5
+

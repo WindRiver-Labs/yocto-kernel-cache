@@ -1,0 +1,224 @@
+From dc4ccff6c22b3f9678194f141520770dbbdaf9aa Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Wed, 14 Mar 2018 14:10:13 +0800
+Subject: [PATCH 3487/5242] MLK-17803 drm/imx: dpu: kms: Correct the way to do
+ DPR manual/auto mode switch
+
+commit  6bf594228b9c47e2cbb94b743d81bb20f5977558 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The DPR works in manual mode for the first frame and we need to
+switch it to auto mode so that auto shadow load mechanism works.
+The designers require us to switch the DPR manual mode to auto mode
+directly for display controllers instead of using the DPR control
+done irq handler, because the irq will not come in some cases(which
+leads to shadow load failure).  Finer switch operations on DPR
+register bits are needed for SW_SHADOW_LOAD_SEL, SHADOW_LOAD_EN,
+RUN_EN and REPEAT_EN.  Also, for overlay planes, we need to wait for
+a frame additionally in the "on-the-fly" cases to make sure the
+switch is successful.  In all, this patch should be able to address
+frame dropping and screen tearing issue(due to the shadow load
+failure) when users play video on overlay planes.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-plane.c   |   19 +++++++++++++------
+ drivers/gpu/imx/dpu/dpu-fetchdecode.c |   11 ++++++++++-
+ drivers/gpu/imx/imx8_dprc.c           |   25 +++++++++++++++++++------
+ include/video/dpu.h                   |    1 +
+ include/video/imx8-prefetch.h         |    3 ++-
+ 5 files changed, 45 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.c b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+index 8a3aeab..606ad1f 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+@@ -412,7 +412,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	struct dpu_layerblend *lb;
+ 	struct dpu_constframe *cf;
+ 	struct dpu_extdst *ed;
+-	struct dpu_framegen *fg;
++	struct dpu_framegen *fg = res->fg[dplane->stream_id];
+ 	struct device *dev = plane->dev->dev;
+ 	dma_addr_t baseaddr, uv_baseaddr = 0;
+ 	dpu_block_id_t fe_id, vs_id = ID_NONE, hs_id;
+@@ -421,6 +421,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	int bpp, fd_id, lb_id;
+ 	bool need_fetcheco = false, need_hscaler = false, need_vscaler = false;
+ 	bool prefetch_start = false, aux_prefetch_start = false;
++	bool need_modeset;
++	bool is_overlay = plane->type == DRM_PLANE_TYPE_OVERLAY;
+ 
+ 	/*
+ 	 * Do nothing since the plane is disabled by
+@@ -429,6 +431,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	if (!fb)
+ 		return;
+ 
++	need_modeset = drm_atomic_crtc_needs_modeset(state->crtc->state);
++
+ 	fd_id = source_to_id(dpstate->source);
+ 	if (fd_id < 0)
+ 		return;
+@@ -486,7 +490,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	if (dpstate->use_prefetch &&
+ 	    (fetchdecode_get_stream_id(fd) == DPU_PLANE_SRC_DISABLED ||
+-	     drm_atomic_crtc_needs_modeset(state->crtc->state)))
++	     need_modeset))
+ 		prefetch_start = true;
+ 
+ 	fetchdecode_set_burstlength(fd, baseaddr, dpstate->use_prefetch);
+@@ -510,7 +514,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 
+ 		if (dpstate->use_prefetch &&
+ 		    (fetcheco_get_stream_id(fe) == DPU_PLANE_SRC_DISABLED ||
+-		     drm_atomic_crtc_needs_modeset(state->crtc->state)))
++		     need_modeset))
+ 			aux_prefetch_start = true;
+ 
+ 		fetchdecode_pixengcfg_dynamic_src_sel(fd,
+@@ -599,8 +603,12 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 
+ 		fetchdecode_reg_update_prefetch(fd);
+ 
+-		if (prefetch_start || aux_prefetch_start)
+-			fetchdecode_prefetch_enable_first_frame_irq(fd);
++		if (prefetch_start || aux_prefetch_start) {
++			fetchdecode_prefetch_first_frame_handle(fd);
++
++			if (!need_modeset && is_overlay)
++				framegen_wait_for_frame_counter_moving(fg);
++		}
+ 
+ 		dev_dbg(dev, "[PLANE:%d:%s] use prefetch\n",
+ 					plane->base.id, plane->name);
+@@ -623,7 +631,6 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 					dpstate->base_w, dpstate->base_h);
+ 		constframe_constantcolor(cf, 0, 0, 0, 0);
+ 
+-		fg = res->fg[dplane->stream_id];
+ 		framegen_sacfg(fg, dpstate->base_x, dpstate->base_y);
+ 	}
+ 
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchdecode.c b/drivers/gpu/imx/dpu/dpu-fetchdecode.c
+index e8d4ec8..6723132 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchdecode.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchdecode.c
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2016 Freescale Semiconductor, Inc.
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -773,6 +773,15 @@ void fetchdecode_reg_update_prefetch(struct dpu_fetchdecode *fd)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_reg_update_prefetch);
+ 
++void fetchdecode_prefetch_first_frame_handle(struct dpu_fetchdecode *fd)
++{
++	if (WARN_ON(!fd || !fd->dprc))
++		return;
++
++	dprc_first_frame_handle(fd->dprc);
++}
++EXPORT_SYMBOL_GPL(fetchdecode_prefetch_first_frame_handle);
++
+ void fetchdecode_prefetch_irq_handle(struct dpu_fetchdecode *fd)
+ {
+ 	if (WARN_ON(!fd || !fd->dprc))
+diff --git a/drivers/gpu/imx/imx8_dprc.c b/drivers/gpu/imx/imx8_dprc.c
+index 6afaf6b..f1c42b0 100644
+--- a/drivers/gpu/imx/imx8_dprc.c
++++ b/drivers/gpu/imx/imx8_dprc.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -447,10 +447,19 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 	dprc_write(dprc, val, MODE_CTRL0);
+ 
+ 	if (start) {
+-		val = RUN_EN | REPEAT_EN | SHADOW_LOAD_EN;
+ 		/* software shadow load for the first frame */
+-		val |= SW_SHADOW_LOAD_SEL;
+-		dprc_write(dprc, val, SYSTEM_CTRL0);
++		val = SW_SHADOW_LOAD_SEL;
++		if (dprc->is_blit_chan) {
++			val |= RUN_EN | REPEAT_EN | SHADOW_LOAD_EN;
++			dprc_write(dprc, val, SYSTEM_CTRL0);
++		} else {
++			val |= SHADOW_LOAD_EN;
++			dprc_write(dprc, val, SYSTEM_CTRL0);
++
++			/* and then, run... */
++			val |= RUN_EN | REPEAT_EN;
++			dprc_write(dprc, val, SYSTEM_CTRL0);
++		}
+ 	}
+ 
+ 	prg_configure(dprc->prgs[0], width, height, x_offset, y_offset,
+@@ -475,17 +484,21 @@ void dprc_reg_update(struct dprc *dprc)
+ }
+ EXPORT_SYMBOL_GPL(dprc_reg_update);
+ 
+-static void dprc_first_frame_handle(struct dprc *dprc)
++void dprc_first_frame_handle(struct dprc *dprc)
+ {
+ 	if (WARN_ON(!dprc))
+ 		return;
+ 
+-	dprc_write(dprc, SW_SHADOW_LOAD_SEL, SYSTEM_CTRL0 + CLR);
++	if (dprc->is_blit_chan)
++		dprc_write(dprc, SW_SHADOW_LOAD_SEL, SYSTEM_CTRL0 + CLR);
++	else
++		dprc_write(dprc, REPEAT_EN, SYSTEM_CTRL0);
+ 
+ 	prg_shadow_enable(dprc->prgs[0]);
+ 	if (dprc->use_aux_prg)
+ 		prg_shadow_enable(dprc->prgs[1]);
+ }
++EXPORT_SYMBOL_GPL(dprc_first_frame_handle);
+ 
+ void dprc_irq_handle(struct dprc *dprc)
+ {
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index 8b7f456..14dfee2 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -515,6 +515,7 @@ void fetchdecode_yuv_constantcolor(struct dpu_fetchdecode *fd,
+ void fetchdecode_enable_prefetch(struct dpu_fetchdecode *fd);
+ void fetchdecode_disable_prefetch(struct dpu_fetchdecode *fd);
+ void fetchdecode_reg_update_prefetch(struct dpu_fetchdecode *fd);
++void fetchdecode_prefetch_first_frame_handle(struct dpu_fetchdecode *fd);
+ void fetchdecode_prefetch_irq_handle(struct dpu_fetchdecode *fd);
+ void fetchdecode_prefetch_enable_first_frame_irq(struct dpu_fetchdecode *fd);
+ bool fetchdecode_has_prefetch(struct dpu_fetchdecode *fd);
+diff --git a/include/video/imx8-prefetch.h b/include/video/imx8-prefetch.h
+index 946c491..e621ad0 100644
+--- a/include/video/imx8-prefetch.h
++++ b/include/video/imx8-prefetch.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -55,6 +55,7 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 		    unsigned long baddr, unsigned long uv_baddr,
+ 		    bool start, bool aux_start);
+ void dprc_reg_update(struct dprc *dprc);
++void dprc_first_frame_handle(struct dprc *dprc);
+ void dprc_irq_handle(struct dprc *dprc);
+ void dprc_enable_ctrl_done_irq(struct dprc *dprc);
+ bool dprc_format_supported(struct dprc *dprc, u32 format, u64 modifier);
+-- 
+1.7.9.5
+

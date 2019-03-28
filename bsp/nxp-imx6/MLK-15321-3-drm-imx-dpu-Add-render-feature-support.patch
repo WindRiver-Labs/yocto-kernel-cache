@@ -1,0 +1,393 @@
+From b34d4c0d58bbdd401d7c524ea3ed68342600a343 Mon Sep 17 00:00:00 2001
+From: Meng Mingming <mingming.meng@nxp.com>
+Date: Thu, 31 Aug 2017 17:14:06 +0800
+Subject: [PATCH 2479/5242] MLK-15321-3 drm/imx: dpu: Add render feature
+ support
+
+commit  a5a5d8268df7627c3d19170ed9e05e09cfc23a68 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Implement Blt engine as DRM renderer.
+Add dpu ioctl to support imx-drm render feature.
+
+Signed-off-by: Adrian Negreanu <adrian.negreanu@nxp.com>
+Signed-off-by: Marius Vlad <marius-cristian.vlad@nxp.com>
+Signed-off-by: Meng Mingming <mingming.meng@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/Makefile   |    3 +
+ drivers/gpu/drm/imx/dpu/dpu-blit.c |  270 ++++++++++++++++++++++++++++++++++++
+ include/uapi/drm/imx_drm.h         |   73 ++++++++++
+ 3 files changed, 346 insertions(+)
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-blit.c
+ create mode 100644 include/uapi/drm/imx_drm.h
+
+diff --git a/drivers/gpu/drm/imx/dpu/Makefile b/drivers/gpu/drm/imx/dpu/Makefile
+index f29915f..c09e487 100644
+--- a/drivers/gpu/drm/imx/dpu/Makefile
++++ b/drivers/gpu/drm/imx/dpu/Makefile
+@@ -2,3 +2,6 @@ ccflags-y += -Idrivers/gpu/drm/imx
+ 
+ imx-dpu-crtc-objs := dpu-crtc.o dpu-plane.o dpu-kms.o
+ obj-$(CONFIG_DRM_IMX_DPU) += imx-dpu-crtc.o
++
++imx-dpu-render-objs := dpu-blit.o
++obj-$(CONFIG_DRM_IMX_DPU) += imx-dpu-render.o
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-blit.c b/drivers/gpu/drm/imx/dpu/dpu-blit.c
+new file mode 100644
+index 0000000..fae1d133
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-blit.c
+@@ -0,0 +1,270 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include <drm/drmP.h>
++#include <drm/imx_drm.h>
++#include <linux/component.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <video/dpu.h>
++
++#include "imx-drm.h"
++
++struct imx_drm_dpu_bliteng {
++	struct dpu_bliteng *dpu_be;
++	struct list_head list;
++};
++
++static DEFINE_MUTEX(imx_drm_dpu_bliteng_lock);
++static LIST_HEAD(imx_drm_dpu_bliteng_list);
++
++static int imx_dpu_num;
++
++static struct imx_drm_dpu_bliteng *imx_drm_dpu_bliteng_find_by_id(s32 id)
++{
++	struct imx_drm_dpu_bliteng *bliteng;
++
++	mutex_lock(&imx_drm_dpu_bliteng_lock);
++
++	list_for_each_entry(bliteng, &imx_drm_dpu_bliteng_list, list) {
++		if (id == dpu_bliteng_get_id(bliteng->dpu_be)) {
++			mutex_unlock(&imx_drm_dpu_bliteng_lock);
++			return bliteng;
++		}
++	}
++
++	mutex_unlock(&imx_drm_dpu_bliteng_lock);
++
++	return NULL;
++}
++
++static int imx_drm_dpu_set_cmdlist_ioctl(struct drm_device *drm_dev, void *data,
++					  struct drm_file *file)
++{
++	struct drm_imx_dpu_set_cmdlist *req;
++	struct imx_drm_dpu_bliteng *bliteng;
++	struct dpu_bliteng *dpu_be;
++	u32 cmd_nr, *cmd, *cmd_list;
++	void *user_data;
++	s32 id = 0;
++	int ret;
++
++	req = data;
++	user_data = (void *)(unsigned long)req->user_data;
++	if (copy_from_user(&id, (void __user *)user_data,
++		sizeof(id))) {
++		return -EFAULT;
++	}
++
++	if (id != 0 && id != 1)
++		return -EINVAL;
++
++	bliteng = imx_drm_dpu_bliteng_find_by_id(id);
++	if (!bliteng) {
++		DRM_ERROR("Failed to get dpu_bliteng\n");
++		return -ENODEV;
++	}
++
++	dpu_be = bliteng->dpu_be;
++
++retry:
++	ret = dpu_be_get(dpu_be);
++	if (ret == -EBUSY)
++		goto retry;
++
++	cmd_nr = req->cmd_nr;
++	cmd = (u32 *)(unsigned long)req->cmd;
++	cmd_list = dpu_bliteng_get_cmd_list(dpu_be);
++
++	if (copy_from_user(cmd_list, (void __user *)cmd,
++			sizeof(*cmd) * cmd_nr)) {
++		ret = -EFAULT;
++		goto err;
++	}
++
++	ret = dpu_be_blit(dpu_be, cmd_list, cmd_nr);
++
++err:
++	dpu_be_put(dpu_be);
++
++	return ret;
++}
++
++static int imx_drm_dpu_wait_ioctl(struct drm_device *drm_dev, void *data,
++				  struct drm_file *file)
++{
++	struct drm_imx_dpu_wait *wait;
++	struct imx_drm_dpu_bliteng *bliteng;
++	struct dpu_bliteng *dpu_be;
++	void *user_data;
++	s32 id = 0;
++	int ret;
++
++	wait = data;
++	user_data = (void *)(unsigned long)wait->user_data;
++	if (copy_from_user(&id, (void __user *)user_data,
++		sizeof(id))) {
++		return -EFAULT;
++	}
++
++	if (id != 0 && id != 1)
++		return -EINVAL;
++
++	bliteng = imx_drm_dpu_bliteng_find_by_id(id);
++	if (!bliteng) {
++		DRM_ERROR("Failed to get dpu_bliteng\n");
++		return -ENODEV;
++	}
++
++	dpu_be = bliteng->dpu_be;
++
++retry:
++	ret = dpu_be_get(dpu_be);
++	if (ret == -EBUSY)
++		goto retry;
++
++	dpu_be_wait(dpu_be);
++
++	dpu_be_put(dpu_be);
++
++	return ret;
++}
++
++static int imx_drm_dpu_get_param_ioctl(struct drm_device *drm_dev, void *data,
++				       struct drm_file *file)
++{
++	enum drm_imx_dpu_param *param = data;
++	int ret;
++
++	switch (*param) {
++	case (DRM_IMX_MAX_DPUS):
++		ret = imx_dpu_num;
++		break;
++	default:
++		ret = -EINVAL;
++		DRM_ERROR("Unknown param![%d]\n", *param);
++		break;
++	}
++
++	return ret;
++}
++
++static struct drm_ioctl_desc imx_drm_dpu_ioctls[] = {
++	DRM_IOCTL_DEF_DRV(IMX_DPU_SET_CMDLIST, imx_drm_dpu_set_cmdlist_ioctl,
++			DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(IMX_DPU_WAIT, imx_drm_dpu_wait_ioctl,
++			DRM_RENDER_ALLOW),
++	DRM_IOCTL_DEF_DRV(IMX_DPU_GET_PARAM, imx_drm_dpu_get_param_ioctl,
++			DRM_RENDER_ALLOW),
++};
++
++static int dpu_bliteng_bind(struct device *dev, struct device *master,
++			    void *data)
++{
++	struct drm_device *drm = (struct drm_device *)data;
++	struct imx_drm_dpu_bliteng *bliteng;
++	struct dpu_bliteng *dpu_bliteng = NULL;
++	int ret;
++
++	bliteng = devm_kzalloc(dev, sizeof(*bliteng), GFP_KERNEL);
++	if (!bliteng)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&bliteng->list);
++
++	ret = dpu_bliteng_get_empty_instance(&dpu_bliteng, dev);
++	if (ret)
++		return ret;
++
++	dpu_bliteng_set_id(dpu_bliteng, imx_dpu_num);
++	dpu_bliteng_set_dev(dpu_bliteng, dev);
++
++	ret = dpu_bliteng_init(dpu_bliteng);
++	if (ret)
++		return ret;
++
++	mutex_lock(&imx_drm_dpu_bliteng_lock);
++	bliteng->dpu_be = dpu_bliteng;
++	list_add_tail(&bliteng->list, &imx_drm_dpu_bliteng_list);
++	mutex_unlock(&imx_drm_dpu_bliteng_lock);
++
++	dev_set_drvdata(dev, dpu_bliteng);
++
++	imx_dpu_num++;
++
++	if (drm->driver->num_ioctls == 0) {
++		drm->driver->ioctls = imx_drm_dpu_ioctls;
++		drm->driver->num_ioctls = ARRAY_SIZE(imx_drm_dpu_ioctls);
++	}
++
++	return 0;
++}
++
++static void dpu_bliteng_unbind(struct device *dev, struct device *master,
++			       void *data)
++{
++	struct drm_device *drm = (struct drm_device *)data;
++	struct imx_drm_dpu_bliteng *bliteng;
++	struct dpu_bliteng *dpu_bliteng = dev_get_drvdata(dev);
++	s32 id = dpu_bliteng_get_id(dpu_bliteng);
++
++	bliteng = imx_drm_dpu_bliteng_find_by_id(id);
++	list_del(&bliteng->list);
++
++	dpu_bliteng_fini(dpu_bliteng);
++
++	imx_dpu_num--;
++
++	if (drm->driver->num_ioctls != 0) {
++		drm->driver->ioctls = NULL;
++		drm->driver->num_ioctls = 0;
++	}
++}
++
++static const struct component_ops dpu_bliteng_ops = {
++	.bind = dpu_bliteng_bind,
++	.unbind = dpu_bliteng_unbind,
++};
++
++static int dpu_bliteng_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++
++	if (!dev->platform_data)
++		return -EINVAL;
++
++	return component_add(dev, &dpu_bliteng_ops);
++}
++
++static int dpu_bliteng_remove(struct platform_device *pdev)
++{
++	component_del(&pdev->dev, &dpu_bliteng_ops);
++	return 0;
++}
++
++struct platform_driver dpu_bliteng_driver = {
++	.driver = {
++		.name = "imx-drm-dpu-bliteng",
++	},
++	.probe = dpu_bliteng_probe,
++	.remove = dpu_bliteng_remove,
++};
++
++module_platform_driver(dpu_bliteng_driver);
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("NXP Semiconductor");
++MODULE_DESCRIPTION("i.MX DRM DPU BLITENG");
+diff --git a/include/uapi/drm/imx_drm.h b/include/uapi/drm/imx_drm.h
+new file mode 100644
+index 0000000..b285388
+--- /dev/null
++++ b/include/uapi/drm/imx_drm.h
+@@ -0,0 +1,73 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _UAPI_IMX_DRM_H_
++#define _UAPI_IMX_DRM_H_
++
++#include "drm.h"
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#define DRM_IMX_DPU_SET_CMDLIST                 0x00
++#define DRM_IMX_DPU_WAIT                        0x01
++#define DRM_IMX_DPU_GET_PARAM                   0x02
++
++#define DRM_IOCTL_IMX_DPU_SET_CMDLIST   DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_IMX_DPU_SET_CMDLIST, struct drm_imx_dpu_set_cmdlist)
++#define DRM_IOCTL_IMX_DPU_WAIT          DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_IMX_DPU_WAIT, struct drm_imx_dpu_wait)
++#define DRM_IOCTL_IMX_DPU_GET_PARAM     DRM_IOWR(DRM_COMMAND_BASE + \
++		DRM_IMX_DPU_GET_PARAM, enum drm_imx_dpu_param)
++
++/**
++ * struct drm_imx_dpu_set_cmdlist - ioctl argument for
++ * DRM_IMX_DPU_SET_CMDLIST.
++ */
++struct drm_imx_dpu_set_cmdlist {
++	__u64	cmd;
++	__u32	cmd_nr;
++
++	/* reserved */
++	__u64	user_data;
++};
++
++/**
++ * struct drm_imx_dpu_wait - ioctl argument for
++ * DRM_IMX_DPU_WAIT.
++ *
++ */
++struct drm_imx_dpu_wait {
++	/* reserved */
++	__u64   user_data;
++};
++
++/**
++ * enum drm_imx_dpu_param - ioctl argument for
++ * DRM_IMX_DPU_GET_PARAM.
++ *
++ */
++enum drm_imx_dpu_param {
++	DRM_IMX_MAX_DPUS,
++};
++
++#if defined(__cplusplus)
++}
++#endif
++
++#endif /* _UAPI_IMX_DRM_H_ */
+-- 
+1.7.9.5
+

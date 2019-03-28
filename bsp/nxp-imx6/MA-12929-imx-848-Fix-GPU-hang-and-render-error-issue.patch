@@ -1,0 +1,115 @@
+From 9fd4c3c5d9ecc06bd9dc0ec76f60a2bc721e178b Mon Sep 17 00:00:00 2001
+From: Richard Liu <xuegang.liu@nxp.com>
+Date: Thu, 27 Sep 2018 22:15:29 +0800
+Subject: [PATCH 4744/5242] MA-12929 [#imx-848] Fix GPU hang and render error
+ issue with frame compression
+
+commit  0d8e68879b314dcd7a1e23c81bb0c9fd2e68eca1 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Fill tile status node with tillStatusFiller first time.
+Refine surface cache mode related code to make sure it is immutable.
+
+Test cases:
+mirada_AA: GPU Hang when run Filrate case on 8mscale_O81
+
+Change-Id: I44a00b07bec7bdf8af7408877d9e0f95316dd88b
+Signed-off-by: Richard Liu <xuegang.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../hal/kernel/arch/gc_hal_kernel_hardware.c       |    8 +++++
+ .../hal/os/linux/kernel/gc_hal_kernel_drm.c        |   38 ++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+index 9a2fd6d..8c0d2a3 100644
+--- a/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
++++ b/drivers/mxc/gpu-viv/hal/kernel/arch/gc_hal_kernel_hardware.c
+@@ -1350,6 +1350,14 @@
+         available = database->PE_TILE_CACHE_FLUSH_FIX;
+         break;
+ 
++    case gcvFEATURE_TILE_STATUS_2BITS:
++        available = database->REG_TileStatus2Bits;
++        break;
++
++    case gcvFEATURE_COMPRESSION_DEC400:
++        available = database->DEC400;
++        break;
++
+     default:
+         gcmkFATAL("Invalid feature has been requested.");
+         available = gcvFALSE;
+diff --git a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_drm.c b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_drm.c
+index b4846cb..8cad497 100644
+--- a/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_drm.c
++++ b/drivers/mxc/gpu-viv/hal/os/linux/kernel/gc_hal_kernel_drm.c
+@@ -72,6 +72,7 @@ struct viv_gem_object {
+ 
+     uint32_t              node_handle;
+     gckVIDMEM_NODE        node_object;
++    gctBOOL               cacheable;
+ };
+ 
+ struct dma_buf *viv_gem_prime_export(struct drm_device *drm,
+@@ -213,6 +214,7 @@ static int viv_ioctl_gem_create(struct drm_device *drm, void *data,
+     viv_obj = container_of(gem_obj, struct viv_gem_object, base);
+     viv_obj->node_handle = iface.u.AllocateLinearVideoMemory.node;
+     viv_obj->node_object = nodeObject;
++    viv_obj->cacheable = flags & gcvALLOC_FLAG_CACHEABLE;
+ 
+     /* drop reference from allocate - handle holds it now */
+     drm_gem_object_unreference_unlocked(gem_obj);
+@@ -551,6 +553,13 @@ static int viv_ioctl_gem_attach_aux(struct drm_device *drm, void *data,
+     {
+         struct viv_gem_object *viv_ts_obj;
+         gckKERNEL kernel = gal_dev->device->map[gal_dev->device->defaultHwType].kernels[0];
++        gcsHAL_INTERFACE iface;
++        gctBOOL is2BitPerTile = gckHARDWARE_IsFeatureAvailable(kernel->hardware , gcvFEATURE_TILE_STATUS_2BITS);
++        gctBOOL isCompressionDEC400 = gckHARDWARE_IsFeatureAvailable(kernel->hardware , gcvFEATURE_COMPRESSION_DEC400);
++        gctPOINTER entry = gcvNULL;
++        gctUINT32 tileStatusFiller = (isCompressionDEC400 || ((kernel->hardware->identity.chipModel == gcv500) && (kernel->hardware->identity.chipRevision > 2)))
++                                  ? 0xFFFFFFFF
++                                  : is2BitPerTile ? 0x55555555 : 0x11111111;
+ 
+         gem_ts_obj = drm_gem_object_lookup(file, args->ts_handle);
+         if (!gem_ts_obj)
+@@ -561,6 +570,35 @@ static int viv_ioctl_gem_attach_aux(struct drm_device *drm, void *data,
+ 
+         gcmkONERROR(gckVIDMEM_NODE_Reference(kernel, viv_ts_obj->node_object));
+         nodeObj->tsNode = viv_ts_obj->node_object;
++
++        /* Fill tile status node with tileStatusFiller value first time to avoid GPU hang. */
++        /* Lock tile status node. */
++        gckOS_ZeroMemory(&iface, sizeof(iface));
++        iface.command = gcvHAL_LOCK_VIDEO_MEMORY;
++        iface.hardwareType = gal_dev->device->defaultHwType;
++        iface.u.LockVideoMemory.node = viv_ts_obj->node_handle;
++        iface.u.LockVideoMemory.cacheable = viv_ts_obj->cacheable;
++        gcmkONERROR(gckDEVICE_Dispatch(gal_dev->device, &iface));
++
++        gcmkONERROR(gckOS_MapPhysical(kernel->os, (gctUINT32) iface.u.LockVideoMemory.physicalAddress, (__u64)gem_ts_obj->size, &entry));
++
++        /* Fill tile status node with tileStatusFiller. */
++        memset(entry , tileStatusFiller , (__u64)gem_ts_obj->size);
++
++        /* UnLock tile status node. */
++        memset(&iface, 0, sizeof(iface));
++        iface.command = gcvHAL_UNLOCK_VIDEO_MEMORY;
++        iface.hardwareType = gal_dev->device->defaultHwType;
++        iface.u.UnlockVideoMemory.node = (gctUINT64)viv_ts_obj->node_handle;
++        iface.u.UnlockVideoMemory.type = gcvSURF_TYPE_UNKNOWN;
++        gcmkONERROR(gckDEVICE_Dispatch(gal_dev->device, &iface));
++
++        memset(&iface, 0, sizeof(iface));
++        iface.command = gcvHAL_BOTTOM_HALF_UNLOCK_VIDEO_MEMORY;
++        iface.hardwareType = gal_dev->device->defaultHwType;
++        iface.u.BottomHalfUnlockVideoMemory.node = (gctUINT64)viv_ts_obj->node_handle;
++        iface.u.BottomHalfUnlockVideoMemory.type = gcvSURF_TYPE_UNKNOWN;
++        gcmkONERROR(gckDEVICE_Dispatch(gal_dev->device, &iface));
+     }
+ 
+ OnError:
+-- 
+1.7.9.5
+

@@ -1,0 +1,138 @@
+From 4dab53651b12df2ebfcd2b2c470abc40fc3109fa Mon Sep 17 00:00:00 2001
+From: Joakim Zhang <qiangqing.zhang@nxp.com>
+Date: Fri, 9 Nov 2018 12:58:48 +0800
+Subject: [PATCH 5197/5242] MLK-20166 can: flexcan: fix CAN can't wakeup
+ system during suspend
+
+commit  8220d7d4e869d39d2b594e7becdab1b6f478f64e from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The system can be wakeuped only when system is totally suspend, when the
+wakeup event comes during suspend will cause the system hang. For the reason
+that CAN will not call flexcan_noirq_resume() callback if the wakeup event
+comes before noirq suspend stage.
+
+The way to fix the issue is that assure the system to call
+flexcan_noirq_suspend() during suspend and then call
+flexcan_noirq_resume() during resume.
+
+Signed-off-by: Joakim Zhang <qiangqing.zhang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/can/flexcan.c |   47 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/can/flexcan.c b/drivers/net/can/flexcan.c
+index 2cf1495..16ef5d7 100644
+--- a/drivers/net/can/flexcan.c
++++ b/drivers/net/can/flexcan.c
+@@ -42,6 +42,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/pinctrl/consumer.h>
+ 
+ #ifdef CONFIG_ARCH_MXC_ARM64
+ #include <soc/imx8/sc/sci.h>
+@@ -575,6 +576,26 @@ static void flexcan_clks_disable(const struct flexcan_priv *priv)
+ 	clk_disable_unprepare(priv->clk_per);
+ }
+ 
++static void flexcan_wake_mask_enable(struct flexcan_priv *priv)
++{
++	struct flexcan_regs __iomem *regs = priv->regs;
++	u32 reg_mcr;
++
++	reg_mcr = priv->read(&regs->mcr);
++	reg_mcr |= FLEXCAN_MCR_WAK_MSK;
++	priv->write(reg_mcr, &regs->mcr);
++}
++
++static void flexcan_wake_mask_disable(struct flexcan_priv *priv)
++{
++	struct flexcan_regs __iomem *regs = priv->regs;
++	u32 reg_mcr;
++
++	reg_mcr = priv->read(&regs->mcr);
++	reg_mcr &= ~FLEXCAN_MCR_WAK_MSK;
++	priv->write(reg_mcr, &regs->mcr);
++}
++
+ #ifdef CONFIG_ARCH_MXC_ARM64
+ static void imx8_ipg_stop_enable(struct flexcan_priv *priv, bool enabled)
+ {
+@@ -1196,7 +1217,7 @@ static void flexcan_set_bittiming(struct net_device *dev)
+ 			   dbt->sjw - 1, dbt->prop_seg);
+ 
+ 		netdev_dbg(dev, "%s: mcr=0x%08x ctrl=0x%08x cbt=0x%08x fdcbt=0x%08x\n",
+-			   __func__, flexcan_read(&regs->mcr),
++			   __func__, priv->read(&regs->mcr),
+ 			   priv->read(&regs->ctrl),
+ 			   priv->read(&regs->cbt),
+ 			   priv->read(&regs->fdcbt));
+@@ -1273,7 +1294,7 @@ static int flexcan_chip_start(struct net_device *dev)
+ 		reg_mcr |= FLEXCAN_MCR_FEN;
+ 
+ 	/* enable self wakeup */
+-	reg_mcr |= FLEXCAN_MCR_WAK_MSK | FLEXCAN_MCR_SLF_WAK;
++	reg_mcr |= FLEXCAN_MCR_SLF_WAK;
+ 
+ 	netdev_dbg(dev, "%s: writing mcr=0x%08x", __func__, reg_mcr);
+ 	priv->write(reg_mcr, &regs->mcr);
+@@ -1332,12 +1353,12 @@ static int flexcan_chip_start(struct net_device *dev)
+ 	}
+ 
+ 	if (priv->can.ctrlmode & CAN_CTRLMODE_FD) {
+-		reg_fdctrl = flexcan_read(&regs->fdctrl) &
++		reg_fdctrl = priv->read(&regs->fdctrl) &
+ 			     ~FLEXCAN_CANFD_MBDSR_MASK;
+ 		reg_fdctrl |= FLEXCAN_CANFD_MBDSR_DEFAULT <<
+ 			      FLEXCAN_CANFD_MBDSR_SHIFT;
+ 		priv->write(reg_fdctrl, &regs->fdctrl);
+-		reg_mcr = flexcan_read(&regs->mcr);
++		reg_mcr = priv->read(&regs->mcr);
+ 		priv->write(reg_mcr | FLEXCAN_MCR_FDEN, &regs->mcr);
+ 
+ 		priv->mb_size = FLEXCAN_MB_FD_SIZE;
+@@ -1961,7 +1982,9 @@ static int __maybe_unused flexcan_resume(struct device *device)
+ 		netif_device_attach(dev);
+ 		netif_start_queue(dev);
+ 
+-		if (!device_may_wakeup(device)) {
++		if (device_may_wakeup(device)) {
++			flexcan_wake_mask_disable(priv);
++		} else {
+ 			pinctrl_pm_select_default_state(device);
+ 
+ 			err = pm_runtime_force_resume(device);
+@@ -1994,6 +2017,18 @@ static int __maybe_unused flexcan_runtime_resume(struct device *device)
+ 	return 0;
+ }
+ 
++static int __maybe_unused flexcan_noirq_suspend(struct device *device)
++{
++	struct net_device *dev = dev_get_drvdata(device);
++	struct flexcan_priv *priv = netdev_priv(dev);
++
++	if (netif_running(dev) && device_may_wakeup(device)) {
++		flexcan_wake_mask_enable(priv);
++	}
++
++	return 0;
++}
++
+ static int __maybe_unused flexcan_noirq_resume(struct device *device)
+ {
+ 	struct net_device *dev = dev_get_drvdata(device);
+@@ -2010,7 +2045,7 @@ static int __maybe_unused flexcan_noirq_resume(struct device *device)
+ static const struct dev_pm_ops flexcan_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(flexcan_suspend, flexcan_resume)
+ 	SET_RUNTIME_PM_OPS(flexcan_runtime_suspend, flexcan_runtime_resume, NULL)
+-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, flexcan_noirq_resume)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(flexcan_noirq_suspend, flexcan_noirq_resume)
+ };
+ 
+ static struct platform_driver flexcan_driver = {
+-- 
+1.7.9.5
+

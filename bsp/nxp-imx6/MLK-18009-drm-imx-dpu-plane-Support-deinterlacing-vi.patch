@@ -1,0 +1,539 @@
+From c60d1629f887a2497b988407f1802a233f16f05b Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Thu, 12 Apr 2018 12:40:48 +0800
+Subject: [PATCH 3597/5242] MLK-18009 drm/imx: dpu: plane: Support
+ deinterlacing via fetchdecode & vscaler
+
+commit  b188160b99184340370d8932fca44f4e134cd0fc from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Fetchdecode may work together with vscaler to do bob deinterlacing.
+This patch adds the deinterlacing support for DPU DRM plane by using them.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-plane.c   |   45 ++++++++++++++++++++++++---------
+ drivers/gpu/imx/dpu-blit/dpu-blit.c   |    5 ++--
+ drivers/gpu/imx/dpu/dpu-common.c      |    5 ++--
+ drivers/gpu/imx/dpu/dpu-fetchdecode.c |   20 +++++++++++----
+ drivers/gpu/imx/dpu/dpu-fetcheco.c    |   20 +++++++++++----
+ drivers/gpu/imx/dpu/dpu-fetchlayer.c  |    2 +-
+ drivers/gpu/imx/dpu/dpu-fetchwarp.c   |    2 +-
+ drivers/gpu/imx/dpu/dpu-vscaler.c     |   21 ++++++++++-----
+ drivers/gpu/imx/imx8_dprc.c           |   11 ++++++--
+ include/video/dpu.h                   |   22 ++++++++--------
+ include/video/imx8-prefetch.h         |    2 +-
+ 11 files changed, 108 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.c b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+index 44258dd..fdf63ac 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+@@ -168,6 +168,9 @@ static bool dpu_drm_plane_format_mod_supported(struct drm_plane *plane,
+ 	if (fb->modifier)
+ 		return cma_obj->paddr + fb->offsets[0];
+ 
++	if (fb->flags & DRM_MODE_FB_INTERLACED)
++		y /= 2;
++
+ 	return cma_obj->paddr + fb->offsets[0] + fb->pitches[0] * y +
+ 	       drm_format_plane_cpp(fb->format->format, 0) * x;
+ }
+@@ -189,6 +192,9 @@ static bool dpu_drm_plane_format_mod_supported(struct drm_plane *plane,
+ 	x /= drm_format_horz_chroma_subsampling(fb->format->format);
+ 	y /= drm_format_vert_chroma_subsampling(fb->format->format);
+ 
++	if (fb->flags & DRM_MODE_FB_INTERLACED)
++		y /= 2;
++
+ 	return cma_obj->paddr + fb->offsets[1] + fb->pitches[1] * y +
+ 	       drm_format_plane_cpp(fb->format->format, 1) * x;
+ }
+@@ -208,6 +214,7 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	u32 src_w = state->src_w >> 16, src_h = state->src_h >> 16,
+ 	    src_x = state->src_x >> 16, src_y = state->src_y >> 16;
+ 	int bpp, fu_id, fu_type;
++	bool fb_is_interlaced;
+ 
+ 	/* pure software check */
+ 	if (plane->type != DRM_PLANE_TYPE_PRIMARY)
+@@ -234,6 +241,8 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	if (!state->crtc)
+ 		return -EINVAL;
+ 
++	fb_is_interlaced = !!(fb->flags & DRM_MODE_FB_INTERLACED);
++
+ 	if (fb->modifier &&
+ 	    fb->modifier != DRM_FORMAT_MOD_AMPHION_TILED &&
+ 	    fb->modifier != DRM_FORMAT_MOD_VIVANTE_TILED &&
+@@ -274,9 +283,12 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	if (drm_format_horz_chroma_subsampling(fb->format->format) == 2 &&
+ 	    ((src_w % 2) || (src_x % 2)))
+ 		return -EINVAL;
+-	if (drm_format_vert_chroma_subsampling(fb->format->format) == 2 &&
+-	    ((src_h % 2) || (src_y % 2)))
+-		return -EINVAL;
++	if (drm_format_vert_chroma_subsampling(fb->format->format) == 2) {
++		if (src_h % (fb_is_interlaced ? 4 : 2))
++			return -EINVAL;
++		if (src_y % (fb_is_interlaced ? 4 : 2))
++			return -EINVAL;
++	}
+ 
+ 	/* for tile formats, framebuffer has to be tile aligned */
+ 	switch (fb->modifier) {
+@@ -424,6 +436,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	bool prefetch_start = false, aux_prefetch_start = false;
+ 	bool need_modeset;
+ 	bool is_overlay = plane->type == DRM_PLANE_TYPE_OVERLAY;
++	bool fb_is_interlaced;
+ 
+ 	/*
+ 	 * Do nothing since the plane is disabled by
+@@ -433,6 +446,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 		return;
+ 
+ 	need_modeset = drm_atomic_crtc_needs_modeset(state->crtc->state);
++	fb_is_interlaced = !!(fb->flags & DRM_MODE_FB_INTERLACED);
+ 
+ 	fu_type = source_to_type(dpstate->source);
+ 	fu_id = source_to_id(dpstate->source);
+@@ -483,7 +497,7 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 				return;
+ 		}
+ 
+-		if (src_h != state->crtc_h) {
++		if ((src_h != state->crtc_h) || fb_is_interlaced) {
+ 			need_vscaler = true;
+ 			vs = fetchdecode_get_vscaler(fd);
+ 			if (IS_ERR(vs))
+@@ -532,10 +546,12 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 		fetchdecode_source_bpp(fd, bpp);
+ 		fetchdecode_source_stride(fd, src_w, bpp, fb->pitches[0],
+ 					baseaddr, dpstate->use_prefetch);
+-		fetchdecode_src_buf_dimensions(fd, src_w, src_h);
+-		fetchdecode_set_fmt(fd, fb->format->format);
++		fetchdecode_src_buf_dimensions(fd, src_w, src_h,
++					fb_is_interlaced);
++		fetchdecode_set_fmt(fd, fb->format->format, fb_is_interlaced);
+ 		fetchdecode_source_buffer_enable(fd);
+-		fetchdecode_framedimensions(fd, src_w, src_h);
++		fetchdecode_framedimensions(fd, src_w, src_h,
++					fb_is_interlaced);
+ 		fetchdecode_baseaddress(fd, baseaddr);
+ 		fetchdecode_set_stream_id(fd, dplane->stream_id ?
+ 						DPU_PLANE_SRC_TO_DISP_STREAM1 :
+@@ -602,8 +618,9 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 		fetcheco_source_stride(fe, src_w, bpp, fb->pitches[1],
+ 					uv_baseaddr, dpstate->use_prefetch);
+ 		fetcheco_set_fmt(fe, fb->format->format);
+-		fetcheco_src_buf_dimensions(fe, src_w, src_h, fb->format->format);
+-		fetcheco_framedimensions(fe, src_w, src_h);
++		fetcheco_src_buf_dimensions(fe, src_w, src_h,
++					fb->format->format, fb_is_interlaced);
++		fetcheco_framedimensions(fe, src_w, src_h, fb_is_interlaced);
+ 		fetcheco_baseaddress(fe, uv_baseaddr);
+ 		fetcheco_source_buffer_enable(fe);
+ 		fetcheco_set_stream_id(fe, dplane->stream_id ?
+@@ -628,9 +645,12 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 		vscaler_pixengcfg_dynamic_src_sel(vs,
+ 					(vs_src_sel_t)(dpstate->source));
+ 		vscaler_pixengcfg_clken(vs, CLKEN__AUTOMATIC);
+-		vscaler_setup1(vs, src_h, state->crtc_h);
++		vscaler_setup1(vs, src_h, state->crtc_h, fb_is_interlaced);
++		vscaler_setup2(vs, fb_is_interlaced);
++		vscaler_setup3(vs, fb_is_interlaced);
+ 		vscaler_output_size(vs, state->crtc_h);
+-		vscaler_field_mode(vs, SCALER_INPUT);
++		vscaler_field_mode(vs, fb_is_interlaced ?
++						SCALER_ALWAYS0 : SCALER_INPUT);
+ 		vscaler_filter_mode(vs, SCALER_LINEAR);
+ 		vscaler_scale_mode(vs, SCALER_UPSCALE);
+ 		vscaler_mode(vs, SCALER_ACTIVE);
+@@ -676,7 +696,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 					     fb->modifier,
+ 					     baseaddr, uv_baseaddr,
+ 					     prefetch_start,
+-					     aux_prefetch_start);
++					     aux_prefetch_start,
++					     fb_is_interlaced);
+ 		if (prefetch_start || aux_prefetch_start)
+ 			fetchunit_enable_prefetch(fd, fl, fw);
+ 
+diff --git a/drivers/gpu/imx/dpu-blit/dpu-blit.c b/drivers/gpu/imx/dpu-blit/dpu-blit.c
+index d2f1f22..7035dd0 100644
+--- a/drivers/gpu/imx/dpu-blit/dpu-blit.c
++++ b/drivers/gpu/imx/dpu-blit/dpu-blit.c
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2016 Freescale Semiconductor, Inc.
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -132,7 +132,8 @@ void dpu_be_configure_prefetch(struct dpu_bliteng *dpu_be,
+ 		       x_offset, y_offset,
+ 		       stride, format, modifier,
+ 		       baddr, uv_addr,
+-		       start, start);
++		       start, start,
++		       false);
+ 
+ 	if (start)
+ 		dprc_enable(dprc);
+diff --git a/drivers/gpu/imx/dpu/dpu-common.c b/drivers/gpu/imx/dpu/dpu-common.c
+index b580dfa..800cdb9 100644
+--- a/drivers/gpu/imx/dpu/dpu-common.c
++++ b/drivers/gpu/imx/dpu/dpu-common.c
+@@ -741,13 +741,14 @@ void fetchunit_configure_prefetch(struct dpu_fetchdecode *fd,
+ 				  unsigned int x_offset, unsigned int y_offset,
+ 				  unsigned int stride, u32 format, u64 modifier,
+ 				  unsigned long baddr, unsigned long uv_baddr,
+-				  bool start, bool aux_start)
++				  bool start, bool aux_start,
++				  bool fb_is_interlaced)
+ {
+ 	if (fd)
+ 		fetchdecode_configure_prefetch(fd, stream_id, width, height,
+ 					x_offset, y_offset, stride,
+ 					format, modifier, baddr, uv_baddr,
+-					start, aux_start);
++					start, aux_start, fb_is_interlaced);
+ 	else if (fl)
+ 		fetchlayer_configure_prefetch(fl, stream_id, width, height,
+ 					x_offset, y_offset, stride,
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchdecode.c b/drivers/gpu/imx/dpu/dpu-fetchdecode.c
+index 6387dbf..670b7a6 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchdecode.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchdecode.c
+@@ -302,10 +302,13 @@ void fetchdecode_source_stride(struct dpu_fetchdecode *fd, unsigned int width,
+ EXPORT_SYMBOL_GPL(fetchdecode_source_stride);
+ 
+ void fetchdecode_src_buf_dimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				    unsigned int h)
++				    unsigned int h, bool deinterlace)
+ {
+ 	u32 val;
+ 
++	if (deinterlace)
++		h /= 2;
++
+ 	val = LINEWIDTH(w) | LINECOUNT(h);
+ 
+ 	mutex_lock(&fd->mutex);
+@@ -314,7 +317,7 @@ void fetchdecode_src_buf_dimensions(struct dpu_fetchdecode *fd, unsigned int w,
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_src_buf_dimensions);
+ 
+-void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt)
++void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace)
+ {
+ 	u32 val, bits, shift;
+ 	bool is_planar_yuv = false, is_rastermode_yuv422 = false;
+@@ -336,6 +339,8 @@ void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt)
+ 		/* fall-through */
+ 	case DRM_FORMAT_NV12:
+ 	case DRM_FORMAT_NV21:
++		if (deinterlace)
++			is_yuv422upsamplingmode_interpolate = true;
+ 		is_planar_yuv = true;
+ 		is_rastermode_yuv422 = true;
+ 		is_inputselect_compact = true;
+@@ -485,10 +490,13 @@ void fetchdecode_clipdimensions(struct dpu_fetchdecode *fd, unsigned int w,
+ EXPORT_SYMBOL_GPL(fetchdecode_clipdimensions);
+ 
+ void fetchdecode_framedimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				 unsigned int h)
++				 unsigned int h, bool deinterlace)
+ {
+ 	u32 val;
+ 
++	if (deinterlace)
++		h /= 2;
++
+ 	val = FRAMEWIDTH(w) | FRAMEHEIGHT(h);
+ 
+ 	mutex_lock(&fd->mutex);
+@@ -735,14 +743,16 @@ void fetchdecode_set_stream_id(struct dpu_fetchdecode *fd, unsigned int id)
+ 			       unsigned int x_offset, unsigned int y_offset,
+ 			       unsigned int stride, u32 format, u64 modifier,
+ 			       unsigned long baddr, unsigned long uv_baddr,
+-			       bool start, bool aux_start)
++			       bool start, bool aux_start,
++			       bool fb_is_interlaced)
+ {
+ 	if (WARN_ON(!fd || !fd->dprc))
+ 		return;
+ 
+ 	dprc_configure(fd->dprc,
+ 			stream_id, width, height, x_offset, y_offset, stride,
+-			format, modifier, baddr, uv_baddr, start, aux_start);
++			format, modifier, baddr, uv_baddr, start, aux_start,
++			fb_is_interlaced);
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_configure_prefetch);
+ 
+diff --git a/drivers/gpu/imx/dpu/dpu-fetcheco.c b/drivers/gpu/imx/dpu/dpu-fetcheco.c
+index 77ee950..2a03c59 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetcheco.c
++++ b/drivers/gpu/imx/dpu/dpu-fetcheco.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -179,12 +179,19 @@ void fetcheco_source_stride(struct dpu_fetcheco *fe, unsigned int width,
+ EXPORT_SYMBOL_GPL(fetcheco_source_stride);
+ 
+ void fetcheco_src_buf_dimensions(struct dpu_fetcheco *fe, unsigned int w,
+-				 unsigned int h, u32 fmt)
++				 unsigned int h, u32 fmt, bool deinterlace)
+ {
+-	int width = dpu_format_plane_width(w, fmt, 1);
+-	int height = dpu_format_plane_height(h, fmt, 1);
++	int width, height;
+ 	u32 val;
+ 
++	if (deinterlace) {
++		width = w;
++		height = h / 2;
++	} else {
++		width = dpu_format_plane_width(w, fmt, 1);
++		height = dpu_format_plane_height(h, fmt, 1);
++	}
++
+ 	switch (fmt) {
+ 	case DRM_FORMAT_NV12:
+ 	case DRM_FORMAT_NV21:
+@@ -359,10 +366,13 @@ bool fetcheco_is_enabled(struct dpu_fetcheco *fe)
+ EXPORT_SYMBOL_GPL(fetcheco_is_enabled);
+ 
+ void fetcheco_framedimensions(struct dpu_fetcheco *fe, unsigned int w,
+-			      unsigned int h)
++			      unsigned int h, bool deinterlace)
+ {
+ 	u32 val;
+ 
++	if (deinterlace)
++		h /= 2;
++
+ 	val = FRAMEWIDTH(w) | FRAMEHEIGHT(h);
+ 
+ 	mutex_lock(&fe->mutex);
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchlayer.c b/drivers/gpu/imx/dpu/dpu-fetchlayer.c
+index 71a00c5..2a81056 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchlayer.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchlayer.c
+@@ -435,7 +435,7 @@ void fetchlayer_set_stream_id(struct dpu_fetchlayer *fl, unsigned int id)
+ 
+ 	dprc_configure(fl->dprc,
+ 			stream_id, width, height, x_offset, y_offset, stride,
+-			format, modifier, baddr, 0, start, false);
++			format, modifier, baddr, 0, start, false, false);
+ }
+ EXPORT_SYMBOL_GPL(fetchlayer_configure_prefetch);
+ 
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchwarp.c b/drivers/gpu/imx/dpu/dpu-fetchwarp.c
+index fef6713..2a6fc41 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchwarp.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchwarp.c
+@@ -434,7 +434,7 @@ void fetchwarp_set_stream_id(struct dpu_fetchwarp *fw, unsigned int id)
+ 
+ 	dprc_configure(fw->dprc,
+ 			stream_id, width, height, x_offset, y_offset, stride,
+-			format, modifier, baddr, 0, start, false);
++			format, modifier, baddr, 0, start, false, false);
+ }
+ EXPORT_SYMBOL_GPL(fetchwarp_configure_prefetch);
+ 
+diff --git a/drivers/gpu/imx/dpu/dpu-vscaler.c b/drivers/gpu/imx/dpu/dpu-vscaler.c
+index 8c8fddf..d58042b 100644
+--- a/drivers/gpu/imx/dpu/dpu-vscaler.c
++++ b/drivers/gpu/imx/dpu/dpu-vscaler.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2017 NXP
++ * Copyright 2017-2018 NXP
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the
+@@ -162,12 +162,15 @@ void vscaler_shden(struct dpu_vscaler *vs, bool enable)
+ }
+ EXPORT_SYMBOL_GPL(vscaler_shden);
+ 
+-void vscaler_setup1(struct dpu_vscaler *vs, u32 src, u32 dst)
++void vscaler_setup1(struct dpu_vscaler *vs, u32 src, u32 dst, bool deinterlace)
+ {
+ 	struct dpu_soc *dpu = vs->dpu;
+ 	u32 scale_factor;
+ 	u64 tmp64;
+ 
++	if (deinterlace)
++		dst *= 2;
++
+ 	if (src == dst) {
+ 		scale_factor = 0x80000;
+ 	} else {
+@@ -193,16 +196,22 @@ void vscaler_setup1(struct dpu_vscaler *vs, u32 src, u32 dst)
+ }
+ EXPORT_SYMBOL_GPL(vscaler_setup1);
+ 
+-void vscaler_setup2(struct dpu_vscaler *vs, u32 phase_offset)
++void vscaler_setup2(struct dpu_vscaler *vs, bool deinterlace)
+ {
++	/* 0x20000: +0.25 phase offset for deinterlace */
++	u32 phase_offset = deinterlace ? 0x20000 : 0;
++
+ 	mutex_lock(&vs->mutex);
+ 	dpu_vs_write(vs, PHASE_OFFSET(phase_offset), SETUP2);
+ 	mutex_unlock(&vs->mutex);
+ }
+ EXPORT_SYMBOL_GPL(vscaler_setup2);
+ 
+-void vscaler_setup3(struct dpu_vscaler *vs, u32 phase_offset)
++void vscaler_setup3(struct dpu_vscaler *vs, bool deinterlace)
+ {
++	/* 0x1e0000: -0.25 phase offset for deinterlace */
++	u32 phase_offset = deinterlace ? 0x1e0000 : 0;
++
+ 	mutex_lock(&vs->mutex);
+ 	dpu_vs_write(vs, PHASE_OFFSET(phase_offset), SETUP3);
+ 	mutex_unlock(&vs->mutex);
+@@ -393,8 +402,8 @@ void _dpu_vs_init(struct dpu_soc *dpu, unsigned int id)
+ 	vs = dpu->vs_priv[i];
+ 
+ 	vscaler_shden(vs, true);
+-	vscaler_setup2(vs, 0);
+-	vscaler_setup3(vs, 0);
++	vscaler_setup2(vs, false);
++	vscaler_setup3(vs, false);
+ 	vscaler_setup4(vs, 0);
+ 	vscaler_setup5(vs, 0);
+ 	vscaler_pixengcfg_dynamic_src_sel(vs, VS_SRC_SEL__DISABLE);
+diff --git a/drivers/gpu/imx/imx8_dprc.c b/drivers/gpu/imx/imx8_dprc.c
+index c5aea6e..1acabdf 100644
+--- a/drivers/gpu/imx/imx8_dprc.c
++++ b/drivers/gpu/imx/imx8_dprc.c
+@@ -319,11 +319,11 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 		    unsigned int x_offset, unsigned int y_offset,
+ 		    unsigned int stride, u32 format, u64 modifier,
+ 		    unsigned long baddr, unsigned long uv_baddr,
+-		    bool start, bool aux_start)
++		    bool start, bool aux_start, bool interlace_frame)
+ {
+ 	const struct dprc_format_info *info = dprc_format_info(format);
+ 	unsigned int dprc_width = width + x_offset;
+-	unsigned int dprc_height = height + y_offset;
++	unsigned int dprc_height;
+ 	unsigned int p1_w, p1_h, p2_w, p2_h;
+ 	unsigned int prg_stride = width * info->cpp[0];
+ 	unsigned int bpp = 8 * info->cpp[0];
+@@ -343,6 +343,13 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 			dprc_dpu_gpr_configure(dprc, stream_id);
+ 	}
+ 
++	if (interlace_frame) {
++		height /= 2;
++		y_offset /= 2;
++	}
++
++	dprc_height = height + y_offset;
++
+ 	/* disable all control irqs and enable all error irqs */
+ 	dprc_write(dprc, IRQ_CTRL_MASK, IRQ_MASK);
+ 
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index 99b2b6a..bfbd516 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -480,8 +480,8 @@ void fetchdecode_source_stride(struct dpu_fetchdecode *fd, unsigned int width,
+ 			       int bpp, unsigned int stride,
+ 			       dma_addr_t baddr, bool use_prefetch);
+ void fetchdecode_src_buf_dimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				    unsigned int h);
+-void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt);
++				    unsigned int h, bool deinterlace);
++void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace);
+ void fetchdecode_layeroffset(struct dpu_fetchdecode *fd, unsigned int x,
+ 			     unsigned int y);
+ void fetchdecode_clipoffset(struct dpu_fetchdecode *fd, unsigned int x,
+@@ -492,7 +492,7 @@ void fetchdecode_clipdimensions(struct dpu_fetchdecode *fd, unsigned int w,
+ void fetchdecode_source_buffer_disable(struct dpu_fetchdecode *fd);
+ bool fetchdecode_is_enabled(struct dpu_fetchdecode *fd);
+ void fetchdecode_framedimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				 unsigned int h);
++				 unsigned int h, bool deinterlace);
+ void fetchdecode_rgb_constantcolor(struct dpu_fetchdecode *fd,
+ 					u8 r, u8 g, u8 b, u8 a);
+ void fetchdecode_yuv_constantcolor(struct dpu_fetchdecode *fd,
+@@ -511,7 +511,8 @@ void fetchdecode_yuv_constantcolor(struct dpu_fetchdecode *fd,
+ 			       unsigned int x_offset, unsigned int y_offset,
+ 			       unsigned int stride, u32 format, u64 modifier,
+ 			       unsigned long baddr, unsigned long uv_baddr,
+-			       bool start, bool aux_start);
++			       bool start, bool aux_start,
++			       bool fb_is_interlaced);
+ void fetchdecode_enable_prefetch(struct dpu_fetchdecode *fd);
+ void fetchdecode_disable_prefetch(struct dpu_fetchdecode *fd);
+ void fetchdecode_reg_update_prefetch(struct dpu_fetchdecode *fd);
+@@ -550,7 +551,7 @@ void fetcheco_source_stride(struct dpu_fetcheco *fe, unsigned int width,
+ 			    int bpp, unsigned int stride,
+ 			    dma_addr_t baddr, bool use_prefetch);
+ void fetcheco_src_buf_dimensions(struct dpu_fetcheco *fe, unsigned int w,
+-				 unsigned int h, u32 fmt);
++				 unsigned int h, u32 fmt, bool deinterlace);
+ void fetcheco_set_fmt(struct dpu_fetcheco *fe, u32 fmt);
+ void fetcheco_layeroffset(struct dpu_fetcheco *fe, unsigned int x,
+ 			  unsigned int y);
+@@ -562,7 +563,7 @@ void fetcheco_clipdimensions(struct dpu_fetcheco *fe, unsigned int w,
+ void fetcheco_source_buffer_disable(struct dpu_fetcheco *fe);
+ bool fetcheco_is_enabled(struct dpu_fetcheco *fe);
+ void fetcheco_framedimensions(struct dpu_fetcheco *fe, unsigned int w,
+-			      unsigned int h);
++			      unsigned int h, bool deinterlace);
+ void fetcheco_frameresampling(struct dpu_fetcheco *fe, unsigned int x,
+ 			      unsigned int y);
+ void fetcheco_controltrigger(struct dpu_fetcheco *fe, bool trigger);
+@@ -772,9 +773,9 @@ void layerblend_pixengcfg_clken(struct dpu_layerblend *lb,
+ int vscaler_pixengcfg_dynamic_src_sel(struct dpu_vscaler *vs, vs_src_sel_t src);
+ void vscaler_pixengcfg_clken(struct dpu_vscaler *vs, pixengcfg_clken_t clken);
+ void vscaler_shden(struct dpu_vscaler *vs, bool enable);
+-void vscaler_setup1(struct dpu_vscaler *vs, unsigned int src, unsigned int dst);
+-void vscaler_setup2(struct dpu_vscaler *vs, u32 phase_offset);
+-void vscaler_setup3(struct dpu_vscaler *vs, u32 phase_offset);
++void vscaler_setup1(struct dpu_vscaler *vs, u32 src, u32 dst, bool deinterlace);
++void vscaler_setup2(struct dpu_vscaler *vs, bool deinterlace);
++void vscaler_setup3(struct dpu_vscaler *vs, bool deinterlace);
+ void vscaler_setup4(struct dpu_vscaler *vs, u32 phase_offset);
+ void vscaler_setup5(struct dpu_vscaler *vs, u32 phase_offset);
+ void vscaler_output_size(struct dpu_vscaler *vs, u32 line_num);
+@@ -834,7 +835,8 @@ void fetchunit_configure_prefetch(struct dpu_fetchdecode *fd,
+ 				  unsigned int x_offset, unsigned int y_offset,
+ 				  unsigned int stride, u32 format, u64 modifier,
+ 				  unsigned long baddr, unsigned long uv_baddr,
+-				  bool start, bool aux_start);
++				  bool start, bool aux_start,
++				  bool fb_is_interlaced);
+ void fetchunit_enable_prefetch(struct dpu_fetchdecode *fd,
+ 			       struct dpu_fetchlayer *fl,
+ 			       struct dpu_fetchwarp *fw);
+diff --git a/include/video/imx8-prefetch.h b/include/video/imx8-prefetch.h
+index 2a7c972a..83769f0 100644
+--- a/include/video/imx8-prefetch.h
++++ b/include/video/imx8-prefetch.h
+@@ -54,7 +54,7 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 		    unsigned int x_offset, unsigned int y_offset,
+ 		    unsigned int stride, u32 format, u64 modifier,
+ 		    unsigned long baddr, unsigned long uv_baddr,
+-		    bool start, bool aux_start);
++		    bool start, bool aux_start, bool interlace_frame);
+ void dprc_reg_update(struct dprc *dprc);
+ void dprc_first_frame_handle(struct dprc *dprc);
+ void dprc_irq_handle(struct dprc *dprc);
+-- 
+1.7.9.5
+

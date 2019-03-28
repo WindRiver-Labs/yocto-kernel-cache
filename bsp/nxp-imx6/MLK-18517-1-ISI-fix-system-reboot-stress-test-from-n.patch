@@ -1,0 +1,267 @@
+From c0209814c45c2ce540c08ffc29d3474790098749 Mon Sep 17 00:00:00 2001
+From: "Guoniu.Zhou" <guoniu.zhou@nxp.com>
+Date: Thu, 28 Jun 2018 09:47:54 +0800
+Subject: [PATCH 4317/5242] MLK-18517-1: ISI: fix system reboot stress test
+ from nfs fail
+
+commit  67d229e85e7c9e82c97e539a7108524e4d04c261 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+1. System will dump painc message and hang when do system
+reboot stress test. It caused by ISI HW reset function. When
+user open the video device, it will get the device and driver
+will turn on ISI power domain, but after that, ISI HW reset
+will first turn off and then turn on it's power. During this
+time, the process which open ISI channel 0 maybe sleep and
+the other process which open other ISI channel will active but
+the other channel power domain depend on channel 0. It leads to
+system panic. So change msleep to udelay and move HW reset to
+other place.
+
+2. Refine ISI system and runtime suspend/resume.
+
+Signed-off-by: Guoniu.Zhou <guoniu.zhou@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/mxc-isi-cap.c  |   36 ++++++++++-----
+ drivers/media/platform/imx8/mxc-isi-core.c |   66 ++++------------------------
+ drivers/media/platform/imx8/mxc-isi-core.h |    6 ---
+ drivers/media/platform/imx8/mxc-isi-hw.c   |    2 +-
+ 4 files changed, 36 insertions(+), 74 deletions(-)
+
+diff --git a/drivers/media/platform/imx8/mxc-isi-cap.c b/drivers/media/platform/imx8/mxc-isi-cap.c
+index 4603977..c7ec894 100644
+--- a/drivers/media/platform/imx8/mxc-isi-cap.c
++++ b/drivers/media/platform/imx8/mxc-isi-cap.c
+@@ -580,6 +580,7 @@ static int mxc_isi_capture_open(struct file *file)
+ 
+ 	dev_dbg(&mxc_isi->pdev->dev, "%s, ISI%d\n", __func__, mxc_isi->id);
+ 
++
+ 	/* Get remote source pad */
+ 	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
+ 	if (source_pad == NULL) {
+@@ -594,14 +595,20 @@ static int mxc_isi_capture_open(struct file *file)
+ 		return -EINVAL;
+ 	}
+ 
+-	pm_runtime_get_sync(dev);
+-
+ 	mutex_lock(&mxc_isi->lock);
+ 	ret = v4l2_fh_open(file);
+ 	mutex_unlock(&mxc_isi->lock);
+ 
+-	mxc_isi_channel_init(mxc_isi);
+-	return v4l2_subdev_call(sd, core, s_power, 1);
++	pm_runtime_get_sync(dev);
++
++	ret = v4l2_subdev_call(sd, core, s_power, 1);
++	if (ret) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s, Call subdev s_power fail!\n", __func__);
++		pm_runtime_put(dev);
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ static int mxc_isi_capture_release(struct file *file)
+@@ -618,30 +625,38 @@ static int mxc_isi_capture_release(struct file *file)
+ 	source_pad = mxc_isi_get_remote_source_pad(mxc_isi);
+ 	if (source_pad == NULL) {
+ 		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote pad found!\n", __func__);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto label;
+ 	}
+ 
+ 	/* Get remote source pad subdev */
+ 	sd = media_entity_to_v4l2_subdev(source_pad->entity);
+ 	if (sd == NULL) {
+ 		v4l2_err(mxc_isi->v4l2_dev, "%s, No remote subdev found!\n", __func__);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto label;
+ 	}
+ 
+ 	mutex_lock(&mxc_isi->lock);
+ 	ret = _vb2_fop_release(file, NULL);
++	if (ret) {
++		v4l2_err(mxc_isi->v4l2_dev, "%s fail\n", __func__);
++		mutex_unlock(&mxc_isi->lock);
++		goto label;
++	}
+ 	mutex_unlock(&mxc_isi->lock);
++
+ 	mxc_isi_channel_deinit(mxc_isi);
+ 
+ 	ret = v4l2_subdev_call(sd, core, s_power, 0);
+ 	if (ret < 0 && ret != -ENOIOCTLCMD) {
+ 		v4l2_err(mxc_isi->v4l2_dev, "%s s_power fail\n", __func__);
+-		return -EINVAL;
++		goto label;
+ 	}
+ 
+-	pm_runtime_put_sync(dev);
+-
+-	return ret;
++label:
++	pm_runtime_put(dev);
++	return (ret) ? ret : 0;
+ }
+ 
+ static const struct v4l2_file_operations mxc_isi_capture_fops = {
+@@ -868,6 +883,7 @@ static int mxc_isi_cap_s_fmt_mplane(struct file *file, void *priv,
+ 
+ 	mxc_isi_source_fmt_init(mxc_isi);
+ 
++	mxc_isi_channel_init(mxc_isi);
+ 	/* configure mxc isi channel */
+ 	mxc_isi_channel_config(mxc_isi);
+ 
+diff --git a/drivers/media/platform/imx8/mxc-isi-core.c b/drivers/media/platform/imx8/mxc-isi-core.c
+index ccf5e24..b72eadd 100644
+--- a/drivers/media/platform/imx8/mxc-isi-core.c
++++ b/drivers/media/platform/imx8/mxc-isi-core.c
+@@ -180,12 +180,9 @@ static int mxc_isi_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mxc_isi_channel_set_chain_buf(mxc_isi);
+-	mxc_isi->flags = MXC_ISI_PM_POWERED;
++	clk_disable_unprepare(mxc_isi->clk);
+ 
+-	pm_runtime_set_active(dev);
+ 	pm_runtime_enable(dev);
+-	pm_runtime_get_sync(dev);
+-	pm_runtime_put_sync(dev);
+ 
+ 	dev_dbg(dev, "mxc_isi.%d registered successfully\n", mxc_isi->id);
+ 
+@@ -201,11 +198,7 @@ static int mxc_isi_remove(struct platform_device *pdev)
+ 	struct mxc_isi_dev *mxc_isi = platform_get_drvdata(pdev);
+ 	struct device *dev = &pdev->dev;
+ 
+-	pm_runtime_get_sync(&pdev->dev);
+ 	mxc_isi_unregister_capture_subdev(mxc_isi);
+-
+-	clk_disable_unprepare(mxc_isi->clk);
+-	pm_runtime_put_sync(&pdev->dev);
+ 	pm_runtime_disable(dev);
+ 
+ 	return 0;
+@@ -214,42 +207,12 @@ static int mxc_isi_remove(struct platform_device *pdev)
+ #ifdef CONFIG_PM_SLEEP
+ static int mxc_isi_pm_suspend(struct device *dev)
+ {
+-	struct mxc_isi_dev *mxc_isi = dev_get_drvdata(dev);
+-
+-	pm_runtime_get_sync(dev);
+-
+-	if ((mxc_isi->flags & MXC_ISI_PM_SUSPENDED) ||
+-		(mxc_isi->flags & MXC_ISI_RUNTIME_SUSPEND))
+-		return 0;
+-
+-	clk_disable_unprepare(mxc_isi->clk);
+-	mxc_isi->flags |= MXC_ISI_PM_SUSPENDED;
+-	mxc_isi->flags &= ~MXC_ISI_PM_POWERED;
+-	pm_runtime_put_sync(dev);
+-
+-	return 0;
++	return pm_runtime_force_suspend(dev);
+ }
+ 
+ static int mxc_isi_pm_resume(struct device *dev)
+ {
+-	struct mxc_isi_dev *mxc_isi = dev_get_drvdata(dev);
+-	int ret;
+-
+-	pm_runtime_get_sync(dev);
+-	if (mxc_isi->flags & MXC_ISI_PM_POWERED)
+-		return 0;
+-
+-	ret = clk_prepare_enable(mxc_isi->clk);
+-	if (ret) {
+-		pr_info("== %s ret=%d\n", __func__, ret);
+-		return -EAGAIN;
+-	}
+-
+-	mxc_isi->flags |= MXC_ISI_PM_POWERED;
+-	mxc_isi->flags &= ~MXC_ISI_PM_SUSPENDED;
+-	pm_runtime_put_sync(dev);
+-
+-	return 0;
++	return pm_runtime_force_resume(dev);
+ }
+ #endif
+ 
+@@ -257,31 +220,20 @@ static int mxc_isi_runtime_suspend(struct device *dev)
+ {
+ 	struct mxc_isi_dev *mxc_isi = dev_get_drvdata(dev);
+ 
+-	if (mxc_isi->flags & MXC_ISI_RUNTIME_SUSPEND)
+-		return 0;
+-
+-	if (mxc_isi->flags & MXC_ISI_PM_POWERED) {
+-		clk_disable_unprepare(mxc_isi->clk);
+-		mxc_isi->flags |= MXC_ISI_RUNTIME_SUSPEND;
+-		mxc_isi->flags &= ~MXC_ISI_PM_POWERED;
+-	}
++	clk_disable_unprepare(mxc_isi->clk);
+ 	return 0;
+ }
+ 
+ static int mxc_isi_runtime_resume(struct device *dev)
+ {
+ 	struct mxc_isi_dev *mxc_isi = dev_get_drvdata(dev);
++	int ret;
+ 
+-	if (mxc_isi->flags & MXC_ISI_PM_POWERED)
+-		return 0;
+-
+-	if (mxc_isi->flags & MXC_ISI_RUNTIME_SUSPEND) {
+-		clk_prepare_enable(mxc_isi->clk);
+-		mxc_isi->flags |= MXC_ISI_PM_POWERED;
+-		mxc_isi->flags &= ~MXC_ISI_RUNTIME_SUSPEND;
+-	}
++	ret = clk_prepare_enable(mxc_isi->clk);
++	if (ret)
++		dev_err(dev, "%s clk enable fail\n", __func__);
+ 
+-	return 0;
++	return (ret) ? ret : 0;
+ }
+ 
+ static const struct dev_pm_ops mxc_isi_pm_ops = {
+diff --git a/drivers/media/platform/imx8/mxc-isi-core.h b/drivers/media/platform/imx8/mxc-isi-core.h
+index 44af7aa..ebb1e09 100644
+--- a/drivers/media/platform/imx8/mxc-isi-core.h
++++ b/drivers/media/platform/imx8/mxc-isi-core.h
+@@ -155,12 +155,6 @@ enum mxc_isi_m2m_in_fmt {
+ 	MXC_ISI_M2M_IN_FMT_YUV422_1P10P,
+ };
+ 
+-enum mxc_isi_power_state {
+-	MXC_ISI_PM_SUSPENDED = 0x01,
+-	MXC_ISI_PM_POWERED = 0x02,
+-	MXC_ISI_RUNTIME_SUSPEND = 0x04,
+-};
+-
+ struct mxc_isi_fmt {
+ 	char	*name;
+ 	u32 mbus_code;
+diff --git a/drivers/media/platform/imx8/mxc-isi-hw.c b/drivers/media/platform/imx8/mxc-isi-hw.c
+index 8e6ca0a..1875077 100644
+--- a/drivers/media/platform/imx8/mxc-isi-hw.c
++++ b/drivers/media/platform/imx8/mxc-isi-hw.c
+@@ -161,7 +161,7 @@ void mxc_isi_channel_hw_reset(struct mxc_isi_dev *mxc_isi)
+ 	if (sciErr != SC_ERR_NONE)
+ 		pr_err("sc_misc_MIPI reset failed! (sciError = %d)\n", sciErr);
+ 
+-	msleep(10);
++	udelay(500);
+ 
+ 	sc_ipc_close(mu_id);
+ }
+-- 
+1.7.9.5
+

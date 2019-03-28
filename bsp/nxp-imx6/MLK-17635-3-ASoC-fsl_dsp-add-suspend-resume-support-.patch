@@ -1,0 +1,310 @@
+From fd3c10376da99429db75d1f13428162e94465f5f Mon Sep 17 00:00:00 2001
+From: Weiguang Kong <weiguang.kong@nxp.com>
+Date: Wed, 4 Apr 2018 11:11:11 +0800
+Subject: [PATCH 3671/5242] MLK-17635-3: ASoC: fsl_dsp: add suspend & resume
+ support for new framework
+
+commit  050dfd93b9beb561cf983049fe5c9419480d5ec0 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The architecture of dsp framework has been changed, so update dsp
+driver to support suspend & resume test of new dsp framework.
+
+Signed-off-by: Weiguang Kong <weiguang.kong@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_hifi4.c       |   25 +++++++++++++---
+ sound/soc/fsl/fsl_hifi4_proxy.c |   61 +++++++++++++++++++++++++++++++++++++++
+ sound/soc/fsl/fsl_hifi4_proxy.h |   31 +++++++++++++++++---
+ 3 files changed, 109 insertions(+), 8 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_hifi4.c b/sound/soc/fsl/fsl_hifi4.c
+index b8a3abc..63a4981 100644
+--- a/sound/soc/fsl/fsl_hifi4.c
++++ b/sound/soc/fsl/fsl_hifi4.c
+@@ -243,6 +243,7 @@ static int fsl_dsp_ipc_msg_from_dsp(struct xf_client *client,
+ 
+ 	/* ...return the message back to a pool and release lock */
+ 	xf_msg_free(&hifi4_priv->proxy, m);
++	xf_unlock(&hifi4_priv->proxy.lock);
+ 
+ 	ret = copy_to_user(user, &msg, sizeof(struct xf_proxy_message));
+ 	if (ret) {
+@@ -384,8 +385,6 @@ static int fsl_hifi4_open(struct inode *inode, struct file *file)
+ 	atomic_long_inc(&hifi4_priv->refcnt);
+ 	mutex_unlock(&hifi4_priv->hifi4_mutex);
+ 
+-	pr_info("client-%x created\n", client->id);
+-
+ 	return ret;
+ }
+ 
+@@ -401,8 +400,6 @@ static int fsl_hifi4_close(struct inode *inode, struct file *file)
+ 	if (IS_ERR(client))
+ 		return PTR_ERR(client);
+ 
+-	pr_info("client-%x released\n", client->id);
+-
+ 	proxy = client->proxy;
+ 	if (proxy) {
+ 		/* ...release all pending messages */
+@@ -964,8 +961,18 @@ static int fsl_hifi4_runtime_suspend(struct device *dev)
+ #ifdef CONFIG_PM_SLEEP
+ static int fsl_hifi4_suspend(struct device *dev)
+ {
++	struct fsl_hifi4 *hifi4_priv = dev_get_drvdata(dev);
++	struct xf_proxy *proxy = &hifi4_priv->proxy;
+ 	int ret = 0;
+ 
++	if (proxy->is_ready) {
++		ret = xf_cmd_send_suspend(proxy);
++		if (ret) {
++			dev_err(dev, "hifi4 suspend fail\n");
++			return ret;
++		}
++	}
++
+ 	ret = pm_runtime_force_suspend(dev);
+ 
+ 	return ret;
+@@ -973,12 +980,22 @@ static int fsl_hifi4_suspend(struct device *dev)
+ 
+ static int fsl_hifi4_resume(struct device *dev)
+ {
++	struct fsl_hifi4 *hifi4_priv = dev_get_drvdata(dev);
++	struct xf_proxy *proxy = &hifi4_priv->proxy;
+ 	int ret = 0;
+ 
+ 	ret = pm_runtime_force_resume(dev);
+ 	if (ret)
+ 		return ret;
+ 
++	if (proxy->is_ready) {
++		ret = xf_cmd_send_resume(proxy);
++		if (ret) {
++			dev_err(dev, "hifi4 resume fail\n");
++			return ret;
++		}
++	}
++
+ 	return 0;
+ }
+ #endif /* CONFIG_PM_SLEEP */
+diff --git a/sound/soc/fsl/fsl_hifi4_proxy.c b/sound/soc/fsl/fsl_hifi4_proxy.c
+index 931faec..27aece7 100644
+--- a/sound/soc/fsl/fsl_hifi4_proxy.c
++++ b/sound/soc/fsl/fsl_hifi4_proxy.c
+@@ -135,8 +135,15 @@ struct xf_message *xf_msg_received(struct xf_proxy *proxy,
+ {
+ 	struct xf_message *m;
+ 
++	/* ...acquire global lock */
++	xf_lock(&proxy->lock);
++
+ 	/* ...try to peek message from the queue */
+ 	m = xf_msg_dequeue(queue);
++	if (m == NULL) {
++		/* ...queue is empty; release lock */
++		xf_unlock(&proxy->lock);
++	}
+ 
+ 	/* ...if message is non-null, lock is held */
+ 	return m;
+@@ -250,6 +257,10 @@ irqreturn_t fsl_hifi4_mu_isr(int irq, void *dev_id)
+ 			proxy->is_ready = 1;
+ 			complete(&proxy->cmd_complete);
+ 			break;
++		case XF_SUSPEND:
++		case XF_RESUME:
++			complete(&proxy->cmd_complete);
++			break;
+ 		default:
+ 			schedule_work(&proxy->work);
+ 			break;
+@@ -371,6 +382,7 @@ static u32 xf_shmem_process_responses(struct xf_proxy *proxy)
+ 		m->opcode = response->opcode;
+ 		m->length = response->length;
+ 		m->buffer = xf_proxy_a2b(proxy, response->address);
++		m->ret = response->ret;
+ 
+ 		/* ...advance local reading index copy */
+ 		read_idx = XF_QUEUE_ADVANCE_IDX(read_idx);
+@@ -416,6 +428,7 @@ static u32 xf_shmem_process_commands(struct xf_proxy *proxy)
+ 		command->opcode = m->opcode;
+ 		command->length = m->length;
+ 		command->address = xf_proxy_b2a(proxy, m->buffer);
++		command->ret = m->ret;
+ 
+ 		/* ...return message back to the pool */
+ 		xf_msg_free(proxy, m);
+@@ -427,6 +440,9 @@ static u32 xf_shmem_process_commands(struct xf_proxy *proxy)
+ 		XF_PROXY_WRITE(proxy, cmd_write_idx, write_idx);
+ 	}
+ 
++	if (status)
++		icm_intr_send(proxy, 0);
++
+ 	return status;
+ }
+ 
+@@ -490,8 +506,10 @@ int xf_proxy_init(struct xf_proxy *proxy)
+ 	/* ...initialize shared memory interface */
+ 	XF_PROXY_WRITE(proxy, cmd_read_idx, 0);
+ 	XF_PROXY_WRITE(proxy, cmd_write_idx, 0);
++	XF_PROXY_WRITE(proxy, cmd_invalid, 0);
+ 	XF_PROXY_WRITE(proxy, rsp_read_idx, 0);
+ 	XF_PROXY_WRITE(proxy, rsp_write_idx, 0);
++	XF_PROXY_WRITE(proxy, rsp_invalid, 0);
+ 
+ 	return 0;
+ }
+@@ -639,3 +657,46 @@ int xf_cmd_free(struct xf_proxy *proxy, void *buffer, u32 length)
+ 
+ 	return ret;
+ }
++
++/*
++ * suspend & resume functions
++ */
++int xf_cmd_send_suspend(struct xf_proxy *proxy)
++{
++	union icm_header_t msghdr;
++	int ret = 0;
++
++	init_completion(&proxy->cmd_complete);
++
++	msghdr.allbits = 0;	/* clear all bits; */
++	msghdr.ack  = 0;
++	msghdr.intr = 1;
++	msghdr.msg  = XF_SUSPEND;
++	msghdr.size = 0;
++	icm_intr_send(proxy, msghdr.allbits);
++
++	/* wait for response here */
++	ret = icm_ack_wait(proxy, msghdr.allbits);
++
++	return ret;
++}
++
++int xf_cmd_send_resume(struct xf_proxy *proxy)
++{
++	union icm_header_t msghdr;
++	int ret = 0;
++
++	init_completion(&proxy->cmd_complete);
++
++	msghdr.allbits = 0;	/* clear all bits; */
++	msghdr.ack  = 0;
++	msghdr.intr = 1;
++	msghdr.msg  = XF_RESUME;
++	msghdr.size = 0;
++	icm_intr_send(proxy, msghdr.allbits);
++
++	/* wait for response here */
++	ret = icm_ack_wait(proxy, msghdr.allbits);
++
++	return ret;
++}
+diff --git a/sound/soc/fsl/fsl_hifi4_proxy.h b/sound/soc/fsl/fsl_hifi4_proxy.h
+index f89e974..03d2b55 100644
+--- a/sound/soc/fsl/fsl_hifi4_proxy.h
++++ b/sound/soc/fsl/fsl_hifi4_proxy.h
+@@ -85,15 +85,18 @@ enum icm_action_t {
+ 	ICM_CORE_READY = 1,
+ 	ICM_CORE_INIT,
+ 	ICM_CORE_EXIT,
+-	ICM_SUSPEND,
+-	ICM_RESUME,
+ };
+ 
+ /* ...adjust IPC client of message going from user-space */
+ #define XF_MSG_AP_FROM_USER(id, client) (((id) & ~(0xF << 2)) | (client << 2))
+ 
++/* ...message id contains source and destination ports specification */
++#define __XF_MSG_ID(src, dst)   (((src) & 0xFFFF) | (((dst) & 0xFFFF) << 16))
++
+ /* ...wipe out IPC client from message going to user-space */
+-#define XF_MSG_AP_TO_USER(id) ((id) & ~(0xF << 18))
++#define XF_MSG_AP_TO_USER(id)   ((id) & ~(0xF << 18))
++#define __XF_AP_PROXY(core)     ((core) | 0x8000)
++#define __XF_DSP_PROXY(core)    ((core) | 0x8000)
+ 
+ /* ...message id contains source and destination ports specification */
+ #define __XF_MSG_ID(src, dst)   (((src) & 0xFFFF) | (((dst) & 0xFFFF) << 16))
+@@ -143,7 +146,7 @@ enum icm_action_t {
+ 
+ /* ...increment ring-buffer index */
+ #define XF_QUEUE_ADVANCE_IDX(idx)       \
+-		(((idx) + 1) & (0xFFFF0000 | XF_PROXY_MESSAGE_QUEUE_MASK))
++		(((idx) + 0x10001) & (0xFFFF0000 | XF_PROXY_MESSAGE_QUEUE_MASK))
+ 
+ /* ...test if ring buffer is empty */
+ #define XF_QUEUE_EMPTY(read, write)     \
+@@ -168,6 +171,9 @@ struct xf_proxy_host_data {
+ 
+ 	/* ...reading index for response queue */
+ 	u32                 rsp_read_idx;
++
++	/* ...indicate command queue is valid or not */
++	u32                 cmd_invalid;
+ };
+ 
+ /* ...data managed by DSP (local) */
+@@ -181,6 +187,8 @@ struct xf_proxy_dsp_data {
+ 	/* ...reading index for command queue */
+ 	u32                 cmd_read_idx;
+ 
++	/* ...indicate response queue is valid or not */
++	u32                 rsp_invalid;
+ };
+ 
+ /* ...shared memory data */
+@@ -222,12 +230,18 @@ struct xf_shmem_data {
+ #define __XF_PROXY_READ_cmd_read_idx(shmem)         \
+ 		shmem->remote.cmd_read_idx
+ 
++#define __XF_PROXY_READ_cmd_invalid(shmem)            \
++		__XF_PROXY_READ_ATOMIC(shmem->local.cmd_invalid)
++
+ #define __XF_PROXY_READ_rsp_write_idx(shmem)        \
+ 		__XF_PROXY_READ_ATOMIC(shmem->remote.rsp_write_idx)
+ 
+ #define __XF_PROXY_READ_rsp_read_idx(shmem)         \
+ 		shmem->local.rsp_read_idx
+ 
++#define __XF_PROXY_READ_rsp_invalid(shmem)            \
++		__XF_PROXY_READ_ATOMIC(shmem->remote.rsp_invalid)
++
+ /* ...individual fields writings */
+ #define __XF_PROXY_WRITE_cmd_write_idx(shmem, v)    \
+ 		__XF_PROXY_WRITE_ATOMIC(shmem->local.cmd_write_idx, v)
+@@ -235,12 +249,18 @@ struct xf_shmem_data {
+ #define __XF_PROXY_WRITE_cmd_read_idx(shmem, v)     \
+ 		__XF_PROXY_WRITE_ATOMIC(shmem->remote.cmd_read_idx, v)
+ 
++#define __XF_PROXY_WRITE_cmd_invalid(shmem, v)     \
++		__XF_PROXY_WRITE_ATOMIC(shmem->local.cmd_invalid, v)
++
+ #define __XF_PROXY_WRITE_rsp_read_idx(shmem, v)     \
+ 		__XF_PROXY_WRITE_ATOMIC(shmem->local.rsp_read_idx, v)
+ 
+ #define __XF_PROXY_WRITE_rsp_write_idx(shmem, v)    \
+ 		__XF_PROXY_WRITE_ATOMIC(shmem->remote.rsp_write_idx, v)
+ 
++#define __XF_PROXY_WRITE_rsp_invalid(shmem, v)     \
++		__XF_PROXY_WRITE_ATOMIC(shmem->remote.rsp_invalid, v)
++
+ /* ...command buffer accessor */
+ #define XF_PROXY_COMMAND(proxy, idx)                \
+ 		(&XF_SHMEM_DATA(proxy)->local.command[(idx)])
+@@ -378,4 +398,7 @@ struct xf_message *xf_cmd_recv(struct xf_proxy *proxy,
+ /* ...shared memory translation - shared address to kernel virtual address */
+ void *xf_proxy_a2b(struct xf_proxy *proxy, u32 address);
+ 
++int xf_cmd_send_suspend(struct xf_proxy *proxy);
++int xf_cmd_send_resume(struct xf_proxy *proxy);
++
+ #endif
+-- 
+1.7.9.5
+

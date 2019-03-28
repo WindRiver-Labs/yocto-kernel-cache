@@ -1,0 +1,678 @@
+From 4de1d779436a5f5001cf73fc47ed4eefabded42a Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Mon, 23 Oct 2017 12:57:55 +0800
+Subject: [PATCH 2735/5242] MLK-16771 drm/imx: dpu: kms: Change to use a
+ better KMS
+
+commit  fb442f338221799c63ebc59336e0e63562401c57 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch improves DPU KMS by the following means:
+1) Wait for shadow registers being loaded in ->atomic_flush()
+   to make sure there is no intermediate register values being
+   loaded when doing atomic update.
+2) Improve CRTC enablement/disablement sequences/configurations
+   according to spec.
+3) Remove the FGDM__PRIM framegen display mode from ->mode_set_nofb()
+   and always use FGDM__SEC_ON_TOP mode so that we may prepare
+   for introducing a safety stream solution in the future.
+4) Better vblank on/off and vblank event handling, though there
+   should be no essential improvements.
+5) Some fixes for adding correct CRTC/plane/connector states
+   in the full atomic state in dpu_drm_atomic_check().
+6) Remove CRTC and plane states from the full atomic state where
+   possible to improve atomic update performance.
+7) Introduce a plane group mutex to protect plane source mask and
+   vproc source mask.  This is a little bit superfluous due to
+   the protection provided by the atomic helper, but just one of
+   the DPU core itself.
+
+The changes are in a bundle to avoid any unexpected drawbacks
+of introducing them at a smaller granularity.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-crtc.c |  197 +++++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/imx/dpu/dpu-crtc.h |   23 +++++
+ drivers/gpu/drm/imx/dpu/dpu-kms.c  |  146 ++++++++++++++++++++++++--
+ drivers/gpu/imx/dpu/dpu-common.c   |    2 +
+ drivers/gpu/imx/dpu/dpu-framegen.c |    5 +-
+ include/video/dpu.h                |    1 +
+ 6 files changed, 338 insertions(+), 36 deletions(-)
+ create mode 100644 drivers/gpu/drm/imx/dpu/dpu-crtc.h
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.c b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+index 4e462a9..506e12e 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-crtc.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+@@ -41,7 +41,14 @@ struct dpu_crtc {
+ 	struct dpu_plane	**plane;
+ 	unsigned int		hw_plane_num;
+ 	unsigned int		stream_id;
+-	int			irq;
++	int			vbl_irq;
++	int			safety_shdld_irq;
++	int			content_shdld_irq;
++	int			dec_shdld_irq;
++
++	struct completion	safety_shdld_done;
++	struct completion	content_shdld_done;
++	struct completion	dec_shdld_done;
+ };
+ 
+ struct dpu_crtc_state {
+@@ -71,16 +78,56 @@ static inline struct dpu_crtc *to_dpu_crtc(struct drm_crtc *crtc)
+ 	return states;
+ }
+ 
++struct dpu_plane_state **
++crtc_state_get_dpu_plane_states(struct drm_crtc_state *state)
++{
++	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(state);
++	struct dpu_crtc_state *dcstate = to_dpu_crtc_state(imx_crtc_state);
++
++	return dcstate->dpu_plane_states;
++}
++
+ static void dpu_crtc_atomic_enable(struct drm_crtc *crtc,
+ 				   struct drm_crtc_state *old_crtc_state)
+ {
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
++	unsigned long ret;
++
++	drm_crtc_vblank_on(crtc);
+ 
+ 	framegen_enable_clock(dpu_crtc->fg);
+ 	extdst_pixengcfg_sync_trigger(dpu_crtc->ed);
+-	framegen_pkickconfig(dpu_crtc->fg, true);
+ 	framegen_shdtokgen(dpu_crtc->fg);
+ 	framegen_enable(dpu_crtc->fg);
++
++	enable_irq(dpu_crtc->safety_shdld_irq);
++	enable_irq(dpu_crtc->content_shdld_irq);
++	enable_irq(dpu_crtc->dec_shdld_irq);
++
++	ret = wait_for_completion_timeout(&dpu_crtc->safety_shdld_done, HZ);
++	if (ret == 0)
++		dev_warn(dpu_crtc->dev,
++			 "enable - wait for safety shdld done timeout\n");
++	ret = wait_for_completion_timeout(&dpu_crtc->content_shdld_done, HZ);
++	if (ret == 0)
++		dev_warn(dpu_crtc->dev,
++			 "enable - wait for content shdld done timeout\n");
++	ret = wait_for_completion_timeout(&dpu_crtc->dec_shdld_done, HZ);
++	if (ret == 0)
++		dev_warn(dpu_crtc->dev,
++			 "enable - wait for DEC shdld done timeout\n");
++
++	disable_irq(dpu_crtc->safety_shdld_irq);
++	disable_irq(dpu_crtc->content_shdld_irq);
++	disable_irq(dpu_crtc->dec_shdld_irq);
++
++	if (crtc->state->event) {
++		spin_lock_irq(&crtc->dev->event_lock);
++		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		spin_unlock_irq(&crtc->dev->event_lock);
++
++		crtc->state->event = NULL;
++	}
+ }
+ 
+ static void dpu_crtc_disable(struct drm_crtc *crtc)
+@@ -88,16 +135,18 @@ static void dpu_crtc_disable(struct drm_crtc *crtc)
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+ 
+ 	framegen_disable(dpu_crtc->fg);
+-	framegen_pkickconfig(dpu_crtc->fg, false);
+ 	framegen_wait_done(dpu_crtc->fg);
+ 	framegen_disable_clock(dpu_crtc->fg);
+ 
+-	spin_lock_irq(&crtc->dev->event_lock);
++	WARN_ON(!crtc->state->event);
++
+ 	if (crtc->state->event) {
++		spin_lock_irq(&crtc->dev->event_lock);
+ 		drm_crtc_send_vblank_event(crtc, crtc->state->event);
++		spin_unlock_irq(&crtc->dev->event_lock);
++
+ 		crtc->state->event = NULL;
+ 	}
+-	spin_unlock_irq(&crtc->dev->event_lock);
+ 
+ 	drm_crtc_vblank_off(crtc);
+ }
+@@ -172,7 +221,7 @@ static int dpu_enable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+ 
+-	enable_irq(dpu_crtc->irq);
++	enable_irq(dpu_crtc->vbl_irq);
+ 
+ 	return 0;
+ }
+@@ -181,7 +230,7 @@ static void dpu_disable_vblank(struct drm_crtc *crtc)
+ {
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+ 
+-	disable_irq_nosync(dpu_crtc->irq);
++	disable_irq_nosync(dpu_crtc->vbl_irq);
+ }
+ 
+ static const struct drm_crtc_funcs dpu_crtc_funcs = {
+@@ -195,7 +244,7 @@ static void dpu_disable_vblank(struct drm_crtc *crtc)
+ 	.disable_vblank = dpu_disable_vblank,
+ };
+ 
+-static irqreturn_t dpu_irq_handler(int irq, void *dev_id)
++static irqreturn_t dpu_vbl_irq_handler(int irq, void *dev_id)
+ {
+ 	struct dpu_crtc *dpu_crtc = dev_id;
+ 
+@@ -204,6 +253,33 @@ static irqreturn_t dpu_irq_handler(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
++static irqreturn_t dpu_safety_shdld_irq_handler(int irq, void *dev_id)
++{
++	struct dpu_crtc *dpu_crtc = dev_id;
++
++	complete(&dpu_crtc->safety_shdld_done);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t dpu_content_shdld_irq_handler(int irq, void *dev_id)
++{
++	struct dpu_crtc *dpu_crtc = dev_id;
++
++	complete(&dpu_crtc->content_shdld_done);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t dpu_dec_shdld_irq_handler(int irq, void *dev_id)
++{
++	struct dpu_crtc *dpu_crtc = dev_id;
++
++	complete(&dpu_crtc->dec_shdld_done);
++
++	return IRQ_HANDLED;
++}
++
+ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
+ 				 struct drm_crtc_state *crtc_state)
+ {
+@@ -240,16 +316,6 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	struct dpu_crtc_state *old_dcstate = to_dpu_crtc_state(imx_crtc_state);
+ 	int i;
+ 
+-	drm_crtc_vblank_on(crtc);
+-
+-	spin_lock_irq(&crtc->dev->event_lock);
+-	if (crtc->state->event) {
+-		WARN_ON(drm_crtc_vblank_get(crtc));
+-		drm_crtc_arm_vblank_event(crtc, crtc->state->event);
+-		crtc->state->event = NULL;
+-	}
+-	spin_unlock_irq(&crtc->dev->event_lock);
+-
+ 	/*
+ 	 * Disable all planes' resources in SHADOW only.
+ 	 * Whether any of them would be disabled or kept running depends
+@@ -266,6 +332,7 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		struct dpu_vscaler *vs;
+ 		struct dpu_layerblend *lb;
+ 		struct dpu_extdst *ed;
++		extdst_src_sel_t ed_src;
+ 		int fd_id, lb_id;
+ 
+ 		old_dpstate = old_dcstate->dpu_plane_states[i];
+@@ -301,7 +368,9 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		vscaler_mode(vs, SCALER_NEUTRAL);
+ 		if (old_dpstate->is_top) {
+ 			ed = res->ed[dplane->stream_id];
+-			extdst_pixengcfg_src_sel(ed, ED_SRC_DISABLE);
++			ed_src = dplane->stream_id ?
++				ED_SRC_CONSTFRAME1 : ED_SRC_CONSTFRAME0;
++			extdst_pixengcfg_src_sel(ed, ed_src);
+ 		}
+ 	}
+ }
+@@ -309,16 +378,42 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 				  struct drm_crtc_state *old_crtc_state)
+ {
++	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+ 	struct dpu_plane *dplane = to_dpu_plane(crtc->primary);
+ 	struct dpu_plane_res *res = &dplane->grp->res;
+ 	struct dpu_extdst *ed = res->ed[dplane->stream_id];
++	unsigned long ret;
+ 	int i;
++	bool need_modeset = drm_atomic_crtc_needs_modeset(crtc->state);
+ 
+-	if (!crtc->state->enable && !old_crtc_state->enable)
++	if (!crtc->state->active && !old_crtc_state->active)
+ 		return;
+ 
++	if (!need_modeset)
++		enable_irq(dpu_crtc->content_shdld_irq);
++
+ 	extdst_pixengcfg_sync_trigger(ed);
+ 
++	if (!need_modeset) {
++		ret = wait_for_completion_timeout(&dpu_crtc->content_shdld_done,
++						  HZ);
++		if (ret == 0)
++			dev_warn(dpu_crtc->dev,
++			      "flush - wait for content shdld done timeout\n");
++
++		disable_irq(dpu_crtc->content_shdld_irq);
++
++		WARN_ON(!crtc->state->event);
++
++		if (crtc->state->event) {
++			spin_lock_irq(&crtc->dev->event_lock);
++			drm_crtc_send_vblank_event(crtc, crtc->state->event);
++			spin_unlock_irq(&crtc->dev->event_lock);
++
++			crtc->state->event = NULL;
++		}
++	}
++
+ 	for (i = 0; i < ARRAY_SIZE(res->fd); i++) {
+ 		if (res->fd[i] && !fetchdecode_is_enabled(res->fd[i]))
+ 			fetchdecode_set_stream_id(res->fd[i],
+@@ -349,6 +444,9 @@ static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+ 	struct imx_crtc_state *imx_crtc_state = to_imx_crtc_state(crtc->state);
+ 	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
++	struct dpu_plane *dplane = to_dpu_plane(crtc->primary);
++	struct dpu_plane_res *res = &dplane->grp->res;
++	struct dpu_extdst *plane_ed = res->ed[dplane->stream_id];
+ 	extdst_src_sel_t ed_src;
+ 
+ 	dev_dbg(dpu_crtc->dev, "%s: mode->hdisplay: %d\n", __func__,
+@@ -357,10 +455,7 @@ static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 			mode->vdisplay);
+ 
+ 	framegen_cfg_videomode(dpu_crtc->fg, mode);
+-	if (crtc->state->plane_mask)
+-		framegen_displaymode(dpu_crtc->fg, FGDM__SEC_ON_TOP);
+-	else
+-		framegen_displaymode(dpu_crtc->fg, FGDM__PRIM);
++	framegen_displaymode(dpu_crtc->fg, FGDM__SEC_ON_TOP);
+ 
+ 	framegen_panic_displaymode(dpu_crtc->fg, FGDM__TEST);
+ 
+@@ -376,6 +471,9 @@ static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 
+ 	ed_src = dpu_crtc->stream_id ? ED_SRC_CONSTFRAME5 : ED_SRC_CONSTFRAME4;
+ 	extdst_pixengcfg_src_sel(dpu_crtc->ed, ed_src);
++
++	ed_src = dpu_crtc->stream_id ? ED_SRC_CONSTFRAME1 : ED_SRC_CONSTFRAME0;
++	extdst_pixengcfg_src_sel(plane_ed, ed_src);
+ }
+ 
+ static const struct drm_crtc_helper_funcs dpu_helper_funcs = {
+@@ -454,6 +552,10 @@ static int dpu_crtc_init(struct dpu_crtc *dpu_crtc,
+ 	unsigned int stream_id = pdata->stream_id;
+ 	int i, ret;
+ 
++	init_completion(&dpu_crtc->safety_shdld_done);
++	init_completion(&dpu_crtc->content_shdld_done);
++	init_completion(&dpu_crtc->dec_shdld_done);
++
+ 	dpu_crtc->stream_id = stream_id;
+ 	dpu_crtc->hw_plane_num = plane_grp->hw_plane_num;
+ 
+@@ -499,16 +601,55 @@ static int dpu_crtc_init(struct dpu_crtc *dpu_crtc,
+ 		}
+ 	}
+ 
+-	dpu_crtc->irq = dpu_map_irq(dpu, stream_id ?
++	dpu_crtc->vbl_irq = dpu_map_irq(dpu, stream_id ?
+ 				IRQ_DISENGCFG_FRAMECOMPLETE1 :
+ 				IRQ_DISENGCFG_FRAMECOMPLETE0);
+-	ret = devm_request_irq(dev, dpu_crtc->irq, dpu_irq_handler, 0,
++	ret = devm_request_irq(dev, dpu_crtc->vbl_irq, dpu_vbl_irq_handler, 0,
+ 				"imx_drm", dpu_crtc);
+ 	if (ret < 0) {
+-		dev_err(dev, "irq request failed with %d.\n", ret);
++		dev_err(dev, "vblank irq request failed with %d.\n", ret);
++		goto err_put_resources;
++	}
++	disable_irq(dpu_crtc->vbl_irq);
++
++	dpu_crtc->safety_shdld_irq = dpu_map_irq(dpu, stream_id ?
++			IRQ_EXTDST5_SHDLOAD : IRQ_EXTDST4_SHDLOAD);
++	ret = devm_request_irq(dev, dpu_crtc->safety_shdld_irq,
++				dpu_safety_shdld_irq_handler, 0, "imx_drm",
++				dpu_crtc);
++	if (ret < 0) {
++		dev_err(dev,
++			"safety shadow load irq request failed with %d.\n",
++			ret);
++		goto err_put_resources;
++	}
++	disable_irq(dpu_crtc->safety_shdld_irq);
++
++	dpu_crtc->content_shdld_irq = dpu_map_irq(dpu, stream_id ?
++			IRQ_EXTDST1_SHDLOAD : IRQ_EXTDST0_SHDLOAD);
++	ret = devm_request_irq(dev, dpu_crtc->content_shdld_irq,
++				dpu_content_shdld_irq_handler, 0, "imx_drm",
++				dpu_crtc);
++	if (ret < 0) {
++		dev_err(dev,
++			"content shadow load irq request failed with %d.\n",
++			ret);
++		goto err_put_resources;
++	}
++	disable_irq(dpu_crtc->content_shdld_irq);
++
++	dpu_crtc->dec_shdld_irq = dpu_map_irq(dpu, stream_id ?
++			IRQ_DISENGCFG_SHDLOAD1 : IRQ_DISENGCFG_SHDLOAD0);
++	ret = devm_request_irq(dev, dpu_crtc->dec_shdld_irq,
++				dpu_dec_shdld_irq_handler, 0, "imx_drm",
++				dpu_crtc);
++	if (ret < 0) {
++		dev_err(dev,
++			"DEC shadow load irq request failed with %d.\n",
++			ret);
+ 		goto err_put_resources;
+ 	}
+-	disable_irq(dpu_crtc->irq);
++	disable_irq(dpu_crtc->dec_shdld_irq);
+ 
+ 	return 0;
+ 
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.h b/drivers/gpu/drm/imx/dpu/dpu-crtc.h
+new file mode 100644
+index 0000000..f624fb7
+--- /dev/null
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.h
+@@ -0,0 +1,23 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#ifndef _DPU_CRTC_H_
++#define _DPU_CRTC_H_
++
++#include "dpu-plane.h"
++
++struct dpu_plane_state **
++crtc_state_get_dpu_plane_states(struct drm_crtc_state *state);
++
++#endif
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-kms.c b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+index fc8f311..f155967 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-kms.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+@@ -21,6 +21,7 @@
+ #include <linux/reservation.h>
+ #include <linux/sort.h>
+ #include <video/dpu.h>
++#include "dpu-crtc.h"
+ #include "dpu-plane.h"
+ #include "imx-drm.h"
+ 
+@@ -150,6 +151,7 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 		sid = dplane->stream_id;
+ 
+ 		/* assign source */
++		mutex_lock(&grp->mutex);
+ 		for (k = 0; k < grp->hw_plane_num; k++) {
+ 			/* already used by others? */
+ 			if (grp->src_mask & BIT(k))
+@@ -232,6 +234,7 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 			grp->src_mask |= BIT(k);
+ 			break;
+ 		}
++		mutex_unlock(&grp->mutex);
+ 
+ 		if (k == grp->hw_plane_num)
+ 			return -EINVAL;
+@@ -252,6 +255,119 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 	return 0;
+ }
+ 
++static void
++dpu_atomic_mark_pipe_states_prone_to_put_per_crtc(struct drm_crtc *crtc,
++						u32 crtc_mask,
++						struct drm_atomic_state *state,
++						bool *puts)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	bool found_pstate = false;
++	int i;
++
++	if ((crtc_mask & drm_crtc_mask(crtc)) == 0) {
++		for_each_plane_in_state(state, plane, plane_state, i) {
++			if (plane->possible_crtcs &
++			    drm_crtc_mask(crtc)) {
++				found_pstate = true;
++				break;
++			}
++		}
++
++		if (!found_pstate)
++			puts[drm_crtc_index(crtc)] = true;
++	}
++}
++
++static void
++dpu_atomic_put_plane_state(struct drm_atomic_state *state,
++			   struct drm_plane *plane)
++{
++	int index = drm_plane_index(plane);
++
++	plane->funcs->atomic_destroy_state(plane, state->planes[index].state);
++	state->planes[index].ptr = NULL;
++	state->planes[index].state = NULL;
++
++	drm_modeset_unlock(&plane->mutex);
++}
++
++static void
++dpu_atomic_put_crtc_state(struct drm_atomic_state *state,
++			  struct drm_crtc *crtc)
++{
++	int index = drm_crtc_index(crtc);
++
++	crtc->funcs->atomic_destroy_state(crtc, state->crtcs[index].state);
++	state->crtcs[index].ptr = NULL;
++	state->crtcs[index].state = NULL;
++
++	drm_modeset_unlock(&crtc->mutex);
++}
++
++static void
++dpu_atomic_put_possible_states_per_crtc(struct drm_crtc_state *crtc_state)
++{
++	struct drm_atomic_state *state = crtc_state->state;
++	struct drm_crtc *crtc = crtc_state->crtc;
++	struct drm_crtc_state *old_crtc_state = crtc->state;
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	struct dpu_plane *dplane = to_dpu_plane(crtc->primary);
++	struct dpu_plane_state **old_dpstates;
++	struct dpu_plane_state *old_dpstate, *new_dpstate;
++	u32 active_mask = 0;
++	int i;
++
++	old_dpstates = crtc_state_get_dpu_plane_states(old_crtc_state);
++	if (WARN_ON(!old_dpstates))
++		return;
++
++	for (i = 0; i < dplane->grp->hw_plane_num; i++) {
++		old_dpstate = old_dpstates[i];
++		if (!old_dpstate)
++			continue;
++
++		active_mask |= BIT(i);
++
++		drm_atomic_crtc_state_for_each_plane(plane, crtc_state) {
++			if (drm_plane_index(plane) !=
++			    drm_plane_index(old_dpstate->base.plane))
++				continue;
++
++			plane_state =
++				drm_atomic_get_existing_plane_state(state,
++									plane);
++			WARN_ON(!plane_state);
++
++			new_dpstate = to_dpu_plane_state(plane_state);
++
++			active_mask &= ~BIT(i);
++
++			/*
++			 * Should be enough to check the below real HW plane
++			 * resources only.
++			 * Vproc resources and things like layer_x/y should
++			 * be fine.
++			 */
++			if (old_dpstate->stage  != new_dpstate->stage ||
++			    old_dpstate->source != new_dpstate->source ||
++			    old_dpstate->blend  != new_dpstate->blend)
++				return;
++		}
++	}
++
++	/* pure software check */
++	if (WARN_ON(active_mask))
++		return;
++
++	drm_atomic_crtc_state_for_each_plane(plane, crtc_state)
++		dpu_atomic_put_plane_state(state, plane);
++
++	dpu_atomic_put_crtc_state(state, crtc);
++}
++
+ static int dpu_drm_atomic_check(struct drm_device *dev,
+ 				struct drm_atomic_state *state)
+ {
+@@ -266,6 +382,15 @@ static int dpu_drm_atomic_check(struct drm_device *dev,
+ 	int active_plane_fetcheco[MAX_DPU_PLANE_GRP];
+ 	int active_plane_hscale[MAX_DPU_PLANE_GRP];
+ 	int active_plane_vscale[MAX_DPU_PLANE_GRP];
++	bool pipe_states_prone_to_put[MAX_CRTC];
++	u32 crtc_mask_in_state = 0;
++
++	ret = drm_atomic_helper_check_modeset(dev, state);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < MAX_CRTC; i++)
++		pipe_states_prone_to_put[i] = false;
+ 
+ 	for (i = 0; i < MAX_DPU_PLANE_GRP; i++) {
+ 		active_plane[i] = 0;
+@@ -275,14 +400,20 @@ static int dpu_drm_atomic_check(struct drm_device *dev,
+ 		grp[i] = NULL;
+ 	}
+ 
++	for_each_crtc_in_state(state, crtc, crtc_state, i)
++		crtc_mask_in_state |= drm_crtc_mask(crtc);
++
+ 	drm_for_each_crtc(crtc, dev) {
++		dpu_atomic_mark_pipe_states_prone_to_put_per_crtc(crtc,
++						crtc_mask_in_state, state,
++						pipe_states_prone_to_put);
++
+ 		crtc_state = drm_atomic_get_crtc_state(state, crtc);
+ 		if (IS_ERR(crtc_state))
+ 			return PTR_ERR(crtc_state);
+ 
+-		ret = drm_atomic_add_affected_planes(state, crtc);
+-		if (ret)
+-			return ret;
++		drm_atomic_crtc_state_for_each_plane(plane, crtc_state)
++			plane_state = drm_atomic_get_plane_state(state, plane);
+ 
+ 		drm_atomic_crtc_state_for_each_plane_state(plane, plane_state,
+ 							   crtc_state) {
+@@ -328,15 +459,13 @@ static int dpu_drm_atomic_check(struct drm_device *dev,
+ 	/* clear resource mask */
+ 	for (i = 0; i < MAX_DPU_PLANE_GRP; i++) {
+ 		if (grp[i]) {
++			mutex_lock(&grp[i]->mutex);
+ 			grp[i]->src_mask = 0;
+ 			grp[i]->src_use_vproc_mask = 0;
++			mutex_unlock(&grp[i]->mutex);
+ 		}
+ 	}
+ 
+-	ret = drm_atomic_helper_check_modeset(dev, state);
+-	if (ret)
+-		return ret;
+-
+ 	ret = drm_atomic_normalize_zpos(dev, state);
+ 	if (ret)
+ 		return ret;
+@@ -382,6 +511,9 @@ static int dpu_drm_atomic_check(struct drm_device *dev,
+ 		}
+ 
+ 		kfree(states);
++
++		if (pipe_states_prone_to_put[drm_crtc_index(crtc)])
++			dpu_atomic_put_possible_states_per_crtc(crtc_state);
+ 	}
+ 
+ 	ret = drm_atomic_helper_check_planes(dev, state);
+diff --git a/drivers/gpu/imx/dpu/dpu-common.c b/drivers/gpu/imx/dpu/dpu-common.c
+index 9f00dd1..9249edf 100644
+--- a/drivers/gpu/imx/dpu/dpu-common.c
++++ b/drivers/gpu/imx/dpu/dpu-common.c
+@@ -995,6 +995,8 @@ static int dpu_add_client_devices(struct dpu_soc *dpu)
+ 	if (!plane_grp)
+ 		return -ENODEV;
+ 
++	mutex_init(&plane_grp->mutex);
++
+ 	mutex_lock(&dpu_client_id_mutex);
+ 	id = dpu_client_id;
+ 	dpu_client_id += client_num;
+diff --git a/drivers/gpu/imx/dpu/dpu-framegen.c b/drivers/gpu/imx/dpu/dpu-framegen.c
+index d7dba5a..2e72398 100644
+--- a/drivers/gpu/imx/dpu/dpu-framegen.c
++++ b/drivers/gpu/imx/dpu/dpu-framegen.c
+@@ -242,8 +242,11 @@ void framegen_cfg_videomode(struct dpu_framegen *fg, struct drm_display_mode *m)
+ 	dpu_fg_write(fg, VACT(vact) | VTOTAL(vtotal), VTCFG1);
+ 	dpu_fg_write(fg, VSYNC(vsync) | VSBP(vsbp) | VSEN, VTCFG2);
+ 
++	/* pkickconfig */
++	dpu_fg_write(fg, COL(hact) | ROW(vact) | EN, PKICKCONFIG);
++
+ 	/* skikconfig */
+-	dpu_fg_write(fg, COL(hact - 40) | ROW(vact - 1) | EN, SKICKCONFIG);
++	dpu_fg_write(fg, COL(hact) | ROW(vact) | EN, SKICKCONFIG);
+ 
+ 	/* primary position config */
+ 	dpu_fg_write(fg, STARTX(0) | STARTY(0), PACFG);
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index a640a38..979d032 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -698,6 +698,7 @@ struct dpu_plane_grp {
+ 	 * index:    0   1   2   3
+ 	 * source: fd0 fd1 fd2 fd3
+ 	 */
++	struct mutex		mutex;
+ 	u32			src_mask;
+ 	u32			src_use_vproc_mask;
+ };
+-- 
+1.7.9.5
+

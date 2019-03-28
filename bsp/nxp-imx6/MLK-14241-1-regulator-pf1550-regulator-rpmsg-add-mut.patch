@@ -1,0 +1,136 @@
+From 156eee222f323007b65bc014db497b3e94c095bf Mon Sep 17 00:00:00 2001
+From: Robin Gong <yibin.gong@nxp.com>
+Date: Sun, 19 Feb 2017 15:50:56 +0800
+Subject: [PATCH 1539/5242] MLK-14241-1 regulator: pf1550-regulator-rpmsg: add
+ mutex for pm_qos_add_request reentry
+
+commit  8762bcd06f8bc76627d76e807f317e4f84483a7c from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Multi drivers(mmc, cpufreq..) may access pf1550 regulator rpmsg driver at
+the same time, so we have to add mutex for this multi-entry case. Otherwise
+the below kernel warning maybe triggered:
+
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 19 at kernel/power/qos.c:453 pf1550_send_message+0x4c/0xf8()
+pm_qos_add_request() called for already added request
+Modules linked in:
+CPU: 0 PID: 19 Comm: kworker/0:1 Not tainted 4.1.33-02293-g80b8c19 #636
+Hardware name: Freescale i.MX7ULP (Device Tree)
+Workqueue: events od_dbs_timer
+[<80015d78>] (unwind_backtrace) from [<8001271c>] (show_stack+0x10/0x14)
+[<8001271c>] (show_stack) from [<8082ba50>] (dump_stack+0x88/0x9c)
+[<8082ba50>] (dump_stack) from [<800387c8>] (warn_slowpath_common+0x80/0xb0)
+[<800387c8>] (warn_slowpath_common) from [<80038828>] (warn_slowpath_fmt+0x30/0x40)
+[<80038828>] (warn_slowpath_fmt) from [<80341180>] (pf1550_send_message+0x4c/0xf8)
+[<80341180>] (pf1550_send_message) from [<80341504>] (pf1550_get_voltage+0x48/0x5c)
+[<80341504>] (pf1550_get_voltage) from [<803370a0>] (_regulator_get_voltage+0x68/0xb4)
+[<803370a0>] (_regulator_get_voltage) from [<8033936c>] (_regulator_do_set_voltage+0x5c/0x3e4)
+[<8033936c>] (_regulator_do_set_voltage) from [<803397a4>] (regulator_set_voltage+0xb0/0x14c)
+[<803397a4>] (regulator_set_voltage) from [<8058dae8>] (imx7ulp_set_target+0x178/0x238)
+[<8058dae8>] (imx7ulp_set_target) from [<80584d14>] (__cpufreq_driver_target+0x164/0x294)
+[<80584d14>] (__cpufreq_driver_target) from [<8058bb08>] (dbs_check_cpu+0x1a0/0x1e0)
+[<8058bb08>] (dbs_check_cpu) from [<805888e8>] (od_dbs_timer+0x80/0x138)
+[<805888e8>] (od_dbs_timer) from [<8004bbbc>] (process_one_work+0x118/0x3e4)
+[<8004bbbc>] (process_one_work) from [<8004bed4>] (worker_thread+0x4c/0x4f4)
+[<8004bed4>] (worker_thread) from [<80050e4c>] (kthread+0xdc/0xf4)
+[<80050e4c>] (kthread) from [<8000f528>] (ret_from_fork+0x14/0x2c)
+---[ end trace f8281ecde7a0b4ce ]---
+------------[ cut here ]------------
+
+Signed-off-by: Robin Gong <yibin.gong@nxp.com>
+---
+ drivers/regulator/pf1550-regulator-rpmsg.c |   30 ++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/regulator/pf1550-regulator-rpmsg.c b/drivers/regulator/pf1550-regulator-rpmsg.c
+index 877dfa4..57404ea 100644
+--- a/drivers/regulator/pf1550-regulator-rpmsg.c
++++ b/drivers/regulator/pf1550-regulator-rpmsg.c
+@@ -74,6 +74,7 @@ struct pf1550_regulator_info {
+ 	struct pf1550_regulator_rpmsg *msg;
+ 	struct completion cmd_complete;
+ 	struct pm_qos_request pm_qos_req;
++	struct mutex lock;
+ 	struct regulator_desc *regulators;
+ };
+ 
+@@ -100,42 +101,47 @@ static int pf1550_send_message(struct pf1550_regulator_rpmsg *msg,
+ {
+ 	int err;
+ 
+-	msg->header.cate = IMX_RPMSG_PMIC;
+-	msg->header.major = IMX_RMPSG_MAJOR;
+-	msg->header.minor = IMX_RMPSG_MINOR;
+-	msg->header.type = 0;
+-
+ 	if (!info->rpdev) {
+ 		dev_dbg(info->dev,
+ 			 "rpmsg channel not ready, m4 image ready?\n");
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&info->lock);
+ 	pm_qos_add_request(&info->pm_qos_req, PM_QOS_CPU_DMA_LATENCY, 0);
+ 
++	msg->header.cate = IMX_RPMSG_PMIC;
++	msg->header.major = IMX_RMPSG_MAJOR;
++	msg->header.minor = IMX_RMPSG_MINOR;
++	msg->header.type = 0;
++
+ 	/* wait response from rpmsg */
+ 	reinit_completion(&info->cmd_complete);
+ 
+ 	err = rpmsg_send(info->rpdev->ept, (void *)msg,
+ 			    sizeof(struct pf1550_regulator_rpmsg));
+-
+-	pm_qos_remove_request(&info->pm_qos_req);
+-
+ 	if (err) {
+ 		dev_err(&info->rpdev->dev, "rpmsg_send failed: %d\n", err);
+-		return err;
++		goto err_out;
+ 	}
+ 	err = wait_for_completion_timeout(&info->cmd_complete,
+ 					  msecs_to_jiffies(RPMSG_TIMEOUT));
+ 	if (!err) {
+ 		dev_err(&info->rpdev->dev, "rpmsg_send timeout!\n");
+-		return -ETIMEDOUT;
++		err = -ETIMEDOUT;
++		goto err_out;
+ 	}
+ 
++	err = 0;
++
++err_out:
++	pm_qos_remove_request(&info->pm_qos_req);
++	mutex_unlock(&info->lock);
++
+ 	dev_dbg(&info->rpdev->dev, "cmd:%d, reg:%d, resp:%d.\n",
+ 		  msg->header.cmd, msg->regulator, msg->response);
+ 
+-	return 0;
++	return err;
+ }
+ 
+ static int pf1550_enable(struct regulator_dev *reg)
+@@ -327,6 +333,7 @@ static int rpmsg_regulator_probe(struct rpmsg_device *rpdev)
+ 	pf1550_info.rpdev = rpdev;
+ 
+ 	init_completion(&pf1550_info.cmd_complete);
++	mutex_init(&pf1550_info.lock);
+ 
+ 	dev_info(&rpdev->dev, "new channel: 0x%x -> 0x%x!\n",
+ 			rpdev->src, rpdev->dst);
+@@ -469,6 +476,7 @@ static int pf1550_regulator_probe(struct platform_device *pdev)
+ 		return i;
+ 	}
+ #endif
++
+ 	platform_set_drvdata(pdev, &pf1550_info);
+ 
+ 	return 0;
+-- 
+1.7.9.5
+

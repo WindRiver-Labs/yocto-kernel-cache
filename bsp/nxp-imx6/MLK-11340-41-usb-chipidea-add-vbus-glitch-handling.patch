@@ -1,0 +1,200 @@
+From 637dfdd87f14874efa8c3cd58d7c335eff00ef7d Mon Sep 17 00:00:00 2001
+From: Li Jun <b47624@freescale.com>
+Date: Fri, 20 Jun 2014 15:52:14 +0800
+Subject: [PATCH 0092/5242] MLK-11340-41 usb: chipidea: add vbus glitch
+ handling
+
+commit  560d2772b7f7fb7f8d68159babe3683619c2581f from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+We add vbus glitch handling for both BSV rise and drop interruptes.
+This patch changes covers usb otg certification case, so the possible
+cases of vbus rise:
+- USB vbus can reach AVV(4.4v), valid vbus.
+- USB vbus keeps above BSV(0.8v) but lower than AVV(4.4v) for
+  more than 300ms, we think it's valid vbus event, this can meet
+  usb otg certificataion case(B device can do connection in 1s when
+  vbus is 4.0v).
+- USB vbus cannot be kept above BSV(0.8v) for more than 300ms,
+  it's a vbus glitch.
+
+In case of vbus drop: if the vbus on flag is not set, it's a vbus glitch,
+otherwise it's a valid vbus drop event.
+
+Signed-off-by: Peter Chen <peter.chen@freescale.com>
+Signed-off-by: Li Jun <b47624@freescale.com>
+
+During 4.14 rebase this was squashed from 2 commits:
+commit c133d378ab68 ("MLK-11340-41 usb: chipidea: add vbus glitch handling")
+commit 2d0f6361ceef ("MLK-11340-42 usb: chipidea: usb vbus glitch check logic change")
+
+The first patch used a hw_wait_reg that was deleted from upstream long
+ago and the second patch removed it. Generate a single commit instead.
+
+Signed-off-by: Leonard Crestez <leonard.crestez@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/usb/chipidea/ci.h      |    2 ++
+ drivers/usb/chipidea/core.c    |    2 +-
+ drivers/usb/chipidea/otg.c     |   63 +++++++++++++++++++++++++++++++++++++++-
+ drivers/usb/chipidea/otg_fsm.c |   11 +++----
+ 4 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/usb/chipidea/ci.h b/drivers/usb/chipidea/ci.h
+index 01e875e..6364a3b 100644
+--- a/drivers/usb/chipidea/ci.h
++++ b/drivers/usb/chipidea/ci.h
+@@ -200,6 +200,7 @@ struct hw_bank {
+  * @debugfs: root dentry for this controller in debugfs
+  * @id_event: indicates there is an id event, and handled at ci_otg_work
+  * @b_sess_valid_event: indicates there is a vbus event, and handled
++ * @vbus_glitch_check_event: check if vbus change is a glitch
+  * at ci_otg_work
+  * @imx28_write_fix: Freescale imx28 needs swp instruction for writing
+  * @supports_runtime_pm: if runtime pm is supported
+@@ -253,6 +254,7 @@ struct ci_hdrc {
+ 	struct dentry			*debugfs;
+ 	bool				id_event;
+ 	bool				b_sess_valid_event;
++	bool				vbus_glitch_check_event;
+ 	bool				imx28_write_fix;
+ 	bool				supports_runtime_pm;
+ 	bool				in_lpm;
+diff --git a/drivers/usb/chipidea/core.c b/drivers/usb/chipidea/core.c
+index c242ce8..c7ffb12 100644
+--- a/drivers/usb/chipidea/core.c
++++ b/drivers/usb/chipidea/core.c
+@@ -571,7 +571,7 @@ static irqreturn_t ci_irq(int irq, void *data)
+ 	 * and disconnection events.
+ 	 */
+ 	if (ci->is_otg && (otgsc & OTGSC_BSVIE) && (otgsc & OTGSC_BSVIS)) {
+-		ci->b_sess_valid_event = true;
++		ci->vbus_glitch_check_event = true;
+ 		/* Clear BSV irq */
+ 		hw_write_otgsc(ci, OTGSC_BSVIS, OTGSC_BSVIS);
+ 		ci_otg_queue_work(ci);
+diff --git a/drivers/usb/chipidea/otg.c b/drivers/usb/chipidea/otg.c
+index a2ed361..3d956ac 100644
+--- a/drivers/usb/chipidea/otg.c
++++ b/drivers/usb/chipidea/otg.c
+@@ -127,6 +127,32 @@ enum ci_role ci_otg_role(struct ci_hdrc *ci)
+ 	return role;
+ }
+ 
++/*
++ * Handling vbus glitch
++ * We only need to consider glitch for without usb connection,
++ * With usb connection, we consider it as real disconnection.
++ *
++ * If the vbus can't be kept above B session valid for timeout value,
++ * we think it is a vbus glitch, otherwise it's a valid vbus.
++ */
++#define CI_VBUS_CONNECT_TIMEOUT_MS 300
++static int ci_is_vbus_glitch(struct ci_hdrc *ci)
++{
++	int i;
++
++	for (i = 0; i < CI_VBUS_CONNECT_TIMEOUT_MS/20; i++) {
++		if (hw_read_otgsc(ci, OTGSC_AVV)) {
++			return 0;
++		} else if (!hw_read_otgsc(ci, OTGSC_BSV)) {
++			dev_warn(ci->dev, "there is a vbus glitch\n");
++			return 1;
++		}
++		msleep(20);
++	}
++
++	return 0;
++}
++
+ void ci_handle_vbus_connected(struct ci_hdrc *ci)
+ {
+ 	/*
+@@ -137,7 +163,7 @@ void ci_handle_vbus_connected(struct ci_hdrc *ci)
+ 	if (!ci->is_otg)
+ 		return;
+ 
+-	if (hw_read_otgsc(ci, OTGSC_BSV))
++	if (hw_read_otgsc(ci, OTGSC_BSV) && !ci_is_vbus_glitch(ci))
+ 		usb_gadget_vbus_connect(&ci->gadget);
+ }
+ 
+@@ -210,6 +236,32 @@ void ci_handle_id_switch(struct ci_hdrc *ci)
+ 			ci_handle_vbus_change(ci);
+ 	}
+ }
++
++static void ci_handle_vbus_glitch(struct ci_hdrc *ci)
++{
++	bool valid_vbus_change = false;
++
++	if (hw_read_otgsc(ci, OTGSC_BSV)) {
++		if (!ci_is_vbus_glitch(ci)) {
++			if (ci_otg_is_fsm_mode(ci)) {
++				ci->fsm.b_sess_vld = 1;
++				ci->fsm.b_ssend_srp = 0;
++				otg_del_timer(&ci->fsm, B_SSEND_SRP);
++				otg_del_timer(&ci->fsm, B_SRP_FAIL);
++			}
++			valid_vbus_change = true;
++		}
++	} else {
++		if (ci->vbus_active && !ci_otg_is_fsm_mode(ci))
++			valid_vbus_change = true;
++	}
++
++	if (valid_vbus_change) {
++		ci->b_sess_valid_event = true;
++		ci_otg_queue_work(ci);
++	}
++}
++
+ /**
+  * ci_otg_work - perform otg (vbus/id) event handle
+  * @work: work struct
+@@ -218,6 +270,15 @@ static void ci_otg_work(struct work_struct *work)
+ {
+ 	struct ci_hdrc *ci = container_of(work, struct ci_hdrc, work);
+ 
++	if (ci->vbus_glitch_check_event) {
++		ci->vbus_glitch_check_event = false;
++		pm_runtime_get_sync(ci->dev);
++		ci_handle_vbus_glitch(ci);
++		pm_runtime_put_sync(ci->dev);
++		enable_irq(ci->irq);
++		return;
++	}
++
+ 	if (ci_otg_is_fsm_mode(ci) && !ci_otg_fsm_work(ci)) {
+ 		enable_irq(ci->irq);
+ 		return;
+diff --git a/drivers/usb/chipidea/otg_fsm.c b/drivers/usb/chipidea/otg_fsm.c
+index 1b8d589..4bcf195 100644
+--- a/drivers/usb/chipidea/otg_fsm.c
++++ b/drivers/usb/chipidea/otg_fsm.c
+@@ -782,18 +782,15 @@ irqreturn_t ci_otg_fsm_irq(struct ci_hdrc *ci)
+ 			}
+ 		} else if (otg_int_src & OTGSC_BSVIS) {
+ 			hw_write_otgsc(ci, OTGSC_BSVIS, OTGSC_BSVIS);
+-			ci->b_sess_valid_event = true;
+-			if (otgsc & OTGSC_BSV) {
+-				fsm->b_sess_vld = 1;
+-				ci_otg_del_timer(ci, B_SSEND_SRP);
+-				ci_otg_del_timer(ci, B_SRP_FAIL);
+-				fsm->b_ssend_srp = 0;
+-			} else {
++			if (!(otgsc & OTGSC_BSV) && fsm->b_sess_vld) {
++				ci->b_sess_valid_event = true;
+ 				fsm->b_sess_vld = 0;
+ 				if (fsm->id)
+ 					ci_otg_add_timer(ci, B_SSEND_SRP);
+ 				if (fsm->b_bus_req)
+ 					fsm->b_bus_req = 0;
++			} else {
++				ci->vbus_glitch_check_event = true;
+ 			}
+ 		} else if (otg_int_src & OTGSC_AVVIS) {
+ 			hw_write_otgsc(ci, OTGSC_AVVIS, OTGSC_AVVIS);
+-- 
+1.7.9.5
+

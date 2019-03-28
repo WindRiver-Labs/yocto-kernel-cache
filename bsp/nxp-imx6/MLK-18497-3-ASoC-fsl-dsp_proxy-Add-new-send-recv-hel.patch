@@ -1,0 +1,206 @@
+From 4f56119f3809a957ac1fb63d9324300f3ed6391b Mon Sep 17 00:00:00 2001
+From: Daniel Baluta <daniel.baluta@nxp.com>
+Date: Thu, 4 Oct 2018 11:17:35 +0300
+Subject: [PATCH 4834/5242] MLK-18497-3: ASoC: fsl: dsp_proxy: Add new
+ send/recv helpers
+
+commit  cc72baf6bda440a55ae8b30d50301e50214fd415 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This commit adds 3 new function helpers for sending
+messages to DSP framework and waiting for response.
+
+While at it cleanup spaces around struct client fields.
+
+Reviewed-by: Cosmin-Gabriel Samoila <cosmin.samoila@nxp.com>
+Signed-off-by: Shengjiu Wang <shengjiu.wang@nxp.com
+Signed-off-by: Daniel Baluta <daniel.baluta@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_dsp.h       |   15 ++++----
+ sound/soc/fsl/fsl_dsp_proxy.c |   77 +++++++++++++++++++++++++++++++++++++++++
+ sound/soc/fsl/fsl_dsp_proxy.h |   25 +++++++++++--
+ 3 files changed, 107 insertions(+), 10 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_dsp.h b/sound/soc/fsl/fsl_dsp.h
+index 9288ac1..1d1ca32 100644
+--- a/sound/soc/fsl/fsl_dsp.h
++++ b/sound/soc/fsl/fsl_dsp.h
+@@ -22,22 +22,21 @@ struct xf_client {
+ 	struct xf_proxy     *proxy;
+ 
+ 	/* ...allocated proxy client id */
+-	u32                 id;
++	u32 id;
+ 
+ 	/* ...pending response queue */
+-	struct xf_msg_queue queue;
+-
++	struct xf_msg_queue	queue;
+ 	/* ...response waiting queue */
+-	wait_queue_head_t   wait;
++	wait_queue_head_t	wait;
+ 
+ 	/* ...virtual memory mapping */
+-	unsigned long       vm_start;
+-
++	unsigned long	vm_start;
+ 	/* ...counter of memory mappings (no real use of it yet - tbd) */
+-	atomic_t            vm_use;
++	atomic_t	vm_use;
+ 
+ 	/* ...global structure pointer */
+-	void				*global;
++	void	*global;
++	struct xf_message m;
+ };
+ 
+ union xf_client_link {
+diff --git a/sound/soc/fsl/fsl_dsp_proxy.c b/sound/soc/fsl/fsl_dsp_proxy.c
+index bc07158..4a569c4 100644
+--- a/sound/soc/fsl/fsl_dsp_proxy.c
++++ b/sound/soc/fsl/fsl_dsp_proxy.c
+@@ -571,6 +571,27 @@ struct xf_message *xf_cmd_recv(struct xf_proxy *proxy,
+ 	return m;
+ }
+ 
++struct xf_message *xf_cmd_recv_timeout(struct xf_proxy *proxy,
++				       wait_queue_head_t *wq,
++				       struct xf_msg_queue *queue, int wait)
++{
++	struct xf_message *m;
++	int ret;
++
++	/* ...wait for message reception (take lock on success) */
++	ret = wait_event_interruptible_timeout(*wq,
++			(m = xf_msg_received(proxy, queue)) != NULL || !wait,
++			msecs_to_jiffies(1000));
++	if (ret < 0)
++		return ERR_PTR(-EINTR);
++
++	if (ret == 0)
++		return ERR_PTR(-ETIMEDOUT);
++
++	/* ...return message with a lock taken */
++	return m;
++}
++
+ /* ...helper function for synchronous command execution */
+ struct xf_message *xf_cmd_send_recv(struct xf_proxy *proxy,
+ 							   u32 id, u32 opcode,
+@@ -588,6 +609,62 @@ struct xf_message *xf_cmd_send_recv(struct xf_proxy *proxy,
+ 	return xf_cmd_recv(proxy, &proxy->wait, &proxy->response, 1);
+ }
+ 
++struct xf_message *xf_cmd_send_recv_wq(struct xf_proxy *proxy, u32 id,
++				       u32 opcode, void *buffer, u32 length,
++				       wait_queue_head_t *wq,
++				       struct xf_msg_queue *queue)
++{
++	int ret;
++
++	/* ...send command to remote proxy */
++	ret = xf_cmd_send(proxy, id, opcode, buffer, length);
++	if (ret)
++		return ERR_PTR(ret);
++
++	/* ...wait for message delivery */
++	return xf_cmd_recv(proxy, wq, queue, 1);
++}
++
++struct xf_message *xf_cmd_send_recv_complete(struct xf_client *client,
++					     struct xf_proxy *proxy,
++					     u32 id, u32 opcode, void *buffer,
++					     u32 length,
++					     struct work_struct *work,
++					     struct completion *completion)
++{
++	struct xf_message *m;
++	int ret;
++
++	/* ...retrieve message handle (take the lock on success) */
++	m = xf_msg_available(proxy);
++	if (!m)
++		return ERR_PTR(-EBUSY);
++
++	/* ...fill-in message parameters (lock is taken) */
++	m->id = id;
++	m->opcode = opcode;
++	m->length = length;
++	m->buffer = buffer;
++	m->ret = 0;
++
++	init_completion(completion);
++
++	/* ...submit command to the proxy */
++	xf_proxy_command(proxy, m);
++
++	schedule_work(work);
++
++	/* ...wait for message reception (take lock on success) */
++	ret = wait_for_completion_timeout(completion,
++					  msecs_to_jiffies(1000));
++	if (!ret)
++		return ERR_PTR(-ETIMEDOUT);
++
++	m = &client->m;
++
++	/* ...return message with a lock taken */
++	return m;
++}
+ /*
+  * Proxy allocate and free memory functions
+  */
+diff --git a/sound/soc/fsl/fsl_dsp_proxy.h b/sound/soc/fsl/fsl_dsp_proxy.h
+index 131acf3..dc54dc2 100644
+--- a/sound/soc/fsl/fsl_dsp_proxy.h
++++ b/sound/soc/fsl/fsl_dsp_proxy.h
+@@ -21,6 +21,8 @@
+ 
+ #define XF_CFG_MESSAGE_POOL_SIZE        256
+ 
++struct xf_client;
++
+ /*******************************************************************************
+  * Local proxy data
+  ******************************************************************************/
+@@ -284,8 +286,8 @@ struct xf_proxy {
+ 	/* ...shared memory status change processing item */
+ 	struct work_struct      work;
+ 
+-	struct completion		cmd_complete;
+-	int						is_ready;
++	struct completion	cmd_complete;
++	int			is_ready;
+ 
+ 	/* ...internal lock */
+ 	spinlock_t              lock;
+@@ -366,6 +368,25 @@ struct xf_message *xf_cmd_recv(struct xf_proxy *proxy,
+ 					struct xf_msg_queue *queue,
+ 					int wait);
+ 
++struct xf_message*
++xf_cmd_recv_timeout(struct xf_proxy *proxy, wait_queue_head_t *wq,
++		    struct xf_msg_queue *queue, int wait);
++
++struct xf_message*
++xf_cmd_send_recv(struct xf_proxy *proxy, u32 id, u32 opcode,
++		 void *buffer, u32 length);
++
++struct xf_message*
++xf_cmd_send_recv_wq(struct xf_proxy *proxy, u32 id, u32 opcode, void *buffer,
++		    u32 length, wait_queue_head_t *wq,
++		    struct xf_msg_queue *queue);
++
++struct xf_message*
++xf_cmd_send_recv_complete(struct xf_client *client, struct xf_proxy *proxy,
++			  u32 id, u32 opcode, void *buffer, u32 length,
++			  struct work_struct *work,
++			  struct completion *completion);
++
+ /* ...mu interrupt handle */
+ irqreturn_t fsl_dsp_mu_isr(int irq, void *dev_id);
+ 
+-- 
+1.7.9.5
+

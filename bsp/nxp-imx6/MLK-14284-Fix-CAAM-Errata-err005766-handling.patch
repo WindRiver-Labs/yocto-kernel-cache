@@ -1,0 +1,155 @@
+From 0ed66d9a95b4ca654573b252da1f0221e6e3d56f Mon Sep 17 00:00:00 2001
+From: Radu Solea <radu.solea@nxp.com>
+Date: Thu, 13 Apr 2017 16:14:06 +0300
+Subject: [PATCH 1710/5242] MLK-14284 Fix CAAM Errata err005766 handling
+
+commit  b78c70b436eef5b36732c88665dd3e2fdcaebc1d from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+* Update ERA detection code to check 3 sources CCBVID, CAAMVID and
+the device tree.
+* Fix bit handling of CAAMVID data to obtain correct results.
+* Remove default device tree values.
+* Update errata handling to target known affected platforms.
+
+Signed-off-by: Radu Solea <radu.solea@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm/boot/dts/imx6qdl.dtsi |    1 -
+ arch/arm/boot/dts/imx6sx.dtsi  |    1 -
+ drivers/crypto/caam/ctrl.c     |   45 ++++++++++++++++++++++++++--------------
+ drivers/crypto/caam/intern.h   |    7 +++++++
+ drivers/crypto/caam/regs.h     |    5 ++++-
+ 5 files changed, 41 insertions(+), 18 deletions(-)
+
+diff --git a/arch/arm/boot/dts/imx6qdl.dtsi b/arch/arm/boot/dts/imx6qdl.dtsi
+index ae36507..9f2d213 100644
+--- a/arch/arm/boot/dts/imx6qdl.dtsi
++++ b/arch/arm/boot/dts/imx6qdl.dtsi
+@@ -1040,7 +1040,6 @@
+ 
+ 			crypto: caam@2100000 {
+ 				compatible = "fsl,sec-v4.0";
+-				fsl,sec-era = <4>;
+ 				#address-cells = <1>;
+ 				#size-cells = <1>;
+ 				reg = <0x2100000 0x10000>;
+diff --git a/arch/arm/boot/dts/imx6sx.dtsi b/arch/arm/boot/dts/imx6sx.dtsi
+index 047d1b8..859ad67 100644
+--- a/arch/arm/boot/dts/imx6sx.dtsi
++++ b/arch/arm/boot/dts/imx6sx.dtsi
+@@ -948,7 +948,6 @@
+ 
+ 			crypto: caam@2100000 {
+ 				compatible = "fsl,sec-v4.0";
+-				fsl,sec-era = <4>;
+ 				#address-cells = <1>;
+ 				#size-cells = <1>;
+ 				reg = <0x2100000 0x40000>;
+diff --git a/drivers/crypto/caam/ctrl.c b/drivers/crypto/caam/ctrl.c
+index fdef077..8125cf3 100644
+--- a/drivers/crypto/caam/ctrl.c
++++ b/drivers/crypto/caam/ctrl.c
+@@ -475,6 +475,34 @@ static int caam_get_era(struct caam_ctrl __iomem *ctrl)
+ 		return caam_get_era_from_hw(ctrl);
+ }
+ 
++static void handle_imx6_err005766(struct caam_drv_private *ctrlpriv)
++{
++	/*
++	 * ERRATA:  mx6 devices have an issue wherein AXI bus transactions
++	 * may not occur in the correct order. This isn't a problem running
++	 * single descriptors, but can be if running multiple concurrent
++	 * descriptors. Reworking the driver to throttle to single requests
++	 * is impractical, thus the workaround is to limit the AXI pipeline
++	 * to a depth of 1 (from it's default of 4) to preclude this situation
++	 * from occurring.
++	 */
++
++	u32 mcr_val;
++ 
++	if (ctrlpriv->era != IMX_ERR005766_ERA)
++		return;
++
++	if (of_machine_is_compatible("fsl,imx6q") ||
++	    of_machine_is_compatible("fsl,imx6dl") ||
++	    of_machine_is_compatible("fsl,imx6qp")) {
++		pr_info("AXI pipeline throttling enabled.\n");
++		mcr_val = rd_reg32(&ctrlpriv->ctrl->mcr);
++		wr_reg32(&ctrlpriv->ctrl->mcr,
++			 (mcr_val & ~(MCFGR_AXIPIPE_MASK)) |
++			 ((1 << MCFGR_AXIPIPE_SHIFT) & MCFGR_AXIPIPE_MASK));
++	}
++}
++
+ static const struct of_device_id caam_match[] = {
+ 	{
+ 		.compatible = "fsl,sec-v4.0",
+@@ -653,21 +681,6 @@ static int caam_probe(struct platform_device *pdev)
+ 			      (sizeof(dma_addr_t) == sizeof(u64) ?
+ 			       MCFGR_LONG_PTR : 0));
+ 
+-#ifdef CONFIG_ARCH_MX6
+-	/*
+-	 * ERRATA:  mx6 devices have an issue wherein AXI bus transactions
+-	 * may not occur in the correct order. This isn't a problem running
+-	 * single descriptors, but can be if running multiple concurrent
+-	 * descriptors. Reworking the driver to throttle to single requests
+-	 * is impractical, thus the workaround is to limit the AXI pipeline
+-	 * to a depth of 1 (from it's default of 4) to preclude this situation
+-	 * from occurring.
+-	 */
+-	wr_reg32(&topregs->ctrl.mcr,
+-		 (rd_reg32(&topregs->ctrl.mcr) & ~(MCFGR_AXIPIPE_MASK)) |
+-		 ((1 << MCFGR_AXIPIPE_SHIFT) & MCFGR_AXIPIPE_MASK));
+-#endif
+-
+ 	/*
+ 	 *  Read the Compile Time paramters and SCFGR to determine
+ 	 * if Virtualization is enabled for this platform
+@@ -711,6 +724,8 @@ static int caam_probe(struct platform_device *pdev)
+ 
+ 	ctrlpriv->era = caam_get_era(ctrl);
+ 
++	handle_imx6_err005766(ctrlpriv);
++
+ 	ret = of_platform_populate(nprop, caam_match, NULL, dev);
+ 	if (ret) {
+ 		dev_err(dev, "JR platform devices creation error\n");
+diff --git a/drivers/crypto/caam/intern.h b/drivers/crypto/caam/intern.h
+index 626dc9d..3c890d9 100644
+--- a/drivers/crypto/caam/intern.h
++++ b/drivers/crypto/caam/intern.h
+@@ -71,6 +71,13 @@ struct caam_drv_private {
+ 
+ 	struct device *smdev;
+ 
++	/*
++	 * ERA of the CAAM block,
++	 * -ENOTSUPP if no era version was supplied or detected.
++	 */
++#define IMX_ERR005766_ERA 4	/* ERA affected by i.mx AXI errata */
++	int era;
++
+ 	/* Physical-presence section */
+ 	struct caam_ctrl __iomem *ctrl; /* controller region */
+ 	struct caam_deco __iomem *deco; /* DECO/CCB views */
+diff --git a/drivers/crypto/caam/regs.h b/drivers/crypto/caam/regs.h
+index 03a38d6..a210f79 100644
+--- a/drivers/crypto/caam/regs.h
++++ b/drivers/crypto/caam/regs.h
+@@ -284,7 +284,10 @@ struct sec_vid {
+ 
+ #define SEC_VID_IPID_SHIFT      16
+ #define SEC_VID_MAJ_SHIFT       8
+-#define SEC_VID_MAJ_MASK        0xFF00
++#define SEC_VID_MAJ_MASK        0x0000FF00
++
++#define CCB_VID_ERA_SHIFT       24
++#define CCB_VID_ERA_MASK        0x000000FF
+ 
+ struct caam_perfmon {
+ 	/* Performance Monitor Registers			f00-f9f */
+-- 
+1.7.9.5
+

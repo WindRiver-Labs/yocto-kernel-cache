@@ -1,0 +1,752 @@
+From fa968f720f989d43da19082ea22f2a1c9fc21f61 Mon Sep 17 00:00:00 2001
+From: Cedric Neveux <cedric.neveux@nxp.com>
+Date: Thu, 18 Oct 2018 13:48:16 +0200
+Subject: [PATCH 5013/5242] MLK-20023 Move Busfreq support to OPTEE OS
+
+commit  0a569abd8bed55d999ea301f1616d59eb63d7bcf from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+  - When OPTEE OS is present and if it support the busfreq
+    for the running the i.MX, the busfreq is executed in
+    the OPTEE OS by calling a specific SMC function
+  - Only a WFE function is copied into the OCRAM to
+    synchronize all Cores in multi-core devices
+  - OPTEE OS add a DT property 'busfreq=1' in the 'firmware/optee'
+    node to indicate the busfreq support
+
+Signed-off-by: Cedric Neveux <cedric.neveux@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm/mach-imx/Makefile        |    5 +
+ arch/arm/mach-imx/busfreq-imx.c   |  152 +++++++++++++------
+ arch/arm/mach-imx/busfreq_optee.c |  300 +++++++++++++++++++++++++++++++++++++
+ arch/arm/mach-imx/smc_sip.h       |   36 +++++
+ arch/arm/mach-imx/smp_wfe_imx6.S  |   54 +++++++
+ 5 files changed, 500 insertions(+), 47 deletions(-)
+ create mode 100644 arch/arm/mach-imx/busfreq_optee.c
+ create mode 100644 arch/arm/mach-imx/smc_sip.h
+
+diff --git a/arch/arm/mach-imx/Makefile b/arch/arm/mach-imx/Makefile
+index 01ec96f..85b51b17 100644
+--- a/arch/arm/mach-imx/Makefile
++++ b/arch/arm/mach-imx/Makefile
+@@ -133,4 +133,9 @@ obj-$(CONFIG_SOC_VF610) += mach-vf610.o
+ 
+ obj-$(CONFIG_SOC_LS1021A) += mach-ls1021a.o
+ 
++ifneq ($(CONFIG_OPTEE)$(CONFIG_SOC_IMX6)$(CONFIG_SOC_IMX7),)
++# Bus frequency by OPTEE OS
++obj-y += busfreq_optee.o
++endif
++
+ obj-y += devices/
+diff --git a/arch/arm/mach-imx/busfreq-imx.c b/arch/arm/mach-imx/busfreq-imx.c
+index b6aa072..5298af7 100644
+--- a/arch/arm/mach-imx/busfreq-imx.c
++++ b/arch/arm/mach-imx/busfreq-imx.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (C) 2011-2016 Freescale Semiconductor, Inc. All Rights Reserved.
+  * Copyright 2017 NXP.
++ * Copyright 2018 NXP.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -71,6 +72,9 @@
+ extern unsigned long iram_tlb_phys_addr;
+ extern int unsigned long iram_tlb_base_addr;
+ 
++/*
++ * Bus frequency management by Linux
++ */
+ extern int init_mmdc_lpddr2_settings(struct platform_device *dev);
+ extern int init_mmdc_lpddr2_settings_mx6q(struct platform_device *dev);
+ extern int init_mmdc_ddr3_settings_imx6_up(struct platform_device *dev);
+@@ -81,6 +85,23 @@
+ extern int update_lpddr2_freq(int ddr_rate);
+ extern int update_lpddr2_freq_smp(int ddr_rate);
+ 
++#ifdef CONFIG_OPTEE
++/*
++ * Bus frequency management by OPTEE OS
++ */
++extern int update_freq_optee(int ddr_rate);
++extern int init_freq_optee(struct platform_device *busfreq_pdev);
++#endif
++
++/**
++ * @brief  Functions to init and update the busfreq function of
++ *         device and memory type
++ */
++static struct busfreq_func {
++	int (*init)(struct platform_device *dev);
++	int (*update)(int ddr_rate);
++} busfreq_func = {NULL, NULL};
++
+ DEFINE_MUTEX(bus_freq_mutex);
+ 
+ static struct clk *osc_clk;
+@@ -239,10 +260,10 @@ static void enter_lpm_imx6_up(void)
+ 		/* Need to ensure that PLL2_PFD_400M is kept ON. */
+ 		clk_prepare_enable(pll2_400_clk);
+ 		if (ddr_type == IMX_DDR_TYPE_DDR3)
+-			update_ddr_freq_imx6_up(LOW_AUDIO_CLK);
++			busfreq_func.update(LOW_AUDIO_CLK);
+ 		else if (ddr_type == IMX_DDR_TYPE_LPDDR2 ||
+ 			 ddr_type == IMX_MMDC_DDR_TYPE_LPDDR3)
+-			update_lpddr2_freq(HIGH_AUDIO_CLK);
++			busfreq_func.update(HIGH_AUDIO_CLK);
+ 		clk_set_parent(periph2_clk2_sel_clk, pll3_clk);
+ 		clk_set_parent(periph2_pre_clk, pll2_400_clk);
+ 		clk_set_parent(periph2_clk, periph2_pre_clk);
+@@ -270,11 +291,8 @@ static void enter_lpm_imx6_up(void)
+ 		low_bus_freq_mode = 0;
+ 		cur_bus_freq_mode = BUS_FREQ_AUDIO;
+ 	} else {
+-		if (ddr_type == IMX_DDR_TYPE_DDR3)
+-			update_ddr_freq_imx6_up(LPAPM_CLK);
+-		else if (ddr_type == IMX_DDR_TYPE_LPDDR2 ||
+-			 ddr_type == IMX_MMDC_DDR_TYPE_LPDDR3)
+-			update_lpddr2_freq(LPAPM_CLK);
++		busfreq_func.update(LPAPM_CLK);
++
+ 		clk_set_parent(periph2_clk2_sel_clk, osc_clk);
+ 		clk_set_parent(periph2_clk, periph2_clk2_clk);
+ 
+@@ -300,9 +318,9 @@ static void enter_lpm_imx6_smp(void)
+ 		/* Need to ensure that PLL2_PFD_400M is kept ON. */
+ 		clk_prepare_enable(pll2_400_clk);
+ 		if (ddr_type == MMDC_MDMISC_DDR_TYPE_DDR3)
+-			update_ddr_freq_imx_smp(LOW_AUDIO_CLK);
++			busfreq_func.update(LOW_AUDIO_CLK);
+ 		else if (ddr_type == MMDC_MDMISC_DDR_TYPE_LPDDR2)
+-			update_lpddr2_freq_smp(HIGH_AUDIO_CLK);
++			busfreq_func.update(HIGH_AUDIO_CLK);
+ 		/* Make sure periph clk's parent also got updated */
+ 		clk_set_parent(periph_clk2_sel_clk, pll3_clk);
+ 		if (ddr_type == MMDC_MDMISC_DDR_TYPE_DDR3)
+@@ -329,10 +347,8 @@ static void enter_lpm_imx6_smp(void)
+ 		low_bus_freq_mode = 0;
+ 		cur_bus_freq_mode = BUS_FREQ_AUDIO;
+ 	} else {
+-		if (ddr_type == MMDC_MDMISC_DDR_TYPE_DDR3)
+-			update_ddr_freq_imx_smp(LPAPM_CLK);
+-		else if (ddr_type == MMDC_MDMISC_DDR_TYPE_LPDDR2)
+-			update_lpddr2_freq_smp(LPAPM_CLK);
++		busfreq_func.update(LPAPM_CLK);
++
+ 		/* Make sure periph clk's parent also got updated */
+ 		clk_set_parent(periph_clk2_sel_clk, osc_clk);
+ 		/* Set periph_clk parent to OSC via periph_clk2_sel */
+@@ -372,10 +388,8 @@ static void exit_lpm_imx6_up(void)
+ 	/* set periph_clk2 to pll3 */
+ 	clk_set_parent(periph_clk2_sel_clk, pll3_clk);
+ 
+-	if (ddr_type == IMX_DDR_TYPE_DDR3)
+-		update_ddr_freq_imx6_up(ddr_normal_rate);
+-	else if (ddr_type == IMX_DDR_TYPE_LPDDR2 || ddr_type == IMX_MMDC_DDR_TYPE_LPDDR3)
+-		update_lpddr2_freq(ddr_normal_rate);
++	busfreq_func.update(ddr_normal_rate);
++
+ 	/* correct parent info after ddr freq change in asm code */
+ 	clk_set_parent(periph2_pre_clk, pll2_400_clk);
+ 	clk_set_parent(periph2_clk, periph2_pre_clk);
+@@ -409,10 +423,9 @@ static void exit_lpm_imx6_smp(void)
+ 		periph_clk_parent = pll2_400_clk;
+ 
+ 	clk_prepare_enable(pll2_400_clk);
+-	if (ddr_type == MMDC_MDMISC_DDR_TYPE_DDR3)
+-		update_ddr_freq_imx_smp(ddr_normal_rate);
+-	else if (ddr_type == MMDC_MDMISC_DDR_TYPE_LPDDR2)
+-		update_lpddr2_freq_smp(ddr_normal_rate);
++
++	busfreq_func.update(ddr_normal_rate);
++
+ 	/* Make sure periph clk's parent also got updated */
+ 	clk_set_parent(periph_clk2_sel_clk, pll3_clk);
+ 	clk_set_parent(periph_pre_clk, periph_clk_parent);
+@@ -456,7 +469,7 @@ static void enter_lpm_imx6sl(void)
+ 		clk_set_rate(ahb_clk, LPAPM_CLK / 3);
+ 
+ 		/* Set up DDR to 100MHz. */
+-		update_lpddr2_freq(HIGH_AUDIO_CLK);
++		busfreq_func.update(HIGH_AUDIO_CLK);
+ 
+ 		/* Fix the clock tree in kernel */
+ 		clk_set_parent(periph2_pre_clk, pll2_200_clk);
+@@ -552,8 +565,9 @@ static void enter_lpm_imx6sl(void)
+ 				 * is requested sometime later, the change is ignored.
+ 				 */
+ 				clk_set_parent(step_clk, osc_clk);
++
+ 				/* Now set DDR to 24MHz. */
+-				update_lpddr2_freq(LPAPM_CLK);
++				busfreq_func.update(LPAPM_CLK);
+ 
+ 				/*
+ 				 * Fix the clock tree in kernel.
+@@ -581,7 +595,7 @@ static void enter_lpm_imx6sl(void)
+ static void exit_lpm_imx6sl(void)
+ {
+ 	/* Change DDR freq in IRAM. */
+-	update_lpddr2_freq(ddr_normal_rate);
++	busfreq_func.update(ddr_normal_rate);
+ 
+ 	/*
+ 	 * Fix the clock tree in kernel.
+@@ -630,7 +644,7 @@ static void enter_lpm_imx7d(void)
+ 	clk_prepare_enable(pfd2_270m);
+ 	if (audio_bus_count) {
+ 		clk_prepare_enable(pfd0_392m);
+-		update_ddr_freq_imx_smp(HIGH_AUDIO_CLK);
++		busfreq_func.update(HIGH_AUDIO_CLK);
+ 
+ 		clk_set_parent(dram_alt_sel, pfd0_392m);
+ 		clk_set_parent(dram_root, dram_alt_root);
+@@ -644,7 +658,7 @@ static void enter_lpm_imx7d(void)
+ 		low_bus_freq_mode = 0;
+ 		cur_bus_freq_mode = BUS_FREQ_AUDIO;
+ 	} else {
+-		update_ddr_freq_imx_smp(LPAPM_CLK);
++		busfreq_func.update(LPAPM_CLK);
+ 
+ 		clk_set_parent(dram_alt_sel, osc_clk);
+ 		clk_set_parent(dram_root, dram_alt_root);
+@@ -666,7 +680,7 @@ static void exit_lpm_imx7d(void)
+ 	clk_set_rate(ahb_clk, LPAPM_CLK / 2);
+ 	clk_set_parent(ahb_sel_clk, pfd2_270m);
+ 
+-	update_ddr_freq_imx_smp(ddr_normal_rate);
++	busfreq_func.update(ddr_normal_rate);
+ 
+ 	clk_set_parent(dram_root, pll_dram);
+ }
+@@ -1106,6 +1120,10 @@ static DEVICE_ATTR(enable, 0644, bus_freq_scaling_enable_show,
+ static int busfreq_probe(struct platform_device *pdev)
+ {
+ 	u32 err;
++#ifdef CONFIG_OPTEE
++	struct device_node *node_optee = 0;
++	uint32_t busfreq_val;
++#endif
+ 
+ 	busfreq_dev = &pdev->dev;
+ 
+@@ -1305,35 +1323,75 @@ static int busfreq_probe(struct platform_device *pdev)
+ 			ddr_normal_rate = 400000000;
+ 			pr_info("ddr3 normal rate changed to 400MHz for TO1.1.\n");
+ 		}
+-		err = init_ddrc_ddr_settings(pdev);
++		busfreq_func.init   = &init_ddrc_ddr_settings;
++		busfreq_func.update = &update_ddr_freq_imx_smp;
+ 	} else if (cpu_is_imx6sx() || cpu_is_imx6ul() || cpu_is_imx6ull() ||
+ 		cpu_is_imx6sll()) {
+ 		ddr_type = imx_mmdc_get_ddr_type();
+-		if (ddr_type == IMX_DDR_TYPE_DDR3)
+-			err = init_mmdc_ddr3_settings_imx6_up(pdev);
+-		else if (ddr_type == IMX_DDR_TYPE_LPDDR2 ||
+-			 ddr_type == IMX_MMDC_DDR_TYPE_LPDDR3)
+-			err = init_mmdc_lpddr2_settings(pdev);
++		if (ddr_type == IMX_DDR_TYPE_DDR3) {
++			busfreq_func.init   = &init_mmdc_ddr3_settings_imx6_up;
++			busfreq_func.update = &update_ddr_freq_imx6_up;
++		} else if (ddr_type == IMX_DDR_TYPE_LPDDR2 ||
++			 ddr_type == IMX_MMDC_DDR_TYPE_LPDDR3) {
++			busfreq_func.init   = &init_mmdc_lpddr2_settings;
++			busfreq_func.update = &update_lpddr2_freq;
++		}
+ 	} else if (cpu_is_imx6q() || cpu_is_imx6dl()) {
+ 		ddr_type = imx_mmdc_get_ddr_type();
+-		if (ddr_type == MMDC_MDMISC_DDR_TYPE_DDR3)
+-			err = init_mmdc_ddr3_settings_imx6_smp(pdev);
+-		else if (ddr_type == MMDC_MDMISC_DDR_TYPE_LPDDR2)
+-			err = init_mmdc_lpddr2_settings_mx6q(pdev);
++		if (ddr_type == MMDC_MDMISC_DDR_TYPE_DDR3) {
++			busfreq_func.init   = &init_mmdc_ddr3_settings_imx6_smp;
++			busfreq_func.update = &update_ddr_freq_imx_smp;
++		} else if (ddr_type == MMDC_MDMISC_DDR_TYPE_LPDDR2) {
++			busfreq_func.init   = &init_mmdc_lpddr2_settings_mx6q;
++			busfreq_func.update = &update_lpddr2_freq_smp;
++		}
+ 	} else if (cpu_is_imx6sl()) {
+-		err = init_mmdc_lpddr2_settings(pdev);
++		busfreq_func.init   = &init_mmdc_lpddr2_settings;
++		busfreq_func.update = &update_lpddr2_freq;
+ 	}
+ 
+-	if (cpu_is_imx6sx()) {
+-		/* if M4 is enabled and rate > 24MHz, add high bus count */
+-		if (imx_src_is_m4_enabled() &&
+-			(clk_get_rate(m4_clk) > LPAPM_CLK))
+-			high_bus_count++;
++#ifdef CONFIG_OPTEE
++	/*
++	 * Find the OPTEE node in the DT and look for the
++	 * busfreq property.
++	 * If property present and set to 1, busfreq is done by
++	 * calling the OPTEE OS
++	 */
++	node_optee = of_find_compatible_node(NULL, NULL, "linaro,optee-tz");
++
++	if (node_optee) {
++		if (of_property_read_u32(node_optee, "busfreq",
++			    &busfreq_val) == 0) {
++			pr_info("OPTEE busfreq %s",
++				(busfreq_val ? "Supported" : "Not Supported"));
++			if (busfreq_val) {
++				busfreq_func.init   = &init_freq_optee;
++				busfreq_func.update = &update_freq_optee;
++			}
++		}
+ 	}
++#endif
+ 
+-	if (cpu_is_imx7d() && imx_src_is_m4_enabled()) {
+-		high_bus_count++;
+-		imx_mu_lpm_ready(true);
++	if (busfreq_func.init)
++		err = busfreq_func.init(pdev);
++	else
++		err = -EINVAL;
++
++	if (!err) {
++		if (cpu_is_imx6sx()) {
++			/*
++			 * If M4 is enabled and rate > 24MHz,
++			 * add high bus count
++			 */
++			if (imx_src_is_m4_enabled() &&
++				(clk_get_rate(m4_clk) > LPAPM_CLK))
++				high_bus_count++;
++		}
++
++		if (cpu_is_imx7d() && imx_src_is_m4_enabled()) {
++			high_bus_count++;
++			imx_mu_lpm_ready(true);
++		}
+ 	}
+ 
+ 	if (err) {
+@@ -1369,7 +1427,7 @@ static int __init busfreq_init(void)
+ 	if (platform_driver_register(&busfreq_driver) != 0)
+ 		return -ENODEV;
+ 
+-	printk(KERN_INFO "Bus freq driver module loaded\n");
++	pr_info("Bus freq driver module loaded\n");
+ #endif
+ 	return 0;
+ }
+diff --git a/arch/arm/mach-imx/busfreq_optee.c b/arch/arm/mach-imx/busfreq_optee.c
+new file mode 100644
+index 0000000..2130052
+--- /dev/null
++++ b/arch/arm/mach-imx/busfreq_optee.c
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2018 NXP
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   busfreq_optee.c
++ *
++ * @brief  iMX.6 and i.MX7 Bus Frequency change.\n
++ *         Call OPTEE busfreq function regardless memory type and device.
++ *
++ * @ingroup PM
++ */
++#include <asm/fncpy.h>
++#include <linux/busfreq-imx.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqchip/arm-gic.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_device.h>
++#include <linux/slab.h>
++#include <linux/platform_device.h>
++
++#include "hardware.h"
++#include "smc_sip.h"
++
++/*
++ * External declaration
++ */
++extern void imx_smp_wfe_optee(u32 cpuid, u32 status_addr);
++extern unsigned long imx_smp_wfe_start asm("imx_smp_wfe_optee");
++extern unsigned long imx_smp_wfe_end asm("imx_smp_wfe_optee_end");
++
++extern unsigned int ddr_normal_rate;
++extern unsigned long ddr_freq_change_iram_base;
++
++
++/**
++ * @brief  Definition of the synchronization status
++ *         structure used to control to CPUs status
++ *         and on-going frequency change
++ */
++struct busfreq_sync {
++	uint32_t change_ongoing;
++	uint32_t wfe_status[NR_CPUS];
++} __aligned(8);
++
++static struct busfreq_sync *pSync;
++
++static void (*wfe_change_freq)(uint32_t *wfe_status, uint32_t *freq_done);
++
++static uint32_t *irqs_for_wfe;
++static void __iomem *gic_dist_base;
++
++static int curr_ddr_rate;
++
++#ifdef CONFIG_SMP
++/**
++ * @brief  Switch all active cores, except the one changing the
++ *         bus frequency, in WFE mode until completion of the
++ *         frequency change
++ *
++ * @param[in]  irq     Interrupt ID - not used
++ * @param[in]  dev_id  Client data - not used
++ *
++ * @retval IRQ_HANDLED  Interrupt handled
++ */
++static irqreturn_t wait_in_wfe_irq(int irq, void *dev_id)
++{
++	uint32_t me;
++
++	me = smp_processor_id();
++#ifdef CONFIG_LOCAL_TIMERS
++	clockevents_notify(CLOCK_EVT_NOTIFY_BROADCAST_ENTER,
++		&me);
++#endif
++
++	wfe_change_freq(&pSync->wfe_status[me], &pSync->change_ongoing);
++
++#ifdef CONFIG_LOCAL_TIMERS
++	clockevents_notify(CLOCK_EVT_NOTIFY_BROADCAST_EXIT,
++		&me);
++#endif
++
++	return IRQ_HANDLED;
++}
++#endif
++
++/**
++ * @brief   Request OPTEE OS to change the memory bus frequency
++ *          to \a ddr_rate value
++ *
++ * @param[in]  rate  Bus Frequency
++ *
++ * @retval 0  Success
++ */
++int update_freq_optee(int ddr_rate)
++{
++	struct arm_smccc_res res;
++
++	uint32_t me      = 0;
++	uint32_t dll_off = 0;
++	int      mode    = get_bus_freq_mode();
++
++#ifdef CONFIG_SMP
++	uint32_t reg         = 0;
++	uint32_t cpu         = 0;
++	uint32_t online_cpus = 0;
++	uint32_t all_cpus    = 0;
++#endif
++
++	pr_debug("\nBusfreq DDR3 OPTEE set from %d to %d start...\n",
++			curr_ddr_rate, ddr_rate);
++
++	if (ddr_rate == curr_ddr_rate)
++		return 0;
++
++	if (cpu_is_imx6()) {
++		if ((mode == BUS_FREQ_LOW) || (mode == BUS_FREQ_AUDIO))
++			dll_off = 1;
++	}
++
++	local_irq_disable();
++
++#ifdef CONFIG_SMP
++	me = smp_processor_id();
++
++	/* Make sure all the online cores to be active */
++	do {
++		all_cpus = 0;
++
++		for_each_online_cpu(cpu)
++			all_cpus |= (pSync->wfe_status[cpu] << cpu);
++	} while (all_cpus);
++
++	pSync->change_ongoing = 1;
++	dsb();
++
++	for_each_online_cpu(cpu) {
++		if (cpu != me) {
++			online_cpus |= (1 << cpu);
++			/* Set the interrupt to be pending in the GIC. */
++			reg = 1 << (irqs_for_wfe[cpu] % 32);
++			writel_relaxed(reg, gic_dist_base + GIC_DIST_PENDING_SET
++				+ (irqs_for_wfe[cpu] / 32) * 4);
++		}
++	}
++
++	/* Wait for all active CPUs to be in WFE */
++	do {
++		all_cpus = 0;
++
++		for_each_online_cpu(cpu)
++			all_cpus |= (pSync->wfe_status[cpu] << cpu);
++	} while (all_cpus != online_cpus);
++
++#endif
++
++	/* Now we can change the DDR frequency. */
++	/* Call the TEE SiP */
++	arm_smccc_smc(OPTEE_SMC_FAST_CALL_SIP_VAL(IMX_SIP_BUSFREQ_CHANGE),
++				ddr_rate, dll_off, 0, 0, 0, 0, 0, &res);
++
++	curr_ddr_rate = ddr_rate;
++
++#ifdef CONFIG_SMP
++	/* DDR frequency change is done */
++	pSync->change_ongoing = 0;
++	dsb();
++
++	/* wake up all the cores. */
++	sev();
++#endif
++
++	local_irq_enable();
++
++	pr_debug("Busfreq OPTEE set to %d done! cpu=%d\n", ddr_rate, me);
++
++	return 0;
++}
++
++static int init_freq_optee_smp(struct platform_device *busfreq_pdev)
++{
++	struct device_node *node = 0;
++	struct device *dev = &busfreq_pdev->dev;
++	uint32_t cpu;
++	int err;
++	int irq;
++	struct irq_data *irq_data;
++	unsigned long wfe_iram_base;
++
++	if (cpu_is_imx6()) {
++		node = of_find_compatible_node(NULL, NULL, "arm,cortex-a9-gic");
++		if (!node) {
++			if (cpu_is_imx6q())
++				pr_debug("failed to find imx6q-a9-gic device tree data!\n");
++
++			return -EINVAL;
++		}
++	} else {
++		node = of_find_compatible_node(NULL, NULL, "arm,cortex-a7-gic");
++		if (!node) {
++			pr_debug("failed to find imx7d-a7-gic device tree data!\n");
++			return -EINVAL;
++		}
++	}
++
++	gic_dist_base = of_iomap(node, 0);
++	WARN(!gic_dist_base, "unable to map gic dist registers\n");
++
++	irqs_for_wfe = devm_kzalloc(dev, sizeof(uint32_t) * num_present_cpus(),
++					GFP_KERNEL);
++
++	for_each_online_cpu(cpu) {
++		/*
++		 * set up a reserved interrupt to get all
++		 * the active cores into a WFE state
++		 * before changing the DDR frequency.
++		 */
++		irq = platform_get_irq(busfreq_pdev, cpu);
++
++		if (cpu_is_imx6()) {
++			err = request_irq(irq, wait_in_wfe_irq,
++				IRQF_PERCPU, "mmdc_1", NULL);
++		} else {
++			err = request_irq(irq, wait_in_wfe_irq,
++				IRQF_PERCPU, "ddrc", NULL);
++		}
++
++		if (err) {
++			dev_err(dev,
++				"Busfreq:request_irq failed %d, err = %d\n",
++				irq, err);
++			return err;
++		}
++
++		err = irq_set_affinity(irq, cpumask_of(cpu));
++		if (err) {
++			dev_err(dev,
++				"Busfreq: Cannot set irq affinity irq=%d,\n",
++				irq);
++			return err;
++		}
++
++		irq_data = irq_get_irq_data(irq);
++		irqs_for_wfe[cpu] = irq_data->hwirq + 32;
++	}
++
++	/* Store the variable used to communicate between cores */
++	pSync = (void *)ddr_freq_change_iram_base;
++
++	memset(pSync, 0, sizeof(*pSync));
++
++	wfe_iram_base = ddr_freq_change_iram_base + sizeof(*pSync);
++
++	if (wfe_iram_base & (FNCPY_ALIGN - 1))
++		wfe_iram_base += FNCPY_ALIGN -
++				((uintptr_t)wfe_iram_base % (FNCPY_ALIGN));
++
++	wfe_change_freq = (void *)fncpy((void *)wfe_iram_base,
++				&imx_smp_wfe_optee,
++				((&imx_smp_wfe_end -&imx_smp_wfe_start) *4));
++
++	return 0;
++
++}
++
++int init_freq_optee(struct platform_device *busfreq_pdev)
++{
++	int err = -EINVAL;
++	struct device *dev = &busfreq_pdev->dev;
++
++	if (num_present_cpus() <= 1) {
++		wfe_change_freq = NULL;
++
++		/* Allocate the cores synchronization variables (not used) */
++		pSync = devm_kzalloc(dev, sizeof(*pSync), GFP_KERNEL);
++
++		if (pSync)
++			err = 0;
++	} else {
++		err = init_freq_optee_smp(busfreq_pdev);
++	}
++
++	if (err == 0)
++		curr_ddr_rate = ddr_normal_rate;
++
++	return err;
++}
++
+diff --git a/arch/arm/mach-imx/smc_sip.h b/arch/arm/mach-imx/smc_sip.h
+new file mode 100644
+index 0000000..30c854b
+--- /dev/null
++++ b/arch/arm/mach-imx/smc_sip.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright 2018 NXP
++ */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#ifndef __SMC_SIP_H__
++#define __SMC_SIP_H__
++
++#include <linux/arm-smccc.h>
++
++/*
++ * Macro definition building the OPTEE SMC Code function
++ * for a Fast Call, SIP operation
++ */
++#define OPTEE_SMC_FAST_CALL_SIP_VAL(func_num) \
++							ARM_SMCCC_CALL_VAL( \
++							ARM_SMCCC_FAST_CALL, \
++							ARM_SMCCC_SMC_32, \
++							ARM_SMCCC_OWNER_SIP, \
++							(func_num))
++
++
++/*
++ * Definition of the i.MX SMC SIP Operations
++ * Operation value must be aligned with i.MX OPTEE
++ * SIP definitions
++ */
++/* Busfreq operation */
++#define IMX_SIP_BUSFREQ_CHANGE             6
++
++#endif /* __SMC_SIP_H__ */
++
+diff --git a/arch/arm/mach-imx/smp_wfe_imx6.S b/arch/arm/mach-imx/smp_wfe_imx6.S
+index cdee616..7695d89 100644
+--- a/arch/arm/mach-imx/smp_wfe_imx6.S
++++ b/arch/arm/mach-imx/smp_wfe_imx6.S
+@@ -129,4 +129,58 @@ go_back_wfe:
+ 	mov	pc, lr
+ 	.ltorg
+ wfe_smp_freq_change_end:
++ENDPROC(wfe_smp_freq_change)
++
++#ifdef CONFIG_OPTEE
++/**
++ * @brief  Switch CPU in WFE mode while bus frequency change
++ *         on-going
++ *
++ * @param[in] r0  CPU in WFE Status
++ * @param[in] r1  Bus frequency change status
++ */
++
++.globl imx_smp_wfe_optee_end
++
++ENTRY(imx_smp_wfe_optee)
++	push  {r4-r11, lr}
++
++	dsb
++	isb
++
++	disable_l1_dcache
++	isb
++
++	/* Set flag CPU entering WFE. */
++	mov   r4, #1
++	str   r4, [r0]
++
++	dsb
++	isb
++
++1:
++	wfe
++
++	/* Check if busfreq is done, else loop */
++	ldr   r4, [r1]
++	cmp   r4, #1
++	beq   1b
++
++	/* Enable L1 data cache. */
++	mrc   p15, 0, r4, c1, c0, 0
++	orr   r4, r4, #0x4
++	mcr   p15, 0, r4, c1, c0, 0
++	isb
++
++	/* Set flag CPU exiting WFE. */
++	mov   r4, #0
++	str   r4, [r0]
++
++	/* Pop all saved registers. */
++	pop   {r4-r11, lr}
++	mov   pc, lr
++	.ltorg
++imx_smp_wfe_optee_end:
++ENDPROC(imx_smp_wfe_optee)
++#endif
+ #endif
+-- 
+1.7.9.5
+

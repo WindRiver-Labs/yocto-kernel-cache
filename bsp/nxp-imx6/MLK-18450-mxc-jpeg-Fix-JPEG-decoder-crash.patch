@@ -1,0 +1,1070 @@
+From 615c42fde9acec7f94ce0d418da49be8cd136348 Mon Sep 17 00:00:00 2001
+From: Mirela Rabulea <mirela.rabulea@nxp.com>
+Date: Wed, 27 Jun 2018 19:43:33 +0300
+Subject: [PATCH 4321/5242] MLK-18450: mxc-jpeg: Fix JPEG decoder crash
+
+commit  a1c512bfcc949632a8fefb983ebf0c7b014766e9 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Fixed decoder crasher by creating a structure to encompass the descriptors
+and associated it to the jpeg device, one for each slot.
+Removed mxc_jpeg_buf, as writing to its fields was causing
+memory corruption sometimes (depending on how src_buf & dst_buf
+got allocated, writing to one was overwriting the other).
+
+For now, only slot 0 is used (no regression here, just a TODO).
+
+Note that the decoded image looks ok only on QXP B0, not A0.
+
+The decoder_test application will be patched in linux-test,
+the old one should work too, but needed cleanup.
+
+Signed-off-by: Mirela Rabulea <mirela.rabulea@nxp.com>
+Reviewed-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/imx8/mxc-jpeg-hw.c |  231 +++++++++++++------
+ drivers/media/platform/imx8/mxc-jpeg-hw.h |   75 +++++--
+ drivers/media/platform/imx8/mxc-jpeg.c    |  349 +++++++++++++++++++----------
+ drivers/media/platform/imx8/mxc-jpeg.h    |   17 +-
+ 4 files changed, 454 insertions(+), 218 deletions(-)
+
+diff --git a/drivers/media/platform/imx8/mxc-jpeg-hw.c b/drivers/media/platform/imx8/mxc-jpeg-hw.c
+index 88ba0fe..5b6408b 100644
+--- a/drivers/media/platform/imx8/mxc-jpeg-hw.c
++++ b/drivers/media/platform/imx8/mxc-jpeg-hw.c
+@@ -14,16 +14,76 @@
+ #include <media/videobuf2-core.h>
+ #include "mxc-jpeg-hw.h"
+ 
++#define print_wrapper_reg(dev, base_address, reg_offset)\
++		internal_print_wrapper_reg(dev, (base_address), #reg_offset,\
++					   (reg_offset))
++#define internal_print_wrapper_reg(dev, base_address, reg_name, reg_offset) {\
++		int val;\
++		val = readl((base_address) + (reg_offset));\
++		dev_info(dev, "Wrapper reg %s = 0x%x\n", reg_name, val);\
++}
++
+ void print_descriptor_info(struct device *dev, struct mxc_jpeg_desc *desc)
+ {
+-	dev_info(dev, " MXC JPEG NEXT PTR 0x%x\n", desc->next_descpt_ptr);
+-	dev_info(dev, " MXC JPEG BUF BASE0 0x%x\n", desc->buf_base0);
+-	dev_info(dev, " MXC JPEG PITCH %d\n", desc->line_pitch);
+-	dev_info(dev, " MXC JPEG BUF BASE 0x%x\n", desc->stm_bufbase);
+-	dev_info(dev, " MXC JPEG BUF SIZE %d\n", desc->stm_bufsize);
++	dev_info(dev, " MXC JPEG NEXT_DESCPT_PTR 0x%x\n",
++		desc->next_descpt_ptr);
++	dev_info(dev, " MXC JPEG BUF_BASE0 0x%x\n", desc->buf_base0);
++	dev_info(dev, " MXC JPEG BUF_BASE1 0x%x\n", desc->buf_base1);
++	dev_info(dev, " MXC JPEG LINE_PITCH %d\n", desc->line_pitch);
++	dev_info(dev, " MXC JPEG STM_BUFBASE 0x%x\n", desc->stm_bufbase);
++	dev_info(dev, " MXC JPEG STM_BUFSIZE %d\n", desc->stm_bufsize);
+ 	dev_info(dev, " MXC JPEG IMGSIZE %x (%d x %d)\n", desc->imgsize,
+ 		desc->imgsize >> 16, desc->imgsize & 0xFFFF);
+-	dev_info(dev, " MXC JPEG STM CTRL 0x%x\n", desc->stm_ctrl);
++	dev_info(dev, " MXC JPEG STM_CTRL 0x%x\n", desc->stm_ctrl);
++}
++
++void print_cast_decoder_info(struct device *dev, void __iomem *reg)
++{
++	dev_info(dev, "CAST IP decoder regs:\n");
++	print_wrapper_reg(dev, reg, CAST_STATUS0);
++	print_wrapper_reg(dev, reg, CAST_STATUS1);
++	print_wrapper_reg(dev, reg, CAST_STATUS2);
++	print_wrapper_reg(dev, reg, CAST_STATUS3);
++	print_wrapper_reg(dev, reg, CAST_STATUS4);
++	print_wrapper_reg(dev, reg, CAST_STATUS5);
++	print_wrapper_reg(dev, reg, CAST_STATUS6);
++	print_wrapper_reg(dev, reg, CAST_STATUS7);
++	print_wrapper_reg(dev, reg, CAST_STATUS8);
++	print_wrapper_reg(dev, reg, CAST_STATUS9);
++	print_wrapper_reg(dev, reg, CAST_STATUS10);
++	print_wrapper_reg(dev, reg, CAST_STATUS11);
++	print_wrapper_reg(dev, reg, CAST_STATUS12);
++	print_wrapper_reg(dev, reg, CAST_STATUS13);
++}
++
++void print_cast_encoder_info(struct device *dev, void __iomem *reg)
++{
++	dev_info(dev, "CAST IP encoder regs:\n");
++	print_wrapper_reg(dev, reg, CAST_MODE);
++	print_wrapper_reg(dev, reg, CAST_CFG_MODE);
++	print_wrapper_reg(dev, reg, CAST_QUALITY);
++	print_wrapper_reg(dev, reg, CAST_RSVD);
++	print_wrapper_reg(dev, reg, CAST_REC_REGS_SEL);
++	print_wrapper_reg(dev, reg, CAST_LUMTH);
++	print_wrapper_reg(dev, reg, CAST_CHRTH);
++	print_wrapper_reg(dev, reg, CAST_NOMFRSIZE_LO);
++	print_wrapper_reg(dev, reg, CAST_NOMFRSIZE_HI);
++	print_wrapper_reg(dev, reg, CAST_OFBSIZE_LO);
++	print_wrapper_reg(dev, reg, CAST_OFBSIZE_HI);
++}
++
++void print_wrapper_info(struct device *dev, void __iomem *reg)
++{
++	dev_info(dev, "Wrapper regs:\n");
++	print_wrapper_reg(dev, reg, GLB_CTRL);
++	print_wrapper_reg(dev, reg, COM_STATUS);
++	print_wrapper_reg(dev, reg, BUF_BASE0);
++	print_wrapper_reg(dev, reg, BUF_BASE1);
++	print_wrapper_reg(dev, reg, LINE_PITCH);
++	print_wrapper_reg(dev, reg, STM_BUFBASE);
++	print_wrapper_reg(dev, reg, STM_BUFSIZE);
++	print_wrapper_reg(dev, reg, IMGSIZE);
++	print_wrapper_reg(dev, reg, STM_CTRL);
+ }
+ 
+ void mxc_jpeg_enable_irq(void __iomem *reg, int slot)
+@@ -33,7 +93,12 @@ void mxc_jpeg_enable_irq(void __iomem *reg, int slot)
+ 
+ void mxc_jpeg_reset(void __iomem *reg)
+ {
+-	writel(MXC_ENABLE_DEC, reg);
++	writel(GLB_CTRL_JPG_EN, reg + GLB_CTRL);
++}
++
++void mxc_jpeg_sw_reset(void __iomem *reg)
++{
++	writel(GLB_CTRL_SFT_RST | GLB_CTRL_JPG_EN, reg + GLB_CTRL);
+ }
+ 
+ u32 mxc_jpeg_get_offset(void __iomem *reg, int slot)
+@@ -41,43 +106,67 @@ u32 mxc_jpeg_get_offset(void __iomem *reg, int slot)
+ 	return readl(reg + MXC_SLOT_OFFSET(slot, SLOT_BUF_PTR));
+ }
+ 
+-void mxc_jpeg_enc_config(void __iomem *reg, struct mxc_jpeg_desc *cfg_desc,
+-			 u32 cfg_handle, u32 tbl_handle, u32 jpg_handle)
++void mxc_jpeg_enc_config(struct device *dev,
++			 void __iomem *reg, struct mxc_jpeg_desc *cfg_desc,
++			 u32 cfg_handle, u32 cfg_stream_handle, u32 jpg_handle)
+ {
+-	u32 regval, slot;
++	u32 slot;
+ 
+-	writel(0x1e0, reg + CAST_STATUS0); /* X = Image width, RO reg */
+-	writel(0x3ff, reg + CAST_STATUS1); /* Y = Image height , RO reg */
+-	writel(0x4b, reg + CAST_STATUS2); /* HMCU , RO reg */
++	/*
++	 * "Config_Mode" enabled, "Config_Mode auto clear enabled",
++	 * "GO" enabled, "GO bit auto clear" enabled
++	 */
++	writel(0x1e0, reg + CAST_MODE);
+ 
+-	slot = mxc_jpeg_get_slot(reg);
+-	mxc_jpeg_enable_irq(reg, slot);
+-	writel(MXC_SLOT_EN(slot), reg + GLB_CTRL);
++	/* all markers and segments */
++	writel(0x3ff, reg + CAST_CFG_MODE);
++
++	/* quality factor */
++	writel(0x4b, reg + CAST_QUALITY);
+ 
+ 	cfg_desc->next_descpt_ptr = 0;
+-	cfg_desc->buf_base0 = tbl_handle;
++	cfg_desc->buf_base0 = cfg_stream_handle;
+ 	cfg_desc->buf_base1 = 0;
+-	cfg_desc->line_pitch = 0x300;
+-	cfg_desc->stm_bufbase = jpg_handle;
+-	cfg_desc->stm_bufsize = 0x100000;
+-	cfg_desc->imgsize = 0x01000100;
+-	cfg_desc->stm_ctrl = MXC_CONFIG_MOD;
+-
+-	//print_descriptor_info(cfg_desc);
+-	writel(cfg_handle, reg + MXC_SLOT_OFFSET(slot, SLOT_NXT_DESCPT_PTR));
+-	writel(cfg_handle | MXC_NXT_DESCPT_EN, reg +
+-	       MXC_SLOT_OFFSET(slot, SLOT_NXT_DESCPT_PTR));
+-	writel(MXC_SLOT_EN(slot) | MXC_ENDIAN_MD | MXC_ENABLE_DEC |
+-	       MXC_DEC_GO, reg + GLB_CTRL);
+-	regval = readl(reg + STM_BUFBASE);
+-	regval = readl(reg + MXC_SLOT_OFFSET(slot, SLOT_BUF_PTR));
++	cfg_desc->line_pitch = 0;
++	cfg_desc->stm_bufbase = 0;
++	cfg_desc->stm_bufsize = 0x2000;
++	cfg_desc->imgsize = 0;
++	cfg_desc->stm_ctrl = STM_CTRL_CONFIG_MOD(1) | STM_CTRL_AUTO_START(1);
++
++	slot = 0; /* TODO get slot*/
++	writel(GLB_CTRL_SLOT_EN(slot) | GLB_CTRL_L_ENDIAN | GLB_CTRL_JPG_EN,
++	       reg + GLB_CTRL);
++
++	mxc_jpeg_enable_irq(reg, slot);
++
++	print_descriptor_info(dev, cfg_desc);
++	print_wrapper_info(dev, reg);
++	print_cast_encoder_info(dev, reg);
++
++	mxc_jpeg_set_desc(cfg_handle, reg, slot);
++	mxc_jpeg_go_auto(reg);
++}
++
++void wait_frmdone(struct device *dev, void __iomem *reg)
++{
++	u32 regval = 0;
++
++	do {
++		regval = readl(reg + MXC_SLOT_OFFSET(0, SLOT_STATUS));
++	} while (!(regval & SLOTa_STATUS_FRMDONE));
++
++	writel(regval, reg + MXC_SLOT_OFFSET(0, SLOT_STATUS)); /* w1c */
++
++	dev_dbg(dev, "Received FRMDONE\n");
++	if (regval & SLOTa_STATUS_ENC_CONFIG_ERR)
++		dev_info(dev, "SLOTa_STATUS_ENC_CONFIG_ERR\n");
+ }
+ 
+ int mxc_jpeg_enable(void __iomem *reg)
+ {
+ 	u32 regval;
+ 
+-	writel(MXC_ENABLE_DEC, reg + GLB_CTRL);
++	writel(GLB_CTRL_JPG_EN, reg + GLB_CTRL);
+ 	regval = readl(reg);
+ 	return regval;
+ }
+@@ -87,55 +176,30 @@ void mxc_jpeg_go(void __iomem *reg)
+ 	u32 val;
+ 
+ 	val = readl(reg + GLB_CTRL);
+-	writel(MXC_ENDIAN_MD | MXC_DEC_GO | val, reg + GLB_CTRL);
++	writel(GLB_CTRL_L_ENDIAN | GLB_CTRL_DEC_GO | val, reg + GLB_CTRL);
+ 	writel(MXC_DEC_EXIT_IDLE_MODE, reg + CAST_STATUS13);
+-	//print_cast_decoder_info(reg);
+ }
+ 
+-void print_cast_decoder_info(struct device *dev, void __iomem *reg)
++void mxc_jpeg_go_auto(void __iomem *reg)
+ {
+-	int regval;
+-
+-	regval = readl(reg + MXC_SLOT_OFFSET(0, SLOT_CUR_DESCPT_PTR));
+-	dev_info(dev, " MXC_JPEG: CUR DESCPT PTR: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS0);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 0: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS1);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 1: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS2);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 2: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS3);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 3: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS4);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 4: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS5);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 5: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS6);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 6: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS7);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 7: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS8);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 8: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS9);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 9: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS10);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 10: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS11);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 11: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS12);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 12: %x\n", regval);
+-	regval = readl(reg + CAST_STATUS13);
+-	dev_info(dev, " MXC_JPEG: CAST_INFO 13: %x\n", regval);
++	u32 val;
++
++	/* Automatically start the CAST encoder/decoder */
++	val = readl(reg + STM_CTRL);
++	writel(STM_CTRL_AUTO_START(1) | val, reg + STM_CTRL);
++
++	val = readl(reg + GLB_CTRL);
++	writel(GLB_CTRL_L_ENDIAN | GLB_CTRL_DEC_GO | val, reg + GLB_CTRL);
+ }
+ 
+ int mxc_jpeg_get_slot(void __iomem *reg)
+ {
+ 	int slot_val;
+ 	int i = 0;
+-	int tmp = MXC_SLOT_EN(0);
++	int tmp = GLB_CTRL_SLOT_EN(0);
+ 
+ 	/* currently enabled slots */
+-	slot_val = readl(reg) & 0xF0;
++	slot_val = readl(reg + GLB_CTRL) & 0xF0;
+ 
+ 	for (; tmp != tmp << 4; tmp = tmp << 1) {
+ 		if ((slot_val & tmp) == 0)
+@@ -151,14 +215,16 @@ void mxc_jpeg_enable_slot(void __iomem *reg, int slot)
+ 	u32 regval;
+ 
+ 	regval = readl(reg + GLB_CTRL);
+-	writel(MXC_SLOT_EN(slot) | regval, reg + GLB_CTRL);
++	writel(GLB_CTRL_SLOT_EN(slot) | regval, reg + GLB_CTRL);
+ }
+ 
+-void mxc_jpeg_set_addrs(struct mxc_jpeg_desc *desc, u32 buf_base0, u32 bufbase)
++void mxc_jpeg_set_config_mode(void __iomem *reg, int config_mode)
+ {
+-	desc->buf_base0 = buf_base0;
+-	desc->buf_base1 = 0x0;
+-	desc->stm_bufbase = bufbase;
++	u32 regval;
++
++	regval = readl(reg + STM_CTRL);
++	regval &= ~STM_CTRL_CONFIG_MOD(1);
++	writel(STM_CTRL_CONFIG_MOD(config_mode) | regval, reg + STM_CTRL);
+ }
+ 
+ int mxc_jpeg_set_params(struct mxc_jpeg_desc *desc,  u32 bufsize,
+@@ -192,8 +258,25 @@ void mxc_jpeg_set_res(struct mxc_jpeg_desc *desc, u16 w, u16 h)
+ 	desc->imgsize = w << 16 | h;
+ }
+ 
++
++void mxc_jpeg_set_line_pitch(struct mxc_jpeg_desc *desc, u32 line_pitch)
++{
++	desc->line_pitch = line_pitch;
++}
++
+ void mxc_jpeg_set_desc(u32 desc, void __iomem *reg, int slot)
+ {
+ 	writel(desc | MXC_NXT_DESCPT_EN,
+ 	       reg + MXC_SLOT_OFFSET(slot, SLOT_NXT_DESCPT_PTR));
+ }
++
++void mxc_jpeg_set_regs_from_desc(struct mxc_jpeg_desc *desc, void __iomem *reg)
++{
++	writel(desc->buf_base0, reg + BUF_BASE0);
++	writel(desc->buf_base1, reg + BUF_BASE1);
++	writel(desc->line_pitch, reg + LINE_PITCH);
++	writel(desc->stm_bufbase, reg + STM_BUFBASE);
++	writel(desc->stm_bufsize, reg + STM_BUFSIZE);
++	writel(desc->imgsize, reg + IMGSIZE);
++	writel(desc->stm_ctrl, reg + STM_CTRL);
++}
+diff --git a/drivers/media/platform/imx8/mxc-jpeg-hw.h b/drivers/media/platform/imx8/mxc-jpeg-hw.h
+index 613721f..bd89895 100644
+--- a/drivers/media/platform/imx8/mxc-jpeg-hw.h
++++ b/drivers/media/platform/imx8/mxc-jpeg-hw.h
+@@ -12,18 +12,18 @@
+ #ifndef _MXC_JPEG_HW_H
+ #define _MXC_JPEG_HW_H
+ 
+-/* JPEG-Decoder Wrapper Register Map */
++/* JPEG Decoder/Encoder Wrapper Register Map */
+ #define GLB_CTRL			0x0
+ #define COM_STATUS			0x4
+-#define OUT_BUFFER0			0x14
+-#define OUT_BUFFER1			0x18
+-#define OUT_PITCH			0x1C
++#define BUF_BASE0			0x14
++#define BUF_BASE1			0x18
++#define LINE_PITCH			0x1C
+ #define STM_BUFBASE			0x20
+ #define STM_BUFSIZE			0x24
+-#define IMG_SIZE			0x28
++#define IMGSIZE				0x28
+ #define STM_CTRL			0x2C
+ 
+-/* JPEG-Decoder Register Map */
++/* CAST JPEG-Decoder Register Map */
+ #define CAST_STATUS0			0x100
+ #define CAST_STATUS1			0x104
+ #define CAST_STATUS2			0x108
+@@ -39,6 +39,21 @@
+ #define CAST_STATUS12			0x130
+ #define CAST_STATUS13			0x134
+ 
++/* CAST JPEG-Encoder Register Map */
++#define CAST_MODE			0x100
++#define CAST_CFG_MODE			0x104
++#define CAST_QUALITY			0x108
++#define CAST_RSVD			0x10c
++#define CAST_REC_REGS_SEL		0x110
++#define CAST_LUMTH			0x114
++#define CAST_CHRTH			0x118
++#define CAST_NOMFRSIZE_LO		0x11c
++#define CAST_NOMFRSIZE_HI		0x120
++#define CAST_OFBSIZE_LO			0x124
++#define CAST_OFBSIZE_HI			0x128
++/* TODO add more if necessary*/
++
++#define MXC_MAX_SLOTS	1 /* TODO use all 4 slots*/
+ /* JPEG-Decoder Wrapper Slot Registers 0..3 */
+ #define SLOT_BASE			0x10000
+ #define SLOT_STATUS			0x0
+@@ -48,15 +63,28 @@
+ #define SLOT_NXT_DESCPT_PTR		0x10
+ #define MXC_SLOT_OFFSET(slot, offset)	((SLOT_BASE * (slot + 1)) + offset)
+ 
+-#define MXC_ENABLE_DEC			(0x1)
+-#define MXC_RESET_DEC			(0x1 << 1)
+-#define MXC_DEC_GO			(0x1 << 2)
+-#define MXC_ENDIAN_MD			(0x1 << 3)
+-#define MXC_SLOT_EN(slot)		(0x1 << (slot + 4))
+-#define MXC_CONFIG_MOD			(0x1 << 9)
+-#define MXC_FRMDONE			0x8
+-#define MXC_NXT_DESCPT_EN		0x1
+-#define MXC_DEC_EXIT_IDLE_MODE		0x4
++/* GLB_CTRL fields */
++#define GLB_CTRL_JPG_EN					0x1
++#define GLB_CTRL_SFT_RST				(0x1 << 1)
++#define GLB_CTRL_DEC_GO					(0x1 << 2)
++#define GLB_CTRL_L_ENDIAN				(0x1 << 3)
++#define GLB_CTRL_SLOT_EN(slot)				(0x1 << (slot + 4))
++
++/* STM_CTRL fields */
++#define STM_CTRL_PIXEL_PRECISION		(0x1 << 2)
++#define STM_CTRL_IMAGE_FORMAT(img_fmt)		((img_fmt) << 3)
++#define STM_CTRL_BITBUF_PTR_CLR(clr)		((clr) << 7)
++#define STM_CTRL_AUTO_START(go)			((go) << 8)
++#define STM_CTRL_CONFIG_MOD(mod)		((mod) << 9)
++
++/* SLOTa_STATUS fields TBD */
++#define SLOTa_STATUS_FRMDONE			(0x1 << 3)
++#define SLOTa_STATUS_ENC_CONFIG_ERR		(0x1 << 8)
++
++/* SLOTa_IRQ_EN fields TBD */
++
++#define MXC_NXT_DESCPT_EN			0x1
++#define MXC_DEC_EXIT_IDLE_MODE			0x4
+ 
+ /* JPEG-Decoder Wrapper - STM_CTRL Register Fields */
+ #define MXC_PIXEL_PRECISION(precision) ((precision)/8 << 2)
+@@ -69,18 +97,22 @@ enum mxc_jpeg_image_format {
+ 	MXC_JPEG_RESERVED = 0x5,
+ 	MXC_JPEG_ARGB	= 0x6,
+ };
+-#define MXC_IMAGE_FORMAT(jpeg_img_fmt) ((jpeg_img_fmt) << 3)
+-#define MXC_BITBUF_PTR_CLR(clr) ((clr) << 7)
+-#define MXC_AUTO_START(go) ((go) << 8)
+ 
+ 
+ #include "mxc-jpeg.h"
+ void print_descriptor_info(struct device *dev, struct mxc_jpeg_desc *desc);
++void print_cast_decoder_info(struct device *dev, void __iomem *reg);
++void print_cast_encoder_info(struct device *dev, void __iomem *reg);
++void print_wrapper_info(struct device *dev, void __iomem *reg);
+ void mxc_jpeg_reset(void __iomem *reg);
++void mxc_jpeg_sw_reset(void __iomem *reg);
+ int mxc_jpeg_enable(void __iomem *reg);
+-void mxc_jpeg_enc_config(void __iomem *reg, struct mxc_jpeg_desc *cfg_desc,
++void wait_frmdone(struct device *dev, void __iomem *reg);
++void mxc_jpeg_enc_config(struct device *dev,
++			 void __iomem *reg, struct mxc_jpeg_desc *cfg_desc,
+ 			 u32 cfg_handle, u32 tbl_handle, u32 jpg_handle);
+ void mxc_jpeg_go(void __iomem *reg);
++void mxc_jpeg_go_auto(void __iomem *reg);
+ int mxc_jpeg_get_slot(void __iomem *reg);
+ u32 mxc_jpeg_get_offset(void __iomem *reg, int slot);
+ void mxc_jpeg_enable_slot(void __iomem *reg, int slot);
+@@ -88,11 +120,12 @@ void mxc_jpeg_enc_config(void __iomem *reg, struct mxc_jpeg_desc *cfg_desc,
+ int mxc_jpeg_set_input(void __iomem *reg, u32 in_buf, u32 bufsize);
+ int mxc_jpeg_set_output(void __iomem *reg, u16 out_pitch, u32 out_buf,
+ 			u16 w, u16 h);
+-void mxc_jpeg_set_addrs(struct mxc_jpeg_desc *desc, u32 src_addr, u32 dst_addr);
++void mxc_jpeg_set_config_mode(void __iomem *reg, int config_mode);
+ int mxc_jpeg_set_params(struct mxc_jpeg_desc *desc,  u32 bufsize, u16
+ 			 out_pitch, u32 format);
+ void mxc_jpeg_set_bufsize(struct mxc_jpeg_desc *desc,  u32 bufsize);
+ void mxc_jpeg_set_res(struct mxc_jpeg_desc *desc, u16 w, u16 h);
++void mxc_jpeg_set_line_pitch(struct mxc_jpeg_desc *desc, u32 line_pitch);
+ void mxc_jpeg_set_desc(u32 desc, void __iomem *reg, int slot);
+-void print_cast_decoder_info(struct device *dev, void __iomem *reg);
++void mxc_jpeg_set_regs_from_desc(struct mxc_jpeg_desc *desc, void __iomem *reg);
+ #endif
+diff --git a/drivers/media/platform/imx8/mxc-jpeg.c b/drivers/media/platform/imx8/mxc-jpeg.c
+index fc6cb0f..efa4cee 100644
+--- a/drivers/media/platform/imx8/mxc-jpeg.c
++++ b/drivers/media/platform/imx8/mxc-jpeg.c
+@@ -101,8 +101,8 @@
+ 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63,
+ 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63,
+ 0x63, 0x63, 0x63, 0x63, 0x63, 0x63, 0x63,
+-0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0x00,
+-0x01, 0x00, 0x03, 0x01, 0x11, 0x00, 0x02,
++0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x40,
++0x00, 0x40, 0x03, 0x01, 0x21, 0x00, 0x02,
+ 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xC4,
+ 0x01, 0xA2, 0x00, 0x00, 0x01, 0x05, 0x01,
+ 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00,
+@@ -169,16 +169,21 @@
+ 0x11, 0x00, 0x3F, 0x00, 0xFF, 0xD9
+ };
+ 
+-struct mxc_jpeg_src_buf {
+-	struct vb2_v4l2_buffer b;
+-	struct list_head list;
+-	struct mxc_jpeg_desc *desc;
+-	void *tbl;
+-	int flags;
+-	dma_addr_t handle;
+-	dma_addr_t cfg_handle;
+-	dma_addr_t tbl_handle;
+-};
++static void print_buf(struct device *dev, struct vb2_buffer *buf)
++{
++	void *testaddri;
++	char *data;
++	u32 dma_addr;
++
++	testaddri = vb2_plane_vaddr(buf, 0);
++	dma_addr = vb2_dma_contig_plane_dma_addr(buf, 0);
++	data = (char *)testaddri;
++
++	/* print just the first 4 bytes from the beginning of the buffer */
++	dev_dbg(dev, "vaddr=%p dma_addr=%x: %x %x %x %x ...\n",
++		testaddri, dma_addr,
++		data[0], data[1], data[2], data[3]);
++}
+ 
+ #define MXC_NUM_FORMATS ARRAY_SIZE(mxc_formats)
+ static inline u32 mxc_jpeg_align(u32 val, u32 align)
+@@ -192,11 +197,6 @@ static inline struct mxc_jpeg_ctx *mxc_jpeg_fh_to_ctx(struct v4l2_fh *fh)
+ 	return container_of(fh, struct mxc_jpeg_ctx, fh);
+ }
+ 
+-static inline struct mxc_jpeg_src_buf *mxc_jpeg_vb2_to_srcbuf(
+-							struct vb2_buffer *vb)
+-{
+-	return container_of(to_vb2_v4l2_buffer(vb), struct mxc_jpeg_src_buf, b);
+-}
+ 
+ static int enum_fmt(struct mxc_jpeg_fmt *mxc_formats, int n,
+ 		    struct v4l2_fmtdesc *f, u32 type)
+@@ -225,14 +225,14 @@ static int enum_fmt(struct mxc_jpeg_fmt *mxc_formats, int n,
+ 	return 0;
+ }
+ 
+-void mxc_jpeg_addrs(struct mxc_jpeg_desc *desc, struct vb2_buffer *b_base0_buf,
+-struct vb2_buffer *bufbase_buf, int offset)
++static void mxc_jpeg_addrs(struct mxc_jpeg_desc *desc,
++			   struct vb2_buffer *b_base0_buf,
++			   struct vb2_buffer *bufbase_buf, int offset)
+ {
+-	u32 buf_base0, bufbase;
+-
+-	buf_base0 = vb2_dma_contig_plane_dma_addr(b_base0_buf, 0);
+-	bufbase = vb2_dma_contig_plane_dma_addr(bufbase_buf, 0);
+-	mxc_jpeg_set_addrs(desc, buf_base0, bufbase + offset);
++	desc->buf_base0 = vb2_dma_contig_plane_dma_addr(b_base0_buf, 0);
++	desc->buf_base1 = 0; /* TODO for YUV420*/
++	desc->stm_bufbase = vb2_dma_contig_plane_dma_addr(bufbase_buf, 0) +
++		offset;
+ }
+ 
+ static irqreturn_t mxc_jpeg_dec_irq(int irq, void *priv)
+@@ -240,73 +240,110 @@ static irqreturn_t mxc_jpeg_dec_irq(int irq, void *priv)
+ 	struct mxc_jpeg_dev *jpeg = priv;
+ 	struct mxc_jpeg_ctx *ctx;
+ 	void __iomem *reg = jpeg->base_reg;
++	struct device *dev = jpeg->dev;
+ 	struct vb2_buffer *src_buf, *dst_buf;
+-	struct mxc_jpeg_src_buf *jpeg_src_buf;
+-	enum vb2_buffer_state buf_state = VB2_BUF_STATE_ERROR;
+ 	struct mxc_jpeg_desc *desc;
+ 	dma_addr_t dma_handle;
+-	u32 dec_ret, offset, slot;
+-	struct mxc_jpeg_q_data *q_data;
+-	void *testaddri;
+-	void *testaddro;
++	u32 dec_ret;
++	int slot = 0; /* TODO remove hardcoded slot 0 */
+ 
+-
+-	/* hardcoded slot 0 */
+-	dec_ret = readl(reg + MXC_SLOT_OFFSET(0, SLOT_STATUS));
+-	writel(dec_ret, reg + MXC_SLOT_OFFSET(0, SLOT_STATUS)); /* w1c */
+-	if (!(dec_ret & MXC_FRMDONE))
+-		return IRQ_HANDLED;
++	spin_lock(&jpeg->hw_lock);
+ 
+ 	ctx = v4l2_m2m_get_curr_priv(jpeg->m2m_dev);
++	if (!ctx) {
++		dev_err(dev,
++			 "Instance released before the end of transaction.\n");
++		goto job_unlock;
++	}
++	if (ctx->aborting) {
++		dev_dbg(dev, "Aborting current job\n");
++		mxc_jpeg_sw_reset(reg);
++		goto job_finish;
++	}
++
++	dec_ret = readl(reg + MXC_SLOT_OFFSET(slot, SLOT_STATUS));
++	writel(dec_ret, reg + MXC_SLOT_OFFSET(slot, SLOT_STATUS)); /* w1c */
++	if (!(dec_ret & SLOTa_STATUS_FRMDONE))
++		goto job_unlock;
++
+ 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+ 	src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+-	jpeg_src_buf = mxc_jpeg_vb2_to_srcbuf(src_buf);
+-
+-	if (ctx->mode == MXC_JPEG_ENCODE &&
+-	    ctx->enc_state == MXC_JPEG_ENC_CONF) {
+-		q_data = &ctx->out_q;
+-		desc = jpeg_src_buf->desc;
+-		dma_handle = jpeg_src_buf->handle;
+-
+-		testaddri = vb2_plane_vaddr(src_buf, 0);
+-		testaddro = vb2_plane_vaddr(dst_buf, 0);
+-
+-		offset = mxc_jpeg_get_offset(jpeg->base_reg, 0);
+-		mxc_jpeg_addrs(desc, src_buf, dst_buf, offset);
+-		slot = mxc_jpeg_get_slot(jpeg->base_reg);
+-		mxc_jpeg_set_params(desc, mxc_jpeg_align(
+-				    vb2_plane_size(src_buf, 0), 1024),
+-				    q_data->bytesperline[0],
+-				    q_data->fmt->fourcc);
+-		mxc_jpeg_set_res(desc, q_data->w, q_data->h);
++
++	if (ctx->mode == MXC_JPEG_ENCODE
++	    && ctx->enc_state == MXC_JPEG_ENC_CONF) {
+ 		ctx->enc_state = MXC_JPEG_ENC_DONE;
++		if (dec_ret & SLOTa_STATUS_ENC_CONFIG_ERR) {
++			dev_err(dev, "Encoder config finished with errors.\n");
++			goto job_finish;
++		}
++
++		dev_dbg(dev, "Encoder config finished.\n");
++
++		/* get out of config mode*/
++		mxc_jpeg_set_config_mode(reg, 0);
++
++		slot = 0; /* TODO get slot*/
++
++		desc = jpeg->slot_data[slot].desc;
++		dma_handle = jpeg->slot_data[slot].desc_handle;
++
++		mxc_jpeg_addrs(desc, src_buf, dst_buf, 0);
++
++		/* TODO remove hardcodings*/
++		mxc_jpeg_set_bufsize(desc, 0x1000);
++		mxc_jpeg_set_res(desc, 64, 64);
++		mxc_jpeg_set_line_pitch(desc, 64 * 2);
++		desc->stm_ctrl = STM_CTRL_CONFIG_MOD(0) |
++				 STM_CTRL_AUTO_START(1) |
++				 STM_CTRL_IMAGE_FORMAT(MXC_JPEG_YUV422);
++
++		mxc_jpeg_enable_slot(jpeg->base_reg, slot);
++		mxc_jpeg_enable_irq(jpeg->base_reg, slot);
+ 		mxc_jpeg_set_desc(dma_handle, jpeg->base_reg, slot);
+-		return IRQ_HANDLED;
++
++		print_descriptor_info(dev, desc);
++		print_wrapper_info(dev, jpeg->base_reg);
++		print_cast_encoder_info(dev, jpeg->base_reg);
++
++		dev_dbg(dev, "Encoder starts encoding...\n");
++		mxc_jpeg_go_auto(jpeg->base_reg);
++		goto job_unlock;
+ 	}
+-	buf_state = VB2_BUF_STATE_DONE;
++	if (ctx->mode == MXC_JPEG_ENCODE)
++		dev_dbg(dev, "Encoding finished\n");
++	else
++		dev_dbg(dev, "Decoding finished\n");
++
++	/* short preview of the results */
++	dev_dbg(dev, "src_buf: ");
++	print_buf(dev, src_buf);
++	dev_dbg(dev, "dst_buf: ");
++	print_buf(dev, dst_buf);
++
+ 	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+ 	v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+-	v4l2_m2m_buf_done(to_vb2_v4l2_buffer(src_buf), buf_state);
+-	v4l2_m2m_buf_done(to_vb2_v4l2_buffer(dst_buf), buf_state);
++	v4l2_m2m_buf_done(to_vb2_v4l2_buffer(src_buf), VB2_BUF_STATE_DONE);
++	v4l2_m2m_buf_done(to_vb2_v4l2_buffer(dst_buf), VB2_BUF_STATE_DONE);
++job_finish:
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
++job_unlock:
++	spin_unlock(&jpeg->hw_lock);
+ 	return IRQ_HANDLED;
+ }
+-void mxc_jpeg_config_enc(struct vb2_buffer *out_buf,
+-			 struct mxc_jpeg_src_buf *jpeg_src_buf,
++
++static void mxc_jpeg_config_enc(struct vb2_buffer *out_buf,
++			 int slot,
+ 			 struct mxc_jpeg_dev *jpeg)
+ {
+ 	dma_addr_t jpg_handle;
+ 
+ 	jpg_handle = vb2_dma_contig_plane_dma_addr(out_buf, 0);
+-	jpeg_src_buf->tbl = dma_zalloc_coherent(jpeg->dev,
+-				  sizeof(unsigned char) * 615,
+-				  &jpeg_src_buf->tbl_handle, 0);
+-	memcpy(jpeg_src_buf->tbl, &hactbl, sizeof(unsigned char) * 615);
+-
+-	mxc_jpeg_enc_config(jpeg->base_reg, jpeg_src_buf->desc, jpeg_src_buf->handle,
+-			    jpeg_src_buf->tbl_handle, jpg_handle);
+-
++	mxc_jpeg_enc_config(jpeg->dev,
++		jpeg->base_reg,
++		jpeg->slot_data[slot].desc, jpeg->slot_data[slot].desc_handle,
++		jpeg->slot_data[slot].cfg_stream_handle, jpg_handle);
+ }
++
+ static void mxc_jpeg_device_run(void *priv)
+ {
+ 	struct mxc_jpeg_ctx *ctx = priv;
+@@ -314,34 +351,31 @@ static void mxc_jpeg_device_run(void *priv)
+ 	struct device *dev = jpeg->dev;
+ 	struct vb2_buffer *src_buf, *dst_buf;
+ 	unsigned long flags;
+-	struct mxc_jpeg_src_buf *jpeg_src_buf;
+-	int slot;
+-	void *testaddri;
+-	void *testaddro;
++	int slot = 0;
+ 	dma_addr_t dma_handle;
+ 	struct mxc_jpeg_desc *desc;
+ 
+-
++	spin_lock_irqsave(&ctx->mxc_jpeg->hw_lock, flags);
+ 	src_buf = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+ 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+-	jpeg_src_buf = mxc_jpeg_vb2_to_srcbuf(src_buf);
+-	desc = jpeg_src_buf->desc;
+-	dma_handle = jpeg_src_buf->handle;
+-
+-
+-	testaddri = vb2_plane_vaddr(src_buf, 0);
+-	testaddro = vb2_plane_vaddr(dst_buf, 0);
+-	spin_lock_irqsave(&ctx->mxc_jpeg->hw_lock, flags);
++	if (!src_buf || !dst_buf) {
++		dev_err(dev, "Null src or dst buf\n");
++		goto end;
++	}
++	slot = 0; /* TODO get slot */
+ 	mxc_jpeg_enable(jpeg->base_reg);
+ 
+ 	if (ctx->mode == MXC_JPEG_ENCODE) {
++		dev_dbg(dev, "Encoding on slot %d\n", slot);
+ 		ctx->enc_state = MXC_JPEG_ENC_CONF;
+-		mxc_jpeg_config_enc(dst_buf, jpeg_src_buf, jpeg);
++		mxc_jpeg_config_enc(dst_buf, slot, jpeg);
+ 	} else {
++		dev_dbg(dev, "Decoding on slot %d\n", slot);
++		desc = jpeg->slot_data[slot].desc;
++		dma_handle = jpeg->slot_data[slot].desc_handle;
++
+ 		mxc_jpeg_addrs(desc, dst_buf, src_buf, 0);
+-		slot = mxc_jpeg_get_slot(jpeg->base_reg);
+-		if (slot == -EINVAL)
+-			dev_err(dev, "No more slots available!\n");
++
+ 		mxc_jpeg_enable_slot(jpeg->base_reg, slot);
+ 		mxc_jpeg_set_bufsize(desc,
+ 			mxc_jpeg_align(vb2_plane_size(src_buf, 0), 1024));
+@@ -350,20 +384,34 @@ static void mxc_jpeg_device_run(void *priv)
+ 		mxc_jpeg_set_desc(dma_handle, jpeg->base_reg, slot);
+ 		mxc_jpeg_go(jpeg->base_reg);
+ 	}
++end:
+ 	spin_unlock_irqrestore(&ctx->mxc_jpeg->hw_lock, flags);
+ }
++
+ static int mxc_jpeg_job_ready(void *priv)
+ {
+ 	struct mxc_jpeg_ctx *ctx = priv;
++	unsigned int num_src_bufs_ready;
++	unsigned int num_dst_bufs_ready;
++	unsigned long flags;
+ 
+-	dev_warn(ctx->mxc_jpeg->dev, "mxc_jpeg_job_ready unimplemented\n");
+-	return 1;
++	spin_lock_irqsave(&ctx->mxc_jpeg->hw_lock, flags);
++
++	num_src_bufs_ready = v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx);
++	num_dst_bufs_ready = v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx);
++
++	spin_unlock_irqrestore(&ctx->mxc_jpeg->hw_lock, flags);
++
++	if (num_src_bufs_ready >= 1 && num_dst_bufs_ready >= 1)
++		return 1;
++	return 0;
+ }
+ static void mxc_jpeg_job_abort(void *priv)
+ {
+ 	struct mxc_jpeg_ctx *ctx = priv;
+ 
+-	dev_warn(ctx->mxc_jpeg->dev, "mxc_jpeg_job_abort unimplemented\n");
++	ctx->aborting = 1;
++	dev_dbg(ctx->mxc_jpeg->dev, "Abort requested\n");
+ }
+ 
+ static struct mxc_jpeg_q_data *mxc_jpeg_get_q_data(struct mxc_jpeg_ctx *ctx,
+@@ -399,6 +447,7 @@ static int mxc_jpeg_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	struct mxc_jpeg_ctx *ctx = vb2_get_drv_priv(q);
+ 	int ret;
+ 
++	dev_dbg(ctx->mxc_jpeg->dev, "Start streaming\n");
+ 	ret = pm_runtime_get_sync(ctx->mxc_jpeg->dev);
+ 	return ret > 0 ? 0 : ret;
+ }
+@@ -407,7 +456,8 @@ static void mxc_jpeg_stop_streaming(struct vb2_queue *q)
+ {
+ 	struct mxc_jpeg_ctx *ctx = vb2_get_drv_priv(q);
+ 
+-	pm_runtime_put(&ctx->mxc_jpeg->pdev->dev);
++	dev_dbg(ctx->mxc_jpeg->dev, "Stop streaming\n");
++	pm_runtime_put_sync(&ctx->mxc_jpeg->pdev->dev);
+ }
+ struct mxc_jpeg_stream {
+ 	u8 *addr;
+@@ -567,7 +617,7 @@ static int mxc_jpeg_parse(struct device *dev,
+ 	dev_info(dev, "JPEG imgsize = 0x%x (%dx%d)\n", desc->imgsize,
+ 		sof.width, sof.height);
+ 	img_fmt = mxc_jpeg_get_image_format(dev, &sof);
+-	desc->stm_ctrl |= MXC_IMAGE_FORMAT(img_fmt);
++	desc->stm_ctrl |= STM_CTRL_IMAGE_FORMAT(img_fmt);
+ 	desc->line_pitch = mxc_jpeg_get_line_pitch(dev, &sof, img_fmt);
+ 	return 0;
+ }
+@@ -575,21 +625,19 @@ static int mxc_jpeg_parse(struct device *dev,
+ static void mxc_jpeg_buf_queue(struct vb2_buffer *vb)
+ {
+ 	int ret;
+-	struct mxc_jpeg_src_buf *jpeg_src_buf;
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+ 	struct mxc_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	int slot = 0; /* TODO get slot*/
+ 
+ 	if (vb->vb2_queue->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+ 		goto end;
+-	jpeg_src_buf = container_of(vbuf, struct mxc_jpeg_src_buf, b);
+-	jpeg_src_buf->desc = dma_zalloc_coherent(ctx->mxc_jpeg->dev,
+-					     sizeof(struct mxc_jpeg_desc),
+-					     &jpeg_src_buf->handle, 0);
++
+ 	if (ctx->mode != MXC_JPEG_DECODE)
+ 		goto end;
+ 	ret = mxc_jpeg_parse(ctx->mxc_jpeg->dev,
+-			     jpeg_src_buf->desc, (u8 *)vb2_plane_vaddr(vb, 0),
+-			     vb2_get_plane_payload(vb, 0));
++			ctx->mxc_jpeg->slot_data[slot].desc,
++			(u8 *)vb2_plane_vaddr(vb, 0),
++			vb2_get_plane_payload(vb, 0));
+ 	if (ret) {
+ 		v4l2_err(&ctx->mxc_jpeg->v4l2_dev,
+ 			 "driver does not support this resolution\n");
+@@ -629,31 +677,18 @@ static int mxc_jpeg_buf_prepare(struct vb2_buffer *vb)
+ 
+ static void mxc_jpeg_buf_clean(struct vb2_buffer *vb)
+ {
+-	struct mxc_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+-	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+-	struct mxc_jpeg_src_buf *jpeg_src_buf;
+-
+-	jpeg_src_buf = container_of(vbuf, struct mxc_jpeg_src_buf, b);
+-
+-	if (ctx->mode == MXC_JPEG_ENCODE &&
+-		ctx->enc_state == MXC_JPEG_ENC_CONF)
+-			dma_free_coherent(ctx->mxc_jpeg->dev, sizeof(hactbl),
+-					  jpeg_src_buf->tbl, jpeg_src_buf->tbl_handle);
+-
+-	dma_free_coherent(ctx->mxc_jpeg->dev, sizeof(struct mxc_jpeg_desc),
+-			  jpeg_src_buf->desc, jpeg_src_buf->handle);
++	return;
+ }
+ 
+ static const struct vb2_ops mxc_jpeg_qops = {
+ 	.queue_setup		= mxc_jpeg_queue_setup,
+-
+-	.buf_prepare		= mxc_jpeg_buf_prepare,
+-	.buf_queue		= mxc_jpeg_buf_queue,
+ 	.wait_prepare		= vb2_ops_wait_prepare,
+ 	.wait_finish		= vb2_ops_wait_finish,
++	.buf_prepare		= mxc_jpeg_buf_prepare,
++	.buf_cleanup		= mxc_jpeg_buf_clean,
+ 	.start_streaming	= mxc_jpeg_start_streaming,
+ 	.stop_streaming		= mxc_jpeg_stop_streaming,
+-	.buf_cleanup		= mxc_jpeg_buf_clean,
++	.buf_queue		= mxc_jpeg_buf_queue,
+ };
+ static int mxc_jpeg_queue_init(void *priv, struct vb2_queue *src_vq,
+ 			       struct vb2_queue *dst_vq)
+@@ -711,6 +746,76 @@ static struct mxc_jpeg_fmt *mxc_jpeg_find_format(struct mxc_jpeg_ctx *ctx,
+ 	return NULL;
+ }
+ 
++static int mxc_jpeg_alloc_slot_data(struct mxc_jpeg_dev *jpeg)
++{
++	int slot;
++
++	for (slot = 0; slot < MXC_MAX_SLOTS; slot++) {
++		/* allocate descriptor for decoding/encoding phase */
++		jpeg->slot_data[slot].desc = dma_zalloc_coherent(jpeg->dev,
++			sizeof(struct mxc_jpeg_desc),
++			&(jpeg->slot_data[slot].desc_handle), 0);
++		if (!jpeg->slot_data[slot].desc)
++			goto err;
++		dev_dbg(jpeg->dev, "Descriptor for dec/enc: %p 0x%llx\n",
++			jpeg->slot_data[slot].desc,
++			jpeg->slot_data[slot].desc_handle);
++
++		/* allocate descriptor for configuration phase (encoder only) */
++		jpeg->slot_data[slot].cfg_desc = dma_zalloc_coherent(jpeg->dev,
++			sizeof(struct mxc_jpeg_desc),
++			&jpeg->slot_data[slot].cfg_desc_handle, 0);
++		if (!jpeg->slot_data[slot].cfg_desc)
++			goto err;
++		dev_dbg(jpeg->dev, "Descriptor for config phase: %p 0x%llx\n",
++			jpeg->slot_data[slot].cfg_desc,
++			jpeg->slot_data[slot].cfg_desc_handle);
++
++		/* allocate configuration stream */
++		jpeg->slot_data[slot].cfg_stream_vaddr = dma_zalloc_coherent(
++			jpeg->dev,
++			sizeof(hactbl),
++			&jpeg->slot_data[slot].cfg_stream_handle, 0);
++		if (!jpeg->slot_data[slot].cfg_stream_vaddr)
++			goto err;
++		dev_dbg(jpeg->dev, "Configuration stream: %p 0x%llx\n",
++			jpeg->slot_data[slot].cfg_stream_vaddr,
++			jpeg->slot_data[slot].cfg_stream_handle);
++
++		/* initial set-up for configuration stream
++		 * TODO: fixup the sizes, currently harcoded to 64x64)
++		 */
++		memcpy(jpeg->slot_data[slot].cfg_stream_vaddr,
++		       &hactbl, sizeof(hactbl));
++	}
++	return 0;
++err:
++	dev_err(jpeg->dev, "Could not allocate descriptors\n");
++	return 1;
++}
++
++static int mxc_jpeg_free_slot_data(struct mxc_jpeg_dev *jpeg)
++{
++	int slot;
++
++	for (slot = 0; slot < MXC_MAX_SLOTS; slot++) {
++		/* free descriptor for decoding/encoding phase */
++		dma_free_coherent(jpeg->dev, sizeof(struct mxc_jpeg_desc),
++			jpeg->slot_data[slot].desc,
++			jpeg->slot_data[slot].desc_handle);
++
++		/* free descriptor for configuration phase (encoder only) */
++		dma_free_coherent(jpeg->dev, sizeof(struct mxc_jpeg_desc),
++			jpeg->slot_data[slot].cfg_desc,
++			jpeg->slot_data[slot].cfg_desc_handle);
++
++		/* free configuration stream */
++		dma_free_coherent(jpeg->dev, sizeof(hactbl),
++			jpeg->slot_data[slot].cfg_stream_vaddr,
++			jpeg->slot_data[slot].cfg_stream_handle);
++	}
++	return 0;
++}
+ 
+ static int mxc_jpeg_open(struct file *file)
+ {
+@@ -758,7 +863,8 @@ static int mxc_jpeg_open(struct file *file)
+ 		goto error;
+ 	}
+ 
+-
++	if (mxc_jpeg_alloc_slot_data(mxc_jpeg))
++		goto error;
+ 
+ 	mutex_unlock(&mxc_jpeg->lock);
+ 	return 0;
+@@ -967,7 +1073,6 @@ static int mxc_jpeg_qbuf(struct file *file, void *priv, struct v4l2_buffer *buf)
+ 	struct mxc_jpeg_ctx *ctx = mxc_jpeg_fh_to_ctx(priv);
+ 	struct vb2_queue *vq;
+ 	struct vb2_buffer *vb;
+-	struct mxc_jpeg_src_buf *jpeg_src_buf;
+ 
+ 	if (buf->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+ 		goto end;
+@@ -979,7 +1084,6 @@ static int mxc_jpeg_qbuf(struct file *file, void *priv, struct v4l2_buffer *buf)
+ 	}
+ 
+ 	vb = vq->bufs[buf->index];
+-	jpeg_src_buf = mxc_jpeg_vb2_to_srcbuf(vb);
+ end:
+ 	return v4l2_m2m_qbuf(file, fh->m2m_ctx, buf);
+ }
+@@ -1016,6 +1120,7 @@ static int mxc_jpeg_release(struct file *file)
+ 	struct mxc_jpeg_ctx *ctx = mxc_jpeg_fh_to_ctx(file->private_data);
+ 
+ 	mutex_lock(&mxc_jpeg->lock);
++	mxc_jpeg_free_slot_data(mxc_jpeg);
+ 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+ 	v4l2_fh_del(&ctx->fh);
+ 	v4l2_fh_exit(&ctx->fh);
+@@ -1060,6 +1165,11 @@ static int mxc_jpeg_probe(struct platform_device *pdev)
+ 	mutex_init(&jpeg->lock);
+ 	spin_lock_init(&jpeg->hw_lock);
+ 
++	if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
++		dev_err(&pdev->dev, "No suitable DMA available.\n");
++		return -EINVAL;
++	}
++
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	dec_irq = platform_get_irq(pdev, 0);
+ 	if (!res || dec_irq < 0) {
+@@ -1126,7 +1236,7 @@ static int mxc_jpeg_probe(struct platform_device *pdev)
+ 	jpeg->dec_vdev->ioctl_ops = &mxc_jpeg_ioctl_ops;
+ 	jpeg->dec_vdev->minor = -1;
+ 	jpeg->dec_vdev->release = video_device_release;
+-	jpeg->dec_vdev->lock = &jpeg->lock;
++	jpeg->dec_vdev->lock = &jpeg->lock; /* lock for ioctl serialization*/
+ 	jpeg->dec_vdev->v4l2_dev = &jpeg->v4l2_dev;
+ 	jpeg->dec_vdev->vfl_dir = VFL_DIR_M2M;
+ 	jpeg->dec_vdev->device_caps = V4L2_CAP_STREAMING |
+@@ -1217,6 +1327,7 @@ static int mxc_jpeg_remove(struct platform_device *pdev)
+ 	video_device_release(jpeg->dec_vdev);
+ 	v4l2_m2m_release(jpeg->m2m_dev);
+ 	v4l2_device_unregister(&jpeg->v4l2_dev);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/imx8/mxc-jpeg.h b/drivers/media/platform/imx8/mxc-jpeg.h
+index 8028f30..88a3fba 100644
+--- a/drivers/media/platform/imx8/mxc-jpeg.h
++++ b/drivers/media/platform/imx8/mxc-jpeg.h
+@@ -89,14 +89,24 @@ struct mxc_jpeg_ctx {
+ 	struct v4l2_fh			fh;
+ 	unsigned int			mode;
+ 	unsigned int			enc_state;
++	unsigned int			aborting;
++};
++
++struct mxc_jpeg_slot_data {
++	int used;
++	struct mxc_jpeg_desc *desc; // enc/dec descriptor
++	struct mxc_jpeg_desc *cfg_desc; // configuration descriptor
++	void *cfg_stream_vaddr; // configuration bitstream virtual address
++	int flags;
++	dma_addr_t desc_handle;
++	dma_addr_t cfg_desc_handle; // configuration descriptor dma address
++	dma_addr_t cfg_stream_handle; // configuration bitstream dma address
+ };
+ 
+ struct mxc_jpeg_dev {
+ 	spinlock_t				hw_lock;
+ 	unsigned int				mode;
+ 	struct mutex			lock;
+-	struct mutex			lock2;
+-	//wait_queue_head_t		irq_queue;
+ 	bool					enc;
+ 	bool					dec;
+ 	struct clk				*clk_ipg;
+@@ -111,8 +121,7 @@ struct mxc_jpeg_dev {
+ 	unsigned int				irq;
+ 	int					id;
+ 
+-	struct mxc_jpeg_desc			*cfg_desc;
+-	dma_addr_t				cfg_handle;
++	struct mxc_jpeg_slot_data slot_data[MXC_MAX_SLOTS];
+ };
+ 
+ /* JPEG Start Of Frame marker fields*/
+-- 
+1.7.9.5
+

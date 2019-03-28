@@ -1,0 +1,995 @@
+From 56fa1569506bc6a93821482d22b70947b1ac6a0e Mon Sep 17 00:00:00 2001
+From: Peng Fan <peng.fan@nxp.com>
+Date: Wed, 26 Sep 2018 11:19:24 +0800
+Subject: [PATCH 4784/5242] MLK-19728-2 i2c: introduce xen i2c
+ paravirtualization driver
+
+commit  27fc72f9314e77a9fa3f53fec1b67b2b1ca8e543 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add i2c backend frontend support.
+The transaction only support one msg each time.
+The frontend sends a request to backend, backend use i2c_transfer
+to do real transaction to hardware and return the results to frontend.
+
+Now i2cdump/get/set works.
+In domu cfg file, use
+"vi2c = ['backend=0,be-adapter=5a800000.i2c,addr=0x51;0x44']" to
+create a dummy controller in frontend and allowed slaves in backend.
+
+Currently the slave address check not added, it will be supported in
+furture patch.
+
+Signed-off-by: Peng Fan <peng.fan@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/i2c/busses/Kconfig        |   20 ++
+ drivers/i2c/busses/Makefile       |    3 +
+ drivers/i2c/busses/xen-i2cback.c  |  468 +++++++++++++++++++++++++++++++++++++
+ drivers/i2c/busses/xen-i2cfront.c |  438 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 929 insertions(+)
+ create mode 100644 drivers/i2c/busses/xen-i2cback.c
+ create mode 100644 drivers/i2c/busses/xen-i2cfront.c
+
+diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+index 805a360..4ca9a7b 100644
+--- a/drivers/i2c/busses/Kconfig
++++ b/drivers/i2c/busses/Kconfig
+@@ -1330,4 +1330,24 @@ config I2C_ZX2967
+ 	  This driver can also be built as a module. If so, the module will be
+ 	  called i2c-zx2967.
+ 
++config XEN_I2C_FRONTEND
++	tristate "Xen virtual i2c device support"
++	depends on XEN
++	default y
++	select XEN_XENBUS_FRONTEND
++	help
++	  This driver implements the front-end of the Xen virtual
++	  i2c device driver.  It communicates with a back-end driver
++	  in another domain which drives the actual i2c device.
++
++config XEN_I2C_BACKEND
++	tristate "Xen i2c-device backend driver"
++	depends on XEN_BACKEND
++	help
++	  The i2c-device backend driver allows the kernel to export its
++	  block devices to other guests.
++
++	  The corresponding Linux frontend driver is enabled by the
++	  CONFIG_XEN_I2C_FRONTEND configuration option.
++
+ endmenu
+diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+index 5a86914..f56b663 100644
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -138,4 +138,7 @@ obj-$(CONFIG_I2C_SIBYTE)	+= i2c-sibyte.o
+ obj-$(CONFIG_I2C_XGENE_SLIMPRO) += i2c-xgene-slimpro.o
+ obj-$(CONFIG_SCx200_ACB)	+= scx200_acb.o
+ 
++obj-$(CONFIG_XEN_I2C_FRONTEND)	+= xen-i2cfront.o
++obj-$(CONFIG_XEN_I2C_BACKEND)	+= xen-i2cback.o
++
+ ccflags-$(CONFIG_I2C_DEBUG_BUS) := -DDEBUG
+diff --git a/drivers/i2c/busses/xen-i2cback.c b/drivers/i2c/busses/xen-i2cback.c
+new file mode 100644
+index 0000000..fd5f832
+--- /dev/null
++++ b/drivers/i2c/busses/xen-i2cback.c
+@@ -0,0 +1,468 @@
++/*
++ * Copyright 2018 NXP
++ *
++ * Peng Fan <peng.fan@nxp.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/i2c.h>
++#include <linux/slab.h>
++
++#include <xen/xen.h>
++#include <xen/events.h>
++#include <xen/xenbus.h>
++#include <xen/grant_table.h>
++#include <xen/page.h>
++
++#include <xen/interface/grant_table.h>
++#include <xen/interface/io/i2cif.h>
++
++struct i2cback_info {
++	domid_t domid;
++	u32 irq;
++	u64 handle;
++	struct xenbus_device *i2cdev;
++	spinlock_t i2c_ring_lock;
++	struct i2cif_back_ring i2c_ring;
++	int is_connected;
++	int ring_error;
++	struct i2c_adapter *adapter;
++	u32 num_slaves;
++	u32 *allowed_slaves;
++};
++
++static bool i2cback_access_allowed(struct i2cback_info *info,
++				   struct i2cif_request *req)
++{
++	int i;
++
++	if (req->num_msg == I2CIF_MAX_MSG) {
++		if (req->msg[0].addr != req->msg[1].addr)
++			return false;
++	}
++
++	for (i = 0; i < info->num_slaves; i++) {
++		if (req->msg[0].addr == info->allowed_slaves[i])
++			return true;
++	}
++
++	return false;
++}
++
++static bool i2cback_handle_int(struct i2cback_info *info)
++{
++	struct i2cif_back_ring *i2c_ring = &info->i2c_ring;
++	struct i2cif_request req;
++	struct i2cif_response *res;
++	RING_IDX rc, rp;
++	int more_to_do, notify, num_msg, ret;
++	struct i2c_msg msg[I2CIF_MAX_MSG];
++	char tmp_buf[I2CIF_BUF_LEN];
++	unsigned long flags;
++	bool allow_access;
++	int i;
++
++	rc = i2c_ring->req_cons;
++	rp = i2c_ring->sring->req_prod;
++	rmb();	/* req_cons is written by frontend. */
++
++	if (RING_REQUEST_PROD_OVERFLOW(i2c_ring, rp)) {
++		rc = i2c_ring->rsp_prod_pvt;
++		dev_err(&info->i2cdev->dev, "ring overflow\n");
++		info->ring_error = 1;
++		return 0;
++	}
++
++	while (rc != rp) {
++		if (RING_REQUEST_CONS_OVERFLOW(i2c_ring, rc)) {
++			dev_err(&info->i2cdev->dev, "%s overflow\n", __func__);
++			break;
++		}
++
++		req = *RING_GET_REQUEST(i2c_ring, rc);
++		allow_access = i2cback_access_allowed(info, &req);
++		if (allow_access) {
++			/* Write/Read sequence */
++			if (req.num_msg > I2CIF_MAX_MSG)
++				num_msg = I2CIF_MAX_MSG;
++			for (i = 0; i < num_msg; i++) {
++				msg[i].addr = req.msg[i].addr;
++				msg[i].len = req.msg[i].len;
++				msg[i].flags = 0;
++				if (req.msg[i].flags & I2CIF_M_RD)
++					msg[i].flags |= I2C_M_RD;
++				if (req.msg[i].flags & I2CIF_M_TEN)
++					msg[i].flags |= I2C_M_TEN;
++				if (req.msg[i].flags & I2CIF_M_RECV_LEN)
++					msg[i].flags |= I2C_M_RECV_LEN;
++				if (req.msg[i].flags & I2CIF_M_NO_RD_ACK)
++					msg[i].flags |= I2C_M_NO_RD_ACK;
++				if (req.msg[i].flags & I2CIF_M_IGNORE_NAK)
++					msg[i].flags |= I2C_M_IGNORE_NAK;
++				if (req.msg[i].flags & I2CIF_M_REV_DIR_ADDR)
++					msg[i].flags |= I2C_M_REV_DIR_ADDR;
++				if (req.msg[i].flags & I2CIF_M_NOSTART)
++					msg[i].flags |= I2C_M_NOSTART;
++				if (req.msg[i].flags & I2CIF_M_STOP)
++					msg[i].flags |= I2C_M_STOP;
++			}
++
++			if ((num_msg == 2) &&
++			    (!(msg[0].flags & I2C_M_RD)) &&
++			    (msg[1].flags & I2C_M_RD)) {
++
++				/* overwrite the remote buf with local buf */
++				msg[0].buf = tmp_buf;
++				msg[1].buf = tmp_buf;
++
++				/* msg[0] write buf */
++				memcpy(tmp_buf, req.write_buf, I2CIF_BUF_LEN);
++				ret = i2c_transfer(info->adapter, msg,
++						   num_msg);
++			} else if (req.num_msg == 1) {
++				msg[0].buf = tmp_buf;
++				if (!(msg[0].flags & I2C_M_RD))
++					memcpy(tmp_buf, req.write_buf,
++					       I2CIF_BUF_LEN);
++				ret = i2c_transfer(info->adapter, msg,
++						   req.num_msg);
++			} else {
++				dev_dbg(&info->i2cdev->dev, "too many msgs\n");
++
++				ret = -EIO;
++			}
++		}
++
++		spin_lock_irqsave(&info->i2c_ring_lock, flags);
++		res = RING_GET_RESPONSE(&info->i2c_ring,
++					info->i2c_ring.rsp_prod_pvt);
++
++		if (allow_access) {
++			res->result = ret;
++
++			if ((req.num_msg == 2) &&
++			    (!(msg[0].flags & I2C_M_RD)) &&
++			    (msg[1].flags & I2C_M_RD)) {
++				memcpy(res->read_buf, tmp_buf, I2CIF_BUF_LEN);
++			} else if (req.num_msg == 1) {
++				if (msg[0].flags & I2C_M_RD)
++					memcpy(res->read_buf, tmp_buf,
++					       I2CIF_BUF_LEN);
++			}
++		} else
++			res->result = -EPERM;
++
++		info->i2c_ring.rsp_prod_pvt++;
++
++		barrier();
++		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&info->i2c_ring,
++						     notify);
++		spin_unlock_irqrestore(&info->i2c_ring_lock, flags);
++
++		if (notify)
++			notify_remote_via_irq(info->irq);
++
++		i2c_ring->req_cons = ++rc;
++
++		cond_resched();
++	}
++
++	RING_FINAL_CHECK_FOR_REQUESTS(i2c_ring, more_to_do);
++
++	return !!more_to_do;
++}
++
++static irqreturn_t i2cback_be_int(int irq, void *dev_id)
++{
++	struct i2cback_info *info = dev_id;
++
++	if (info->ring_error)
++		return IRQ_HANDLED;
++
++	while (i2cback_handle_int(info))
++		cond_resched();
++
++	return IRQ_HANDLED;
++}
++
++static int i2cback_map(struct i2cback_info *info, grant_ref_t *i2c_ring_ref,
++		       evtchn_port_t evtchn)
++{
++	int err;
++	void *addr;
++	struct i2cif_sring *i2c_sring;
++
++	if (info->irq)
++		return 0;
++
++	err = xenbus_map_ring_valloc(info->i2cdev, i2c_ring_ref, 1, &addr);
++	if (err)
++		return err;
++
++	i2c_sring = addr;
++
++	BACK_RING_INIT(&info->i2c_ring, i2c_sring, PAGE_SIZE);
++
++	err = bind_interdomain_evtchn_to_irq(info->domid, evtchn);
++	if (err < 0)
++		goto fail_evtchn;
++	info->irq = err;
++
++	err = request_threaded_irq(info->irq, NULL, i2cback_be_int,
++				   IRQF_ONESHOT, "xen-i2cback", info);
++	if (err) {
++		dev_err(&info->i2cdev->dev, "bind evtchn to irq failure!\n");
++		goto free_irq;
++	}
++
++	return 0;
++free_irq:
++	unbind_from_irqhandler(info->irq, info);
++	info->irq = 0;
++	info->i2c_ring.sring = NULL;
++fail_evtchn:
++	xenbus_unmap_ring_vfree(info->i2cdev, i2c_sring);
++	return err;
++}
++
++static int i2cback_connect_rings(struct i2cback_info *info)
++{
++	struct xenbus_device *dev = info->i2cdev;
++	unsigned int i2c_ring_ref, evtchn;
++	int i, err;
++	char *buf;
++	u32 adapter_id;
++
++	err = xenbus_scanf(XBT_NIL, dev->nodename,
++			   "adapter", "%u", &adapter_id);
++	if (err != 1) {
++		xenbus_dev_fatal(dev, err, "%s reading adapter", dev->nodename);
++		return err;
++	}
++
++	info->adapter = i2c_get_adapter(adapter_id);
++	if (!info->adapter)
++		return -ENODEV;
++
++	err = xenbus_scanf(XBT_NIL, dev->nodename,
++			   "num-slaves", "%u", &info->num_slaves);
++	if (err != 1) {
++		xenbus_dev_fatal(dev, err, "%s reading num-slaves",
++				 dev->nodename);
++		return err;
++	}
++
++	info->allowed_slaves = devm_kmalloc(&dev->dev,
++					    info->num_slaves * sizeof(u32),
++					    GFP_KERNEL);
++	if (!info->allowed_slaves)
++		return -ENOMEM;
++
++	/* 128 bytes is enough */
++	buf = kmalloc(128, GFP_KERNEL);
++
++	for (i = 0; i < info->num_slaves; i++) {
++		snprintf(buf, 128, "%s/%d", dev->nodename, i);
++		err = xenbus_scanf(XBT_NIL, buf, "addr", "%x",
++				   &info->allowed_slaves[i]);
++		if (err != 1) {
++			kfree(buf);
++			return err;
++		}
++	}
++
++	kfree(buf);
++
++	err = xenbus_gather(XBT_NIL, dev->otherend,
++			    "ring-ref", "%u", &i2c_ring_ref,
++			    "event-channel", "%u", &evtchn, NULL);
++	if (err) {
++		xenbus_dev_fatal(dev, err,
++				 "reading %s/ring-ref and event-channel",
++				 dev->otherend);
++		return err;
++	}
++
++	dev_info(&info->i2cdev->dev,
++		 "xen-pvi2c: ring-ref %u, event-channel %u\n",
++		 i2c_ring_ref, evtchn);
++
++	err = i2cback_map(info, &i2c_ring_ref, evtchn);
++	if (err)
++		xenbus_dev_fatal(dev, err, "mapping ring-ref %u evtchn %u",
++			i2c_ring_ref, evtchn);
++
++	return err;
++}
++
++static void i2cback_disconnect(struct i2cback_info *info)
++{
++	if (info->irq) {
++		unbind_from_irqhandler(info->irq, info);
++		info->irq = 0;
++	}
++
++	if (info->i2c_ring.sring) {
++		xenbus_unmap_ring_vfree(info->i2cdev, info->i2c_ring.sring);
++		info->i2c_ring.sring = NULL;
++	}
++}
++
++static void i2cback_frontend_changed(struct xenbus_device *dev,
++				     enum xenbus_state frontend_state)
++{
++	struct i2cback_info *info = dev_get_drvdata(&dev->dev);
++	int ret;
++
++	switch (frontend_state) {
++	case XenbusStateInitialised:
++	case XenbusStateReconfiguring:
++	case XenbusStateReconfigured:
++		break;
++
++	case XenbusStateInitialising:
++		if (dev->state == XenbusStateClosed) {
++			dev_info(&dev->dev,
++				 "xen-pvi2c: %s: prepare for reconnect\n",
++				 dev->nodename);
++			xenbus_switch_state(dev, XenbusStateInitWait);
++		}
++		break;
++	case XenbusStateConnected:
++		if (dev->state == XenbusStateConnected)
++			break;
++
++		xenbus_switch_state(dev, XenbusStateConnected);
++
++		ret = i2cback_connect_rings(info);
++		if (ret) {
++			xenbus_dev_fatal(dev, ret, "connect ring fail");
++		}
++		break;
++	case XenbusStateClosing:
++		i2cback_disconnect(info);
++		xenbus_switch_state(dev, XenbusStateClosing);
++		break;
++	case XenbusStateClosed:
++		xenbus_switch_state(dev, XenbusStateClosed);
++		if (xenbus_dev_is_online(dev))
++			break;
++		/* fall through if not online */
++	case XenbusStateUnknown:
++		device_unregister(&dev->dev);
++		break;
++
++	default:
++		xenbus_dev_fatal(dev, -EINVAL, "saw state %d at frontend",
++				 frontend_state);
++		break;
++	}
++}
++
++static struct i2cback_info *i2cback_alloc(domid_t domid, u64 handle)
++{
++	struct i2cback_info *info;
++
++	info = kzalloc(sizeof(struct i2cback_info), GFP_KERNEL);
++	if (!info)
++		return NULL;
++
++	info->domid = domid;
++	info->handle = handle;
++	spin_lock_init(&info->i2c_ring_lock);
++	info->ring_error = 0;
++
++	return info;
++}
++
++static int i2cback_probe(struct xenbus_device *dev,
++			     const struct xenbus_device_id *id)
++{
++	struct i2cback_info *info;
++	unsigned long handle;
++	int err;
++
++	if (kstrtoul(strrchr(dev->otherend, '/') + 1, 0, &handle))
++		return -EINVAL;
++
++	info = i2cback_alloc(dev->otherend_id, handle);
++	if (!info) {
++		xenbus_dev_fatal(dev, -ENOMEM, "Allocating backend interface");
++		return -ENOMEM;
++	}
++
++	info->i2cdev = dev;
++	dev_set_drvdata(&dev->dev, info);
++
++	err = xenbus_switch_state(dev, XenbusStateInitWait);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++static int i2cback_remove(struct xenbus_device *dev)
++{
++	struct i2cback_info *info = dev_get_drvdata(&dev->dev);
++
++	if (!info)
++		return 0;
++
++	i2cback_disconnect(info);
++
++	kfree(info);
++	dev_set_drvdata(&dev->dev, NULL);
++
++	dev_info(&dev->dev, "%s\n", __func__);
++
++	return 0;
++}
++
++static const struct xenbus_device_id i2cback_ids[] = {
++	{ "vi2c" },
++	{ "" },
++};
++
++static struct xenbus_driver i2cback_driver = {
++	.ids			= i2cback_ids,
++	.probe			= i2cback_probe,
++	.otherend_changed	= i2cback_frontend_changed,
++	.remove			= i2cback_remove,
++};
++
++static int __init i2cback_init(void)
++{
++	int err;
++
++	if (!xen_domain())
++		return -ENODEV;
++
++	err = xenbus_register_backend(&i2cback_driver);
++	if (err)
++		return err;
++
++	return 0;
++}
++module_init(i2cback_init);
++
++static void __exit i2cback_exit(void)
++{
++	xenbus_unregister_driver(&i2cback_driver);
++}
++module_exit(i2cback_exit);
++
++MODULE_ALIAS("xen-i2cback:vi2c");
++MODULE_AUTHOR("Peng Fan <peng.fan@nxp.com>");
++MODULE_DESCRIPTION("Xen I2C backend driver (i2cback)");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/i2c/busses/xen-i2cfront.c b/drivers/i2c/busses/xen-i2cfront.c
+new file mode 100644
+index 0000000..714a5d7
+--- /dev/null
++++ b/drivers/i2c/busses/xen-i2cfront.c
+@@ -0,0 +1,438 @@
++/*
++ * Copyright 2018 NXP
++ *
++ * Peng Fan <peng.fan@nxp.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/i2c.h>
++#include <linux/list.h>
++#include <linux/io.h>
++
++#include <xen/xen.h>
++#include <xen/xenbus.h>
++#include <xen/grant_table.h>
++#include <xen/events.h>
++#include <xen/page.h>
++
++#include <xen/interface/io/i2cif.h>
++
++#define GRANT_INVALID_REF	0
++
++struct i2cfront_info {
++	spinlock_t lock;
++	struct mutex xferlock;
++	struct i2c_adapter adapter;
++	struct xenbus_device *i2cdev;
++	int i2c_ring_ref;
++	struct i2cif_front_ring i2c_ring;
++	unsigned int evtchn;
++	unsigned int irq;
++	struct completion completion;
++	struct i2cif_request *req;
++	struct i2cif_response *res;
++};
++
++static void i2cfront_destroy_rings(struct i2cfront_info *info)
++{
++	if (info->irq)
++		unbind_from_irqhandler(info->irq, info);
++	info->irq = 0;
++
++	if (info->i2c_ring_ref != GRANT_INVALID_REF) {
++		gnttab_end_foreign_access(info->i2c_ring_ref, 0,
++					  (unsigned long)info->i2c_ring.sring);
++		info->i2c_ring_ref = GRANT_INVALID_REF;
++	}
++	info->i2c_ring.sring = NULL;
++}
++
++static int i2cfront_do_req(struct i2c_adapter *adapter, struct i2c_msg *msg,
++			   int num)
++{
++	struct i2cfront_info *info = i2c_get_adapdata(adapter);
++	struct i2cif_request *req;
++	struct i2cif_response *res;
++	int notify;
++	int ret;
++	RING_IDX i, rp;
++	int more_to_do = 0;
++	unsigned long flags;
++	int index;
++
++	mutex_lock(&info->xferlock);
++	req = RING_GET_REQUEST(&info->i2c_ring, info->i2c_ring.req_prod_pvt);
++
++	for (index = 0; index < num; index++) {
++		req->msg[index].addr = msg[index].addr;
++		req->msg[index].len = msg[index].len;
++		if (msg[index].flags & I2C_M_RD)
++			req->msg[index].flags |= I2CIF_M_RD;
++		if (msg[index].flags & I2C_M_TEN)
++			req->msg[index].flags |= I2CIF_M_TEN;
++		if (msg[index].flags & I2C_M_RECV_LEN)
++			req->msg[index].flags |= I2CIF_M_RECV_LEN;
++		if (msg[index].flags & I2C_M_NO_RD_ACK)
++			req->msg[index].flags |= I2CIF_M_NO_RD_ACK;
++		if (msg[index].flags & I2C_M_IGNORE_NAK)
++			req->msg[index].flags |= I2CIF_M_IGNORE_NAK;
++		if (msg[index].flags & I2C_M_REV_DIR_ADDR)
++			req->msg[index].flags |= I2CIF_M_REV_DIR_ADDR;
++		if (msg[index].flags & I2C_M_NOSTART)
++			req->msg[index].flags |= I2CIF_M_NOSTART;
++		if (msg[index].flags & I2C_M_STOP)
++			req->msg[index].flags |= I2CIF_M_STOP;
++	}
++
++	req->num_msg = num;
++
++	if ((num == 2) && !(msg[0].flags & I2C_M_RD) &&
++	    (msg[1].flags & I2C_M_RD)) {
++		memcpy(req->write_buf, msg[0].buf,
++		       min_t(int, msg[0].len, I2CIF_BUF_LEN));
++	} else if (num == 1) {
++		if (!(msg->flags & I2C_M_RD))
++			memcpy(req->write_buf, msg->buf,
++			       min_t(int, msg->len, I2CIF_BUF_LEN));
++	} else {
++		dev_err(&adapter->dev, "%s not supported\n", __func__);
++		return -EIO;
++	}
++
++	spin_lock(&info->lock);
++	info->i2c_ring.req_prod_pvt++;
++	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&info->i2c_ring, notify);
++	spin_unlock(&info->lock);
++	if (notify)
++		notify_remote_via_irq(info->irq);
++
++	wait_for_completion(&info->completion);
++
++	spin_lock_irqsave(&info->lock, flags);
++	rp = info->i2c_ring.sring->rsp_prod;
++	rmb(); /* ensure we see queued responses up to "rp" */
++
++	ret = -EIO;
++	for (i = info->i2c_ring.rsp_cons; i != rp; i++) {
++		res = RING_GET_RESPONSE(&info->i2c_ring, i);
++		if ((num == 2) && !(msg[0].flags & I2C_M_RD) &&
++		    (msg[1].flags & I2C_M_RD)) {
++			memcpy(msg[1].buf, res->read_buf,
++			       min_t(int, msg[1].len, I2CIF_BUF_LEN));
++		} else if (num == 1) {
++			if (!(msg->flags & I2C_M_RD))
++			memcpy(msg->buf, res->read_buf,
++			       min_t(int, msg->len, I2CIF_BUF_LEN));
++		}
++
++		ret = res->result;
++	}
++
++	info->i2c_ring.rsp_cons = i;
++
++	if (i != info->i2c_ring.req_prod_pvt)
++		RING_FINAL_CHECK_FOR_RESPONSES(&info->i2c_ring, more_to_do);
++	else
++		info->i2c_ring.sring->rsp_event = i + 1;
++
++	spin_unlock_irqrestore(&info->lock, flags);
++
++	mutex_unlock(&info->xferlock);
++
++	return ret;
++}
++
++int i2cfront_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int num)
++{
++	struct i2cfront_info *info = i2c_get_adapdata(adapter);
++	int ret, i;
++
++	if (!info || !info->i2cdev) {
++		dev_err(&adapter->dev, "Not initialized\n");
++		return -EIO;
++	}
++
++	if (info->i2cdev->state != XenbusStateConnected) {
++		dev_err(&adapter->dev, "Not connected\n");
++		return -EIO;
++	}
++
++	for (i = 0; i < num; i++) {
++		if (msgs[i].flags & I2C_M_RD) {
++			ret = i2cfront_do_req(adapter, &msgs[i], 1);
++		} else if ((i + 1 < num) && (msgs[i + 1].flags & I2C_M_RD) &&
++			(msgs[i].addr == msgs[i + 1].addr)) {
++			ret = i2cfront_do_req(adapter, &msgs[i], 2);
++			i++;
++		} else {
++			ret = i2cfront_do_req(adapter, &msgs[i], 1);
++		}
++
++		if (ret < 0)
++			goto err;
++	}
++err:
++	return (ret < 0) ? ret : num;
++}
++
++static u32 i2cfront_func(struct i2c_adapter *adapter)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
++}
++
++static const struct i2c_algorithm i2cfront_algo = {
++	.master_xfer = i2cfront_xfer,
++	.functionality = i2cfront_func,
++};
++
++static int i2cfront_probe(struct xenbus_device *dev,
++			  const struct xenbus_device_id *id)
++{
++	struct i2cfront_info *info;
++
++	info = kzalloc(sizeof(struct i2cfront_info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	info->i2cdev = dev;
++	dev_set_drvdata(&dev->dev, info);
++	info->adapter.owner = THIS_MODULE;
++	info->adapter.algo = &i2cfront_algo;
++	info->adapter.dev.parent = &dev->dev;
++	strlcpy(info->adapter.name, dev->nodename, sizeof(info->adapter.name));
++	i2c_set_adapdata(&info->adapter, info);
++	spin_lock_init(&info->lock);
++	mutex_init(&info->xferlock);
++	init_completion(&info->completion);
++
++	return 0;
++}
++
++static int i2cfront_handle_int(struct i2cfront_info *info)
++{
++	complete(&info->completion);
++
++	return 0;
++}
++
++static irqreturn_t i2cfront_int(int irq, void *dev_id)
++{
++	struct i2cfront_info *info = dev_id;
++
++	while (i2cfront_handle_int(info))
++		cond_resched();
++
++	return IRQ_HANDLED;
++}
++
++static int i2cfront_setup_rings(struct xenbus_device *dev,
++				struct i2cfront_info *info)
++{
++	struct i2cif_sring *i2c_sring;
++	grant_ref_t gref;
++	int err;
++
++	info->i2c_ring_ref = GRANT_INVALID_REF;
++	i2c_sring = (struct i2cif_sring *)get_zeroed_page(GFP_NOIO |
++							  __GFP_HIGH);
++	if (!i2c_sring) {
++		xenbus_dev_fatal(dev, -ENOMEM, "allocating i2c sring");
++		return -ENOMEM;
++	}
++
++	SHARED_RING_INIT(i2c_sring);
++	FRONT_RING_INIT(&info->i2c_ring, i2c_sring, PAGE_SIZE);
++
++	err = xenbus_grant_ring(dev, i2c_sring, 1, &gref);
++	if (err < 0) {
++		free_page((unsigned long)i2c_sring);
++		info->i2c_ring.sring = NULL;
++		goto fail;
++	}
++	info->i2c_ring_ref = gref;
++
++	err = xenbus_alloc_evtchn(dev, &info->evtchn);
++	if (err) {
++		xenbus_dev_fatal(dev, err, "xenbus_alloc_evtchn");
++		goto fail;
++	}
++
++	err = bind_evtchn_to_irqhandler(info->evtchn, i2cfront_int, 0,
++					"xen_i2cif", info);
++	if (err <= 0) {
++		xenbus_dev_fatal(dev, err, "bind_evtchn_to_irqhandler failed");
++		goto fail;
++	}
++
++	info->irq = err;
++
++	return 0;
++
++fail:
++	i2cfront_destroy_rings(info);
++	return err;
++}
++
++static int i2cfront_connect(struct xenbus_device *dev)
++{
++	struct i2cfront_info *info = dev_get_drvdata(&dev->dev);
++	struct xenbus_transaction xbt;
++	struct device_node *np;
++	const char *be_adapter;
++	char xenstore_adapter[I2CIF_ADAPTER_NAME_LEN];
++	char *message;
++	int err;
++
++	err = i2cfront_setup_rings(dev, info);
++	if (err) {
++		dev_err(&dev->dev, "%s:failure....", __func__);
++		return err;
++	}
++again:
++	err = xenbus_transaction_start(&xbt);
++	if (err) {
++		xenbus_dev_fatal(dev, err, "starting transaction");
++		goto destroy_ring;
++	}
++
++	err = xenbus_printf(xbt, dev->nodename, "ring-ref", "%u",
++			    info->i2c_ring_ref);
++	if (err) {
++		message = "writing i2c ring-ref";
++		goto abort_transaction;
++	}
++
++	err = xenbus_printf(xbt, dev->nodename, "event-channel", "%u",
++			    info->evtchn);
++	if (err) {
++		message = "writing event-channel";
++		goto abort_transaction;
++	}
++
++	err = xenbus_scanf(xbt, dev->nodename,
++			   "be-adapter", "%32s", xenstore_adapter);
++	if (err != 1) {
++		message = "getting be-adapter";
++		goto abort_transaction;
++	}
++
++	err = xenbus_transaction_end(xbt, 0);
++	if (err) {
++		if (err == -EAGAIN)
++			goto again;
++		xenbus_dev_fatal(dev, err, "completing transaction");
++		goto destroy_ring;
++	}
++
++	for_each_compatible_node(np, NULL, "xen,i2c") {
++		err = of_property_read_string(np, "be-adapter", &be_adapter);
++		if (err)
++			continue;
++		if (!strncmp(xenstore_adapter, be_adapter,
++		    I2CIF_ADAPTER_NAME_LEN)) {
++			info->adapter.dev.of_node = np;
++			break;
++		}
++	}
++
++	err = i2c_add_adapter(&info->adapter);
++	if (err)
++		return err;
++
++	dev_info(&info->adapter.dev, "XEN I2C adapter registered\n");
++
++	return 0;
++
++abort_transaction:
++	xenbus_transaction_end(xbt, 1);
++	xenbus_dev_fatal(dev, err, "%s", message);
++
++destroy_ring:
++	i2cfront_destroy_rings(info);
++
++	return err;
++}
++
++static void i2cfront_disconnect(struct xenbus_device *dev)
++{
++	pr_info("%s\n", __func__);
++	xenbus_frontend_closed(dev);
++}
++
++static void i2cfront_backend_changed(struct xenbus_device *dev,
++				     enum xenbus_state backend_state)
++{
++	switch (backend_state) {
++	case XenbusStateInitialising:
++	case XenbusStateReconfiguring:
++	case XenbusStateReconfigured:
++	case XenbusStateUnknown:
++		break;
++
++	case XenbusStateInitWait:
++	case XenbusStateInitialised:
++	case XenbusStateConnected:
++		if (dev->state != XenbusStateInitialising)
++			break;
++		if (!i2cfront_connect(dev))
++			xenbus_switch_state(dev, XenbusStateConnected);
++		break;
++
++	case XenbusStateClosed:
++		if (dev->state == XenbusStateClosed)
++			break;
++		/* Missed the backend's Closing state -- fallthrough */
++	case XenbusStateClosing:
++		i2cfront_disconnect(dev);
++		break;
++
++	default:
++		xenbus_dev_fatal(dev, -EINVAL, "saw state %d at frontend",
++				 backend_state);
++		break;
++	}
++}
++
++static int i2cfront_remove(struct xenbus_device *dev)
++{
++	struct i2cfront_info *info = dev_get_drvdata(&dev->dev);
++
++	i2c_del_adapter(&info->adapter);
++	i2cfront_destroy_rings(info);
++
++	kfree(info);
++
++	dev_info(&dev->dev, "Remove");
++	return 0;
++}
++
++static const struct xenbus_device_id i2cfront_ids[] = {
++	{ "vi2c" },
++	{ "" },
++};
++
++static struct xenbus_driver i2cfront_driver = {
++	.ids = i2cfront_ids,
++	.probe = i2cfront_probe,
++	.otherend_changed = i2cfront_backend_changed,
++	.remove = i2cfront_remove,
++};
++
++static int __init i2cfront_init(void)
++{
++	if (!xen_domain())
++		return -ENODEV;
++
++	return xenbus_register_frontend(&i2cfront_driver);
++}
++subsys_initcall(i2cfront_init);
+-- 
+1.7.9.5
+

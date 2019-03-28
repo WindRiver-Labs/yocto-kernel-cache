@@ -1,0 +1,268 @@
+From dda139cec8e084cb8ec58cf1082a09fe480ea663 Mon Sep 17 00:00:00 2001
+From: Anson Huang <Anson.Huang@nxp.com>
+Date: Fri, 24 Mar 2017 19:33:02 +0800
+Subject: [PATCH 1695/5242] MLK-14513 ARM: imx: restore iomux/gpio settings
+ before isoack on i.mx7ulp
+
+commit  baf8f0ed64cdaffd25ce7b7b97955a9694aa84a1 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+ISOACK must be done only after all IOMUX/GPIO settings done,
+otherwise, some PADs can NOT keep state during VLLS
+enter/exit and cause some pins toggling, and lead to
+external devices in abnormal state, like reset etc..
+
+This patch does all iomux/gpio settings restore in VLLS exit
+flow, since DDR PADs need to be functioning before jump
+to DDR, so isoack can only be done in ASM code, to save
+OCRAM space, all pins in port C - F will be restored, even
+some pins are reserved, but read/write these reserved pins
+settings are OK on i.MX7ULP.
+
+Signed-off-by: Anson Huang <Anson.Huang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm/mach-imx/pm-imx7ulp.c      |   49 +++++++++++----------
+ arch/arm/mach-imx/suspend-imx7ulp.S |   81 ++++++++++++++++++++++++++++-------
+ 2 files changed, 89 insertions(+), 41 deletions(-)
+
+diff --git a/arch/arm/mach-imx/pm-imx7ulp.c b/arch/arm/mach-imx/pm-imx7ulp.c
+index 1f620fe..15aa468 100644
+--- a/arch/arm/mach-imx/pm-imx7ulp.c
++++ b/arch/arm/mach-imx/pm-imx7ulp.c
+@@ -84,6 +84,11 @@
+ 
+ #define MX7ULP_MAX_MMDC_IO_NUM		36
+ #define MX7ULP_MAX_MMDC_NUM		50
++#define MX7ULP_MAX_IOMUX_NUM		116
++#define MX7ULP_MAX_SELECT_INPUT_NUM	78
++
++#define IOMUX_START		0x0
++#define SELECT_INPUT_START	0x200
+ 
+ #define TPM_SC		0x10
+ #define TPM_MOD		0x18
+@@ -129,7 +134,6 @@
+ static void __iomem *suspend_ocram_base;
+ static void (*imx7ulp_suspend_in_ocram_fn)(void __iomem *sram_base);
+ 
+-static u32 gpio_regs[4][2];
+ static u32 tpm5_regs[4];
+ static u32 lpuart4_regs[4];
+ static u32 pcc2_regs[25][2] = {
+@@ -156,8 +160,6 @@
+ 	0x608, 0x60c, 0x610, 0x614,
+ };
+ 
+-static u32 ptc1;
+-
+ extern unsigned long iram_tlb_base_addr;
+ extern unsigned long iram_tlb_phys_addr;
+ 
+@@ -245,11 +247,15 @@ struct imx7ulp_cpu_pm_info {
+ 	void __iomem *sim_base;
+ 	void __iomem *scg1_base;
+ 	void __iomem *mmdc_base;
+-	void __iomem *gpio_base;
+ 	void __iomem *mmdc_io_base;
+ 	void __iomem *smc1_base;
+ 	u32 scg1[16];
+ 	u32 ttbr1; /* Store TTBR1 */
++	u32 gpio[4][2];
++	u32 iomux_num; /* Number of IOs which need saved/restored. */
++	u32 iomux_val[MX7ULP_MAX_IOMUX_NUM]; /* To save value */
++	u32 select_input_num; /* Number of select input which need saved/restored. */
++	u32 select_input_val[MX7ULP_MAX_SELECT_INPUT_NUM]; /* To save value */
+ 	u32 mmdc_io_num; /* Number of MMDC IOs which need saved/restored. */
+ 	u32 mmdc_io_val[MX7ULP_MAX_MMDC_IO_NUM][2]; /* To save offset and value */
+ 	u32 mmdc_num; /* Number of MMDC registers which need saved/restored. */
+@@ -273,18 +279,8 @@ static void imx7ulp_gpio_save(void)
+ 	int i;
+ 
+ 	for (i = 0; i < 4; i++) {
+-		gpio_regs[i][0] = readl_relaxed(gpio_base[i] + GPIO_PDOR);
+-		gpio_regs[i][1] = readl_relaxed(gpio_base[i] + GPIO_PDDR);
+-	}
+-}
+-
+-static void imx7ulp_gpio_restore(void)
+-{
+-	int i;
+-
+-	for (i = 0; i < 4; i++) {
+-		writel_relaxed(gpio_regs[i][0], gpio_base[i] + GPIO_PDOR);
+-		writel_relaxed(gpio_regs[i][1], gpio_base[i] + GPIO_PDDR);
++		pm_info->gpio[i][0] = readl_relaxed(gpio_base[i] + GPIO_PDOR);
++		pm_info->gpio[i][1] = readl_relaxed(gpio_base[i] + GPIO_PDDR);
+ 	}
+ }
+ 
+@@ -330,12 +326,19 @@ static void imx7ulp_pcc2_restore(void)
+ 
+ static inline void imx7ulp_iomuxc_save(void)
+ {
+-	ptc1 = readl_relaxed(iomuxc1_base + 0x4);
+-}
++	int i;
+ 
+-static inline void imx7ulp_iomuxc_restore(void)
+-{
+-	writel_relaxed(ptc1, iomuxc1_base + 0x4);
++	pm_info->iomux_num = MX7ULP_MAX_IOMUX_NUM;
++	pm_info->select_input_num = MX7ULP_MAX_SELECT_INPUT_NUM;
++
++	for (i = 0; i < pm_info->iomux_num; i++)
++		pm_info->iomux_val[i] =
++			readl_relaxed(iomuxc1_base +
++				IOMUX_START + i * 0x4);
++	for (i = 0; i < pm_info->select_input_num; i++)
++		pm_info->select_input_val[i] =
++			readl_relaxed(iomuxc1_base +
++				SELECT_INPUT_START + i * 0x4);
+ }
+ 
+ static void imx7ulp_lpuart_save(void)
+@@ -463,13 +466,11 @@ static int imx7ulp_pm_enter(suspend_state_t state)
+ 		/* Zzz ... */
+ 		cpu_suspend(0, imx7ulp_suspend_finish);
+ 
+-		imx7ulp_gpio_restore();
+ 		imx7ulp_pcc2_restore();
+ 		imx7ulp_pcc3_restore();
+ 		imx7ulp_lpuart_restore();
+ 		imx7ulp_set_dgo(0);
+ 		imx7ulp_tpm_restore();
+-		imx7ulp_iomuxc_restore();
+ 		imx7ulp_set_lpm(RUN);
+ 		break;
+ 	default:
+@@ -677,8 +678,6 @@ void __init imx7ulp_pm_common_init(const struct imx7ulp_pm_socdata
+ 	pm_info->resume_addr = virt_to_phys(imx7ulp_cpu_resume);
+ 	pm_info->pm_info_size = sizeof(*pm_info);
+ 
+-	pm_info->gpio_base = aips1_base +
+-		(MX7ULP_GPIOC_BASE_ADDR & ~ADDR_1M_MASK);
+ 	pm_info->scg1_base = aips2_base +
+ 		(MX7ULP_SCG1_BASE_ADDR & ~ADDR_1M_MASK);
+ 	pm_info->smc1_base = aips3_base +
+diff --git a/arch/arm/mach-imx/suspend-imx7ulp.S b/arch/arm/mach-imx/suspend-imx7ulp.S
+index f98c965..70a0dd8 100644
+--- a/arch/arm/mach-imx/suspend-imx7ulp.S
++++ b/arch/arm/mach-imx/suspend-imx7ulp.S
+@@ -47,16 +47,20 @@
+ #define PM_INFO_PM_INFO_SIM_VBASE_OFFSET	0x18
+ #define PM_INFO_PM_INFO_SCG1_VBASE_OFFSET	0x1c
+ #define PM_INFO_PM_INFO_MMDC_VBASE_OFFSET	0x20
+-#define PM_INFO_PM_INFO_GPIOC_VBASE_OFFSET	0x24
+-#define PM_INFO_PM_INFO_MMDC_IO_VBASE_OFFSET	0x28
+-#define PM_INFO_PM_INFO_SMC1_VBASE_OFFSET	0x2c
+-#define PM_INFO_PM_INFO_SCG1_VAL_OFFSET		0x30
+-#define PM_INFO_MX7ULP_TTBR1_V_OFFSET		0x70
+-#define PM_INFO_MMDC_IO_NUM_OFFSET		0x74
+-#define PM_INFO_MMDC_IO_VAL_OFFSET		0x78
++#define PM_INFO_PM_INFO_MMDC_IO_VBASE_OFFSET	0x24
++#define PM_INFO_PM_INFO_SMC1_VBASE_OFFSET	0x28
++#define PM_INFO_PM_INFO_SCG1_VAL_OFFSET		0x2c
++#define PM_INFO_MX7ULP_TTBR1_V_OFFSET		0x6c
++#define PM_INFO_MX7ULP_GPIO_REG_OFFSET		0x70
++#define PM_INFO_IOMUX_NUM_OFFSET		0x90
++#define PM_INFO_IOMUX_VAL_OFFSET		0x94
++#define PM_INFO_SELECT_INPUT_NUM_OFFSET		0x264
++#define PM_INFO_SELECT_INPUT_VAL_OFFSET		0x268
++#define PM_INFO_MMDC_IO_NUM_OFFSET		0x3a0
++#define PM_INFO_MMDC_IO_VAL_OFFSET		0x3a4
+ /* below offsets depends on MX7ULP_MAX_MMDC_IO_NUM(36) definition */
+-#define PM_INFO_MMDC_NUM_OFFSET			0x198
+-#define PM_INFO_MMDC_VAL_OFFSET			0x19c
++#define PM_INFO_MMDC_NUM_OFFSET			0x4c4
++#define PM_INFO_MMDC_VAL_OFFSET			0x4c8
+ 
+ #define DGO_CTRL0	0x50
+ #define DGO_GPR3	0x60
+@@ -86,11 +90,16 @@
+ 
+ #define PMC1_CTRL	0x24
+ 
+-#define GPIO_PDOR	0x0
+-#define GPIO_PDDR	0x14
++#define GPIO_PDOR		0x0
++#define GPIO_PDDR		0x14
++#define GPIO_PORT_NUM		0x4
++#define GPIO_PORT_OFFSET	0x40
+ 
+ #define PMCTRL		0x10
+ 
++#define IOMUX_OFFSET		0x0
++#define SELECT_INPUT_OFFSET	0x200
++
+ 	.align 3
+ 
+ 	.macro store_ttbr1
+@@ -434,11 +443,6 @@ resume:
+ 	mcr     p15, 0, r6, c1, c0, 0
+ 	isb
+ 
+-	ldr	r6, =MX7ULP_PMC1_BASE_ADDR
+-	ldr	r7, [r6, #PMC1_CTRL]
+-	orr	r7, r7, #(1 << 14)
+-	str	r7, [r6, #PMC1_CTRL]
+-
+ 	ldr	r6, =MX7ULP_SIM_BASE_ADDR
+ 	ldr	r0, [r6, #DGO_GPR4]
+ 	/* get physical resume address from pm_info. */
+@@ -535,7 +539,52 @@ resume:
+ 	orr	r7, r7, #(1 << 30)
+ 	str	r7, [r11, #0x3c]
+ 
++	/* restore gpio settings */
++	ldr	r10, =MX7ULP_GPIOC_BASE_ADDR
++	ldr	r7, =PM_INFO_MX7ULP_GPIO_REG_OFFSET
++	add	r7, r7, r0
++	ldr	r6, =GPIO_PORT_NUM
++12:
++	ldr	r9, [r7], #0x4
++	str	r9, [r10, #GPIO_PDOR]
++	ldr	r9, [r7], #0x4
++	str	r9, [r10, #GPIO_PDDR]
++	add     r10, r10, #GPIO_PORT_OFFSET
++	subs	r6, r6, #0x1
++	bne	12b
++
++	/* restore iomuxc settings */
++	ldr	r10, =MX7ULP_IOMUXC1_BASE_ADDR
++	add	r10, r10, #IOMUX_OFFSET
++	ldr	r6, [r0, #PM_INFO_IOMUX_NUM_OFFSET]
++	ldr	r7, =PM_INFO_IOMUX_VAL_OFFSET
++	add	r7, r7, r0
++13:
++	ldr	r9, [r7], #0x4
++	str	r9, [r10], #0x4
++	subs	r6, r6, #0x1
++	bne	13b
++
++	/* restore select input settings */
++	ldr	r10, =MX7ULP_IOMUXC1_BASE_ADDR
++	add	r10, r10, #SELECT_INPUT_OFFSET
++	ldr	r6, [r0, #PM_INFO_SELECT_INPUT_NUM_OFFSET]
++	ldr	r7, =PM_INFO_SELECT_INPUT_VAL_OFFSET
++	add	r7, r7, r0
++14:
++	ldr	r9, [r7], #0x4
++	str	r9, [r10], #0x4
++	subs	r6, r6, #0x1
++	bne	14b
++
++	/* isoack */
++	ldr	r6, =MX7ULP_PMC1_BASE_ADDR
++	ldr	r7, [r6, #PMC1_CTRL]
++	orr	r7, r7, #(1 << 14)
++	str	r7, [r6, #PMC1_CTRL]
++
+ 	restore_mmdc_settings
++
+ 	mov	pc, lr
+ ENDPROC(imx7ulp_suspend)
+ 
+-- 
+1.7.9.5
+

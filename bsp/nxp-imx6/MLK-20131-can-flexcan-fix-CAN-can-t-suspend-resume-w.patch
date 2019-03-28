@@ -1,0 +1,109 @@
+From a2ad1d6bb93689b43d900679ae51adb964e1eeeb Mon Sep 17 00:00:00 2001
+From: Fugang Duan <fugang.duan@nxp.com>
+Date: Tue, 6 Nov 2018 13:09:42 +0800
+Subject: [PATCH 5196/5242] MLK-20131 can: flexcan: fix CAN can't
+ suspend/resume when CAN is only capable of wakeup
+
+commit  0a182dbafca702d81f2263779c4167332529fed7 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+When dev->power.can_wakeup set to true, device_prepare() may runtime resume the device:
+dpm_suspend_start()
+	dpm_prepare(state);
+		dev->driver->pm->prepare()
+			pm_genpd_prepare()
+				if (resume_needed(dev, genpd))
+				    pm_runtime_resume(dev);
+
+And imx8qm/qxp power domain driver don't implement the active_wakeup() callback, then
+resume_needed() always return "true" when dev->power.can_wakeup is true.
+
+Once CAN device is runtime active status, then CAN's clock's count is 1 during system
+suspend. And CAN0/CAN1/CAN2 share the same module clock, so we can say all CAN's module
+clock is enabled during system suspended.
+
+flexcan_runtime_resume()
+	flexcan_clks_enable(priv);
+
+i.MX8QM/QXP SCU code clock logic requires linux kernel clocks should be disabled during
+suspend, otherwise SCU don't enable them after system resume back.
+
+There are two ways to fix the issue:
+1. CAN driver should check the runtime status to ensure all clocks are disabled  during
+system suspend.
+2. Don't set CAN wakeup capability during probe, move it into flexcan_open().
+
+Signed-off-by: Fugang Duan <fugang.duan@nxp.com>
+Signed-off-by: Joakim Zhang <qiangqing.zhang@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/can/flexcan.c |   13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/can/flexcan.c b/drivers/net/can/flexcan.c
+index b182408..2cf1495 100644
+--- a/drivers/net/can/flexcan.c
++++ b/drivers/net/can/flexcan.c
+@@ -376,6 +376,7 @@ struct flexcan_priv {
+ #ifdef CONFIG_ARCH_MXC_ARM64
+ 	sc_ipc_t ipc_handle;
+ #endif
++	bool wakeup;
+ 
+ 	u32 mb_size;
+ 	u32 mb_num;
+@@ -1478,6 +1479,8 @@ static int flexcan_open(struct net_device *dev)
+ 	if (err)
+ 		goto out_free_irq;
+ 
++	device_set_wakeup_capable(priv->dev, priv->wakeup);
++
+ 	can_led_event(dev, CAN_LED_EVENT_OPEN);
+ 
+ 	can_rx_offload_enable(&priv->offload);
+@@ -1508,6 +1511,8 @@ static int flexcan_close(struct net_device *dev)
+ 
+ 	close_candev(dev);
+ 
++	device_set_wakeup_capable(priv->dev, false);
++
+ 	can_led_event(dev, CAN_LED_EVENT_STOP);
+ 
+ 	pm_runtime_put(priv->dev);
+@@ -1707,7 +1712,6 @@ static int flexcan_probe(struct platform_device *pdev)
+ 	int err, irq;
+ 	u32 clock_freq = 0;
+ 	u32 clk_src = 1;
+-	int wakeup = 1;
+ 
+ 	reg_xceiver = devm_regulator_get(&pdev->dev, "xceiver");
+ 	if (PTR_ERR(reg_xceiver) == -EPROBE_DEFER)
+@@ -1870,22 +1874,21 @@ static int flexcan_probe(struct platform_device *pdev)
+ 
+ 	devm_can_led_init(dev);
+ 
++	priv->wakeup = true;
+ 	if (priv->devtype_data->quirks & FLEXCAN_QUIRK_TIMESTAMP_SUPPORT_FD) {
+ 		err = imx8_sc_ipc_fetch(pdev);
+ 		if (err) {
+-			wakeup = 0;
++			priv->wakeup = false;
+ 			dev_dbg(&pdev->dev, "failed to fetch scu ipc\n");
+ 		}
+ 	} else if (priv->devtype_data->quirks & FLEXCAN_QUIRK_DISABLE_RXFG) {
+ 		err = flexcan_of_parse_stop_mode(pdev);
+ 		if (err) {
+-			wakeup = 0;
++			priv->wakeup = false;;
+ 			dev_dbg(&pdev->dev, "failed to parse stop-mode\n");
+ 		}
+ 	}
+ 
+-	device_set_wakeup_capable(&pdev->dev, wakeup);
+-
+ 	pm_runtime_put(&pdev->dev);
+ 
+ 	dev_info(&pdev->dev, "device registered (reg_base=%p, irq=%d)\n",
+-- 
+1.7.9.5
+

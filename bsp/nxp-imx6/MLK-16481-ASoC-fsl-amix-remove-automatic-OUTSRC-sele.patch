@@ -1,0 +1,796 @@
+From 64f4695b32ad9c99cbdf25d74e58d0bd7e8ed792 Mon Sep 17 00:00:00 2001
+From: Viorel Suman <viorel.suman@nxp.com>
+Date: Thu, 19 Oct 2017 17:07:38 +0300
+Subject: [PATCH 2668/5242] MLK-16481: ASoC: fsl: amix: remove automatic
+ OUTSRC selection
+
+commit  df3d88d426b8f14664a039d0d38eb1e6c1107b03 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Refactor AMIX driver by removing automatic OUTSRC selection
+and enforcing OUTSRC transition constraints as specified in
+AMIX documentation, "Mixer output processing" chapter.
+
+Signed-off-by: Viorel Suman <viorel.suman@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ sound/soc/fsl/fsl_amix.c |  497 ++++++++++++++++++++++++++++++++++------------
+ sound/soc/fsl/fsl_amix.h |   17 +-
+ sound/soc/fsl/imx-amix.c |   88 ++++----
+ 3 files changed, 414 insertions(+), 188 deletions(-)
+
+diff --git a/sound/soc/fsl/fsl_amix.c b/sound/soc/fsl/fsl_amix.c
+index c13071c..3adb621 100644
+--- a/sound/soc/fsl/fsl_amix.c
++++ b/sound/soc/fsl/fsl_amix.c
+@@ -22,6 +22,9 @@
+ #define SOC_ENUM_SINGLE_S(xreg, xshift, xtexts) \
+ 	SOC_ENUM_SINGLE(xreg, xshift, ARRAY_SIZE(xtexts), xtexts)
+ 
++typedef int (*fsl_amix_state_handler)(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr);
++
+ static const char
+ 	*tdm_sel[] = { "TDM1", "TDM2", },
+ 	*mode_sel[] = { "Disabled", "TDM1", "TDM2", "Mixed", },
+@@ -49,10 +52,299 @@
+ SOC_ENUM_SINGLE_S(FSL_AMIX_ATCR1, 1, updn_sel),
+ };
+ 
++static int fsl_amix_state_dis_tdm1(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce the proper TDM is started */
++	if (!(priv->tdms & BIT(0))) {
++		dev_err(comp->dev, "DIS->TDM1: TDM1 is not started!\n");
++		return -EINVAL;
++	}
++	/* Set mix clock */
++	(*mask) |= FSL_AMIX_CTR_MIXCLK_MASK;
++	(*ctr)  |= FSL_AMIX_CTR_MIXCLK(0);
++	return 0;
++}
++
++static int fsl_amix_state_dis_tdm2(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce the proper TDM is started */
++	if (!(priv->tdms & BIT(1))) {
++		dev_err(comp->dev, "DIS->TDM2: TDM2 is not started!\n");
++		return -EINVAL;
++	}
++	/* Set mix clock */
++	(*mask) |= FSL_AMIX_CTR_MIXCLK_MASK;
++	(*ctr)  |= FSL_AMIX_CTR_MIXCLK(1);
++	return 0;
++}
++
++static int fsl_amix_state_tdm1_dis(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce the proper TDM is started */
++	if (!(priv->tdms & BIT(0))) {
++		dev_err(comp->dev, "TDM1->DIS: TDM1 is not started!\n");
++		return -EINVAL;
++	}
++	/* Keep mix clock unchanged */
++	return 0;
++}
++
++static int fsl_amix_state_tdm2_dis(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce the proper TDM is started */
++	if (!(priv->tdms & BIT(1))) {
++		dev_err(comp->dev, "TDM2->DIS: TDM2 is not started!\n");
++		return -EINVAL;
++	}
++	/* Keep mix clock unchanged */
++	return 0;
++}
++
++static int fsl_amix_state_dis_mix(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "DIS->MIX: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Keep mix clock unchanged */
++	return 0;
++}
++
++static int fsl_amix_state_tdm1_tdm2(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "TDM1->TDM2: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Set mix clock */
++	(*mask) |= FSL_AMIX_CTR_MIXCLK_MASK;
++	(*ctr)  |= FSL_AMIX_CTR_MIXCLK(1);
++	return 0;
++}
++
++static int fsl_amix_state_tdm2_tdm1(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "TDM2->TDM1: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Set mix clock */
++	(*mask) |= FSL_AMIX_CTR_MIXCLK_MASK;
++	(*ctr)  |= FSL_AMIX_CTR_MIXCLK(0);
++	return 0;
++}
++
++static int fsl_amix_state_tdm1_mix(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "TDM1->MIX: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Keep mix clock unchanged */
++	return 0;
++}
++
++static int fsl_amix_state_tdm2_mix(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "TDM2->MIX: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Keep mix clock unchanged */
++	return 0;
++}
++
++static int fsl_amix_state_mix_tdm1(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "MIX->TDM1: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Set mix clock */
++	(*mask) |= FSL_AMIX_CTR_MIXCLK_MASK;
++	(*ctr)  |= FSL_AMIX_CTR_MIXCLK(0);
++	return 0;
++}
++
++static int fsl_amix_state_mix_tdm2(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "MIX->TDM2: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Set mix clock */
++	(*mask) |= FSL_AMIX_CTR_MIXCLK_MASK;
++	(*ctr)  |= FSL_AMIX_CTR_MIXCLK(1);
++	return 0;
++}
++
++static int fsl_amix_state_mix_dis(struct snd_soc_component *comp,
++	unsigned int *mask, unsigned int *ctr)
++{
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	/* Enforce all TDMs are started */
++	if (priv->tdms != 3) {
++		dev_err(comp->dev, "MIX->DIS: Please start both TDMs!\n");
++		return -EINVAL;
++	}
++	/* Keep mix clock unchanged */
++	return 0;
++}
++
++static const fsl_amix_state_handler state_machine[4][4] = {
++	/* From Disabled */
++	{
++		0, /* To Disabled, do nothing */
++		fsl_amix_state_dis_tdm1, /* To TDM1*/
++		fsl_amix_state_dis_tdm2, /* To TDM2 */
++		fsl_amix_state_dis_mix   /* To Mixed */
++	},
++	/* From TDM1 */
++	{
++		fsl_amix_state_tdm1_dis,  /* To Disabled */
++		0, /* To TDM1, do nothing */
++		fsl_amix_state_tdm1_tdm2, /* To TDM2 */
++		fsl_amix_state_tdm1_mix   /* To Mixed */
++	},
++	/* From TDM2 */
++	{
++		fsl_amix_state_tdm2_dis,  /* To Disabled */
++		fsl_amix_state_tdm2_tdm1, /* To TDM1 */
++		0, /* To TDM2, do nothing */
++		fsl_amix_state_tdm2_mix   /* To Mixed */
++	},
++	/* From Mixed */
++	{
++		fsl_amix_state_mix_dis,  /* To Disabled */
++		fsl_amix_state_mix_tdm1, /* To TDM1 */
++		fsl_amix_state_mix_tdm2, /* To TDM2 */
++		0  /* To Mixed, do nothing */
++	}
++};
++
++static int fsl_amix_put_mix_clk_src(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
++	unsigned int *item = ucontrol->value.enumerated.item;
++	unsigned int reg_val, val, mix_clk;
++	int ret = 0;
++
++	/* Get current state */
++	ret = snd_soc_component_read(comp, FSL_AMIX_CTR, &reg_val);
++	if (ret)
++		return ret;
++
++	mix_clk = reg_val & 1;
++	val = snd_soc_enum_item_to_val(e, item[0]);
++
++	dev_dbg(comp->dev, "[%s]: TDMs=x%08x, val=x%08x\n", __func__, priv->tdms, val);
++
++	/**
++	 * Ensure the current selected mixer clock is available
++	 * for configuration propagation
++	 */
++	if (!(priv->tdms & BIT(mix_clk))) {
++		dev_err(comp->dev, "MIXCLK: A started TDM%d is required "
++			"for configuration propagation!\n", mix_clk + 1);
++		return -EINVAL;
++	}
++
++	if (!(priv->tdms & BIT(val))) {
++		dev_err(comp->dev, "The selected clock source has "
++			"no TDM%d enabled!\n", val + 1);
++		return -EINVAL;
++	}
++
++	return snd_soc_put_enum_double(kcontrol, ucontrol);
++}
++
++static int fsl_amix_put_out_src(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *comp = snd_kcontrol_chip(kcontrol);
++	struct fsl_amix *priv = snd_soc_component_get_drvdata(comp);
++	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
++	unsigned int *item = ucontrol->value.enumerated.item;
++	u32 out_src, mix_clk;
++	unsigned int reg_val, val, mask = 0, ctr = 0;
++	int ret = 0;
++
++	/* Get current state */
++	ret = snd_soc_component_read(comp, FSL_AMIX_CTR, &reg_val);
++	if (ret)
++		return ret;
++
++	/* "From" state */
++	out_src = ((reg_val & FSL_AMIX_CTR_OUTSRC_MASK) >> FSL_AMIX_CTR_OUTSRC_SHIFT);
++	mix_clk = reg_val & 1;
++
++	/* "To" state */
++	val = snd_soc_enum_item_to_val(e, item[0]);
++
++	dev_dbg(comp->dev, "[%s]: TDMs=x%08x, val=x%08x\n", __func__, priv->tdms, val);
++
++	/* Check if state is changing ... */
++	if (!state_machine[out_src][val])
++		return 0;
++	/**
++	 * Ensure the current selected mixer clock is available
++	 * for configuration propagation
++	 */
++	if (!(priv->tdms & BIT(mix_clk))) {
++		dev_err(comp->dev, "MIXCLK: A started TDM%d is required "
++			"for configuration propagation!\n", mix_clk + 1);
++		return -EINVAL;
++	}
++	/* Check state transition constraints */
++	ret = state_machine[out_src][val](comp, &mask, &ctr);
++	if (ret)
++		return ret;
++
++	/* Complete transition to new state */
++	mask |= FSL_AMIX_CTR_OUTSRC_MASK;
++	ctr  |= FSL_AMIX_CTR_OUTSRC(val);
++
++	return snd_soc_component_update_bits(comp, FSL_AMIX_CTR, mask, ctr);
++}
++
+ static const struct snd_kcontrol_new fsl_amix_snd_controls[] = {
+ 	/* FSL_AMIX_CTR controls */
+-	SOC_ENUM("Mixing Clock Source", fsl_amix_enum[0]),
+-	SOC_ENUM("Output Source", fsl_amix_enum[1]),
++	SOC_ENUM_EXT("Mixing Clock Source", fsl_amix_enum[0],
++		snd_soc_get_enum_double, fsl_amix_put_mix_clk_src),
++	SOC_ENUM_EXT("Output Source", fsl_amix_enum[1],
++		snd_soc_get_enum_double, fsl_amix_put_out_src),
+ 	SOC_ENUM("Output Width", fsl_amix_enum[2]),
+ 	SOC_ENUM("Output Clock Polarity", fsl_amix_enum[3]),
+ 	SOC_ENUM("Frame Rate Diff Error", fsl_amix_enum[4]),
+@@ -87,108 +379,6 @@
+ 			0, 0x3ffff, 0),
+ };
+ 
+-struct amix_dais_st {
+-	u8 input;
+-	u8 output;
+-};
+-
+-static void fsl_amix_get_dais_status(struct snd_soc_pcm_runtime *be_rtd,
+-				     struct amix_dais_st *status)
+-{
+-	struct snd_soc_dpcm *dpcm;
+-	struct snd_soc_pcm_runtime *fe_rtd = NULL;
+-	struct snd_pcm_substream *fe_ss = NULL;
+-	struct snd_soc_dai *fe_dai, *be_dai = be_rtd->cpu_dai;
+-	int stream = SNDRV_PCM_STREAM_PLAYBACK;
+-
+-	/* find active frontends for this backend */
+-	list_for_each_entry(dpcm, &be_rtd->dpcm[stream].fe_clients, list_fe) {
+-		if (dpcm->be != be_rtd)
+-			continue;
+-
+-		fe_rtd = dpcm->fe;
+-		fe_dai = fe_rtd->cpu_dai;
+-		fe_ss  = snd_soc_dpcm_get_substream(fe_rtd, stream);
+-
+-		if (fe_ss && fe_ss->pcm->device < FSL_AMIX_MAX_DAIS) {
+-			if (fe_dai->playback_active)
+-				status->input |= BIT(fe_ss->pcm->device);
+-			if (fe_dai->capture_active)
+-				status->output |= BIT(fe_ss->pcm->device);
+-		} else if (fe_ss) {
+-			dev_err(be_dai->dev, "Wrong device number: %d\n",
+-				fe_ss->pcm->device);
+-		}
+-	}
+-}
+-
+-static int fsl_amix_update(struct snd_soc_pcm_runtime *rtd)
+-{
+-	struct snd_soc_dai *dai = rtd->cpu_dai;
+-	struct fsl_amix *priv = snd_soc_dai_get_drvdata(dai);
+-	u32 mask = 0, ctr = 0, val, old_input;
+-	struct amix_dais_st status = { .input = 0, .output = 0 };
+-
+-	fsl_amix_get_dais_status(rtd, &status);
+-
+-	regmap_read(priv->regmap, FSL_AMIX_CTR, &val);
+-	old_input = ((val & FSL_AMIX_CTR_OUTSRC_MASK) >> FSL_AMIX_CTR_OUTSRC_SHIFT);
+-
+-	dev_dbg(dai->dev, "old_input=x%08x, input=x%08x\n", old_input, status.input);
+-
+-	if (old_input == status.input) {
+-		dev_dbg(dai->dev, "State unchanged, input=x%08x\n", status.input);
+-		return 0;
+-	}
+-
+-	/**
+-	 * Mixing clock selection. Make sure the currently selected clock source
+-	 * has the TDM enabled. If not, switch clock source to enabled TDM.
+-	 */
+-	switch (status.input) {
+-	case 0: /* Both TDMs are disabled, keep the clock source unchanged */
+-	case 3: /* Both TDMs are enabled, keep the clock source unchanged */
+-		break;
+-	case 1:
+-	case 2:
+-		val &= 1;
+-		if (FSL_AMIX_CTR_MIXCLK(status.input) != val) {
+-			mask |= FSL_AMIX_CTR_MIXCLK_MASK;
+-			ctr  |= FSL_AMIX_CTR_MIXCLK(status.input);
+-		}
+-		break;
+-	}
+-
+-	/* Output source selection */
+-	mask |= FSL_AMIX_CTR_OUTSRC_MASK;
+-	ctr  |= FSL_AMIX_CTR_OUTSRC(status.input);
+-
+-	regmap_update_bits(priv->regmap, FSL_AMIX_CTR, mask, ctr);
+-
+-	dev_dbg(dai->dev, "Set AMIX_CTR[0x%08x]=0x%08x, in=0x%08x, out=0x%08x\n",
+-		mask, ctr, status.input, status.output);
+-
+-	return 0;
+-}
+-
+-static int fsl_amix_dai_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+-{
+-	struct snd_soc_card *card = dai->component->card;
+-	struct snd_soc_pcm_runtime *rtd;
+-
+-	rtd = snd_soc_get_pcm_runtime(card, "HiFi-AMIX-BE");
+-
+-	return fsl_amix_update(rtd);
+-}
+-
+-static void fsl_amix_dai_shutdown(struct snd_pcm_substream *substream,
+-				struct snd_soc_dai *dai)
+-{
+-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+-
+-	fsl_amix_update(rtd);
+-}
+-
+ static int fsl_amix_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ {
+ 	struct fsl_amix *priv = snd_soc_dai_get_drvdata(dai);
+@@ -212,11 +402,11 @@ static int fsl_amix_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ 	}
+ 
+ 	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
+-	case SND_SOC_DAIFMT_NB_NF:
++	case SND_SOC_DAIFMT_IB_NF:
+ 		/* Output data will be written on positive edge of the clock */
+ 		ctr |= FSL_AMIX_CTR_OUTCKPOL(0);
+ 		break;
+-	case SND_SOC_DAIFMT_IB_NF:
++	case SND_SOC_DAIFMT_NB_NF:
+ 		/* Output data will be written on negative edge of the clock */
+ 		ctr |= FSL_AMIX_CTR_OUTCKPOL(1);
+ 		break;
+@@ -229,32 +419,85 @@ static int fsl_amix_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+ 	return regmap_update_bits(priv->regmap, FSL_AMIX_CTR, mask, ctr);
+ }
+ 
++static int fsl_amix_dai_trigger(struct snd_pcm_substream *substream, int cmd,
++		struct snd_soc_dai *dai)
++{
++	struct fsl_amix *priv = snd_soc_dai_get_drvdata(dai);
++
++	/* Capture stream shall not be handled */
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
++		return 0;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		priv->tdms |= BIT(dai->driver->id);
++		break;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		priv->tdms &= ~BIT(dai->driver->id);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static struct snd_soc_dai_ops fsl_amix_dai_ops = {
+-	.shutdown     = fsl_amix_dai_shutdown,
+-	.mute_stream  = fsl_amix_dai_mute_stream,
+ 	.set_fmt      = fsl_amix_dai_set_fmt,
++	.trigger      = fsl_amix_dai_trigger,
+ };
+ 
+-static struct snd_soc_dai_driver fsl_amix_dai = {
+-	.playback = {
+-		.stream_name = "AMIX-Playback",
+-		.channels_min = 8,
+-		.channels_max = 8,
+-		.rate_min = 8000,
+-		.rate_max = 96000,
+-		.rates = SNDRV_PCM_RATE_8000_96000,
+-		.formats = FSL_AMIX_FORMATS,
++static struct snd_soc_dai_driver fsl_amix_dai[] = {
++	{
++		.id   = 0,
++		.name = "amix-0",
++		.playback = {
++			.stream_name = "AMIX-Playback-0",
++			.channels_min = 8,
++			.channels_max = 8,
++			.rate_min = 8000,
++			.rate_max = 96000,
++			.rates = SNDRV_PCM_RATE_8000_96000,
++			.formats = FSL_AMIX_FORMATS,
++		},
++		.capture = {
++			.stream_name = "AMIX-Capture-0",
++			.channels_min = 8,
++			.channels_max = 8,
++			.rate_min = 8000,
++			.rate_max = 96000,
++			.rates = SNDRV_PCM_RATE_8000_96000,
++			.formats = FSL_AMIX_FORMATS,
++		},
++		.ops = &fsl_amix_dai_ops,
+ 	},
+-	.capture = {
+-		.stream_name = "AMIX-Capture",
+-		.channels_min = 8,
+-		.channels_max = 8,
+-		.rate_min = 8000,
+-		.rate_max = 96000,
+-		.rates = SNDRV_PCM_RATE_8000_96000,
+-		.formats = FSL_AMIX_FORMATS,
++	{
++		.id   = 1,
++		.name = "amix-1",
++		.playback = {
++			.stream_name = "AMIX-Playback-1",
++			.channels_min = 8,
++			.channels_max = 8,
++			.rate_min = 8000,
++			.rate_max = 96000,
++			.rates = SNDRV_PCM_RATE_8000_96000,
++			.formats = FSL_AMIX_FORMATS,
++		},
++		.capture = {
++			.stream_name = "AMIX-Capture-1",
++			.channels_min = 8,
++			.channels_max = 8,
++			.rate_min = 8000,
++			.rate_max = 96000,
++			.rates = SNDRV_PCM_RATE_8000_96000,
++			.formats = FSL_AMIX_FORMATS,
++		},
++		.ops = &fsl_amix_dai_ops,
+ 	},
+-	.ops = &fsl_amix_dai_ops,
+ };
+ 
+ static const struct snd_soc_component_driver fsl_amix_component = {
+@@ -375,7 +618,7 @@ static int fsl_amix_probe(struct platform_device *pdev)
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	ret = devm_snd_soc_register_component(&pdev->dev, &fsl_amix_component,
+-					      &fsl_amix_dai, 1);
++					      fsl_amix_dai, ARRAY_SIZE(fsl_amix_dai));
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "failed to register ASoC DAI\n");
+ 		return ret;
+diff --git a/sound/soc/fsl/fsl_amix.h b/sound/soc/fsl/fsl_amix.h
+index 1c91516..582fb98 100644
+--- a/sound/soc/fsl/fsl_amix.h
++++ b/sound/soc/fsl/fsl_amix.h
+@@ -35,30 +35,30 @@
+ /* AMIX Control Register */
+ #define FSL_AMIX_CTR_MIXCLK_SHIFT	0
+ #define FSL_AMIX_CTR_MIXCLK_MASK	(1 << FSL_AMIX_CTR_MIXCLK_SHIFT)
+-#define FSL_AMIX_CTR_MIXCLK(i)		(i - 1)
++#define FSL_AMIX_CTR_MIXCLK(i)		((i) << FSL_AMIX_CTR_MIXCLK_SHIFT)
+ #define FSL_AMIX_CTR_OUTSRC_SHIFT	1
+ #define FSL_AMIX_CTR_OUTSRC_MASK	(0x3 << FSL_AMIX_CTR_OUTSRC_SHIFT)
+-#define FSL_AMIX_CTR_OUTSRC(i)		((i  << FSL_AMIX_CTR_OUTSRC_SHIFT) \
++#define FSL_AMIX_CTR_OUTSRC(i)		(((i) << FSL_AMIX_CTR_OUTSRC_SHIFT) \
+ 					      & FSL_AMIX_CTR_OUTSRC_MASK)
+ #define FSL_AMIX_CTR_OUTWIDTH_SHIFT	3
+ #define FSL_AMIX_CTR_OUTWIDTH_MASK	(0x7 << FSL_AMIX_CTR_OUTWIDTH_SHIFT)
+-#define FSL_AMIX_CTR_OUTWIDTH(i)	((i  << FSL_AMIX_CTR_OUTWIDTH_SHIFT) \
++#define FSL_AMIX_CTR_OUTWIDTH(i)	(((i) << FSL_AMIX_CTR_OUTWIDTH_SHIFT) \
+ 					      & FSL_AMIX_CTR_OUTWIDTH_MASK)
+ #define FSL_AMIX_CTR_OUTCKPOL_SHIFT	6
+ #define FSL_AMIX_CTR_OUTCKPOL_MASK	(1 << FSL_AMIX_CTR_OUTCKPOL_SHIFT)
+-#define FSL_AMIX_CTR_OUTCKPOL(i)	(i << FSL_AMIX_CTR_OUTCKPOL_SHIFT)
++#define FSL_AMIX_CTR_OUTCKPOL(i)	((i) << FSL_AMIX_CTR_OUTCKPOL_SHIFT)
+ #define FSL_AMIX_CTR_MASKRTDF_SHIFT	7
+ #define FSL_AMIX_CTR_MASKRTDF_MASK	(1 << FSL_AMIX_CTR_MASKRTDF_SHIFT)
+-#define FSL_AMIX_CTR_MASKRTDF(i)	(i << FSL_AMIX_CTR_MASKRTDF_SHIFT)
++#define FSL_AMIX_CTR_MASKRTDF(i)	((i) << FSL_AMIX_CTR_MASKRTDF_SHIFT)
+ #define FSL_AMIX_CTR_MASKCKDF_SHIFT	8
+ #define FSL_AMIX_CTR_MASKCKDF_MASK	(1 << FSL_AMIX_CTR_MASKCKDF_SHIFT)
+-#define FSL_AMIX_CTR_MASKCKDF(i)	(i << FSL_AMIX_CTR_MASKCKDF_SHIFT)
++#define FSL_AMIX_CTR_MASKCKDF(i)	((i) << FSL_AMIX_CTR_MASKCKDF_SHIFT)
+ #define FSL_AMIX_CTR_SYNCMODE_SHIFT	9
+ #define FSL_AMIX_CTR_SYNCMODE_MASK	(1 << FSL_AMIX_CTR_SYNCMODE_SHIFT)
+-#define FSL_AMIX_CTR_SYNCMODE(i)	(i << FSL_AMIX_CTR_SYNCMODE_SHIFT)
++#define FSL_AMIX_CTR_SYNCMODE(i)	((i) << FSL_AMIX_CTR_SYNCMODE_SHIFT)
+ #define FSL_AMIX_CTR_SYNCSRC_SHIFT	10
+ #define FSL_AMIX_CTR_SYNCSRC_MASK	(1 << FSL_AMIX_CTR_SYNCSRC_SHIFT)
+-#define FSL_AMIX_CTR_SYNCSRC(i)		(i << FSL_AMIX_CTR_SYNCSRC_SHIFT)
++#define FSL_AMIX_CTR_SYNCSRC(i)		((i) << FSL_AMIX_CTR_SYNCSRC_SHIFT)
+ 
+ /* AMIX Status Register */
+ #define FSL_AMIX_STR_RATEDIFF		BIT(0)
+@@ -96,6 +96,7 @@ struct fsl_amix {
+ 	struct platform_device *pdev;
+ 	struct regmap *regmap;
+ 	struct clk *ipg_clk;
++	u8 tdms;
+ };
+ 
+ #endif /* __FSL_AMIX_H */
+diff --git a/sound/soc/fsl/imx-amix.c b/sound/soc/fsl/imx-amix.c
+index 3274516..bd64e6b 100644
+--- a/sound/soc/fsl/imx-amix.c
++++ b/sound/soc/fsl/imx-amix.c
+@@ -67,26 +67,6 @@ static int imx_amix_fe_startup(struct snd_pcm_substream *substream)
+ 			SNDRV_PCM_HW_PARAM_FORMAT, FSL_AMIX_FORMATS);
+ }
+ 
+-static int imx_amix_fe_prepare(struct snd_pcm_substream *substream)
+-{
+-	struct snd_soc_pcm_runtime *be_rtd;
+-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+-
+-	be_rtd = snd_soc_get_pcm_runtime(rtd->card, "HiFi-AMIX-BE");
+-
+-	return snd_soc_dai_digital_mute(be_rtd->cpu_dai, 0, substream->stream);
+-}
+-
+-static void imx_amix_fe_shutdown(struct snd_pcm_substream *substream)
+-{
+-	struct snd_soc_pcm_runtime *be_rtd;
+-	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+-
+-	be_rtd = snd_soc_get_pcm_runtime(rtd->card, "HiFi-AMIX-BE");
+-
+-	snd_soc_dai_digital_mute(be_rtd->cpu_dai, 1, substream->stream);
+-}
+-
+ static int imx_amix_fe_hw_params(struct snd_pcm_substream *substream,
+ 				     struct snd_pcm_hw_params *params)
+ {
+@@ -136,6 +116,9 @@ static int imx_amix_be_hw_params(struct snd_pcm_substream *substream,
+ 	unsigned int fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_NB_NF;
+ 	int ret;
+ 
++	if (!tx)
++		return 0;
++
+ 	/* For playback the AMIX is slave, and for record is master */
+ 	fmt |= tx ? SND_SOC_DAIFMT_CBM_CFM : SND_SOC_DAIFMT_CBS_CFS;
+ 
+@@ -149,8 +132,6 @@ static int imx_amix_be_hw_params(struct snd_pcm_substream *substream,
+ 
+ static struct snd_soc_ops imx_amix_fe_ops = {
+ 	.startup = imx_amix_fe_startup,
+-	.prepare = imx_amix_fe_prepare,
+-	.shutdown = imx_amix_fe_shutdown,
+ 	.hw_params = imx_amix_fe_hw_params,
+ };
+ 
+@@ -168,7 +149,7 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 	struct imx_amix *priv;
+ 	int i, num_dai, ret;
+ 	const char *fe_name_pref = "HiFi-AMIX-FE-";
+-	char *dai_name;
++	char *be_name, *be_pb, *be_cp, *dai_name, *capture_dai_name;
+ 
+ 	num_dai = of_count_phandle_with_args(np, "dais", NULL);
+ 	if (num_dai != FSL_AMIX_MAX_DAIS) {
+@@ -195,8 +176,7 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 	if (!priv)
+ 		return -ENOMEM;
+ 
+-	/* the dais + backend */
+-	priv->num_dai = num_dai + 1;
++	priv->num_dai = 2 * num_dai;
+ 	priv->dai = devm_kzalloc(&pdev->dev,
+ 			priv->num_dai * sizeof(struct snd_soc_dai_link),
+ 			GFP_KERNEL);
+@@ -210,8 +190,7 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 	if (!priv->dai_conf)
+ 		return -ENOMEM;
+ 
+-	/* 2 additional routes needed for Capture */
+-	priv->num_dapm_routes = num_dai + 2;
++	priv->num_dapm_routes = 3 * num_dai;
+ 	priv->dapm_routes = devm_kzalloc(&pdev->dev,
+ 			priv->num_dapm_routes * sizeof(struct snd_soc_dapm_route),
+ 			GFP_KERNEL);
+@@ -226,9 +205,6 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 			return ret;
+ 		}
+ 
+-		if (i == 0)
+-			out_cpu_np = args.np;
+-
+ 		cpu_pdev = of_find_device_by_node(args.np);
+ 		if (!cpu_pdev) {
+ 			dev_err(&pdev->dev, "failed to find SAI platform device\n");
+@@ -240,6 +216,13 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 
+ 		dev_info(&pdev->dev, "DAI FE name:%s\n", dai_name);
+ 
++		if (i == 0) {
++			out_cpu_np = args.np;
++			capture_dai_name =
++				devm_kasprintf(&pdev->dev, GFP_KERNEL, "%s %s",
++					dai_name, "CPU-Capture");
++		}
++
+ 		priv->dai[i].name = dai_name;
+ 		priv->dai[i].stream_name = "HiFi-AMIX-FE";
+ 		priv->dai[i].codec_dai_name = "snd-soc-dummy-dai";
+@@ -253,21 +236,33 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 		priv->dai[i].ignore_pmdown_time = 1;
+ 		priv->dai[i].ops = &imx_amix_fe_ops;
+ 
++		/* Add AMIX Backend */
++		be_name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "amix-%d", i);
++		be_pb = devm_kasprintf(&pdev->dev, GFP_KERNEL, "AMIX-Playback-%d", i);
++		be_cp = devm_kasprintf(&pdev->dev, GFP_KERNEL, "AMIX-Capture-%d", i);
++
++		priv->dai[num_dai+i].name = be_name;
++		priv->dai[num_dai+i].codec_dai_name = "snd-soc-dummy-dai";
++		priv->dai[num_dai+i].codec_name = "snd-soc-dummy";
++		priv->dai[num_dai+i].cpu_of_node = amix_np;
++		priv->dai[num_dai+i].cpu_dai_name = be_name;
++		priv->dai[num_dai+i].platform_name = "snd-soc-dummy";
++		priv->dai[num_dai+i].no_pcm = 1;
++		priv->dai[num_dai+i].dpcm_playback = 1;
++		priv->dai[num_dai+i].dpcm_capture  = 1;
++		priv->dai[num_dai+i].ignore_pmdown_time = 1;
++		priv->dai[num_dai+i].ops = &imx_amix_be_ops;
++
+ 		priv->dai_conf[i].of_node = args.np;
+ 		priv->dai_conf[i].name_prefix = dai_name;
+ 
+ 		priv->dapm_routes[i].source = devm_kasprintf(&pdev->dev,
+ 			GFP_KERNEL, "%s %s", dai_name, "CPU-Playback");
+-		priv->dapm_routes[i].sink = "AMIX-Playback";
+-
+-		if (i == 0) {
+-			priv->dapm_routes[num_dai].source = "AMIX-Capture";
+-			priv->dapm_routes[num_dai].sink =
+-				devm_kasprintf(&pdev->dev, GFP_KERNEL, "%s %s",
+-				dai_name, "CPU-Capture");
+-			priv->dapm_routes[num_dai+1].source = "AMIX-Playback";
+-			priv->dapm_routes[num_dai+1].sink = "AMIX-Capture";
+-		}
++		priv->dapm_routes[i].sink = be_pb;
++		priv->dapm_routes[num_dai+i].source   = be_pb;
++		priv->dapm_routes[num_dai+i].sink     = be_cp;
++		priv->dapm_routes[2*num_dai+i].source = be_cp;
++		priv->dapm_routes[2*num_dai+i].sink   = capture_dai_name;
+ 	}
+ 
+ 	cpu_pdev = of_find_device_by_node(out_cpu_np);
+@@ -282,19 +277,6 @@ static int imx_amix_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Add AMIX Backend */
+-	priv->dai[num_dai].name = "HiFi-AMIX-BE";
+-	priv->dai[num_dai].stream_name = "HiFi-AMIX-BE";
+-	priv->dai[num_dai].codec_dai_name = "snd-soc-dummy-dai";
+-	priv->dai[num_dai].codec_name = "snd-soc-dummy";
+-	priv->dai[num_dai].cpu_of_node = amix_np;
+-	priv->dai[num_dai].platform_name = "snd-soc-dummy";
+-	priv->dai[num_dai].no_pcm = 1;
+-	priv->dai[num_dai].dpcm_playback = 1;
+-	priv->dai[num_dai].dpcm_capture = 1;
+-	priv->dai[num_dai].ignore_pmdown_time = 1;
+-	priv->dai[num_dai].ops = &imx_amix_be_ops;
+-
+ 	priv->amix_pdev = amix_pdev;
+ 	priv->out_pdev  = cpu_pdev;
+ 
+-- 
+1.7.9.5
+

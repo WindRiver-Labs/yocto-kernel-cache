@@ -1,0 +1,136 @@
+From 5fe360b83cf99319e7093e4d8bc912f87bde25f5 Mon Sep 17 00:00:00 2001
+From: Xianzhong <xianzhong.li@nxp.com>
+Date: Fri, 6 Jul 2018 20:04:00 +0800
+Subject: [PATCH 4592/5242] MGS-3940-1 gpu: imx: dpu-blit: fix dpr hang for
+ smaller size
+
+commit  9ba3b8c89b8e35dcaa926279b5fd9bd091280754 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+auto-trigger cause dpr hang in inital blitter implementation,
+the problem is dpr repeat mode has conflict with command sequencer.
+
+as proposed by design, blitter need do manual trigger for each process:
+dpr register -> dpr run -> seeris register -> seeris trigger -> sync
+
+frstly this patch removed dprc first frame handler from dpu blitter,
+then removed dpr repeat, and enable dpr run for each blit processing.
+
+also add sync flag to avoid the duplicated calling to dpu_be_wait.
+
+Signed-off-by: Xianzhong <xianzhong.li@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/imx/dpu-blit/dpu-blit.c |   17 ++++++++---------
+ drivers/gpu/imx/dpu-blit/dpu-blit.h |    2 +-
+ drivers/gpu/imx/imx8_dprc.c         |    6 +++---
+ 3 files changed, 12 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/imx/dpu-blit/dpu-blit.c b/drivers/gpu/imx/dpu-blit/dpu-blit.c
+index bb747d4..ef1e5b8 100644
+--- a/drivers/gpu/imx/dpu-blit/dpu-blit.c
++++ b/drivers/gpu/imx/dpu-blit/dpu-blit.c
+@@ -121,20 +121,16 @@ void dpu_be_configure_prefetch(struct dpu_bliteng *dpu_be,
+ 		dpu_be_wait(dpu_be);
+ 	}
+ 
++	dpu_be->sync = true;
++
+ 	if (baddr == 0x0) {
+ 		if (!dpu_be->start) {
+ 			dprc_disable(dprc);
+-			dpu_be->handle_start = false;
++			dpu_be->start = true;
+ 		}
+-		dpu_be->start = true;
+ 		return;
+ 	}
+ 
+-	if (dpu_be->handle_start) {
+-		dprc_first_frame_handle(dprc);
+-		dpu_be->handle_start = false;
+-	}
+-
+ 	dprc_configure(dprc, 0,
+ 		       width, height,
+ 		       x_offset, y_offset,
+@@ -146,7 +142,6 @@ void dpu_be_configure_prefetch(struct dpu_bliteng *dpu_be,
+ 
+ 	if (dpu_be->start) {
+ 		dprc_enable(dprc);
+-		dpu_be->handle_start = true;
+ 	}
+ 
+ 	dprc_reg_update(dprc);
+@@ -241,6 +236,8 @@ int dpu_be_blit(struct dpu_bliteng *dpu_be,
+ #define STORE9_SEQCOMPLETE_IRQ_MASK	(1U<<STORE9_SEQCOMPLETE_IRQ)
+ void dpu_be_wait(struct dpu_bliteng *dpu_be)
+ {
++	if (!dpu_be->sync) return;
++
+ 	dpu_cs_wait_fifo_space(dpu_be);
+ 
+ 	dpu_be_write(dpu_be, 0x14000001, CMDSEQ_HIF);
+@@ -253,6 +250,8 @@ void dpu_be_wait(struct dpu_bliteng *dpu_be)
+ 
+ 	dpu_be_write(dpu_be, STORE9_SEQCOMPLETE_IRQ_MASK,
+ 		COMCTRL_INTERRUPTCLEAR0);
++
++	dpu_be->sync = false;
+ }
+ EXPORT_SYMBOL(dpu_be_wait);
+ 
+@@ -413,8 +412,8 @@ int dpu_bliteng_init(struct dpu_bliteng *dpu_bliteng)
+ 	dprc_disable(dpu_bliteng->dprc[0]);
+ 	dprc_disable(dpu_bliteng->dprc[1]);
+ 
+-	dpu_bliteng->handle_start = false;
+ 	dpu_bliteng->start = true;
++	dpu_bliteng->sync = false;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/imx/dpu-blit/dpu-blit.h b/drivers/gpu/imx/dpu-blit/dpu-blit.h
+index 2850933..fd6b500 100644
+--- a/drivers/gpu/imx/dpu-blit/dpu-blit.h
++++ b/drivers/gpu/imx/dpu-blit/dpu-blit.h
+@@ -39,8 +39,8 @@ struct dpu_bliteng {
+ 
+ 	struct dprc *dprc[2];
+ 
+-	bool handle_start;
+ 	bool start;
++	bool sync;
+ };
+ 
+ #endif
+diff --git a/drivers/gpu/imx/imx8_dprc.c b/drivers/gpu/imx/imx8_dprc.c
+index 162485f..c267824 100644
+--- a/drivers/gpu/imx/imx8_dprc.c
++++ b/drivers/gpu/imx/imx8_dprc.c
+@@ -544,11 +544,11 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 	}
+ 	dprc_write(dprc, val, MODE_CTRL0);
+ 
+-	if (start) {
++	if (start || dprc->is_blit_chan) {
+ 		/* software shadow load for the first frame */
+ 		val = SW_SHADOW_LOAD_SEL;
+ 		if (dprc->is_blit_chan) {
+-			val |= RUN_EN | REPEAT_EN | SHADOW_LOAD_EN;
++			val |= RUN_EN | SHADOW_LOAD_EN;
+ 			dprc_write(dprc, val, SYSTEM_CTRL0);
+ 		} else {
+ 			val |= SHADOW_LOAD_EN;
+@@ -588,7 +588,7 @@ void dprc_first_frame_handle(struct dprc *dprc)
+ 		return;
+ 
+ 	if (dprc->is_blit_chan)
+-		dprc_write(dprc, SW_SHADOW_LOAD_SEL, SYSTEM_CTRL0 + CLR);
++		return;
+ 	else
+ 		dprc_write(dprc, REPEAT_EN, SYSTEM_CTRL0);
+ 
+-- 
+1.7.9.5
+

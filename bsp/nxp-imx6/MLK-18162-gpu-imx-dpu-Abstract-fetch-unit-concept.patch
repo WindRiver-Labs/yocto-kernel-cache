@@ -1,0 +1,4917 @@
+From b0800124e774c52e3b2c61c92bc74c5f35485cce Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Wed, 25 Apr 2018 13:45:30 +0800
+Subject: [PATCH 3705/5242] MLK-18162 gpu: imx: dpu: Abstract fetch unit
+ concept
+
+commit  549f1b74ba9ccaa18157d151bf871bf1a9dbd285 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch abstracts fetch unit concept for all the fetch units
+we have - fetchdecode, fetcheco, fetchlayer and fetchwarp.
+They have some similar features and operations which are suitable
+to be abstracted.  A lot of boilerplate code is removed.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-crtc.c    |  131 ++-----
+ drivers/gpu/drm/imx/dpu/dpu-kms.c     |   66 +---
+ drivers/gpu/drm/imx/dpu/dpu-plane.c   |  249 +++++--------
+ drivers/gpu/drm/imx/dpu/dpu-plane.h   |   31 ++
+ drivers/gpu/imx/dpu/Makefile          |    5 +-
+ drivers/gpu/imx/dpu/dpu-common.c      |  193 ++---------
+ drivers/gpu/imx/dpu/dpu-fetchdecode.c |  614 ++++++++++-----------------------
+ drivers/gpu/imx/dpu/dpu-fetcheco.c    |  420 +++++++---------------
+ drivers/gpu/imx/dpu/dpu-fetchlayer.c  |  550 ++++++-----------------------
+ drivers/gpu/imx/dpu/dpu-fetchunit.c   |  292 ++++++++++++++++
+ drivers/gpu/imx/dpu/dpu-fetchwarp.c   |  551 ++++++-----------------------
+ drivers/gpu/imx/dpu/dpu-prv.h         |   43 ++-
+ include/video/dpu.h                   |  392 +++++++--------------
+ 13 files changed, 1152 insertions(+), 2385 deletions(-)
+ create mode 100644 drivers/gpu/imx/dpu/dpu-fetchunit.c
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.c b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+index ba2996f..c97fabe 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-crtc.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+@@ -342,16 +342,14 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		struct dpu_plane *dplane;
+ 		struct drm_plane *plane;
+ 		struct dpu_plane_res *res;
+-		struct dpu_fetchdecode *fd = NULL;
+-		struct dpu_fetchlayer *fl = NULL;
+-		struct dpu_fetchwarp *fw = NULL;
+-		struct dpu_fetcheco *fe = NULL;
++		struct dpu_fetchunit *fu;
++		struct dpu_fetchunit *fe = NULL;
+ 		struct dpu_hscaler *hs = NULL;
+ 		struct dpu_vscaler *vs = NULL;
+ 		struct dpu_layerblend *lb;
+ 		struct dpu_extdst *ed;
+ 		extdst_src_sel_t ed_src;
+-		int fu_id, lb_id, fu_type;
++		int lb_id;
+ 		bool crtc_disabling_on_primary = false;
+ 
+ 		old_dpstate = old_dcstate->dpu_plane_states[i];
+@@ -362,26 +360,10 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		dplane = to_dpu_plane(plane_state->plane);
+ 		res = &dplane->grp->res;
+ 
+-		fu_type = source_to_type(old_dpstate->source);
+-		fu_id = source_to_id(old_dpstate->source);
+-		if (fu_id < 0)
++		fu = dpstate_to_fu(old_dpstate);
++		if (!fu)
+ 			return;
+ 
+-		switch (fu_type) {
+-		case DPU_PLANE_SRC_FD:
+-			fd = res->fd[fu_id];
+-			break;
+-		case DPU_PLANE_SRC_FL:
+-			fl = res->fl[fu_id];
+-			break;
+-		case DPU_PLANE_SRC_FW:
+-			fw = res->fw[fu_id];
+-			break;
+-		default:
+-			WARN_ON(1);
+-			return;
+-		}
+-
+ 		lb_id = blend_to_id(old_dpstate->blend);
+ 		if (lb_id < 0)
+ 			return;
+@@ -389,10 +371,10 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 		lb = res->lb[lb_id];
+ 
+ 		layerblend_pixengcfg_clken(lb, CLKEN__DISABLE);
+-		if (fd) {
+-			fe = fetchdecode_get_fetcheco(fd);
+-			hs = fetchdecode_get_hscaler(fd);
+-			vs = fetchdecode_get_vscaler(fd);
++		if (fetchunit_is_fetchdecode(fu)) {
++			fe = fetchdecode_get_fetcheco(fu);
++			hs = fetchdecode_get_hscaler(fu);
++			vs = fetchdecode_get_vscaler(fu);
+ 			hscaler_pixengcfg_clken(hs, CLKEN__DISABLE);
+ 			vscaler_pixengcfg_clken(vs, CLKEN__DISABLE);
+ 			hscaler_mode(hs, SCALER_NEUTRAL);
+@@ -411,29 +393,18 @@ static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
+ 			crtc_disabling_on_primary = true;
+ 
+ 		if (crtc_disabling_on_primary && old_dpstate->use_prefetch) {
+-			if (fd) {
+-				fetchdecode_pin_off(fd);
+-				if (fetcheco_is_enabled(fe))
+-					fetcheco_pin_off(fe);
+-			} else if (fl) {
+-				fetchlayer_pin_off(fl);
+-			} else if (fw) {
+-				fetchwarp_pin_off(fw);
+-			}
++			fu->ops->pin_off(fu);
++			if (fetchunit_is_fetchdecode(fu) &&
++			    fe->ops->is_enabled(fe))
++				fe->ops->pin_off(fe);
+ 		} else {
+-			if (fd) {
+-				fetchdecode_source_buffer_disable(fd);
+-				fetchdecode_pixengcfg_dynamic_src_sel(fd,
++			fu->ops->disable_src_buf(fu);
++			fu->ops->unpin_off(fu);
++			if (fetchunit_is_fetchdecode(fu)) {
++				fetchdecode_pixengcfg_dynamic_src_sel(fu,
+ 								FD_SRC_DISABLE);
+-				fetcheco_source_buffer_disable(fe);
+-				fetchdecode_unpin_off(fd);
+-				fetcheco_unpin_off(fe);
+-			} else if (fl) {
+-				fetchlayer_source_buffer_disable(fl, 0);
+-				fetchlayer_unpin_off(fl);
+-			} else if (fw) {
+-				fetchwarp_source_buffer_disable(fw, 0);
+-				fetchwarp_unpin_off(fw);
++				fe->ops->disable_src_buf(fe);
++				fe->ops->unpin_off(fe);
+ 			}
+ 		}
+ 	}
+@@ -484,76 +455,38 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 
+ 	for (i = 0; i < dpu_crtc->hw_plane_num; i++) {
+ 		struct dpu_plane_state *old_dpstate;
+-		struct drm_plane_state *plane_state;
+-		struct dpu_plane *dplane;
+-		struct dpu_plane_res *res;
+-		struct dpu_fetchdecode *fd = NULL;
+-		struct dpu_fetchlayer *fl = NULL;
+-		struct dpu_fetchwarp *fw = NULL;
+-		struct dpu_fetcheco *fe;
++		struct dpu_fetchunit *fu;
++		struct dpu_fetchunit *fe;
+ 		struct dpu_hscaler *hs;
+ 		struct dpu_vscaler *vs;
+-		int fu_id, fu_type;
+ 
+ 		old_dpstate = old_dcstate->dpu_plane_states[i];
+ 		if (!old_dpstate)
+ 			continue;
+ 
+-		plane_state = &old_dpstate->base;
+-		dplane = to_dpu_plane(plane_state->plane);
+-		res = &dplane->grp->res;
+-
+-		fu_type = source_to_type(old_dpstate->source);
+-		fu_id = source_to_id(old_dpstate->source);
+-		if (fu_id < 0)
+-			return;
+-
+-		switch (fu_type) {
+-		case DPU_PLANE_SRC_FD:
+-			fd = res->fd[fu_id];
+-			break;
+-		case DPU_PLANE_SRC_FL:
+-			fl = res->fl[fu_id];
+-			break;
+-		case DPU_PLANE_SRC_FW:
+-			fw = res->fw[fu_id];
+-			break;
+-		default:
+-			WARN_ON(1);
++		fu = dpstate_to_fu(old_dpstate);
++		if (!fu)
+ 			return;
+-		}
+ 
+-		if (fd) {
+-			if (!fetchdecode_is_enabled(fd) ||
+-			     fetchdecode_is_pinned_off(fd))
+-				fetchdecode_set_stream_id(fd,
+-							DPU_PLANE_SRC_DISABLED);
++		if (!fu->ops->is_enabled(fu) || fu->ops->is_pinned_off(fu))
++			fu->ops->set_stream_id(fu, DPU_PLANE_SRC_DISABLED);
+ 
+-			fe = fetchdecode_get_fetcheco(fd);
+-			if (!fetcheco_is_enabled(fe) ||
+-			     fetcheco_is_pinned_off(fe))
+-				fetcheco_set_stream_id(fe,
++		if (fetchunit_is_fetchdecode(fu)) {
++			fe = fetchdecode_get_fetcheco(fu);
++			if (!fe->ops->is_enabled(fe) ||
++			     fe->ops->is_pinned_off(fe))
++				fe->ops->set_stream_id(fe,
+ 							DPU_PLANE_SRC_DISABLED);
+ 
+-			hs = fetchdecode_get_hscaler(fd);
++			hs = fetchdecode_get_hscaler(fu);
+ 			if (!hscaler_is_enabled(hs))
+ 				hscaler_set_stream_id(hs,
+ 							DPU_PLANE_SRC_DISABLED);
+ 
+-			vs = fetchdecode_get_vscaler(fd);
++			vs = fetchdecode_get_vscaler(fu);
+ 			if (!vscaler_is_enabled(vs))
+ 				vscaler_set_stream_id(vs,
+ 							DPU_PLANE_SRC_DISABLED);
+-		} else if (fl) {
+-			if (!fetchlayer_is_enabled(fl, 0) ||
+-			     fetchlayer_is_pinned_off(fl))
+-				fetchlayer_set_stream_id(fl,
+-							DPU_PLANE_SRC_DISABLED);
+-		} else if (fw) {
+-			if (!fetchwarp_is_enabled(fw, 0) ||
+-			     fetchwarp_is_pinned_off(fw))
+-				fetchwarp_set_stream_id(fw,
+-							DPU_PLANE_SRC_DISABLED);
+ 		}
+ 	}
+ }
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-kms.c b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+index a4fabef..5eb0cd8 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-kms.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-kms.c
+@@ -133,16 +133,13 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 	struct dpu_plane *dplane;
+ 	struct dpu_plane_grp *grp;
+ 	struct drm_framebuffer *fb;
+-	struct dpu_fetchdecode *fd;
+-	struct dpu_fetcheco *fe;
+-	struct dpu_fetchlayer *fl;
+-	struct dpu_fetchwarp *fw;
++	struct dpu_fetchunit *fu;
++	struct dpu_fetchunit *fe;
+ 	struct dpu_hscaler *hs;
+ 	struct dpu_vscaler *vs;
+ 	unsigned int sid, src_sid;
+ 	unsigned int num_planes;
+ 	int i, j, k, l, m;
+-	int fu_id, fu_type;
+ 	int total_asrc_num;
+ 	u32 src_a_mask, cap_mask, fe_mask, hs_mask, vs_mask;
+ 	bool need_fetcheco, need_hscaler, need_vscaler;
+@@ -178,49 +175,23 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 		for (k = 0; k < total_asrc_num; k++) {
+ 			m = ffs(src_a_mask) - 1;
+ 
+-			fu_type = source_to_type(sources[m]);
+-			fu_id = source_to_id(sources[m]);
+-
+-			switch (fu_type) {
+-			case DPU_PLANE_SRC_FL:
+-				fl = grp->res.fl[fu_id];
+-
+-				if (fmt_is_yuv || need_fetcheco ||
+-				    need_hscaler || need_vscaler)
+-					goto next;
+-
+-				/* avoid on-the-fly/hot migration */
+-				src_sid = fetchlayer_get_stream_id(fl);
+-				if (src_sid && src_sid != BIT(sid))
+-					goto next;
+-				break;
+-			case DPU_PLANE_SRC_FW:
+-				fw = grp->res.fw[fu_id];
+-
+-				if (fmt_is_yuv || need_fetcheco ||
+-				    need_hscaler || need_vscaler)
+-					goto next;
+-
+-				/* avoid on-the-fly/hot migration */
+-				src_sid = fetchwarp_get_stream_id(fw);
+-				if (src_sid && src_sid != BIT(sid))
+-					goto next;
+-				break;
+-			case DPU_PLANE_SRC_FD:
+-				fd = grp->res.fd[fu_id];
++			fu = source_to_fu(&grp->res, sources[m]);
++			if (!fu)
++				return -EINVAL;
+ 
+-				/* avoid on-the-fly/hot migration */
+-				src_sid = fetchdecode_get_stream_id(fd);
+-				if (src_sid && src_sid != BIT(sid))
+-					goto next;
++			/* avoid on-the-fly/hot migration */
++			src_sid = fu->ops->get_stream_id(fu);
++			if (src_sid && src_sid != BIT(sid))
++				goto next;
+ 
+-				cap_mask = fetchdecode_get_vproc_mask(fd);
++			if (fetchunit_is_fetchdecode(fu)) {
++				cap_mask = fetchdecode_get_vproc_mask(fu);
+ 
+ 				if (need_fetcheco) {
+-					fe = fetchdecode_get_fetcheco(fd);
++					fe = fetchdecode_get_fetcheco(fu);
+ 
+ 					/* avoid on-the-fly/hot migration */
+-					src_sid = fetcheco_get_stream_id(fe);
++					src_sid = fu->ops->get_stream_id(fe);
+ 					if (src_sid && src_sid != BIT(sid))
+ 						goto next;
+ 
+@@ -237,7 +208,7 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 				}
+ 
+ 				if (need_hscaler) {
+-					hs = fetchdecode_get_hscaler(fd);
++					hs = fetchdecode_get_hscaler(fu);
+ 
+ 					/* avoid on-the-fly/hot migration */
+ 					src_sid = hscaler_get_stream_id(hs);
+@@ -257,7 +228,7 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 				}
+ 
+ 				if (need_vscaler) {
+-					vs = fetchdecode_get_vscaler(fd);
++					vs = fetchdecode_get_vscaler(fu);
+ 
+ 					/* avoid on-the-fly/hot migration */
+ 					src_sid = vscaler_get_stream_id(vs);
+@@ -275,9 +246,10 @@ static int dpu_atomic_sort_planes_per_crtc(struct drm_crtc_state *crtc_state,
+ 					if (grp->src_use_vproc_mask & vs_mask)
+ 						goto next;
+ 				}
+-				break;
+-			default:
+-				return -EINVAL;
++			} else {
++				if (fmt_is_yuv || need_fetcheco ||
++				    need_hscaler || need_vscaler)
++					goto next;
+ 			}
+ 
+ 			grp->src_a_mask &= ~BIT(m);
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.c b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+index fff6e24..6c69ead 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+@@ -19,6 +19,7 @@
+ #include <drm/drm_gem_cma_helper.h>
+ #include <drm/drm_plane_helper.h>
+ #include <video/dpu.h>
++#include <video/imx8-prefetch.h>
+ #include "dpu-plane.h"
+ #include "imx-drm.h"
+ 
+@@ -220,17 +221,15 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 				  struct drm_plane_state *state)
+ {
+ 	struct dpu_plane *dplane = to_dpu_plane(plane);
+-	struct dpu_plane_res *res = &dplane->grp->res;
+ 	struct dpu_plane_state *dpstate = to_dpu_plane_state(state);
+ 	struct drm_crtc_state *crtc_state;
+ 	struct drm_framebuffer *fb = state->fb;
+-	struct dpu_fetchdecode *fd = NULL;
+-	struct dpu_fetchlayer *fl = NULL;
+-	struct dpu_fetchwarp *fw = NULL;
++	struct dpu_fetchunit *fu;
++	struct dprc *dprc;
+ 	dma_addr_t baseaddr, uv_baseaddr = 0;
+ 	u32 src_w = state->src_w >> 16, src_h = state->src_h >> 16,
+ 	    src_x = state->src_x >> 16, src_y = state->src_y >> 16;
+-	int bpp, fu_id, fu_type;
++	int bpp;
+ 	bool fb_is_interlaced;
+ 
+ 	/* pure software check */
+@@ -258,6 +257,12 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	if (!state->crtc)
+ 		return -EINVAL;
+ 
++	fu = dpstate_to_fu(dpstate);
++	if (!fu)
++		return -EINVAL;
++
++	dprc = fu->dprc;
++
+ 	fb_is_interlaced = !!(fb->flags & DRM_MODE_FB_INTERLACED);
+ 
+ 	if (fb->modifier &&
+@@ -331,32 +336,10 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 		break;
+ 	}
+ 
+-	fu_type = source_to_type(dpstate->source);
+-	fu_id = source_to_id(dpstate->source);
+-	if (fu_id < 0)
+-		return -EINVAL;
+-
+-	switch (fu_type) {
+-	case DPU_PLANE_SRC_FD:
+-		fd = res->fd[fu_id];
+-		break;
+-	case DPU_PLANE_SRC_FL:
+-		fl = res->fl[fu_id];
+-		break;
+-	case DPU_PLANE_SRC_FW:
+-		fw = res->fw[fu_id];
+-		break;
+-	default:
+-		return -EINVAL;
+-	}
+-
+-	if (fetchunit_has_prefetch(fd, fl, fw) &&
+-	    fetchunit_prefetch_format_supported(fd, fl, fw, fb->format->format,
+-						fb->modifier) &&
+-	    fetchunit_prefetch_stride_supported(fd, fl, fw, fb->pitches[0],
+-						fb->pitches[1],
+-						src_w,
+-						fb->format->format))
++	if (dprc &&
++	    dprc_format_supported(dprc, fb->format->format, fb->modifier) &&
++	    dprc_stride_supported(dprc, fb->pitches[0], fb->pitches[1],
++					src_w, fb->format->format))
+ 		dpstate->use_prefetch = true;
+ 	else
+ 		dpstate->use_prefetch = false;
+@@ -404,10 +387,9 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	}
+ 
+ 	if (dpstate->use_prefetch &&
+-	    !fetchunit_prefetch_stride_double_check(fd, fl, fw, fb->pitches[0],
+-						    fb->pitches[1],
+-						    src_w, fb->format->format,
+-						    baseaddr, uv_baseaddr)) {
++	    !dprc_stride_double_check(dprc, fb->pitches[0], fb->pitches[1],
++					src_w, fb->format->format,
++					baseaddr, uv_baseaddr)) {
+ 		if (fb->modifier)
+ 			return -EINVAL;
+ 
+@@ -431,10 +413,9 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	struct dpu_plane_state *dpstate = to_dpu_plane_state(state);
+ 	struct drm_framebuffer *fb = state->fb;
+ 	struct dpu_plane_res *res = &dplane->grp->res;
+-	struct dpu_fetchdecode *fd = NULL;
+-	struct dpu_fetchlayer *fl = NULL;
+-	struct dpu_fetchwarp *fw = NULL;
+-	struct dpu_fetcheco *fe = NULL;
++	struct dpu_fetchunit *fu;
++	struct dpu_fetchunit *fe = NULL;
++	struct dprc *dprc;
+ 	struct dpu_hscaler *hs = NULL;
+ 	struct dpu_vscaler *vs = NULL;
+ 	struct dpu_layerblend *lb;
+@@ -446,10 +427,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	dpu_block_id_t fe_id, vs_id = ID_NONE, hs_id;
+ 	lb_sec_sel_t lb_src = dpstate->source;
+ 	unsigned int src_w, src_h, src_x, src_y;
+-	int bpp, fu_id, lb_id, fu_type;
++	int bpp, lb_id;
+ 	bool need_fetcheco = false, need_hscaler = false, need_vscaler = false;
+-	bool need_fetchdecode = false, need_fetchlayer = false,
+-	     need_fetchwarp = false;
+ 	bool prefetch_start = false, aux_prefetch_start = false;
+ 	bool need_modeset;
+ 	bool is_overlay = plane->type == DRM_PLANE_TYPE_OVERLAY;
+@@ -465,28 +444,11 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	need_modeset = drm_atomic_crtc_needs_modeset(state->crtc->state);
+ 	fb_is_interlaced = !!(fb->flags & DRM_MODE_FB_INTERLACED);
+ 
+-	fu_type = source_to_type(dpstate->source);
+-	fu_id = source_to_id(dpstate->source);
+-	if (fu_id < 0)
++	fu = dpstate_to_fu(dpstate);
++	if (!fu)
+ 		return;
+ 
+-	switch (fu_type) {
+-	case DPU_PLANE_SRC_FD:
+-		need_fetchdecode = true;
+-		fd = res->fd[fu_id];
+-		break;
+-	case DPU_PLANE_SRC_FL:
+-		need_fetchlayer = true;
+-		fl = res->fl[fu_id];
+-		break;
+-	case DPU_PLANE_SRC_FW:
+-		need_fetchwarp = true;
+-		fw = res->fw[fu_id];
+-		break;
+-	default:
+-		WARN_ON(1);
+-		return;
+-	}
++	dprc = fu->dprc;
+ 
+ 	lb_id = blend_to_id(dpstate->blend);
+ 	if (lb_id < 0)
+@@ -499,24 +461,24 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	src_x = state->src_x >> 16;
+ 	src_y = state->src_y >> 16;
+ 
+-	if (need_fetchdecode) {
+-		if (fetchdecode_need_fetcheco(fd, fb->format->format)) {
++	if (fetchunit_is_fetchdecode(fu)) {
++		if (fetchdecode_need_fetcheco(fu, fb->format->format)) {
+ 			need_fetcheco = true;
+-			fe = fetchdecode_get_fetcheco(fd);
++			fe = fetchdecode_get_fetcheco(fu);
+ 			if (IS_ERR(fe))
+ 				return;
+ 		}
+ 
+ 		if (src_w != state->crtc_w) {
+ 			need_hscaler = true;
+-			hs = fetchdecode_get_hscaler(fd);
++			hs = fetchdecode_get_hscaler(fu);
+ 			if (IS_ERR(hs))
+ 				return;
+ 		}
+ 
+ 		if ((src_h != state->crtc_h) || fb_is_interlaced) {
+ 			need_vscaler = true;
+-			vs = fetchdecode_get_vscaler(fd);
++			vs = fetchdecode_get_vscaler(fu);
+ 			if (IS_ERR(vs))
+ 				return;
+ 		}
+@@ -540,82 +502,27 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	if (need_fetcheco)
+ 		uv_baseaddr = drm_plane_state_to_uvbaseaddr(state);
+ 
+-	if (dpstate->use_prefetch) {
+-		if (need_fetchdecode &&
+-		    (fetchdecode_get_stream_id(fd) == DPU_PLANE_SRC_DISABLED ||
+-		     need_modeset))
+-			prefetch_start = true;
+-
+-		if (need_fetchlayer &&
+-		    (fetchlayer_get_stream_id(fl) == DPU_PLANE_SRC_DISABLED ||
+-		     need_modeset))
+-			prefetch_start = true;
+-
+-		if (need_fetchwarp &&
+-		    (fetchwarp_get_stream_id(fw) == DPU_PLANE_SRC_DISABLED ||
+-		     need_modeset))
+-			prefetch_start = true;
+-	}
+-
+-	if (need_fetchdecode) {
+-		fetchdecode_set_burstlength(fd, baseaddr,
+-					dpstate->use_prefetch);
+-		fetchdecode_source_bpp(fd, bpp);
+-		fetchdecode_source_stride(fd, src_w, bpp, fb->pitches[0],
+-					baseaddr, dpstate->use_prefetch);
+-		fetchdecode_src_buf_dimensions(fd, src_w, src_h,
+-					fb_is_interlaced);
+-		fetchdecode_set_fmt(fd, fb->format->format, fb_is_interlaced);
+-		fetchdecode_source_buffer_enable(fd);
+-		fetchdecode_framedimensions(fd, src_w, src_h,
+-					fb_is_interlaced);
+-		fetchdecode_baseaddress(fd, baseaddr);
+-		fetchdecode_set_stream_id(fd, dplane->stream_id ?
+-						DPU_PLANE_SRC_TO_DISP_STREAM1 :
+-						DPU_PLANE_SRC_TO_DISP_STREAM0);
+-		fetchdecode_unpin_off(fd);
+-
+-		dev_dbg(dev, "[PLANE:%d:%s] fetchdecode-0x%02x\n",
+-					plane->base.id, plane->name, fu_id);
+-	}
+-
+-	if (need_fetchlayer) {
+-		fetchlayer_set_burstlength(fl, baseaddr, dpstate->use_prefetch);
+-		fetchlayer_source_bpp(fl, 0, bpp);
+-		fetchlayer_source_stride(fl, 0, src_w, bpp, fb->pitches[0],
+-					 baseaddr, dpstate->use_prefetch);
+-		fetchlayer_src_buf_dimensions(fl, 0, src_w, src_h);
+-		fetchlayer_set_fmt(fl, 0, fb->format->format);
+-		fetchlayer_source_buffer_enable(fl, 0);
+-		fetchlayer_framedimensions(fl, src_w, src_h);
+-		fetchlayer_baseaddress(fl, 0, baseaddr);
+-		fetchlayer_set_stream_id(fl, dplane->stream_id ?
+-						DPU_PLANE_SRC_TO_DISP_STREAM1 :
+-						DPU_PLANE_SRC_TO_DISP_STREAM0);
+-		fetchlayer_unpin_off(fl);
+-
+-		dev_dbg(dev, "[PLANE:%d:%s] fetchlayer-0x%02x\n",
+-					plane->base.id, plane->name, fu_id);
+-	}
+-
+-	if (need_fetchwarp) {
+-		fetchwarp_set_burstlength(fw, baseaddr, dpstate->use_prefetch);
+-		fetchwarp_source_bpp(fw, 0, bpp);
+-		fetchwarp_source_stride(fw, 0, src_w, bpp, fb->pitches[0],
+-					baseaddr, dpstate->use_prefetch);
+-		fetchwarp_src_buf_dimensions(fw, 0, src_w, src_h);
+-		fetchwarp_set_fmt(fw, 0, fb->format->format);
+-		fetchwarp_source_buffer_enable(fw, 0);
+-		fetchwarp_framedimensions(fw, src_w, src_h);
+-		fetchwarp_baseaddress(fw, 0, baseaddr);
+-		fetchwarp_set_stream_id(fw, dplane->stream_id ?
++	if (dpstate->use_prefetch &&
++	    (fu->ops->get_stream_id(fu) == DPU_PLANE_SRC_DISABLED ||
++	     need_modeset))
++		prefetch_start = true;
++
++	fu->ops->set_burstlength(fu, baseaddr, dpstate->use_prefetch);
++	fu->ops->set_src_bpp(fu, bpp);
++	fu->ops->set_src_stride(fu, src_w, bpp, fb->pitches[0],
++				baseaddr, dpstate->use_prefetch);
++	fu->ops->set_src_buf_dimensions(fu, src_w, src_h, 0, fb_is_interlaced);
++	fu->ops->set_fmt(fu, fb->format->format, fb_is_interlaced);
++	fu->ops->enable_src_buf(fu);
++	fu->ops->set_framedimensions(fu, src_w, src_h, fb_is_interlaced);
++	fu->ops->set_baseaddress(fu, baseaddr);
++	fu->ops->set_stream_id(fu, dplane->stream_id ?
+ 						DPU_PLANE_SRC_TO_DISP_STREAM1 :
+ 						DPU_PLANE_SRC_TO_DISP_STREAM0);
+-		fetchwarp_unpin_off(fw);
++	fu->ops->unpin_off(fu);
+ 
+-		dev_dbg(dev, "[PLANE:%d:%s] fetchwarp-0x%02x\n",
+-					plane->base.id, plane->name, fu_id);
+-	}
++	dev_dbg(dev, "[PLANE:%d:%s] %s-0x%02x\n",
++				plane->base.id, plane->name, fu->name, fu->id);
+ 
+ 	if (need_fetcheco) {
+ 		fe_id = fetcheco_get_block_id(fe);
+@@ -623,33 +530,35 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 			return;
+ 
+ 		if (dpstate->use_prefetch &&
+-		    (fetcheco_get_stream_id(fe) == DPU_PLANE_SRC_DISABLED ||
++		    (fe->ops->get_stream_id(fe) == DPU_PLANE_SRC_DISABLED ||
+ 		     need_modeset))
+ 			aux_prefetch_start = true;
+ 
+-		fetchdecode_pixengcfg_dynamic_src_sel(fd,
++		fetchdecode_pixengcfg_dynamic_src_sel(fu,
+ 						(fd_dynamic_src_sel_t)fe_id);
+-		fetcheco_set_burstlength(fe, uv_baseaddr,
+-						dpstate->use_prefetch);
+-		fetcheco_source_bpp(fe, 16);
+-		fetcheco_source_stride(fe, src_w, bpp, fb->pitches[1],
++		fe->ops->set_burstlength(fe, uv_baseaddr,
++					 dpstate->use_prefetch);
++		fe->ops->set_src_bpp(fe, 16);
++		fe->ops->set_src_stride(fe, src_w, bpp, fb->pitches[1],
+ 					uv_baseaddr, dpstate->use_prefetch);
+-		fetcheco_set_fmt(fe, fb->format->format);
+-		fetcheco_src_buf_dimensions(fe, src_w, src_h,
+-					fb->format->format, fb_is_interlaced);
+-		fetcheco_framedimensions(fe, src_w, src_h, fb_is_interlaced);
+-		fetcheco_baseaddress(fe, uv_baseaddr);
+-		fetcheco_source_buffer_enable(fe);
+-		fetcheco_set_stream_id(fe, dplane->stream_id ?
++		fe->ops->set_fmt(fe, fb->format->format, fb_is_interlaced);
++		fe->ops->set_src_buf_dimensions(fe, src_w, src_h,
++						fb->format->format,
++						fb_is_interlaced);
++		fe->ops->set_framedimensions(fe, src_w, src_h,
++						fb_is_interlaced);
++		fe->ops->set_baseaddress(fe, uv_baseaddr);
++		fe->ops->enable_src_buf(fe);
++		fe->ops->set_stream_id(fe, dplane->stream_id ?
+ 					DPU_PLANE_SRC_TO_DISP_STREAM1 :
+ 					DPU_PLANE_SRC_TO_DISP_STREAM0);
+-		fetcheco_unpin_off(fe);
++		fe->ops->unpin_off(fe);
+ 
+-		dev_dbg(dev, "[PLANE:%d:%s] fetcheco-0x%02x\n",
+-					plane->base.id, plane->name, fe_id);
++		dev_dbg(dev, "[PLANE:%d:%s] %s-0x%02x\n",
++				plane->base.id, plane->name, fe->name, fe_id);
+ 	} else {
+-		if (fd)
+-			fetchdecode_pixengcfg_dynamic_src_sel(fd,
++		if (fetchunit_is_fetchdecode(fu))
++			fetchdecode_pixengcfg_dynamic_src_sel(fu,
+ 								FD_SRC_DISABLE);
+ 	}
+ 
+@@ -707,21 +616,19 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 	}
+ 
+ 	if (dpstate->use_prefetch) {
+-		fetchunit_configure_prefetch(fd, fl, fw, dplane->stream_id,
+-					     src_w, src_h, src_x, src_y,
+-					     fb->pitches[0], fb->format->format,
+-					     fb->modifier,
+-					     baseaddr, uv_baseaddr,
+-					     prefetch_start,
+-					     aux_prefetch_start,
+-					     fb_is_interlaced);
++		dprc_configure(dprc, dplane->stream_id,
++			       src_w, src_h, src_x, src_y,
++			       fb->pitches[0], fb->format->format,
++			       fb->modifier, baseaddr, uv_baseaddr,
++			       prefetch_start, aux_prefetch_start,
++			       fb_is_interlaced);
+ 		if (prefetch_start || aux_prefetch_start)
+-			fetchunit_enable_prefetch(fd, fl, fw);
++			dprc_enable(dprc);
+ 
+-		fetchunit_reg_update_prefetch(fd, fl, fw);
++		dprc_reg_update(dprc);
+ 
+ 		if (prefetch_start || aux_prefetch_start) {
+-			fetchunit_prefetch_first_frame_handle(fd, fl, fw);
++			dprc_first_frame_handle(dprc);
+ 
+ 			if (!need_modeset && is_overlay)
+ 				framegen_wait_for_frame_counter_moving(fg);
+@@ -729,8 +636,8 @@ static void dpu_plane_atomic_update(struct drm_plane *plane,
+ 
+ 		dev_dbg(dev, "[PLANE:%d:%s] use prefetch\n",
+ 					plane->base.id, plane->name);
+-	} else if (fetchunit_has_prefetch(fd, fl, fw)) {
+-		fetchunit_disable_prefetch(fd, fl, fw);
++	} else if (dprc) {
++		dprc_disable(dprc);
+ 
+ 		dev_dbg(dev, "[PLANE:%d:%s] bypass prefetch\n",
+ 					plane->base.id, plane->name);
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.h b/drivers/gpu/drm/imx/dpu/dpu-plane.h
+index 5dc37f9..cce9576 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.h
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.h
+@@ -128,6 +128,37 @@ static inline int source_to_id(lb_sec_sel_t source)
+ 	return -EINVAL;
+ }
+ 
++static inline struct dpu_fetchunit *
++source_to_fu(struct dpu_plane_res *res, lb_sec_sel_t source)
++{
++	int fu_type = source_to_type(source);
++	int fu_id = source_to_id(source);
++
++	if (fu_type < 0 || fu_id < 0)
++		return NULL;
++
++	switch (fu_type) {
++	case DPU_PLANE_SRC_FD:
++		return res->fd[fu_id];
++	case DPU_PLANE_SRC_FL:
++		return res->fl[fu_id];
++	case DPU_PLANE_SRC_FW:
++		return res->fw[fu_id];
++	}
++
++	return NULL;
++}
++
++static inline struct dpu_fetchunit *
++dpstate_to_fu(struct dpu_plane_state *dpstate)
++{
++	struct drm_plane *plane = dpstate->base.plane;
++	struct dpu_plane *dplane = to_dpu_plane(plane);
++	struct dpu_plane_res *res = &dplane->grp->res;
++
++	return source_to_fu(res, dpstate->source);
++}
++
+ static inline int blend_to_id(dpu_block_id_t blend)
+ {
+ 	int i;
+diff --git a/drivers/gpu/imx/dpu/Makefile b/drivers/gpu/imx/dpu/Makefile
+index 9d02625..784b2a8 100644
+--- a/drivers/gpu/imx/dpu/Makefile
++++ b/drivers/gpu/imx/dpu/Makefile
+@@ -2,5 +2,6 @@ obj-$(CONFIG_IMX_DPU_CORE) += imx-dpu-core.o
+ 
+ imx-dpu-core-objs := dpu-common.o dpu-constframe.o dpu-disengcfg.o \
+ 		     dpu-extdst.o dpu-fetchdecode.o dpu-fetcheco.o \
+-		     dpu-fetchlayer.o dpu-fetchwarp.o dpu-framegen.o \
+-		     dpu-hscaler.o dpu-layerblend.o dpu-tcon.o dpu-vscaler.o
++		     dpu-fetchlayer.o dpu-fetchwarp.o dpu-fetchunit.o \
++		     dpu-framegen.o dpu-hscaler.o dpu-layerblend.o \
++		     dpu-tcon.o dpu-vscaler.o
+diff --git a/drivers/gpu/imx/dpu/dpu-common.c b/drivers/gpu/imx/dpu/dpu-common.c
+index 800cdb9..adcd080 100644
+--- a/drivers/gpu/imx/dpu/dpu-common.c
++++ b/drivers/gpu/imx/dpu/dpu-common.c
+@@ -661,157 +661,6 @@ u32 dpu_vproc_get_vscale_cap(u32 cap_mask)
+ }
+ EXPORT_SYMBOL_GPL(dpu_vproc_get_vscale_cap);
+ 
+-bool fetchunit_has_prefetch(struct dpu_fetchdecode *fd,
+-			    struct dpu_fetchlayer *fl,
+-			    struct dpu_fetchwarp *fw)
+-{
+-	if (fd)
+-		return fetchdecode_has_prefetch(fd);
+-	else if (fl)
+-		return fetchlayer_has_prefetch(fl);
+-	else
+-		return fetchwarp_has_prefetch(fw);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_has_prefetch);
+-
+-bool fetchunit_prefetch_format_supported(struct dpu_fetchdecode *fd,
+-					 struct dpu_fetchlayer *fl,
+-					 struct dpu_fetchwarp *fw,
+-					 u32 format, u64 modifier)
+-{
+-	if (fd)
+-		return fetchdecode_prefetch_format_supported(fd,
+-							format, modifier);
+-	else if (fl)
+-		return fetchlayer_prefetch_format_supported(fl,
+-							format, modifier);
+-	else
+-		return fetchwarp_prefetch_format_supported(fw,
+-							format, modifier);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_prefetch_format_supported);
+-
+-bool fetchunit_prefetch_stride_supported(struct dpu_fetchdecode *fd,
+-					 struct dpu_fetchlayer *fl,
+-					 struct dpu_fetchwarp *fw,
+-					 unsigned int stride,
+-					 unsigned int uv_stride,
+-					 unsigned int width,
+-					 u32 format)
+-{
+-	if (fd)
+-		return fetchdecode_prefetch_stride_supported(fd,
+-					stride, uv_stride, width, format);
+-	else if (fl)
+-		return fetchlayer_prefetch_stride_supported(fl,
+-					stride, width, format);
+-	else
+-		return fetchwarp_prefetch_stride_supported(fw,
+-					stride, width, format);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_prefetch_stride_supported);
+-
+-bool fetchunit_prefetch_stride_double_check(struct dpu_fetchdecode *fd,
+-					    struct dpu_fetchlayer *fl,
+-					    struct dpu_fetchwarp *fw,
+-					    unsigned int stride,
+-					    unsigned int uv_stride,
+-					    unsigned int width,
+-					    u32 format,
+-					    dma_addr_t baseaddr,
+-					    dma_addr_t uv_baseaddr)
+-{
+-	if (fd)
+-		return fetchdecode_prefetch_stride_double_check(fd, stride,
+-			uv_stride, width, format, baseaddr, uv_baseaddr);
+-	else if (fl)
+-		return fetchlayer_prefetch_stride_double_check(fl, stride,
+-						width, format, baseaddr);
+-	else
+-		return fetchwarp_prefetch_stride_double_check(fw, stride,
+-						width, format, baseaddr);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_prefetch_stride_double_check);
+-
+-void fetchunit_configure_prefetch(struct dpu_fetchdecode *fd,
+-				  struct dpu_fetchlayer *fl,
+-				  struct dpu_fetchwarp *fw,
+-				  unsigned int stream_id,
+-				  unsigned int width, unsigned int height,
+-				  unsigned int x_offset, unsigned int y_offset,
+-				  unsigned int stride, u32 format, u64 modifier,
+-				  unsigned long baddr, unsigned long uv_baddr,
+-				  bool start, bool aux_start,
+-				  bool fb_is_interlaced)
+-{
+-	if (fd)
+-		fetchdecode_configure_prefetch(fd, stream_id, width, height,
+-					x_offset, y_offset, stride,
+-					format, modifier, baddr, uv_baddr,
+-					start, aux_start, fb_is_interlaced);
+-	else if (fl)
+-		fetchlayer_configure_prefetch(fl, stream_id, width, height,
+-					x_offset, y_offset, stride,
+-					format, modifier, baddr, start);
+-	else
+-		fetchwarp_configure_prefetch(fw, stream_id, width, height,
+-					x_offset, y_offset, stride,
+-					format, modifier, baddr, start);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_configure_prefetch);
+-
+-void fetchunit_enable_prefetch(struct dpu_fetchdecode *fd,
+-			       struct dpu_fetchlayer *fl,
+-			       struct dpu_fetchwarp *fw)
+-{
+-	if (fd)
+-		fetchdecode_enable_prefetch(fd);
+-	else if (fl)
+-		fetchlayer_enable_prefetch(fl);
+-	else
+-		fetchwarp_enable_prefetch(fw);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_enable_prefetch);
+-
+-void fetchunit_reg_update_prefetch(struct dpu_fetchdecode *fd,
+-				   struct dpu_fetchlayer *fl,
+-				   struct dpu_fetchwarp *fw)
+-{
+-	if (fd)
+-		fetchdecode_reg_update_prefetch(fd);
+-	else if (fl)
+-		fetchlayer_reg_update_prefetch(fl);
+-	else
+-		fetchwarp_reg_update_prefetch(fw);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_reg_update_prefetch);
+-
+-void fetchunit_prefetch_first_frame_handle(struct dpu_fetchdecode *fd,
+-					   struct dpu_fetchlayer *fl,
+-					   struct dpu_fetchwarp *fw)
+-{
+-	if (fd)
+-		fetchdecode_prefetch_first_frame_handle(fd);
+-	else if (fl)
+-		fetchlayer_prefetch_first_frame_handle(fl);
+-	else
+-		fetchwarp_prefetch_first_frame_handle(fw);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_prefetch_first_frame_handle);
+-
+-void fetchunit_disable_prefetch(struct dpu_fetchdecode *fd,
+-				struct dpu_fetchlayer *fl,
+-				struct dpu_fetchwarp *fw)
+-{
+-	if (fd)
+-		fetchdecode_disable_prefetch(fd);
+-	else if (fl)
+-		fetchlayer_disable_prefetch(fl);
+-	else
+-		fetchwarp_disable_prefetch(fw);
+-}
+-EXPORT_SYMBOL_GPL(fetchunit_disable_prefetch);
+-
+ int dpu_format_horz_chroma_subsampling(u32 format)
+ {
+ 	switch (format) {
+@@ -961,9 +810,7 @@ static int dpu_submodules_init(struct dpu_soc *dpu,
+ 
+ 	/* get DPR channel for submodules */
+ 	if (devtype->has_prefetch) {
+-		struct dpu_fetchdecode *fd;
+-		struct dpu_fetchlayer *fl;
+-		struct dpu_fetchwarp *fw;
++		struct dpu_fetchunit *fu;
+ 		struct dprc *dprc;
+ 		int i;
+ 
+@@ -974,9 +821,9 @@ static int dpu_submodules_init(struct dpu_soc *dpu,
+ 			if (!dprc)
+ 				return -EPROBE_DEFER;
+ 
+-			fd = dpu_fd_get(dpu, i);
+-			fetchdecode_get_dprc(fd, dprc);
+-			dpu_fd_put(fd);
++			fu = dpu_fd_get(dpu, i);
++			fetchunit_get_dprc(fu, dprc);
++			dpu_fd_put(fu);
+ 		}
+ 
+ 		for (i = 0; i < fls->num; i++) {
+@@ -986,9 +833,9 @@ static int dpu_submodules_init(struct dpu_soc *dpu,
+ 			if (!dprc)
+ 				return -EPROBE_DEFER;
+ 
+-			fl = dpu_fl_get(dpu, i);
+-			fetchlayer_get_dprc(fl, dprc);
+-			dpu_fl_put(fl);
++			fu = dpu_fl_get(dpu, i);
++			fetchunit_get_dprc(fu, dprc);
++			dpu_fl_put(fu);
+ 		}
+ 
+ 		for (i = 0; i < fws->num; i++) {
+@@ -998,9 +845,9 @@ static int dpu_submodules_init(struct dpu_soc *dpu,
+ 			if (!dprc)
+ 				return -EPROBE_DEFER;
+ 
+-			fw = dpu_fw_get(dpu, fw_ids[i]);
+-			fetchwarp_get_dprc(fw, dprc);
+-			dpu_fw_put(fw);
++			fu = dpu_fw_get(dpu, fw_ids[i]);
++			fetchunit_get_dprc(fu, dprc);
++			dpu_fw_put(fu);
+ 		}
+ 	}
+ 
+@@ -1540,10 +1387,13 @@ static irqreturn_t dpu_dpr0_irq_handler(int irq, void *desc)
+ {
+ 	struct dpu_soc *dpu = desc;
+ 	const struct dpu_unit *fls = dpu->devtype->fls;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+-	for (i = 0; i < fls->num; i++)
+-		fetchlayer_prefetch_irq_handle(dpu->fl_priv[i]);
++	for (i = 0; i < fls->num; i++) {
++		fu = dpu->fl_priv[i];
++		dprc_irq_handle(fu->dprc);
++	}
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1553,13 +1403,18 @@ static irqreturn_t dpu_dpr1_irq_handler(int irq, void *desc)
+ 	struct dpu_soc *dpu = desc;
+ 	const struct dpu_unit *fds = dpu->devtype->fds;
+ 	const struct dpu_unit *fws = dpu->devtype->fws;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+-	for (i = 0; i < fds->num; i++)
+-		fetchdecode_prefetch_irq_handle(dpu->fd_priv[i]);
++	for (i = 0; i < fds->num; i++) {
++		fu = dpu->fd_priv[i];
++		dprc_irq_handle(fu->dprc);
++	}
+ 
+-	for (i = 0; i < fws->num; i++)
+-		fetchwarp_prefetch_irq_handle(dpu->fw_priv[i]);
++	for (i = 0; i < fws->num; i++) {
++		fu = dpu->fw_priv[i];
++		dprc_irq_handle(fu->dprc);
++	}
+ 
+ 	return IRQ_HANDLED;
+ }
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchdecode.c b/drivers/gpu/imx/dpu/dpu-fetchdecode.c
+index 670b7a6..3ba59cb 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchdecode.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchdecode.c
+@@ -19,7 +19,6 @@
+ #include <linux/platform_device.h>
+ #include <linux/types.h>
+ #include <video/dpu.h>
+-#include <video/imx8-prefetch.h>
+ #include "dpu-prv.h"
+ 
+ #define FD_NUM_V1			4
+@@ -98,56 +97,24 @@
+ };
+ 
+ struct dpu_fetchdecode {
+-	void __iomem *pec_base;
+-	void __iomem *base;
+-	struct mutex mutex;
+-	int id;
+-	bool inuse;
+-	bool pin_off;
+-	struct dpu_soc *dpu;
++	struct dpu_fetchunit fu;
+ 	fetchtype_t fetchtype;
+ 	shadow_load_req_t shdlreq;
+-	/* see DPU_PLANE_SRC_xxx */
+-	unsigned int stream_id;
+-	struct dprc *dprc;
+ };
+ 
+-static inline u32 dpu_pec_fd_read(struct dpu_fetchdecode *fd,
+-				  unsigned int offset)
+-{
+-	return readl(fd->pec_base + offset);
+-}
+-
+-static inline void dpu_pec_fd_write(struct dpu_fetchdecode *fd, u32 value,
+-				    unsigned int offset)
+-{
+-	writel(value, fd->pec_base + offset);
+-}
+-
+-static inline u32 dpu_fd_read(struct dpu_fetchdecode *fd, unsigned int offset)
+-{
+-	return readl(fd->base + offset);
+-}
+-
+-static inline void dpu_fd_write(struct dpu_fetchdecode *fd, u32 value,
+-				unsigned int offset)
+-{
+-	writel(value, fd->base + offset);
+-}
+-
+-int fetchdecode_pixengcfg_dynamic_src_sel(struct dpu_fetchdecode *fd,
++int fetchdecode_pixengcfg_dynamic_src_sel(struct dpu_fetchunit *fu,
+ 					  fd_dynamic_src_sel_t src)
+ {
+-	struct dpu_soc *dpu = fd->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 	const struct dpu_devtype *devtype = dpu->devtype;
+ 	int i;
+ 
+-	mutex_lock(&fd->mutex);
++	mutex_lock(&fu->mutex);
+ 	if (devtype->version == DPU_V1) {
+ 		for (i = 0; i < SRC_NUM_V1; i++) {
+-			if (fd_srcs_v1[fd->id][i] == src) {
+-				dpu_pec_fd_write(fd, src, PIXENGCFG_DYNAMIC);
+-				mutex_unlock(&fd->mutex);
++			if (fd_srcs_v1[fu->id][i] == src) {
++				dpu_pec_fu_write(fu, src, PIXENGCFG_DYNAMIC);
++				mutex_unlock(&fu->mutex);
+ 				return 0;
+ 			}
+ 		}
+@@ -159,119 +126,50 @@ int fetchdecode_pixengcfg_dynamic_src_sel(struct dpu_fetchdecode *fd,
+ 			return -EINVAL;
+ 
+ 		for (i = 0; i < SRC_NUM_V2; i++) {
+-			if (fd_srcs_v2[fd->id][i] == src) {
++			if (fd_srcs_v2[fu->id][i] == src) {
+ 				mapped_src = block_id_map[src];
+ 				if (WARN_ON(mapped_src == NA))
+ 					return -EINVAL;
+ 
+-				dpu_pec_fd_write(fd, mapped_src,
++				dpu_pec_fu_write(fu, mapped_src,
+ 							PIXENGCFG_DYNAMIC);
+-				mutex_unlock(&fd->mutex);
++				mutex_unlock(&fu->mutex);
+ 				return 0;
+ 			}
+ 		}
+ 	} else {
+ 		WARN_ON(1);
+ 	}
+-	mutex_unlock(&fd->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+ 	return -EINVAL;
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_pixengcfg_dynamic_src_sel);
+ 
+-static inline u32 rgb_color(u8 r, u8 g, u8 b, u8 a)
+-{
+-	return (r << 24) | (g << 16) | (b << 8) | a;
+-}
+-
+-static inline u32 yuv_color(u8 y, u8 u, u8 v)
+-{
+-	return (y << 24) | (u << 16) | (v << 8);
+-}
+-
+-void fetchdecode_shden(struct dpu_fetchdecode *fd, bool enable)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, STATICCONTROL);
+-	if (enable)
+-		val |= SHDEN;
+-	else
+-		val &= ~SHDEN;
+-	dpu_fd_write(fd, val, STATICCONTROL);
+-	mutex_unlock(&fd->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_shden);
+-
+-void fetchdecode_baddr_autoupdate(struct dpu_fetchdecode *fd, u8 layer_mask)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, STATICCONTROL);
+-	val &= ~BASEADDRESSAUTOUPDATE_MASK;
+-	val |= BASEADDRESSAUTOUPDATE(layer_mask);
+-	dpu_fd_write(fd, val, STATICCONTROL);
+-	mutex_unlock(&fd->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_baddr_autoupdate);
+-
+-void fetchdecode_set_burstlength(struct dpu_fetchdecode *fd, dma_addr_t baddr,
+-				 bool use_prefetch)
+-{
+-	struct dpu_soc *dpu = fd->dpu;
+-	unsigned int burst_size, burst_length;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-		burst_length = burst_size / 8;
+-	} else {
+-		burst_length = 16;
+-	}
+-
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, BURSTBUFFERMANAGEMENT);
+-	val &= ~SETBURSTLENGTH_MASK;
+-	val |= SETBURSTLENGTH(burst_length);
+-	dpu_fd_write(fd, val, BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fd->mutex);
+-
+-	dev_dbg(dpu->dev, "FetchDecode%d burst length is %u\n",
+-							fd->id, burst_length);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_set_burstlength);
+-
+-void fetchdecode_baseaddress(struct dpu_fetchdecode *fd, dma_addr_t paddr)
++static void
++fetchdecode_set_baseaddress(struct dpu_fetchunit *fu, dma_addr_t paddr)
+ {
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, paddr, BASEADDRESS0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, paddr, BASEADDRESS0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_baseaddress);
+ 
+-void fetchdecode_source_bpp(struct dpu_fetchdecode *fd, int bpp)
++static void fetchdecode_set_src_bpp(struct dpu_fetchunit *fu, int bpp)
+ {
+ 	u32 val;
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, SOURCEBUFFERATTRIBUTES0);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, SOURCEBUFFERATTRIBUTES0);
+ 	val &= ~0x3f0000;
+ 	val |= BITSPERPIXEL(bpp);
+-	dpu_fd_write(fd, val, SOURCEBUFFERATTRIBUTES0);
+-	mutex_unlock(&fd->mutex);
++	dpu_fu_write(fu, val, SOURCEBUFFERATTRIBUTES0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_source_bpp);
+ 
+-void fetchdecode_source_stride(struct dpu_fetchdecode *fd, unsigned int width,
+-			       int bpp, unsigned int stride,
+-			       dma_addr_t baddr, bool use_prefetch)
++static void
++fetchdecode_set_src_stride(struct dpu_fetchunit *fu,
++			   unsigned int width, int bpp, unsigned int stride,
++			   dma_addr_t baddr, bool use_prefetch)
+ {
+ 	unsigned int burst_size;
+ 	u32 val;
+@@ -292,17 +190,18 @@ void fetchdecode_source_stride(struct dpu_fetchdecode *fd, unsigned int width,
+ 		stride = round_up(stride, burst_size);
+ 	}
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, SOURCEBUFFERATTRIBUTES0);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, SOURCEBUFFERATTRIBUTES0);
+ 	val &= ~0xffff;
+ 	val |= STRIDE(stride);
+-	dpu_fd_write(fd, val, SOURCEBUFFERATTRIBUTES0);
+-	mutex_unlock(&fd->mutex);
++	dpu_fu_write(fu, val, SOURCEBUFFERATTRIBUTES0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_source_stride);
+ 
+-void fetchdecode_src_buf_dimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				    unsigned int h, bool deinterlace)
++static void
++fetchdecode_set_src_buf_dimensions(struct dpu_fetchunit *fu,
++				   unsigned int w, unsigned int h,
++				   u32 unused, bool deinterlace)
+ {
+ 	u32 val;
+ 
+@@ -311,13 +210,13 @@ void fetchdecode_src_buf_dimensions(struct dpu_fetchdecode *fd, unsigned int w,
+ 
+ 	val = LINEWIDTH(w) | LINECOUNT(h);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, SOURCEBUFFERDIMENSION0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, SOURCEBUFFERDIMENSION0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_src_buf_dimensions);
+ 
+-void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace)
++static void
++fetchdecode_set_fmt(struct dpu_fetchunit *fu, u32 fmt, bool deinterlace)
+ {
+ 	u32 val, bits, shift;
+ 	bool is_planar_yuv = false, is_rastermode_yuv422 = false;
+@@ -357,8 +256,8 @@ void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace)
+ 		break;
+ 	}
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, CONTROL);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, CONTROL);
+ 	val &= ~YUV422UPSAMPLINGMODE_MASK;
+ 	val &= ~INPUTSELECT_MASK;
+ 	val &= ~RASTERMODE_MASK;
+@@ -374,9 +273,9 @@ void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace)
+ 		val |= RASTERMODE(RASTERMODE__YUV422);
+ 	else
+ 		val |= RASTERMODE(RASTERMODE__NORMAL);
+-	dpu_fd_write(fd, val, CONTROL);
++	dpu_fu_write(fu, val, CONTROL);
+ 
+-	val = dpu_fd_read(fd, LAYERPROPERTY0);
++	val = dpu_fu_read(fu, LAYERPROPERTY0);
+ 	val &= ~YUVCONVERSIONMODE_MASK;
+ 	if (need_csc)
+ 		/*
+@@ -389,8 +288,8 @@ void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace)
+ 		val |= YUVCONVERSIONMODE(YUVCONVERSIONMODE__ITU601_FR);
+ 	else
+ 		val |= YUVCONVERSIONMODE(YUVCONVERSIONMODE__OFF);
+-	dpu_fd_write(fd, val, LAYERPROPERTY0);
+-	mutex_unlock(&fd->mutex);
++	dpu_fu_write(fu, val, LAYERPROPERTY0);
++	mutex_unlock(&fu->mutex);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dpu_pixel_format_matrix); i++) {
+ 		if (dpu_pixel_format_matrix[i].pixel_format == fmt) {
+@@ -402,95 +301,93 @@ void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace)
+ 				shift &= ~(U_SHIFT_MASK | V_SHIFT_MASK);
+ 			}
+ 
+-			mutex_lock(&fd->mutex);
+-			dpu_fd_write(fd, bits, COLORCOMPONENTBITS0);
+-			dpu_fd_write(fd, shift, COLORCOMPONENTSHIFT0);
+-			mutex_unlock(&fd->mutex);
++			mutex_lock(&fu->mutex);
++			dpu_fu_write(fu, bits, COLORCOMPONENTBITS0);
++			dpu_fu_write(fu, shift, COLORCOMPONENTSHIFT0);
++			mutex_unlock(&fu->mutex);
+ 			return;
+ 		}
+ 	}
+ 
+ 	WARN_ON(1);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_set_fmt);
+ 
+-void fetchdecode_layeroffset(struct dpu_fetchdecode *fd, unsigned int x,
++void fetchdecode_layeroffset(struct dpu_fetchunit *fu, unsigned int x,
+ 			     unsigned int y)
+ {
+ 	u32 val;
+ 
+ 	val = LAYERXOFFSET(x) | LAYERYOFFSET(y);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, LAYEROFFSET0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, LAYEROFFSET0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_layeroffset);
+ 
+-void fetchdecode_clipoffset(struct dpu_fetchdecode *fd, unsigned int x,
++void fetchdecode_clipoffset(struct dpu_fetchunit *fu, unsigned int x,
+ 			    unsigned int y)
+ {
+ 	u32 val;
+ 
+ 	val = CLIPWINDOWXOFFSET(x) | CLIPWINDOWYOFFSET(y);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, CLIPWINDOWOFFSET0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CLIPWINDOWOFFSET0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_clipoffset);
+ 
+-void fetchdecode_source_buffer_enable(struct dpu_fetchdecode *fd)
++static void fetchdecode_enable_src_buf(struct dpu_fetchunit *fu)
+ {
+ 	u32 val;
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, LAYERPROPERTY0);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY0);
+ 	val |= SOURCEBUFFERENABLE;
+-	dpu_fd_write(fd, val, LAYERPROPERTY0);
+-	mutex_unlock(&fd->mutex);
++	dpu_fu_write(fu, val, LAYERPROPERTY0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_source_buffer_enable);
+ 
+-void fetchdecode_source_buffer_disable(struct dpu_fetchdecode *fd)
++static void fetchdecode_disable_src_buf(struct dpu_fetchunit *fu)
+ {
+ 	u32 val;
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, LAYERPROPERTY0);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY0);
+ 	val &= ~SOURCEBUFFERENABLE;
+-	dpu_fd_write(fd, val, LAYERPROPERTY0);
+-	mutex_unlock(&fd->mutex);
++	dpu_fu_write(fu, val, LAYERPROPERTY0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_source_buffer_disable);
+ 
+-bool fetchdecode_is_enabled(struct dpu_fetchdecode *fd)
++static bool fetchdecode_is_enabled(struct dpu_fetchunit *fu)
+ {
+ 	u32 val;
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, LAYERPROPERTY0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY0);
++	mutex_unlock(&fu->mutex);
+ 
+ 	return !!(val & SOURCEBUFFERENABLE);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_is_enabled);
+ 
+-void fetchdecode_clipdimensions(struct dpu_fetchdecode *fd, unsigned int w,
++void fetchdecode_clipdimensions(struct dpu_fetchunit *fu, unsigned int w,
+ 				unsigned int h)
+ {
+ 	u32 val;
+ 
+ 	val = CLIPWINDOWWIDTH(w) | CLIPWINDOWHEIGHT(h);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, CLIPWINDOWDIMENSIONS0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CLIPWINDOWDIMENSIONS0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_clipdimensions);
+ 
+-void fetchdecode_framedimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				 unsigned int h, bool deinterlace)
++static void
++fetchdecode_set_framedimensions(struct dpu_fetchunit *fu,
++				unsigned int w, unsigned int h,
++				bool deinterlace)
+ {
+ 	u32 val;
+ 
+@@ -499,101 +396,95 @@ void fetchdecode_framedimensions(struct dpu_fetchdecode *fd, unsigned int w,
+ 
+ 	val = FRAMEWIDTH(w) | FRAMEHEIGHT(h);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, FRAMEDIMENSIONS);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, FRAMEDIMENSIONS);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_framedimensions);
+ 
+-void fetchdecode_rgb_constantcolor(struct dpu_fetchdecode *fd,
++void fetchdecode_rgb_constantcolor(struct dpu_fetchunit *fu,
+ 					u8 r, u8 g, u8 b, u8 a)
+ {
+ 	u32 val;
+ 
+ 	val = rgb_color(r, g, b, a);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, CONSTANTCOLOR0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CONSTANTCOLOR0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_rgb_constantcolor);
+ 
+-void fetchdecode_yuv_constantcolor(struct dpu_fetchdecode *fd, u8 y, u8 u, u8 v)
++void fetchdecode_yuv_constantcolor(struct dpu_fetchunit *fu, u8 y, u8 u, u8 v)
+ {
+ 	u32 val;
+ 
+ 	val = yuv_color(y, u, v);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, CONSTANTCOLOR0);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CONSTANTCOLOR0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_yuv_constantcolor);
+ 
+-void fetchdecode_controltrigger(struct dpu_fetchdecode *fd, bool trigger)
++static void fetchdecode_set_controltrigger(struct dpu_fetchunit *fu)
+ {
+-	u32 val;
+-
+-	val = trigger ? SHDTOKGEN : 0;
+-
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, val, CONTROLTRIGGER);
+-	mutex_unlock(&fd->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SHDTOKGEN, CONTROLTRIGGER);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchdecode_controltrigger);
+ 
+-int fetchdecode_fetchtype(struct dpu_fetchdecode *fd, fetchtype_t *type)
++int fetchdecode_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type)
+ {
+-	struct dpu_soc *dpu = fd->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 	u32 val;
+ 
+-	mutex_lock(&fd->mutex);
+-	val = dpu_fd_read(fd, FETCHTYPE);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, FETCHTYPE);
+ 	val &= FETCHTYPE_MASK;
+-	mutex_unlock(&fd->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+ 	switch (val) {
+ 	case FETCHTYPE__DECODE:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with RL and RLAD decoder\n",
+-				fd->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYER:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with fractional "
+-				"plane(8 layers)\n", fd->id);
++				"plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__WARP:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with arbitrary warping and "
+-				"fractional plane(8 layers)\n", fd->id);
++				"fractional plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ECO:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with minimum feature set for "
+ 				"alpha, chroma and coordinate planes\n",
+-				fd->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__PERSP:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with affine, perspective and "
+-				"arbitrary warping\n", fd->id);
++				"arbitrary warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ROT:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with affine and arbitrary "
+-				"warping\n", fd->id);
++				"warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__DECODEL:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with RL and RLAD decoder, "
+-				"reduced feature set\n", fd->id);
++				"reduced feature set\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYERL:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with fractional "
+ 				"plane(8 layers), reduced feature set\n",
+-				fd->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__ROTL:
+ 		dev_dbg(dpu->dev, "FetchDecode%d with affine and arbitrary "
+-				"warping, reduced feature set\n", fd->id);
++				"warping, reduced feature set\n", fu->id);
+ 		break;
+ 	default:
+ 		dev_warn(dpu->dev, "Invalid fetch type %u for FetchDecode%d\n",
+-				val, fd->id);
++				val, fu->id);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -602,11 +493,11 @@ int fetchdecode_fetchtype(struct dpu_fetchdecode *fd, fetchtype_t *type)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_fetchtype);
+ 
+-shadow_load_req_t fetchdecode_to_shdldreq_t(struct dpu_fetchdecode *fd)
++shadow_load_req_t fetchdecode_to_shdldreq_t(struct dpu_fetchunit *fu)
+ {
+ 	shadow_load_req_t t = 0;
+ 
+-	switch (fd->id) {
++	switch (fu->id) {
+ 	case 0:
+ 		t = SHLDREQID_FETCHDECODE0;
+ 		break;
+@@ -627,28 +518,28 @@ shadow_load_req_t fetchdecode_to_shdldreq_t(struct dpu_fetchdecode *fd)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_to_shdldreq_t);
+ 
+-u32 fetchdecode_get_vproc_mask(struct dpu_fetchdecode *fd)
++u32 fetchdecode_get_vproc_mask(struct dpu_fetchunit *fu)
+ {
+-	struct dpu_soc *dpu = fd->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 	const struct dpu_devtype *devtype = dpu->devtype;
+ 
+ 	return devtype->version == DPU_V1 ?
+-			fd_vproc_cap_v1[fd->id] : fd_vproc_cap_v2[fd->id];
++			fd_vproc_cap_v1[fu->id] : fd_vproc_cap_v2[fu->id];
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_get_vproc_mask);
+ 
+-struct dpu_fetcheco *fetchdecode_get_fetcheco(struct dpu_fetchdecode *fd)
++struct dpu_fetchunit *fetchdecode_get_fetcheco(struct dpu_fetchunit *fu)
+ {
+-	struct dpu_soc *dpu = fd->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 
+-	switch (fd->id) {
++	switch (fu->id) {
+ 	case 0:
+ 	case 1:
+-		return dpu->fe_priv[fd->id];
++		return dpu->fe_priv[fu->id];
+ 	case 2:
+ 	case 3:
+ 		/* TODO: for DPU v1, add FetchEco2 support */
+-		return dpu->fe_priv[fd->id - 2];
++		return dpu->fe_priv[fu->id - 2];
+ 	default:
+ 		WARN_ON(1);
+ 	}
+@@ -657,9 +548,9 @@ struct dpu_fetcheco *fetchdecode_get_fetcheco(struct dpu_fetchdecode *fd)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_get_fetcheco);
+ 
+-bool fetchdecode_need_fetcheco(struct dpu_fetchdecode *fd, u32 fmt)
++bool fetchdecode_need_fetcheco(struct dpu_fetchunit *fu, u32 fmt)
+ {
+-	struct dpu_fetcheco *fe = fetchdecode_get_fetcheco(fd);
++	struct dpu_fetchunit *fe = fetchdecode_get_fetcheco(fu);
+ 
+ 	if (IS_ERR_OR_NULL(fe))
+ 		return false;
+@@ -678,11 +569,11 @@ bool fetchdecode_need_fetcheco(struct dpu_fetchdecode *fd, u32 fmt)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_need_fetcheco);
+ 
+-struct dpu_hscaler *fetchdecode_get_hscaler(struct dpu_fetchdecode *fd)
++struct dpu_hscaler *fetchdecode_get_hscaler(struct dpu_fetchunit *fu)
+ {
+-	struct dpu_soc *dpu = fd->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 
+-	switch (fd->id) {
++	switch (fu->id) {
+ 	case 0:
+ 	case 2:
+ 		return dpu->hs_priv[0];
+@@ -697,11 +588,11 @@ struct dpu_hscaler *fetchdecode_get_hscaler(struct dpu_fetchdecode *fd)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_get_hscaler);
+ 
+-struct dpu_vscaler *fetchdecode_get_vscaler(struct dpu_fetchdecode *fd)
++struct dpu_vscaler *fetchdecode_get_vscaler(struct dpu_fetchunit *fu)
+ {
+-	struct dpu_soc *dpu = fd->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 
+-	switch (fd->id) {
++	switch (fu->id) {
+ 	case 0:
+ 	case 2:
+ 		return dpu->vs_priv[0];
+@@ -716,168 +607,9 @@ struct dpu_vscaler *fetchdecode_get_vscaler(struct dpu_fetchdecode *fd)
+ }
+ EXPORT_SYMBOL_GPL(fetchdecode_get_vscaler);
+ 
+-unsigned int fetchdecode_get_stream_id(struct dpu_fetchdecode *fd)
++struct dpu_fetchunit *dpu_fd_get(struct dpu_soc *dpu, int id)
+ {
+-	return fd->stream_id;
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_get_stream_id);
+-
+-void fetchdecode_set_stream_id(struct dpu_fetchdecode *fd, unsigned int id)
+-{
+-	switch (id) {
+-	case DPU_PLANE_SRC_TO_DISP_STREAM0:
+-	case DPU_PLANE_SRC_TO_DISP_STREAM1:
+-	case DPU_PLANE_SRC_DISABLED:
+-		fd->stream_id = id;
+-		break;
+-	default:
+-		WARN_ON(1);
+-	}
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_set_stream_id);
+-
+-void
+-fetchdecode_configure_prefetch(struct dpu_fetchdecode *fd,
+-			       unsigned int stream_id,
+-			       unsigned int width, unsigned int height,
+-			       unsigned int x_offset, unsigned int y_offset,
+-			       unsigned int stride, u32 format, u64 modifier,
+-			       unsigned long baddr, unsigned long uv_baddr,
+-			       bool start, bool aux_start,
+-			       bool fb_is_interlaced)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_configure(fd->dprc,
+-			stream_id, width, height, x_offset, y_offset, stride,
+-			format, modifier, baddr, uv_baddr, start, aux_start,
+-			fb_is_interlaced);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_configure_prefetch);
+-
+-void fetchdecode_enable_prefetch(struct dpu_fetchdecode *fd)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_enable(fd->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_enable_prefetch);
+-
+-void fetchdecode_disable_prefetch(struct dpu_fetchdecode *fd)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_disable(fd->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_disable_prefetch);
+-
+-void fetchdecode_reg_update_prefetch(struct dpu_fetchdecode *fd)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_reg_update(fd->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_reg_update_prefetch);
+-
+-void fetchdecode_prefetch_first_frame_handle(struct dpu_fetchdecode *fd)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_first_frame_handle(fd->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_prefetch_first_frame_handle);
+-
+-void fetchdecode_prefetch_irq_handle(struct dpu_fetchdecode *fd)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_irq_handle(fd->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_prefetch_irq_handle);
+-
+-void fetchdecode_prefetch_enable_first_frame_irq(struct dpu_fetchdecode *fd)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return;
+-
+-	dprc_enable_ctrl_done_irq(fd->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_prefetch_enable_first_frame_irq);
+-
+-bool fetchdecode_has_prefetch(struct dpu_fetchdecode *fd)
+-{
+-	return !!fd->dprc;
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_has_prefetch);
+-
+-bool fetchdecode_prefetch_format_supported(struct dpu_fetchdecode *fd,
+-					   u32 format, u64 modifier)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return false;
+-
+-	return dprc_format_supported(fd->dprc, format, modifier);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_prefetch_format_supported);
+-
+-bool fetchdecode_prefetch_stride_supported(struct dpu_fetchdecode *fd,
+-					   unsigned int stride,
+-					   unsigned int uv_stride,
+-					   unsigned int width,
+-					   u32 format)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return false;
+-
+-	return dprc_stride_supported(fd->dprc,
+-					stride, uv_stride, width, format);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_prefetch_stride_supported);
+-
+-bool fetchdecode_prefetch_stride_double_check(struct dpu_fetchdecode *fd,
+-					      unsigned int stride,
+-					      unsigned int uv_stride,
+-					      unsigned int width,
+-					      u32 format,
+-					      dma_addr_t baseaddr,
+-					      dma_addr_t uv_baseaddr)
+-{
+-	if (WARN_ON(!fd || !fd->dprc))
+-		return false;
+-
+-	return dprc_stride_double_check(fd->dprc,
+-					stride, uv_stride, width, format,
+-					baseaddr, uv_baseaddr);
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_prefetch_stride_double_check);
+-
+-void fetchdecode_pin_off(struct dpu_fetchdecode *fd)
+-{
+-	fd->pin_off = true;
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_pin_off);
+-
+-void fetchdecode_unpin_off(struct dpu_fetchdecode *fd)
+-{
+-	fd->pin_off = false;
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_unpin_off);
+-
+-bool fetchdecode_is_pinned_off(struct dpu_fetchdecode *fd)
+-{
+-	return fd->pin_off;
+-}
+-EXPORT_SYMBOL_GPL(fetchdecode_is_pinned_off);
+-
+-struct dpu_fetchdecode *dpu_fd_get(struct dpu_soc *dpu, int id)
+-{
+-	struct dpu_fetchdecode *fd;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fd_ids); i++)
+@@ -887,36 +619,55 @@ struct dpu_fetchdecode *dpu_fd_get(struct dpu_soc *dpu, int id)
+ 	if (i == ARRAY_SIZE(fd_ids))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	fd = dpu->fd_priv[i];
++	fu = dpu->fd_priv[i];
+ 
+-	mutex_lock(&fd->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	if (fd->inuse) {
+-		fd = ERR_PTR(-EBUSY);
++	if (fu->inuse) {
++		fu = ERR_PTR(-EBUSY);
+ 		goto out;
+ 	}
+ 
+-	fd->inuse = true;
++	fu->inuse = true;
+ out:
+-	mutex_unlock(&fd->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+-	return fd;
++	return fu;
+ }
+ EXPORT_SYMBOL_GPL(dpu_fd_get);
+ 
+-void dpu_fd_put(struct dpu_fetchdecode *fd)
++void dpu_fd_put(struct dpu_fetchunit *fu)
+ {
+-	mutex_lock(&fd->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	fd->inuse = false;
++	fu->inuse = false;
+ 
+-	mutex_unlock(&fd->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(dpu_fd_put);
+ 
++static const struct dpu_fetchunit_ops fd_ops = {
++	.set_burstlength = fetchunit_set_burstlength,
++	.set_baseaddress = fetchdecode_set_baseaddress,
++	.set_src_bpp = fetchdecode_set_src_bpp,
++	.set_src_stride = fetchdecode_set_src_stride,
++	.set_src_buf_dimensions = fetchdecode_set_src_buf_dimensions,
++	.set_fmt = fetchdecode_set_fmt,
++	.enable_src_buf = fetchdecode_enable_src_buf,
++	.disable_src_buf = fetchdecode_disable_src_buf,
++	.is_enabled = fetchdecode_is_enabled,
++	.set_framedimensions = fetchdecode_set_framedimensions,
++	.set_controltrigger = fetchdecode_set_controltrigger,
++	.get_stream_id = fetchunit_get_stream_id,
++	.set_stream_id = fetchunit_set_stream_id,
++	.pin_off = fetchunit_pin_off,
++	.unpin_off = fetchunit_unpin_off,
++	.is_pinned_off = fetchunit_is_pinned_off,
++};
++
+ void _dpu_fd_init(struct dpu_soc *dpu, unsigned int id)
+ {
+-	struct dpu_fetchdecode *fd;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fd_ids); i++)
+@@ -926,53 +677,58 @@ void _dpu_fd_init(struct dpu_soc *dpu, unsigned int id)
+ 	if (WARN_ON(i == ARRAY_SIZE(fd_ids)))
+ 		return;
+ 
+-	fd = dpu->fd_priv[i];
++	fu = dpu->fd_priv[i];
+ 
+-	fetchdecode_pixengcfg_dynamic_src_sel(fd, FD_SRC_DISABLE);
+-	fetchdecode_baddr_autoupdate(fd, 0x0);
+-	fetchdecode_shden(fd, true);
++	fetchdecode_pixengcfg_dynamic_src_sel(fu, FD_SRC_DISABLE);
++	fetchunit_baddr_autoupdate(fu, 0x0);
++	fetchunit_shden(fu, true);
+ 
+-	mutex_lock(&fd->mutex);
+-	dpu_fd_write(fd, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
+ 			BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fd->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ 
+ int dpu_fd_init(struct dpu_soc *dpu, unsigned int id,
+ 		unsigned long pec_base, unsigned long base)
+ {
+ 	struct dpu_fetchdecode *fd;
++	struct dpu_fetchunit *fu;
+ 	int ret, i;
+ 
+ 	fd = devm_kzalloc(dpu->dev, sizeof(*fd), GFP_KERNEL);
+ 	if (!fd)
+ 		return -ENOMEM;
+ 
+-	dpu->fd_priv[id] = fd;
++	fu = &fd->fu;
++	dpu->fd_priv[id] = fu;
+ 
+-	fd->pec_base = devm_ioremap(dpu->dev, pec_base, SZ_16);
+-	if (!fd->pec_base)
++	fu->pec_base = devm_ioremap(dpu->dev, pec_base, SZ_16);
++	if (!fu->pec_base)
+ 		return -ENOMEM;
+ 
+-	fd->base = devm_ioremap(dpu->dev, base, SZ_1K);
+-	if (!fd->base)
++	fu->base = devm_ioremap(dpu->dev, base, SZ_1K);
++	if (!fu->base)
+ 		return -ENOMEM;
+ 
+-	fd->dpu = dpu;
+-	fd->id = id;
++	fu->dpu = dpu;
++	fu->id = id;
++	fu->type = FU_T_FD;
++	fu->ops = &fd_ops;
++	fu->name = "fetchdecode";
+ 	for (i = 0; i < ARRAY_SIZE(fd_ids); i++) {
+ 		if (fd_ids[i] == id) {
+ 			fd->shdlreq = fd_shdlreqs[i];
+ 			break;
+ 		}
+ 	}
+-	mutex_init(&fd->mutex);
++	mutex_init(&fu->mutex);
+ 
+-	ret = fetchdecode_pixengcfg_dynamic_src_sel(fd, FD_SRC_DISABLE);
++	ret = fetchdecode_pixengcfg_dynamic_src_sel(fu, FD_SRC_DISABLE);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = fetchdecode_fetchtype(fd, &fd->fetchtype);
++	ret = fetchdecode_fetchtype(fu, &fd->fetchtype);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -980,11 +736,3 @@ int dpu_fd_init(struct dpu_soc *dpu, unsigned int id,
+ 
+ 	return 0;
+ }
+-
+-void fetchdecode_get_dprc(struct dpu_fetchdecode *fd, void *data)
+-{
+-	if (WARN_ON(!fd))
+-		return;
+-
+-	fd->dprc = data;
+-}
+diff --git a/drivers/gpu/imx/dpu/dpu-fetcheco.c b/drivers/gpu/imx/dpu/dpu-fetcheco.c
+index 2a03c59..3379909 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetcheco.c
++++ b/drivers/gpu/imx/dpu/dpu-fetcheco.c
+@@ -40,146 +40,13 @@
+ #define HIDDENSTATUS			0x54
+ 
+ struct dpu_fetcheco {
+-	void __iomem *pec_base;
+-	void __iomem *base;
+-	struct mutex mutex;
+-	int id;
+-	bool inuse;
+-	bool pin_off;
+-	struct dpu_soc *dpu;
+-	/* see DPU_PLANE_SRC_xxx */
+-	unsigned int stream_id;
++	struct dpu_fetchunit fu;
+ };
+ 
+-static inline u32 dpu_pec_fe_read(struct dpu_fetcheco *fe, unsigned int offset)
+-{
+-	return readl(fe->pec_base + offset);
+-}
+-
+-static inline void dpu_pec_fe_write(struct dpu_fetcheco *fe, u32 value,
+-				    unsigned int offset)
+-{
+-	writel(value, fe->pec_base + offset);
+-}
+-
+-static inline u32 dpu_fe_read(struct dpu_fetcheco *fe, unsigned int offset)
+-{
+-	return readl(fe->base + offset);
+-}
+-
+-static inline void dpu_fe_write(struct dpu_fetcheco *fe, u32 value,
+-				unsigned int offset)
+-{
+-	writel(value, fe->base + offset);
+-}
+-
+-void fetcheco_shden(struct dpu_fetcheco *fe, bool enable)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, STATICCONTROL);
+-	if (enable)
+-		val |= SHDEN;
+-	else
+-		val &= ~SHDEN;
+-	dpu_fe_write(fe, val, STATICCONTROL);
+-	mutex_unlock(&fe->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_shden);
+-
+-void fetcheco_set_burstlength(struct dpu_fetcheco *fe, dma_addr_t baddr,
+-			      bool use_prefetch)
+-{
+-	struct dpu_soc *dpu = fe->dpu;
+-	unsigned int burst_size, burst_length;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-		burst_length = burst_size / 8;
+-	} else {
+-		burst_length = 16;
+-	}
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, BURSTBUFFERMANAGEMENT);
+-	val &= ~SETBURSTLENGTH_MASK;
+-	val |= SETBURSTLENGTH(burst_length);
+-	dpu_fe_write(fe, val, BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fe->mutex);
+-
+-	dev_dbg(dpu->dev, "FetchEco%d burst length is %u\n",
+-						fe->id, burst_length);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_set_burstlength);
+-
+-void fetcheco_baseaddress(struct dpu_fetcheco *fe, dma_addr_t paddr)
+-{
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, paddr, BASEADDRESS0);
+-	mutex_unlock(&fe->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_baseaddress);
+-
+-void fetcheco_source_bpp(struct dpu_fetcheco *fe, int bpp)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, SOURCEBUFFERATTRIBUTES0);
+-	val &= ~0x3f0000;
+-	val |= BITSPERPIXEL(bpp);
+-	dpu_fe_write(fe, val, SOURCEBUFFERATTRIBUTES0);
+-	mutex_unlock(&fe->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_source_bpp);
+-
+-/*
+- * The arguments width and bpp are valid only when use_prefetch is true.
+- * Since the pixel format has to be NV12 or NV21 when use_prefetch is true,
+- * we assume width stands for how many UV we have in bytes for one line,
+- * while bpp should be 8bits for every U or V component.
+- */
+-void fetcheco_source_stride(struct dpu_fetcheco *fe, unsigned int width,
+-			    int bpp, unsigned int stride,
+-			    dma_addr_t baddr, bool use_prefetch)
+-{
+-	unsigned int burst_size;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-
+-		stride = width * (bpp >> 3);
+-		/*
+-		 * address TKT339017:
+-		 * fixup for burst size vs stride mismatch
+-		 */
+-		stride = round_up(stride, burst_size);
+-	}
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, SOURCEBUFFERATTRIBUTES0);
+-	val &= ~0xffff;
+-	val |= STRIDE(stride);
+-	dpu_fe_write(fe, val, SOURCEBUFFERATTRIBUTES0);
+-	mutex_unlock(&fe->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_source_stride);
+-
+-void fetcheco_src_buf_dimensions(struct dpu_fetcheco *fe, unsigned int w,
+-				 unsigned int h, u32 fmt, bool deinterlace)
++static void
++fetcheco_set_src_buf_dimensions(struct dpu_fetchunit *fu,
++				unsigned int w, unsigned int h,
++				u32 fmt, bool deinterlace)
+ {
+ 	int width, height;
+ 	u32 val;
+@@ -207,13 +74,12 @@ void fetcheco_src_buf_dimensions(struct dpu_fetcheco *fe, unsigned int w,
+ 
+ 	val = LINEWIDTH(width) | LINECOUNT(height);
+ 
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, val, SOURCEBUFFERDIMENSION0);
+-	mutex_unlock(&fe->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, SOURCEBUFFERDIMENSION0);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetcheco_src_buf_dimensions);
+ 
+-void fetcheco_set_fmt(struct dpu_fetcheco *fe, u32 fmt)
++static void fetcheco_set_fmt(struct dpu_fetchunit *fu, u32 fmt, bool unused)
+ {
+ 	u32 val, bits, shift;
+ 	int i, hsub, vsub;
+@@ -258,17 +124,17 @@ void fetcheco_set_fmt(struct dpu_fetcheco *fe, u32 fmt)
+ 		return;
+ 	}
+ 
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, FRAMERESAMPLING);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, FRAMERESAMPLING);
+ 	val &= ~(DELTAX_MASK | DELTAY_MASK);
+ 	val |= DELTAX(x) | DELTAY(y);
+-	dpu_fe_write(fe, val, FRAMERESAMPLING);
++	dpu_fu_write(fu, val, FRAMERESAMPLING);
+ 
+-	val = dpu_fe_read(fe, CONTROL);
++	val = dpu_fu_read(fu, CONTROL);
+ 	val &= ~RASTERMODE_MASK;
+ 	val |= RASTERMODE(RASTERMODE__NORMAL);
+-	dpu_fe_write(fe, val, CONTROL);
+-	mutex_unlock(&fe->mutex);
++	dpu_fu_write(fu, val, CONTROL);
++	mutex_unlock(&fu->mutex);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dpu_pixel_format_matrix); i++) {
+ 		if (dpu_pixel_format_matrix[i].pixel_format == fmt) {
+@@ -278,95 +144,60 @@ void fetcheco_set_fmt(struct dpu_fetcheco *fe, u32 fmt)
+ 			bits &= ~Y_BITS_MASK;
+ 			shift &= ~Y_SHIFT_MASK;
+ 
+-			mutex_lock(&fe->mutex);
+-			dpu_fe_write(fe, bits, COLORCOMPONENTBITS0);
+-			dpu_fe_write(fe, shift, COLORCOMPONENTSHIFT0);
+-			mutex_unlock(&fe->mutex);
++			mutex_lock(&fu->mutex);
++			dpu_fu_write(fu, bits, COLORCOMPONENTBITS0);
++			dpu_fu_write(fu, shift, COLORCOMPONENTSHIFT0);
++			mutex_unlock(&fu->mutex);
+ 			return;
+ 		}
+ 	}
+ 
+ 	WARN_ON(1);
+ }
+-EXPORT_SYMBOL_GPL(fetcheco_set_fmt);
+ 
+-void fetcheco_layeroffset(struct dpu_fetcheco *fe, unsigned int x,
++void fetcheco_layeroffset(struct dpu_fetchunit *fu, unsigned int x,
+ 			  unsigned int y)
+ {
+ 	u32 val;
+ 
+ 	val = LAYERXOFFSET(x) | LAYERYOFFSET(y);
+ 
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, val, LAYEROFFSET0);
+-	mutex_unlock(&fe->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, LAYEROFFSET0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetcheco_layeroffset);
+ 
+-void fetcheco_clipoffset(struct dpu_fetcheco *fe, unsigned int x,
++void fetcheco_clipoffset(struct dpu_fetchunit *fu, unsigned int x,
+ 			 unsigned int y)
+ {
+ 	u32 val;
+ 
+ 	val = CLIPWINDOWXOFFSET(x) | CLIPWINDOWYOFFSET(y);
+ 
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, val, CLIPWINDOWOFFSET0);
+-	mutex_unlock(&fe->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CLIPWINDOWOFFSET0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetcheco_clipoffset);
+ 
+-void fetcheco_clipdimensions(struct dpu_fetcheco *fe, unsigned int w,
++void fetcheco_clipdimensions(struct dpu_fetchunit *fu, unsigned int w,
+ 			     unsigned int h)
+ {
+ 	u32 val;
+ 
+ 	val = CLIPWINDOWWIDTH(w) | CLIPWINDOWHEIGHT(h);
+ 
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, val, CLIPWINDOWDIMENSIONS0);
+-	mutex_unlock(&fe->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CLIPWINDOWDIMENSIONS0);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetcheco_clipdimensions);
+ 
+-void fetcheco_source_buffer_enable(struct dpu_fetcheco *fe)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, LAYERPROPERTY0);
+-	val |= SOURCEBUFFERENABLE;
+-	dpu_fe_write(fe, val, LAYERPROPERTY0);
+-	mutex_unlock(&fe->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_source_buffer_enable);
+-
+-void fetcheco_source_buffer_disable(struct dpu_fetcheco *fe)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, LAYERPROPERTY0);
+-	val &= ~SOURCEBUFFERENABLE;
+-	dpu_fe_write(fe, val, LAYERPROPERTY0);
+-	mutex_unlock(&fe->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_source_buffer_disable);
+-
+-bool fetcheco_is_enabled(struct dpu_fetcheco *fe)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, LAYERPROPERTY0);
+-	mutex_unlock(&fe->mutex);
+-
+-	return !!(val & SOURCEBUFFERENABLE);
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_is_enabled);
+-
+-void fetcheco_framedimensions(struct dpu_fetcheco *fe, unsigned int w,
+-			      unsigned int h, bool deinterlace)
++static void
++fetcheco_set_framedimensions(struct dpu_fetchunit *fu,
++			     unsigned int w, unsigned int h,
++			     bool deinterlace)
+ {
+ 	u32 val;
+ 
+@@ -375,90 +206,84 @@ void fetcheco_framedimensions(struct dpu_fetcheco *fe, unsigned int w,
+ 
+ 	val = FRAMEWIDTH(w) | FRAMEHEIGHT(h);
+ 
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, val, FRAMEDIMENSIONS);
+-	mutex_unlock(&fe->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, FRAMEDIMENSIONS);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetcheco_framedimensions);
+ 
+-void fetcheco_frameresampling(struct dpu_fetcheco *fe, unsigned int x,
++void fetcheco_frameresampling(struct dpu_fetchunit *fu, unsigned int x,
+ 			      unsigned int y)
+ {
+ 	u32 val;
+ 
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, FRAMERESAMPLING);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, FRAMERESAMPLING);
+ 	val &= ~(DELTAX_MASK | DELTAY_MASK);
+ 	val |= DELTAX(x) | DELTAY(y);
+-	dpu_fe_write(fe, val, FRAMERESAMPLING);
+-	mutex_unlock(&fe->mutex);
++	dpu_fu_write(fu, val, FRAMERESAMPLING);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetcheco_frameresampling);
+ 
+-void fetcheco_controltrigger(struct dpu_fetcheco *fe, bool trigger)
++static void fetcheco_set_controltrigger(struct dpu_fetchunit *fu)
+ {
+-	u32 val;
+-
+-	val = trigger ? SHDTOKGEN : 0;
+-
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, val, CONTROLTRIGGER);
+-	mutex_unlock(&fe->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SHDTOKGEN, CONTROLTRIGGER);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetcheco_controltrigger);
+ 
+-int fetcheco_fetchtype(struct dpu_fetcheco *fe, fetchtype_t *type)
++int fetcheco_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type)
+ {
+-	struct dpu_soc *dpu = fe->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 	u32 val;
+ 
+-	mutex_lock(&fe->mutex);
+-	val = dpu_fe_read(fe, FETCHTYPE);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, FETCHTYPE);
+ 	val &= FETCHTYPE_MASK;
+-	mutex_unlock(&fe->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+ 	switch (val) {
+ 	case FETCHTYPE__DECODE:
+ 		dev_dbg(dpu->dev, "FetchEco%d with RL and RLAD decoder\n",
+-				fe->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYER:
+ 		dev_dbg(dpu->dev, "FetchEco%d with fractional "
+-				"plane(8 layers)\n", fe->id);
++				"plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__WARP:
+ 		dev_dbg(dpu->dev, "FetchEco%d with arbitrary warping and "
+-				"fractional plane(8 layers)\n", fe->id);
++				"fractional plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ECO:
+ 		dev_dbg(dpu->dev, "FetchEco%d with minimum feature set for "
+ 				"alpha, chroma and coordinate planes\n",
+-				fe->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__PERSP:
+ 		dev_dbg(dpu->dev, "FetchEco%d with affine, perspective and "
+-				"arbitrary warping\n", fe->id);
++				"arbitrary warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ROT:
+ 		dev_dbg(dpu->dev, "FetchEco%d with affine and arbitrary "
+-				"warping\n", fe->id);
++				"warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__DECODEL:
+ 		dev_dbg(dpu->dev, "FetchEco%d with RL and RLAD decoder, "
+-				"reduced feature set\n", fe->id);
++				"reduced feature set\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYERL:
+ 		dev_dbg(dpu->dev, "FetchEco%d with fractional "
+ 				"plane(8 layers), reduced feature set\n",
+-				fe->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__ROTL:
+ 		dev_dbg(dpu->dev, "FetchEco%d with affine and arbitrary "
+-				"warping, reduced feature set\n", fe->id);
++				"warping, reduced feature set\n", fu->id);
+ 		break;
+ 	default:
+ 		dev_warn(dpu->dev, "Invalid fetch type %u for FetchEco%d\n",
+-				val, fe->id);
++				val, fu->id);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -467,9 +292,9 @@ int fetcheco_fetchtype(struct dpu_fetcheco *fe, fetchtype_t *type)
+ }
+ EXPORT_SYMBOL_GPL(fetcheco_fetchtype);
+ 
+-dpu_block_id_t fetcheco_get_block_id(struct dpu_fetcheco *fe)
++dpu_block_id_t fetcheco_get_block_id(struct dpu_fetchunit *fu)
+ {
+-	switch (fe->id) {
++	switch (fu->id) {
+ 	case 0:
+ 		return ID_FETCHECO0;
+ 	case 1:
+@@ -486,47 +311,9 @@ dpu_block_id_t fetcheco_get_block_id(struct dpu_fetcheco *fe)
+ }
+ EXPORT_SYMBOL_GPL(fetcheco_get_block_id);
+ 
+-unsigned int fetcheco_get_stream_id(struct dpu_fetcheco *fe)
+-{
+-	return fe->stream_id;
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_get_stream_id);
+-
+-void fetcheco_set_stream_id(struct dpu_fetcheco *fe, unsigned int id)
++struct dpu_fetchunit *dpu_fe_get(struct dpu_soc *dpu, int id)
+ {
+-	switch (id) {
+-	case DPU_PLANE_SRC_TO_DISP_STREAM0:
+-	case DPU_PLANE_SRC_TO_DISP_STREAM1:
+-	case DPU_PLANE_SRC_DISABLED:
+-		fe->stream_id = id;
+-		break;
+-	default:
+-		WARN_ON(1);
+-	}
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_set_stream_id);
+-
+-void fetcheco_pin_off(struct dpu_fetcheco *fe)
+-{
+-	fe->pin_off = true;
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_pin_off);
+-
+-void fetcheco_unpin_off(struct dpu_fetcheco *fe)
+-{
+-	fe->pin_off = false;
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_unpin_off);
+-
+-bool fetcheco_is_pinned_off(struct dpu_fetcheco *fe)
+-{
+-	return fe->pin_off;
+-}
+-EXPORT_SYMBOL_GPL(fetcheco_is_pinned_off);
+-
+-struct dpu_fetcheco *dpu_fe_get(struct dpu_soc *dpu, int id)
+-{
+-	struct dpu_fetcheco *fe;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fe_ids); i++)
+@@ -536,36 +323,55 @@ struct dpu_fetcheco *dpu_fe_get(struct dpu_soc *dpu, int id)
+ 	if (i == ARRAY_SIZE(fe_ids))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	fe = dpu->fe_priv[i];
++	fu = dpu->fe_priv[i];
+ 
+-	mutex_lock(&fe->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	if (fe->inuse) {
+-		fe = ERR_PTR(-EBUSY);
++	if (fu->inuse) {
++		fu = ERR_PTR(-EBUSY);
+ 		goto out;
+ 	}
+ 
+-	fe->inuse = true;
++	fu->inuse = true;
+ out:
+-	mutex_unlock(&fe->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+-	return fe;
++	return fu;
+ }
+ EXPORT_SYMBOL_GPL(dpu_fe_get);
+ 
+-void dpu_fe_put(struct dpu_fetcheco *fe)
++void dpu_fe_put(struct dpu_fetchunit *fu)
+ {
+-	mutex_lock(&fe->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	fe->inuse = false;
++	fu->inuse = false;
+ 
+-	mutex_unlock(&fe->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(dpu_fe_put);
+ 
++static const struct dpu_fetchunit_ops fe_ops = {
++	.set_burstlength = fetchunit_set_burstlength,
++	.set_baseaddress = fetchunit_set_baseaddress,
++	.set_src_bpp = fetchunit_set_src_bpp,
++	.set_src_stride = fetchunit_set_src_stride,
++	.set_src_buf_dimensions = fetcheco_set_src_buf_dimensions,
++	.set_fmt = fetcheco_set_fmt,
++	.enable_src_buf = fetchunit_enable_src_buf,
++	.disable_src_buf = fetchunit_disable_src_buf,
++	.is_enabled = fetchunit_is_enabled,
++	.set_framedimensions = fetcheco_set_framedimensions,
++	.set_controltrigger = fetcheco_set_controltrigger,
++	.get_stream_id = fetchunit_get_stream_id,
++	.set_stream_id = fetchunit_set_stream_id,
++	.pin_off = fetchunit_pin_off,
++	.unpin_off = fetchunit_unpin_off,
++	.is_pinned_off = fetchunit_is_pinned_off,
++};
++
+ void _dpu_fe_init(struct dpu_soc *dpu, unsigned int id)
+ {
+-	struct dpu_fetcheco *fe;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fe_ids); i++)
+@@ -575,20 +381,21 @@ void _dpu_fe_init(struct dpu_soc *dpu, unsigned int id)
+ 	if (WARN_ON(i == ARRAY_SIZE(fe_ids)))
+ 		return;
+ 
+-	fe = dpu->fe_priv[i];
++	fu = dpu->fe_priv[i];
+ 
+-	fetcheco_shden(fe, true);
++	fetchunit_shden(fu, true);
+ 
+-	mutex_lock(&fe->mutex);
+-	dpu_fe_write(fe, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
+ 			BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fe->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ 
+ int dpu_fe_init(struct dpu_soc *dpu, unsigned int id,
+ 		unsigned long pec_base, unsigned long base)
+ {
+ 	struct dpu_fetcheco *fe;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	fe = devm_kzalloc(dpu->dev, sizeof(*fe), GFP_KERNEL);
+@@ -599,19 +406,24 @@ int dpu_fe_init(struct dpu_soc *dpu, unsigned int id,
+ 		if (fe_ids[i] == id)
+ 			break;
+ 
+-	dpu->fe_priv[i] = fe;
++	fu = &fe->fu;
++	dpu->fe_priv[i] = fu;
+ 
+-	fe->pec_base = devm_ioremap(dpu->dev, pec_base, SZ_16);
+-	if (!fe->pec_base)
++	fu->pec_base = devm_ioremap(dpu->dev, pec_base, SZ_16);
++	if (!fu->pec_base)
+ 		return -ENOMEM;
+ 
+-	fe->base = devm_ioremap(dpu->dev, base, SZ_128);
+-	if (!fe->base)
++	fu->base = devm_ioremap(dpu->dev, base, SZ_128);
++	if (!fu->base)
+ 		return -ENOMEM;
+ 
+-	fe->dpu = dpu;
+-	fe->id = id;
+-	mutex_init(&fe->mutex);
++	fu->dpu = dpu;
++	fu->id = id;
++	fu->type = FU_T_FE;
++	fu->ops = &fe_ops;
++	fu->name = "fetcheco";
++
++	mutex_init(&fu->mutex);
+ 
+ 	_dpu_fe_init(dpu, id);
+ 
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchlayer.c b/drivers/gpu/imx/dpu/dpu-fetchlayer.c
+index 2a81056..319f3d5 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchlayer.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchlayer.c
+@@ -19,7 +19,6 @@
+ #include <linux/platform_device.h>
+ #include <linux/types.h>
+ #include <video/dpu.h>
+-#include <video/imx8-prefetch.h>
+ #include "dpu-prv.h"
+ 
+ #define PIXENGCFG_STATUS		0x8
+@@ -50,351 +49,150 @@
+ };
+ 
+ struct dpu_fetchlayer {
+-	void __iomem *pec_base;
+-	void __iomem *base;
+-	struct mutex mutex;
+-	int id;
+-	bool inuse;
+-	bool pin_off;
+-	struct dpu_soc *dpu;
++	struct dpu_fetchunit fu;
+ 	fetchtype_t fetchtype;
+ 	shadow_load_req_t shdlreq;
+-	/* see DPU_PLANE_SRC_xxx */
+-	unsigned int stream_id;
+-	struct dprc *dprc;
+ };
+ 
+-static inline u32 dpu_fl_read(struct dpu_fetchlayer *fl, unsigned int offset)
+-{
+-	return readl(fl->base + offset);
+-}
+-
+-static inline void dpu_fl_write(struct dpu_fetchlayer *fl, u32 value,
+-				unsigned int offset)
+-{
+-	writel(value, fl->base + offset);
+-}
+-
+-static inline u32 rgb_color(u8 r, u8 g, u8 b, u8 a)
+-{
+-	return (r << 24) | (g << 16) | (b << 8) | a;
+-}
+-
+-static inline u32 yuv_color(u8 y, u8 u, u8 v)
+-{
+-	return (y << 24) | (u << 16) | (v << 8);
+-}
+-
+-void fetchlayer_shden(struct dpu_fetchlayer *fl, bool enable)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, STATICCONTROL);
+-	if (enable)
+-		val |= SHDEN;
+-	else
+-		val &= ~SHDEN;
+-	dpu_fl_write(fl, val, STATICCONTROL);
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_shden);
+-
+-void fetchlayer_baddr_autoupdate(struct dpu_fetchlayer *fl, u8 layer_mask)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, STATICCONTROL);
+-	val &= ~BASEADDRESSAUTOUPDATE_MASK;
+-	val |= BASEADDRESSAUTOUPDATE(layer_mask);
+-	dpu_fl_write(fl, val, STATICCONTROL);
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_baddr_autoupdate);
+-
+-void fetchlayer_shdldreq_sticky(struct dpu_fetchlayer *fl, u8 layer_mask)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, STATICCONTROL);
+-	val &= ~SHDLDREQSTICKY_MASK;
+-	val |= SHDLDREQSTICKY(layer_mask);
+-	dpu_fl_write(fl, val, STATICCONTROL);
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_shdldreq_sticky);
+-
+-void fetchlayer_set_burstlength(struct dpu_fetchlayer *fl, dma_addr_t baddr,
+-				bool use_prefetch)
+-{
+-	struct dpu_soc *dpu = fl->dpu;
+-	unsigned int burst_size, burst_length;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-		burst_length = burst_size / 8;
+-	} else {
+-		burst_length = 16;
+-	}
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, BURSTBUFFERMANAGEMENT);
+-	val &= ~SETBURSTLENGTH_MASK;
+-	val |= SETBURSTLENGTH(burst_length);
+-	dpu_fl_write(fl, val, BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fl->mutex);
+-
+-	dev_dbg(dpu->dev, "FetchLayer%d burst length is %u\n",
+-							fl->id, burst_length);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_set_burstlength);
+-
+-void fetchlayer_baseaddress(struct dpu_fetchlayer *fl, unsigned int index,
+-			    dma_addr_t paddr)
+-{
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, paddr, BASEADDRESS(index));
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_baseaddress);
+-
+-void fetchlayer_source_bpp(struct dpu_fetchlayer *fl, unsigned int index,
+-			   int bpp)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, SOURCEBUFFERATTRIBUTES(index));
+-	val &= ~0x3f0000;
+-	val |= BITSPERPIXEL(bpp);
+-	dpu_fl_write(fl, val, SOURCEBUFFERATTRIBUTES(index));
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_source_bpp);
+-
+-void fetchlayer_source_stride(struct dpu_fetchlayer *fl, unsigned int index,
+-			      unsigned int width, int bpp, unsigned int stride,
+-			      dma_addr_t baddr, bool use_prefetch)
+-{
+-	unsigned int burst_size;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-
+-		stride = width * (bpp >> 3);
+-		/*
+-		 * address TKT339017:
+-		 * fixup for burst size vs stride mismatch
+-		 */
+-		stride = round_up(stride, burst_size);
+-	}
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, SOURCEBUFFERATTRIBUTES(index));
+-	val &= ~0xffff;
+-	val |= STRIDE(stride);
+-	dpu_fl_write(fl, val, SOURCEBUFFERATTRIBUTES(index));
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_source_stride);
+-
+-void fetchlayer_src_buf_dimensions(struct dpu_fetchlayer *fl,
+-				   unsigned int index, unsigned int w,
+-				   unsigned int h)
++static void
++fetchlayer_set_src_buf_dimensions(struct dpu_fetchunit *fu,
++				  unsigned int w, unsigned int h,
++				  u32 unused1, bool unused2)
+ {
+ 	u32 val;
+ 
+ 	val = LINEWIDTH(w) | LINECOUNT(h);
+ 
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, val, SOURCEBUFFERDIMENSION(index));
+-	mutex_unlock(&fl->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, SOURCEBUFFERDIMENSION(fu->sub_id));
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchlayer_src_buf_dimensions);
+ 
+-void fetchlayer_set_fmt(struct dpu_fetchlayer *fl, unsigned int index, u32 fmt)
++static void fetchlayer_set_fmt(struct dpu_fetchunit *fu, u32 fmt, bool unused)
+ {
+ 	u32 val, bits, shift;
+-	int i;
++	int i, sub_id = fu->sub_id;
+ 
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, LAYERPROPERTY(index));
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY(sub_id));
+ 	val &= ~YUVCONVERSIONMODE_MASK;
+ 	val |= YUVCONVERSIONMODE(YUVCONVERSIONMODE__OFF);
+-	dpu_fl_write(fl, val, LAYERPROPERTY(index));
+-	mutex_unlock(&fl->mutex);
++	dpu_fu_write(fu, val, LAYERPROPERTY(sub_id));
++	mutex_unlock(&fu->mutex);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dpu_pixel_format_matrix); i++) {
+ 		if (dpu_pixel_format_matrix[i].pixel_format == fmt) {
+ 			bits = dpu_pixel_format_matrix[i].bits;
+ 			shift = dpu_pixel_format_matrix[i].shift;
+ 
+-			mutex_lock(&fl->mutex);
+-			dpu_fl_write(fl, bits, COLORCOMPONENTBITS(index));
+-			dpu_fl_write(fl, shift, COLORCOMPONENTSHIFT(index));
+-			mutex_unlock(&fl->mutex);
++			mutex_lock(&fu->mutex);
++			dpu_fu_write(fu, bits, COLORCOMPONENTBITS(sub_id));
++			dpu_fu_write(fu, shift, COLORCOMPONENTSHIFT(sub_id));
++			mutex_unlock(&fu->mutex);
+ 			return;
+ 		}
+ 	}
+ 
+ 	WARN_ON(1);
+ }
+-EXPORT_SYMBOL_GPL(fetchlayer_set_fmt);
+-
+-void fetchlayer_source_buffer_enable(struct dpu_fetchlayer *fl,
+-				     unsigned int index)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, LAYERPROPERTY(index));
+-	val |= SOURCEBUFFERENABLE;
+-	dpu_fl_write(fl, val, LAYERPROPERTY(index));
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_source_buffer_enable);
+-
+-void fetchlayer_source_buffer_disable(struct dpu_fetchlayer *fl,
+-				      unsigned int index)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, LAYERPROPERTY(index));
+-	val &= ~SOURCEBUFFERENABLE;
+-	dpu_fl_write(fl, val, LAYERPROPERTY(index));
+-	mutex_unlock(&fl->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_source_buffer_disable);
+-
+-bool fetchlayer_is_enabled(struct dpu_fetchlayer *fl, unsigned int index)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, LAYERPROPERTY(index));
+-	mutex_unlock(&fl->mutex);
+-
+-	return !!(val & SOURCEBUFFERENABLE);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_is_enabled);
+ 
+-void fetchlayer_framedimensions(struct dpu_fetchlayer *fl, unsigned int w,
+-				unsigned int h)
++static void
++fetchlayer_set_framedimensions(struct dpu_fetchunit *fu, unsigned int w,
++			       unsigned int h, bool unused)
+ {
+ 	u32 val;
+ 
+ 	val = FRAMEWIDTH(w) | FRAMEHEIGHT(h);
+ 
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, val, FRAMEDIMENSIONS);
+-	mutex_unlock(&fl->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, FRAMEDIMENSIONS);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchlayer_framedimensions);
+ 
+-void fetchlayer_rgb_constantcolor(struct dpu_fetchlayer *fl,
++void fetchlayer_rgb_constantcolor(struct dpu_fetchunit *fu,
+ 					u8 r, u8 g, u8 b, u8 a)
+ {
+ 	u32 val;
+ 
+ 	val = rgb_color(r, g, b, a);
+ 
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, val, CONSTANTCOLOR(fl->id));
+-	mutex_unlock(&fl->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CONSTANTCOLOR(fu->id));
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchlayer_rgb_constantcolor);
+ 
+-void fetchlayer_yuv_constantcolor(struct dpu_fetchlayer *fl, u8 y, u8 u, u8 v)
++void fetchlayer_yuv_constantcolor(struct dpu_fetchunit *fu, u8 y, u8 u, u8 v)
+ {
+ 	u32 val;
+ 
+ 	val = yuv_color(y, u, v);
+ 
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, val, CONSTANTCOLOR(fl->id));
+-	mutex_unlock(&fl->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CONSTANTCOLOR(fu->id));
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchlayer_yuv_constantcolor);
+ 
+-void fetchlayer_controltrigger(struct dpu_fetchlayer *fl, bool trigger)
++static void fetchlayer_set_controltrigger(struct dpu_fetchunit *fu)
+ {
+-	u32 val;
+-
+-	val = trigger ? SHDTOKGEN : 0;
+-
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, val, CONTROLTRIGGER);
+-	mutex_unlock(&fl->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SHDTOKGEN, CONTROLTRIGGER);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchlayer_controltrigger);
+ 
+-int fetchlayer_fetchtype(struct dpu_fetchlayer *fl, fetchtype_t *type)
++int fetchlayer_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type)
+ {
+-	struct dpu_soc *dpu = fl->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 	u32 val;
+ 
+-	mutex_lock(&fl->mutex);
+-	val = dpu_fl_read(fl, FETCHTYPE);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, FETCHTYPE);
+ 	val &= FETCHTYPE_MASK;
+-	mutex_unlock(&fl->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+ 	switch (val) {
+ 	case FETCHTYPE__DECODE:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with RL and RLAD decoder\n",
+-				fl->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYER:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with fractional "
+-				"plane(8 layers)\n", fl->id);
++				"plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__WARP:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with arbitrary warping and "
+-				"fractional plane(8 layers)\n", fl->id);
++				"fractional plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ECO:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with minimum feature set for "
+ 				"alpha, chroma and coordinate planes\n",
+-				fl->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__PERSP:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with affine, perspective and "
+-				"arbitrary warping\n", fl->id);
++				"arbitrary warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ROT:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with affine and arbitrary "
+-				"warping\n", fl->id);
++				"warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__DECODEL:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with RL and RLAD decoder, "
+-				"reduced feature set\n", fl->id);
++				"reduced feature set\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYERL:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with fractional "
+ 				"plane(8 layers), reduced feature set\n",
+-				fl->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__ROTL:
+ 		dev_dbg(dpu->dev, "FetchLayer%d with affine and arbitrary "
+-				"warping, reduced feature set\n", fl->id);
++				"warping, reduced feature set\n", fu->id);
+ 		break;
+ 	default:
+ 		dev_warn(dpu->dev, "Invalid fetch type %u for FetchLayer%d\n",
+-				val, fl->id);
++				val, fu->id);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -403,159 +201,9 @@ int fetchlayer_fetchtype(struct dpu_fetchlayer *fl, fetchtype_t *type)
+ }
+ EXPORT_SYMBOL_GPL(fetchlayer_fetchtype);
+ 
+-unsigned int fetchlayer_get_stream_id(struct dpu_fetchlayer *fl)
+-{
+-	return fl->stream_id;
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_get_stream_id);
+-
+-void fetchlayer_set_stream_id(struct dpu_fetchlayer *fl, unsigned int id)
++struct dpu_fetchunit *dpu_fl_get(struct dpu_soc *dpu, int id)
+ {
+-	switch (id) {
+-	case DPU_PLANE_SRC_TO_DISP_STREAM0:
+-	case DPU_PLANE_SRC_TO_DISP_STREAM1:
+-	case DPU_PLANE_SRC_DISABLED:
+-		fl->stream_id = id;
+-		break;
+-	default:
+-		WARN_ON(1);
+-	}
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_set_stream_id);
+-
+-void
+-fetchlayer_configure_prefetch(struct dpu_fetchlayer *fl, unsigned int stream_id,
+-			      unsigned int width, unsigned int height,
+-			      unsigned int x_offset, unsigned int y_offset,
+-			      unsigned int stride, u32 format, u64 modifier,
+-			      unsigned long baddr, bool start)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_configure(fl->dprc,
+-			stream_id, width, height, x_offset, y_offset, stride,
+-			format, modifier, baddr, 0, start, false, false);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_configure_prefetch);
+-
+-void fetchlayer_enable_prefetch(struct dpu_fetchlayer *fl)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_enable(fl->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_enable_prefetch);
+-
+-void fetchlayer_disable_prefetch(struct dpu_fetchlayer *fl)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_disable(fl->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_disable_prefetch);
+-
+-void fetchlayer_reg_update_prefetch(struct dpu_fetchlayer *fl)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_reg_update(fl->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_reg_update_prefetch);
+-
+-void fetchlayer_prefetch_first_frame_handle(struct dpu_fetchlayer *fl)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_first_frame_handle(fl->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_prefetch_first_frame_handle);
+-
+-void fetchlayer_prefetch_irq_handle(struct dpu_fetchlayer *fl)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_irq_handle(fl->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_prefetch_irq_handle);
+-
+-void fetchlayer_prefetch_enable_first_frame_irq(struct dpu_fetchlayer *fl)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return;
+-
+-	dprc_enable_ctrl_done_irq(fl->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_prefetch_enable_first_frame_irq);
+-
+-bool fetchlayer_has_prefetch(struct dpu_fetchlayer *fl)
+-{
+-	return !!fl->dprc;
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_has_prefetch);
+-
+-bool fetchlayer_prefetch_format_supported(struct dpu_fetchlayer *fl,
+-					  u32 format, u64 modifier)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return false;
+-
+-	return dprc_format_supported(fl->dprc, format, modifier);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_prefetch_format_supported);
+-
+-bool fetchlayer_prefetch_stride_supported(struct dpu_fetchlayer *fl,
+-					  unsigned int stride,
+-					  unsigned int width,
+-					  u32 format)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return false;
+-
+-	return dprc_stride_supported(fl->dprc, stride, 0, width, format);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_prefetch_stride_supported);
+-
+-bool fetchlayer_prefetch_stride_double_check(struct dpu_fetchlayer *fl,
+-					     unsigned int stride,
+-					     unsigned int width,
+-					     u32 format,
+-					     dma_addr_t baseaddr)
+-{
+-	if (WARN_ON(!fl || !fl->dprc))
+-		return false;
+-
+-	return dprc_stride_double_check(fl->dprc, stride, 0, width, format,
+-					baseaddr, 0);
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_prefetch_stride_double_check);
+-
+-void fetchlayer_pin_off(struct dpu_fetchlayer *fl)
+-{
+-	fl->pin_off = true;
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_pin_off);
+-
+-void fetchlayer_unpin_off(struct dpu_fetchlayer *fl)
+-{
+-	fl->pin_off = false;
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_unpin_off);
+-
+-bool fetchlayer_is_pinned_off(struct dpu_fetchlayer *fl)
+-{
+-	return fl->pin_off;
+-}
+-EXPORT_SYMBOL_GPL(fetchlayer_is_pinned_off);
+-
+-struct dpu_fetchlayer *dpu_fl_get(struct dpu_soc *dpu, int id)
+-{
+-	struct dpu_fetchlayer *fl;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fl_ids); i++)
+@@ -565,36 +213,55 @@ struct dpu_fetchlayer *dpu_fl_get(struct dpu_soc *dpu, int id)
+ 	if (i == ARRAY_SIZE(fl_ids))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	fl = dpu->fl_priv[i];
++	fu = dpu->fl_priv[i];
+ 
+-	mutex_lock(&fl->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	if (fl->inuse) {
+-		fl = ERR_PTR(-EBUSY);
++	if (fu->inuse) {
++		fu = ERR_PTR(-EBUSY);
+ 		goto out;
+ 	}
+ 
+-	fl->inuse = true;
++	fu->inuse = true;
+ out:
+-	mutex_unlock(&fl->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+-	return fl;
++	return fu;
+ }
+ EXPORT_SYMBOL_GPL(dpu_fl_get);
+ 
+-void dpu_fl_put(struct dpu_fetchlayer *fl)
++void dpu_fl_put(struct dpu_fetchunit *fu)
+ {
+-	mutex_lock(&fl->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	fl->inuse = false;
++	fu->inuse = false;
+ 
+-	mutex_unlock(&fl->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(dpu_fl_put);
+ 
++static const struct dpu_fetchunit_ops fl_ops = {
++	.set_burstlength = fetchunit_set_burstlength,
++	.set_baseaddress = fetchunit_set_baseaddress,
++	.set_src_bpp = fetchunit_set_src_bpp,
++	.set_src_stride = fetchunit_set_src_stride,
++	.set_src_buf_dimensions = fetchlayer_set_src_buf_dimensions,
++	.set_fmt = fetchlayer_set_fmt,
++	.enable_src_buf = fetchunit_enable_src_buf,
++	.disable_src_buf = fetchunit_disable_src_buf,
++	.is_enabled = fetchunit_is_enabled,
++	.set_framedimensions = fetchlayer_set_framedimensions,
++	.set_controltrigger = fetchlayer_set_controltrigger,
++	.get_stream_id = fetchunit_get_stream_id,
++	.set_stream_id = fetchunit_set_stream_id,
++	.pin_off = fetchunit_pin_off,
++	.unpin_off = fetchunit_unpin_off,
++	.is_pinned_off = fetchunit_is_pinned_off,
++};
++
+ void _dpu_fl_init(struct dpu_soc *dpu, unsigned int id)
+ {
+-	struct dpu_fetchlayer *fl;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fl_ids); i++)
+@@ -604,51 +271,56 @@ void _dpu_fl_init(struct dpu_soc *dpu, unsigned int id)
+ 	if (WARN_ON(i == ARRAY_SIZE(fl_ids)))
+ 		return;
+ 
+-	fl = dpu->fl_priv[i];
++	fu = dpu->fl_priv[i];
+ 
+-	fetchlayer_baddr_autoupdate(fl, 0x0);
+-	fetchlayer_shden(fl, true);
+-	fetchlayer_shdldreq_sticky(fl, 0xFF);
+-	for (i = 0; i < DPU_FRAC_PLANE_LAYER_NUM; i++)
+-		fetchlayer_source_buffer_disable(fl, i);
++	fetchunit_baddr_autoupdate(fu, 0x0);
++	fetchunit_shden(fu, true);
++	fetchunit_shdldreq_sticky(fu, 0xFF);
++	fetchunit_disable_src_buf(fu);
+ 
+-	mutex_lock(&fl->mutex);
+-	dpu_fl_write(fl, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
+ 			BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fl->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ 
+ int dpu_fl_init(struct dpu_soc *dpu, unsigned int id,
+ 		unsigned long pec_base, unsigned long base)
+ {
+ 	struct dpu_fetchlayer *fl;
++	struct dpu_fetchunit *fu;
+ 	int ret, i;
+ 
+ 	fl = devm_kzalloc(dpu->dev, sizeof(*fl), GFP_KERNEL);
+ 	if (!fl)
+ 		return -ENOMEM;
+ 
+-	dpu->fl_priv[id] = fl;
++	fu = &fl->fu;
++	dpu->fl_priv[id] = fu;
+ 
+-	fl->pec_base = devm_ioremap(dpu->dev, base, SZ_16);
+-	if (!fl->pec_base)
++	fu->pec_base = devm_ioremap(dpu->dev, base, SZ_16);
++	if (!fu->pec_base)
+ 		return -ENOMEM;
+ 
+-	fl->base = devm_ioremap(dpu->dev, base, SZ_512);
+-	if (!fl->base)
++	fu->base = devm_ioremap(dpu->dev, base, SZ_512);
++	if (!fu->base)
+ 		return -ENOMEM;
+ 
+-	fl->dpu = dpu;
+-	fl->id = id;
++	fu->dpu = dpu;
++	fu->id = id;
++	fu->sub_id = 0;
++	fu->type = FU_T_FL;
++	fu->ops = &fl_ops;
++	fu->name = "fetchlayer";
+ 	for (i = 0; i < ARRAY_SIZE(fl_ids); i++) {
+ 		if (fl_ids[i] == id) {
+ 			fl->shdlreq = fl_shdlreqs[i];
+ 			break;
+ 		}
+ 	}
+-	mutex_init(&fl->mutex);
++	mutex_init(&fu->mutex);
+ 
+-	ret = fetchlayer_fetchtype(fl, &fl->fetchtype);
++	ret = fetchlayer_fetchtype(fu, &fl->fetchtype);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -656,11 +328,3 @@ int dpu_fl_init(struct dpu_soc *dpu, unsigned int id,
+ 
+ 	return 0;
+ }
+-
+-void fetchlayer_get_dprc(struct dpu_fetchlayer *fl, void *data)
+-{
+-	if (WARN_ON(!fl))
+-		return;
+-
+-	fl->dprc = data;
+-}
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchunit.c b/drivers/gpu/imx/dpu/dpu-fetchunit.c
+new file mode 100644
+index 0000000..11b57ff
+--- /dev/null
++++ b/drivers/gpu/imx/dpu/dpu-fetchunit.c
+@@ -0,0 +1,292 @@
++/*
++ * Copyright 2018 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 of the License, or (at your
++ * option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ */
++
++#include <video/dpu.h>
++#include "dpu-prv.h"
++
++#define BASEADDRESS(n)			(0x10 + (n) * 0x28)
++#define SOURCEBUFFERATTRIBUTES(n)	(0x14 + (n) * 0x28)
++#define SOURCEBUFFERDIMENSION(n)	(0x18 + (n) * 0x28)
++#define COLORCOMPONENTBITS(n)		(0x1C + (n) * 0x28)
++#define COLORCOMPONENTSHIFT(n)		(0x20 + (n) * 0x28)
++#define LAYEROFFSET(n)			(0x24 + (n) * 0x28)
++#define CLIPWINDOWOFFSET(n)		(0x28 + (n) * 0x28)
++#define CLIPWINDOWDIMENSIONS(n)		(0x2C + (n) * 0x28)
++#define CONSTANTCOLOR(n)		(0x30 + (n) * 0x28)
++#define LAYERPROPERTY(n)		(0x34 + (n) * 0x28)
++
++void fetchunit_get_dprc(struct dpu_fetchunit *fu, void *data)
++{
++	if (WARN_ON(!fu))
++		return;
++
++	fu->dprc = data;
++}
++EXPORT_SYMBOL_GPL(fetchunit_get_dprc);
++
++void fetchunit_shden(struct dpu_fetchunit *fu, bool enable)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, STATICCONTROL);
++	if (enable)
++		val |= SHDEN;
++	else
++		val &= ~SHDEN;
++	dpu_fu_write(fu, val, STATICCONTROL);
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_shden);
++
++void fetchunit_baddr_autoupdate(struct dpu_fetchunit *fu, u8 layer_mask)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, STATICCONTROL);
++	val &= ~BASEADDRESSAUTOUPDATE_MASK;
++	val |= BASEADDRESSAUTOUPDATE(layer_mask);
++	dpu_fu_write(fu, val, STATICCONTROL);
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_baddr_autoupdate);
++
++void fetchunit_shdldreq_sticky(struct dpu_fetchunit *fu, u8 layer_mask)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, STATICCONTROL);
++	val &= ~SHDLDREQSTICKY_MASK;
++	val |= SHDLDREQSTICKY(layer_mask);
++	dpu_fu_write(fu, val, STATICCONTROL);
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_shdldreq_sticky);
++
++void fetchunit_set_burstlength(struct dpu_fetchunit *fu, dma_addr_t baddr,
++			       bool use_prefetch)
++{
++	struct dpu_soc *dpu = fu->dpu;
++	unsigned int burst_size, burst_length;
++	u32 val;
++
++	if (use_prefetch) {
++		/*
++		 * address TKT343664:
++		 * fetch unit base address has to align to burst size
++		 */
++		burst_size = 1 << (ffs(baddr) - 1);
++		burst_size = min(burst_size, 128U);
++		burst_length = burst_size / 8;
++	} else {
++		burst_length = 16;
++	}
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, BURSTBUFFERMANAGEMENT);
++	val &= ~SETBURSTLENGTH_MASK;
++	val |= SETBURSTLENGTH(burst_length);
++	dpu_fu_write(fu, val, BURSTBUFFERMANAGEMENT);
++	mutex_unlock(&fu->mutex);
++
++	dev_dbg(dpu->dev, "%s%d burst length is %u\n",
++					fu->name, fu->id, burst_length);
++}
++EXPORT_SYMBOL_GPL(fetchunit_set_burstlength);
++
++void fetchunit_set_baseaddress(struct dpu_fetchunit *fu, dma_addr_t paddr)
++{
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, paddr, BASEADDRESS(fu->sub_id));
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_set_baseaddress);
++
++void fetchunit_set_src_bpp(struct dpu_fetchunit *fu, int bpp)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, SOURCEBUFFERATTRIBUTES(fu->sub_id));
++	val &= ~0x3f0000;
++	val |= BITSPERPIXEL(bpp);
++	dpu_fu_write(fu, val, SOURCEBUFFERATTRIBUTES(fu->sub_id));
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_set_src_bpp);
++
++/*
++ * The arguments width and bpp are valid only when use_prefetch is true.
++ * For fetcheco, since the pixel format has to be NV12 or NV21 when
++ * use_prefetch is true, we assume width stands for how many UV we have
++ * in bytes for one line, while bpp should be 8bits for every U or V component.
++ */
++void fetchunit_set_src_stride(struct dpu_fetchunit *fu,
++			      unsigned int width, int bpp, unsigned int stride,
++			      dma_addr_t baddr, bool use_prefetch)
++{
++	unsigned int burst_size;
++	u32 val;
++
++	if (use_prefetch) {
++		/*
++		 * address TKT343664:
++		 * fetch unit base address has to align to burst size
++		 */
++		burst_size = 1 << (ffs(baddr) - 1);
++		burst_size = min(burst_size, 128U);
++
++		stride = width * (bpp >> 3);
++		/*
++		 * address TKT339017:
++		 * fixup for burst size vs stride mismatch
++		 */
++		stride = round_up(stride, burst_size);
++	}
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, SOURCEBUFFERATTRIBUTES(fu->sub_id));
++	val &= ~0xffff;
++	val |= STRIDE(stride);
++	dpu_fu_write(fu, val, SOURCEBUFFERATTRIBUTES(fu->sub_id));
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_set_src_stride);
++
++void fetchunit_enable_src_buf(struct dpu_fetchunit *fu)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY(fu->sub_id));
++	val |= SOURCEBUFFERENABLE;
++	dpu_fu_write(fu, val, LAYERPROPERTY(fu->sub_id));
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_enable_src_buf);
++
++void fetchunit_disable_src_buf(struct dpu_fetchunit *fu)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY(fu->sub_id));
++	val &= ~SOURCEBUFFERENABLE;
++	dpu_fu_write(fu, val, LAYERPROPERTY(fu->sub_id));
++	mutex_unlock(&fu->mutex);
++}
++EXPORT_SYMBOL_GPL(fetchunit_disable_src_buf);
++
++bool fetchunit_is_enabled(struct dpu_fetchunit *fu)
++{
++	u32 val;
++
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY(fu->sub_id));
++	mutex_unlock(&fu->mutex);
++
++	return !!(val & SOURCEBUFFERENABLE);
++}
++EXPORT_SYMBOL_GPL(fetchunit_is_enabled);
++
++unsigned int fetchunit_get_stream_id(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return DPU_PLANE_SRC_DISABLED;
++
++	return fu->stream_id;
++}
++EXPORT_SYMBOL_GPL(fetchunit_get_stream_id);
++
++void fetchunit_set_stream_id(struct dpu_fetchunit *fu, unsigned int id)
++{
++	if (WARN_ON(!fu))
++		return;
++
++	switch (id) {
++	case DPU_PLANE_SRC_TO_DISP_STREAM0:
++	case DPU_PLANE_SRC_TO_DISP_STREAM1:
++	case DPU_PLANE_SRC_DISABLED:
++		fu->stream_id = id;
++		break;
++	default:
++		WARN_ON(1);
++	}
++}
++EXPORT_SYMBOL_GPL(fetchunit_set_stream_id);
++
++void fetchunit_pin_off(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return;
++
++	fu->pin_off = true;
++}
++EXPORT_SYMBOL_GPL(fetchunit_pin_off);
++
++void fetchunit_unpin_off(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return;
++
++	fu->pin_off = false;
++}
++EXPORT_SYMBOL_GPL(fetchunit_unpin_off);
++
++bool fetchunit_is_pinned_off(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return false;
++
++	return fu->pin_off;
++}
++EXPORT_SYMBOL_GPL(fetchunit_is_pinned_off);
++
++bool fetchunit_is_fetchdecode(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return false;
++
++	return fu->type == FU_T_FD;
++}
++EXPORT_SYMBOL_GPL(fetchunit_is_fetchdecode);
++
++bool fetchunit_is_fetcheco(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return false;
++
++	return fu->type == FU_T_FE;
++}
++EXPORT_SYMBOL_GPL(fetchunit_is_fetcheco);
++
++bool fetchunit_is_fetchlayer(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return false;
++
++	return fu->type == FU_T_FL;
++}
++EXPORT_SYMBOL_GPL(fetchunit_is_fetchlayer);
++
++bool fetchunit_is_fetchwarp(struct dpu_fetchunit *fu)
++{
++	if (WARN_ON(!fu))
++		return false;
++
++	return fu->type == FU_T_FW;
++}
++EXPORT_SYMBOL_GPL(fetchunit_is_fetchwarp);
+diff --git a/drivers/gpu/imx/dpu/dpu-fetchwarp.c b/drivers/gpu/imx/dpu/dpu-fetchwarp.c
+index 2a6fc41..99ef232 100644
+--- a/drivers/gpu/imx/dpu/dpu-fetchwarp.c
++++ b/drivers/gpu/imx/dpu/dpu-fetchwarp.c
+@@ -18,7 +18,6 @@
+ #include <linux/platform_device.h>
+ #include <linux/types.h>
+ #include <video/dpu.h>
+-#include <video/imx8-prefetch.h>
+ #include "dpu-prv.h"
+ 
+ #define PIXENGCFG_STATUS		0x8
+@@ -51,349 +50,149 @@
+ #define HIDDENSTATUS			0x18c
+ 
+ struct dpu_fetchwarp {
+-	void __iomem *pec_base;
+-	void __iomem *base;
+-	struct mutex mutex;
+-	int id;
+-	bool inuse;
+-	bool pin_off;
+-	struct dpu_soc *dpu;
++	struct dpu_fetchunit fu;
+ 	fetchtype_t fetchtype;
+-	/* see DPU_PLANE_SRC_xxx */
+-	unsigned int stream_id;
+-	struct dprc *dprc;
+ };
+ 
+-static inline u32 dpu_fw_read(struct dpu_fetchwarp *fw, unsigned int offset)
+-{
+-	return readl(fw->base + offset);
+-}
+-
+-static inline void dpu_fw_write(struct dpu_fetchwarp *fw, u32 value,
+-				unsigned int offset)
+-{
+-	writel(value, fw->base + offset);
+-}
+-
+-static inline u32 rgb_color(u8 r, u8 g, u8 b, u8 a)
+-{
+-	return (r << 24) | (g << 16) | (b << 8) | a;
+-}
+-
+-static inline u32 yuv_color(u8 y, u8 u, u8 v)
+-{
+-	return (y << 24) | (u << 16) | (v << 8);
+-}
+-
+-void fetchwarp_shden(struct dpu_fetchwarp *fw, bool enable)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, STATICCONTROL);
+-	if (enable)
+-		val |= SHDEN;
+-	else
+-		val &= ~SHDEN;
+-	dpu_fw_write(fw, val, STATICCONTROL);
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_shden);
+-
+-void fetchwarp_baddr_autoupdate(struct dpu_fetchwarp *fw, u8 layer_mask)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, STATICCONTROL);
+-	val &= ~BASEADDRESSAUTOUPDATE_MASK;
+-	val |= BASEADDRESSAUTOUPDATE(layer_mask);
+-	dpu_fw_write(fw, val, STATICCONTROL);
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_baddr_autoupdate);
+-
+-void fetchwarp_shdldreq_sticky(struct dpu_fetchwarp *fw, u8 layer_mask)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, STATICCONTROL);
+-	val &= ~SHDLDREQSTICKY_MASK;
+-	val |= SHDLDREQSTICKY(layer_mask);
+-	dpu_fw_write(fw, val, STATICCONTROL);
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_shdldreq_sticky);
+-
+-void fetchwarp_set_burstlength(struct dpu_fetchwarp *fw, dma_addr_t baddr,
+-			       bool use_prefetch)
+-{
+-	struct dpu_soc *dpu = fw->dpu;
+-	unsigned int burst_size, burst_length;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-		burst_length = burst_size / 8;
+-	} else {
+-		burst_length = 16;
+-	}
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, BURSTBUFFERMANAGEMENT);
+-	val &= ~SETBURSTLENGTH_MASK;
+-	val |= SETBURSTLENGTH(burst_length);
+-	dpu_fw_write(fw, val, BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fw->mutex);
+-
+-	dev_dbg(dpu->dev, "FetchWarp%d burst length is %u\n",
+-							fw->id, burst_length);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_set_burstlength);
+-
+-void fetchwarp_baseaddress(struct dpu_fetchwarp *fw, unsigned int index,
+-			   dma_addr_t paddr)
+-{
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, paddr, BASEADDRESS(index));
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_baseaddress);
+-
+-void fetchwarp_source_bpp(struct dpu_fetchwarp *fw, unsigned int index,
+-			  int bpp)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, SOURCEBUFFERATTRIBUTES(index));
+-	val &= ~0x3f0000;
+-	val |= BITSPERPIXEL(bpp);
+-	dpu_fw_write(fw, val, SOURCEBUFFERATTRIBUTES(index));
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_source_bpp);
+-
+-void fetchwarp_source_stride(struct dpu_fetchwarp *fw, unsigned int index,
+-			     unsigned int width, int bpp, unsigned int stride,
+-			     dma_addr_t baddr, bool use_prefetch)
+-{
+-	unsigned int burst_size;
+-	u32 val;
+-
+-	if (use_prefetch) {
+-		/*
+-		 * address TKT343664:
+-		 * fetch unit base address has to align to burst size
+-		 */
+-		burst_size = 1 << (ffs(baddr) - 1);
+-		burst_size = min(burst_size, 128U);
+-
+-		stride = width * (bpp >> 3);
+-		/*
+-		 * address TKT339017:
+-		 * fixup for burst size vs stride mismatch
+-		 */
+-		stride = round_up(stride, burst_size);
+-	}
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, SOURCEBUFFERATTRIBUTES(index));
+-	val &= ~0xffff;
+-	val |= STRIDE(stride);
+-	dpu_fw_write(fw, val, SOURCEBUFFERATTRIBUTES(index));
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_source_stride);
+-
+-void fetchwarp_src_buf_dimensions(struct dpu_fetchwarp *fw,
+-				  unsigned int index, unsigned int w,
+-				  unsigned int h)
++static void
++fetchwarp_set_src_buf_dimensions(struct dpu_fetchunit *fu,
++				 unsigned int w, unsigned int h,
++				 u32 unused1, bool unused2)
+ {
+ 	u32 val;
+ 
+ 	val = LINEWIDTH(w) | LINECOUNT(h);
+ 
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, val, SOURCEBUFFERDIMENSION(index));
+-	mutex_unlock(&fw->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, SOURCEBUFFERDIMENSION(fu->sub_id));
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchwarp_src_buf_dimensions);
+ 
+-void fetchwarp_set_fmt(struct dpu_fetchwarp *fw, unsigned int index, u32 fmt)
++static void fetchwarp_set_fmt(struct dpu_fetchunit *fu,
++			      u32 fmt, bool unused)
+ {
+ 	u32 val, bits, shift;
+-	int i;
++	int i, sub_id = fu->sub_id;
+ 
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, LAYERPROPERTY(index));
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, LAYERPROPERTY(sub_id));
+ 	val &= ~YUVCONVERSIONMODE_MASK;
+-	dpu_fw_write(fw, val, LAYERPROPERTY(index));
+-	mutex_unlock(&fw->mutex);
++	dpu_fu_write(fu, val, LAYERPROPERTY(sub_id));
++	mutex_unlock(&fu->mutex);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dpu_pixel_format_matrix); i++) {
+ 		if (dpu_pixel_format_matrix[i].pixel_format == fmt) {
+ 			bits = dpu_pixel_format_matrix[i].bits;
+ 			shift = dpu_pixel_format_matrix[i].shift;
+ 
+-			mutex_lock(&fw->mutex);
+-			dpu_fw_write(fw, bits, COLORCOMPONENTBITS(index));
+-			dpu_fw_write(fw, shift, COLORCOMPONENTSHIFT(index));
+-			mutex_unlock(&fw->mutex);
++			mutex_lock(&fu->mutex);
++			dpu_fu_write(fu, bits, COLORCOMPONENTBITS(sub_id));
++			dpu_fu_write(fu, shift, COLORCOMPONENTSHIFT(sub_id));
++			mutex_unlock(&fu->mutex);
+ 			return;
+ 		}
+ 	}
+ 
+ 	WARN_ON(1);
+ }
+-EXPORT_SYMBOL_GPL(fetchwarp_set_fmt);
+-
+-void fetchwarp_source_buffer_enable(struct dpu_fetchwarp *fw,
+-				    unsigned int index)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, LAYERPROPERTY(index));
+-	val |= SOURCEBUFFERENABLE;
+-	dpu_fw_write(fw, val, LAYERPROPERTY(index));
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_source_buffer_enable);
+-
+-void fetchwarp_source_buffer_disable(struct dpu_fetchwarp *fw,
+-				     unsigned int index)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, LAYERPROPERTY(index));
+-	val &= ~SOURCEBUFFERENABLE;
+-	dpu_fw_write(fw, val, LAYERPROPERTY(index));
+-	mutex_unlock(&fw->mutex);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_source_buffer_disable);
+-
+-bool fetchwarp_is_enabled(struct dpu_fetchwarp *fw, unsigned int index)
+-{
+-	u32 val;
+-
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, LAYERPROPERTY(index));
+-	mutex_unlock(&fw->mutex);
+-
+-	return !!(val & SOURCEBUFFERENABLE);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_is_enabled);
+ 
+-void fetchwarp_framedimensions(struct dpu_fetchwarp *fw, unsigned int w,
+-			       unsigned int h)
++static void
++fetchwarp_set_framedimensions(struct dpu_fetchunit *fu,
++			      unsigned int w, unsigned int h, bool unused)
+ {
+ 	u32 val;
+ 
+ 	val = FRAMEWIDTH(w) | FRAMEHEIGHT(h);
+ 
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, val, FRAMEDIMENSIONS);
+-	mutex_unlock(&fw->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, FRAMEDIMENSIONS);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchwarp_framedimensions);
+ 
+-void fetchwarp_rgb_constantcolor(struct dpu_fetchwarp *fw,
++void fetchwarp_rgb_constantcolor(struct dpu_fetchunit *fu,
+ 				 u8 r, u8 g, u8 b, u8 a)
+ {
+ 	u32 val;
+ 
+ 	val = rgb_color(r, g, b, a);
+ 
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, val, CONSTANTCOLOR(fw->id));
+-	mutex_unlock(&fw->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CONSTANTCOLOR(fu->id));
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchwarp_rgb_constantcolor);
+ 
+-void fetchwarp_yuv_constantcolor(struct dpu_fetchwarp *fw, u8 y, u8 u, u8 v)
++void fetchwarp_yuv_constantcolor(struct dpu_fetchunit *fu, u8 y, u8 u, u8 v)
+ {
+ 	u32 val;
+ 
+ 	val = yuv_color(y, u, v);
+ 
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, val, CONSTANTCOLOR(fw->id));
+-	mutex_unlock(&fw->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, val, CONSTANTCOLOR(fu->id));
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(fetchwarp_yuv_constantcolor);
+ 
+-void fetchwarp_controltrigger(struct dpu_fetchwarp *fw, bool trigger)
++static void fetchwarp_set_controltrigger(struct dpu_fetchunit *fu)
+ {
+-	u32 val;
+-
+-	val = trigger ? SHDTOKGEN : 0;
+-
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, val, CONTROLTRIGGER);
+-	mutex_unlock(&fw->mutex);
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SHDTOKGEN, CONTROLTRIGGER);
++	mutex_unlock(&fu->mutex);
+ }
+-EXPORT_SYMBOL_GPL(fetchwarp_controltrigger);
+ 
+-int fetchwarp_fetchtype(struct dpu_fetchwarp *fw, fetchtype_t *type)
++int fetchwarp_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type)
+ {
+-	struct dpu_soc *dpu = fw->dpu;
++	struct dpu_soc *dpu = fu->dpu;
+ 	u32 val;
+ 
+-	mutex_lock(&fw->mutex);
+-	val = dpu_fw_read(fw, FETCHTYPE);
++	mutex_lock(&fu->mutex);
++	val = dpu_fu_read(fu, FETCHTYPE);
+ 	val &= FETCHTYPE_MASK;
+-	mutex_unlock(&fw->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+ 	switch (val) {
+ 	case FETCHTYPE__DECODE:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with RL and RLAD decoder\n",
+-				fw->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYER:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with fractional "
+-				"plane(8 layers)\n", fw->id);
++				"plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__WARP:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with arbitrary warping and "
+-				"fractional plane(8 layers)\n", fw->id);
++				"fractional plane(8 layers)\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ECO:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with minimum feature set for "
+ 				"alpha, chroma and coordinate planes\n",
+-				fw->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__PERSP:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with affine, perspective and "
+-				"arbitrary warping\n", fw->id);
++				"arbitrary warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__ROT:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with affine and arbitrary "
+-				"warping\n", fw->id);
++				"warping\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__DECODEL:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with RL and RLAD decoder, "
+-				"reduced feature set\n", fw->id);
++				"reduced feature set\n", fu->id);
+ 		break;
+ 	case FETCHTYPE__LAYERL:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with fractional "
+ 				"plane(8 layers), reduced feature set\n",
+-				fw->id);
++				fu->id);
+ 		break;
+ 	case FETCHTYPE__ROTL:
+ 		dev_dbg(dpu->dev, "FetchWarp%d with affine and arbitrary "
+-				"warping, reduced feature set\n", fw->id);
++				"warping, reduced feature set\n", fu->id);
+ 		break;
+ 	default:
+ 		dev_warn(dpu->dev, "Invalid fetch type %u for FetchWarp%d\n",
+-				val, fw->id);
++				val, fu->id);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -402,159 +201,9 @@ int fetchwarp_fetchtype(struct dpu_fetchwarp *fw, fetchtype_t *type)
+ }
+ EXPORT_SYMBOL_GPL(fetchwarp_fetchtype);
+ 
+-unsigned int fetchwarp_get_stream_id(struct dpu_fetchwarp *fw)
+-{
+-	return fw->stream_id;
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_get_stream_id);
+-
+-void fetchwarp_set_stream_id(struct dpu_fetchwarp *fw, unsigned int id)
++struct dpu_fetchunit *dpu_fw_get(struct dpu_soc *dpu, int id)
+ {
+-	switch (id) {
+-	case DPU_PLANE_SRC_TO_DISP_STREAM0:
+-	case DPU_PLANE_SRC_TO_DISP_STREAM1:
+-	case DPU_PLANE_SRC_DISABLED:
+-		fw->stream_id = id;
+-		break;
+-	default:
+-		WARN_ON(1);
+-	}
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_set_stream_id);
+-
+-void
+-fetchwarp_configure_prefetch(struct dpu_fetchwarp *fw, unsigned int stream_id,
+-			     unsigned int width, unsigned int height,
+-			     unsigned int x_offset, unsigned int y_offset,
+-			     unsigned int stride, u32 format, u64 modifier,
+-			     unsigned long baddr, bool start)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_configure(fw->dprc,
+-			stream_id, width, height, x_offset, y_offset, stride,
+-			format, modifier, baddr, 0, start, false, false);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_configure_prefetch);
+-
+-void fetchwarp_enable_prefetch(struct dpu_fetchwarp *fw)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_enable(fw->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_enable_prefetch);
+-
+-void fetchwarp_disable_prefetch(struct dpu_fetchwarp *fw)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_disable(fw->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_disable_prefetch);
+-
+-void fetchwarp_reg_update_prefetch(struct dpu_fetchwarp *fw)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_reg_update(fw->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_reg_update_prefetch);
+-
+-void fetchwarp_prefetch_first_frame_handle(struct dpu_fetchwarp *fw)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_first_frame_handle(fw->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_prefetch_first_frame_handle);
+-
+-void fetchwarp_prefetch_irq_handle(struct dpu_fetchwarp *fw)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_irq_handle(fw->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_prefetch_irq_handle);
+-
+-void fetchwarp_prefetch_enable_first_frame_irq(struct dpu_fetchwarp *fw)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return;
+-
+-	dprc_enable_ctrl_done_irq(fw->dprc);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_prefetch_enable_first_frame_irq);
+-
+-bool fetchwarp_has_prefetch(struct dpu_fetchwarp *fw)
+-{
+-	return !!fw->dprc;
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_has_prefetch);
+-
+-bool fetchwarp_prefetch_format_supported(struct dpu_fetchwarp *fw,
+-					 u32 format, u64 modifier)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return false;
+-
+-	return dprc_format_supported(fw->dprc, format, modifier);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_prefetch_format_supported);
+-
+-bool fetchwarp_prefetch_stride_supported(struct dpu_fetchwarp *fw,
+-					 unsigned int stride,
+-					 unsigned int width,
+-					 u32 format)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return false;
+-
+-	return dprc_stride_supported(fw->dprc, stride, 0, width, format);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_prefetch_stride_supported);
+-
+-bool fetchwarp_prefetch_stride_double_check(struct dpu_fetchwarp *fw,
+-					    unsigned int stride,
+-					    unsigned int width,
+-					    u32 format,
+-					    dma_addr_t baseaddr)
+-{
+-	if (WARN_ON(!fw || !fw->dprc))
+-		return false;
+-
+-	return dprc_stride_double_check(fw->dprc, stride, 0, width, format,
+-					baseaddr, 0);
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_prefetch_stride_double_check);
+-
+-void fetchwarp_pin_off(struct dpu_fetchwarp *fw)
+-{
+-	fw->pin_off = true;
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_pin_off);
+-
+-void fetchwarp_unpin_off(struct dpu_fetchwarp *fw)
+-{
+-	fw->pin_off = false;
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_unpin_off);
+-
+-bool fetchwarp_is_pinned_off(struct dpu_fetchwarp *fw)
+-{
+-	return fw->pin_off;
+-}
+-EXPORT_SYMBOL_GPL(fetchwarp_is_pinned_off);
+-
+-struct dpu_fetchwarp *dpu_fw_get(struct dpu_soc *dpu, int id)
+-{
+-	struct dpu_fetchwarp *fw;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fw_ids); i++)
+@@ -564,36 +213,55 @@ struct dpu_fetchwarp *dpu_fw_get(struct dpu_soc *dpu, int id)
+ 	if (i == ARRAY_SIZE(fw_ids))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	fw = dpu->fw_priv[i];
++	fu = dpu->fw_priv[i];
+ 
+-	mutex_lock(&fw->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	if (fw->inuse) {
+-		fw = ERR_PTR(-EBUSY);
++	if (fu->inuse) {
++		fu = ERR_PTR(-EBUSY);
+ 		goto out;
+ 	}
+ 
+-	fw->inuse = true;
++	fu->inuse = true;
+ out:
+-	mutex_unlock(&fw->mutex);
++	mutex_unlock(&fu->mutex);
+ 
+-	return fw;
++	return fu;
+ }
+ EXPORT_SYMBOL_GPL(dpu_fw_get);
+ 
+-void dpu_fw_put(struct dpu_fetchwarp *fw)
++void dpu_fw_put(struct dpu_fetchunit *fu)
+ {
+-	mutex_lock(&fw->mutex);
++	mutex_lock(&fu->mutex);
+ 
+-	fw->inuse = false;
++	fu->inuse = false;
+ 
+-	mutex_unlock(&fw->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ EXPORT_SYMBOL_GPL(dpu_fw_put);
+ 
++static const struct dpu_fetchunit_ops fw_ops = {
++	.set_burstlength = fetchunit_set_burstlength,
++	.set_baseaddress = fetchunit_set_baseaddress,
++	.set_src_bpp = fetchunit_set_src_bpp,
++	.set_src_stride = fetchunit_set_src_stride,
++	.set_src_buf_dimensions = fetchwarp_set_src_buf_dimensions,
++	.set_fmt = fetchwarp_set_fmt,
++	.enable_src_buf = fetchunit_enable_src_buf,
++	.disable_src_buf = fetchunit_disable_src_buf,
++	.is_enabled = fetchunit_is_enabled,
++	.set_framedimensions = fetchwarp_set_framedimensions,
++	.set_controltrigger = fetchwarp_set_controltrigger,
++	.get_stream_id = fetchunit_get_stream_id,
++	.set_stream_id = fetchunit_set_stream_id,
++	.pin_off = fetchunit_pin_off,
++	.unpin_off = fetchunit_unpin_off,
++	.is_pinned_off = fetchunit_is_pinned_off,
++};
++
+ void _dpu_fw_init(struct dpu_soc *dpu, unsigned int id)
+ {
+-	struct dpu_fetchwarp *fw;
++	struct dpu_fetchunit *fu;
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(fw_ids); i++)
+@@ -603,24 +271,24 @@ void _dpu_fw_init(struct dpu_soc *dpu, unsigned int id)
+ 	if (WARN_ON(i == ARRAY_SIZE(fw_ids)))
+ 		return;
+ 
+-	fw = dpu->fw_priv[i];
++	fu = dpu->fw_priv[i];
+ 
+-	fetchwarp_baddr_autoupdate(fw, 0x0);
+-	fetchwarp_shden(fw, true);
+-	fetchwarp_shdldreq_sticky(fw, 0xFF);
+-	for (i = 0; i < DPU_FRAC_PLANE_LAYER_NUM; i++)
+-		fetchwarp_source_buffer_disable(fw, i);
++	fetchunit_baddr_autoupdate(fu, 0x0);
++	fetchunit_shden(fu, true);
++	fetchunit_shdldreq_sticky(fu, 0xFF);
++	fetchunit_disable_src_buf(fu);
+ 
+-	mutex_lock(&fw->mutex);
+-	dpu_fw_write(fw, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
++	mutex_lock(&fu->mutex);
++	dpu_fu_write(fu, SETNUMBUFFERS(16) | SETBURSTLENGTH(16),
+ 			BURSTBUFFERMANAGEMENT);
+-	mutex_unlock(&fw->mutex);
++	mutex_unlock(&fu->mutex);
+ }
+ 
+ int dpu_fw_init(struct dpu_soc *dpu, unsigned int id,
+ 		unsigned long pec_base, unsigned long base)
+ {
+ 	struct dpu_fetchwarp *fw;
++	struct dpu_fetchunit *fu;
+ 	int i, ret;
+ 
+ 	fw = devm_kzalloc(dpu->dev, sizeof(*fw), GFP_KERNEL);
+@@ -631,22 +299,27 @@ int dpu_fw_init(struct dpu_soc *dpu, unsigned int id,
+ 		if (fw_ids[i] == id)
+ 			break;
+ 
+-	dpu->fw_priv[i] = fw;
++	fu = &fw->fu;
++	dpu->fw_priv[i] = fu;
+ 
+-	fw->pec_base = devm_ioremap(dpu->dev, base, SZ_16);
+-	if (!fw->pec_base)
++	fu->pec_base = devm_ioremap(dpu->dev, base, SZ_16);
++	if (!fu->pec_base)
+ 		return -ENOMEM;
+ 
+-	fw->base = devm_ioremap(dpu->dev, base, SZ_512);
+-	if (!fw->base)
++	fu->base = devm_ioremap(dpu->dev, base, SZ_512);
++	if (!fu->base)
+ 		return -ENOMEM;
+ 
+-	fw->dpu = dpu;
+-	fw->id = id;
++	fu->dpu = dpu;
++	fu->id = id;
++	fu->sub_id = 0;
++	fu->type = FU_T_FW;
++	fu->ops = &fw_ops;
++	fu->name = "fetchwarp";
+ 
+-	mutex_init(&fw->mutex);
++	mutex_init(&fu->mutex);
+ 
+-	ret = fetchwarp_fetchtype(fw, &fw->fetchtype);
++	ret = fetchwarp_fetchtype(fu, &fw->fetchtype);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -654,11 +327,3 @@ int dpu_fw_init(struct dpu_soc *dpu, unsigned int id,
+ 
+ 	return 0;
+ }
+-
+-void fetchwarp_get_dprc(struct dpu_fetchwarp *fw, void *data)
+-{
+-	if (WARN_ON(!fw))
+-		return;
+-
+-	fw->dprc = data;
+-}
+diff --git a/drivers/gpu/imx/dpu/dpu-prv.h b/drivers/gpu/imx/dpu/dpu-prv.h
+index 2f8a7e4..b82b3e2a 100644
+--- a/drivers/gpu/imx/dpu/dpu-prv.h
++++ b/drivers/gpu/imx/dpu/dpu-prv.h
+@@ -16,6 +16,7 @@
+ #define __DPU_PRV_H__
+ 
+ #include <drm/drm_fourcc.h>
++#include <video/dpu.h>
+ 
+ #define NA				0xDEADBEEF	/* not available */
+ 
+@@ -238,11 +239,11 @@ struct dpu_soc {
+ 	struct dpu_constframe	*cf_priv[4];
+ 	struct dpu_disengcfg	*dec_priv[2];
+ 	struct dpu_extdst	*ed_priv[4];
+-	struct dpu_fetchdecode	*fd_priv[4];
+-	struct dpu_fetcheco	*fe_priv[4];
++	struct dpu_fetchunit	*fd_priv[4];
++	struct dpu_fetchunit	*fe_priv[4];
+ 	struct dpu_framegen	*fg_priv[2];
+-	struct dpu_fetchlayer	*fl_priv[2];
+-	struct dpu_fetchwarp	*fw_priv[1];
++	struct dpu_fetchunit	*fl_priv[2];
++	struct dpu_fetchunit	*fw_priv[1];
+ 	struct dpu_hscaler	*hs_priv[3];
+ 	struct dpu_layerblend	*lb_priv[7];
+ 	struct dpu_tcon		*tcon_priv[2];
+@@ -288,9 +289,37 @@ struct dpu_soc {
+ DECLARE_DPU_UNIT_INIT_FUNC(tcon);
+ DECLARE_DPU_UNIT_INIT_FUNC(vs);
+ 
+-void fetchdecode_get_dprc(struct dpu_fetchdecode *fd, void *data);
+-void fetchlayer_get_dprc(struct dpu_fetchlayer *fl, void *data);
+-void fetchwarp_get_dprc(struct dpu_fetchwarp *fw, void *data);
++static inline u32 dpu_pec_fu_read(struct dpu_fetchunit *fu, unsigned int offset)
++{
++	return readl(fu->pec_base + offset);
++}
++
++static inline void dpu_pec_fu_write(struct dpu_fetchunit *fu, u32 value,
++				    unsigned int offset)
++{
++	writel(value, fu->pec_base + offset);
++}
++
++static inline u32 dpu_fu_read(struct dpu_fetchunit *fu, unsigned int offset)
++{
++	return readl(fu->base + offset);
++}
++
++static inline void dpu_fu_write(struct dpu_fetchunit *fu, u32 value,
++				unsigned int offset)
++{
++	writel(value, fu->base + offset);
++}
++
++static inline u32 rgb_color(u8 r, u8 g, u8 b, u8 a)
++{
++	return (r << 24) | (g << 16) | (b << 8) | a;
++}
++
++static inline u32 yuv_color(u8 y, u8 u, u8 v)
++{
++	return (y << 24) | (u << 16) | (v << 8);
++}
+ 
+ static const unsigned int cf_ids[] = {0, 1, 4, 5};
+ static const unsigned int dec_ids[] = {0, 1};
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index bfbd516..fd429b8 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -18,6 +18,7 @@
+ 
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_modes.h>
++#include <video/imx8-prefetch.h>
+ #include <video/videomode.h>
+ 
+ struct dpu_soc;
+@@ -418,6 +419,70 @@ enum dpu_irq {
+ 	CLKEN__FULL = 0x3,
+ } pixengcfg_clken_t;
+ 
++/* fetch unit types */
++enum {
++	FU_T_NA,
++	FU_T_FD,
++	FU_T_FE,
++	FU_T_FL,
++	FU_T_FW,
++};
++
++struct dpu_fetchunit;
++
++struct dpu_fetchunit_ops {
++	void (*set_burstlength)(struct dpu_fetchunit *fu,
++				dma_addr_t baddr, bool use_prefetch);
++
++	void (*set_baseaddress)(struct dpu_fetchunit *fu, dma_addr_t paddr);
++
++	void (*set_src_bpp)(struct dpu_fetchunit *fu, int bpp);
++
++	void (*set_src_stride)(struct dpu_fetchunit *fu,
++			       unsigned int width, int bpp, unsigned int stride,
++			       dma_addr_t baddr, bool use_prefetch);
++
++	void (*set_src_buf_dimensions)(struct dpu_fetchunit *fu,
++				       unsigned int w, unsigned int h, u32 fmt,
++				       bool deinterlace);
++
++	void (*set_fmt)(struct dpu_fetchunit *fu, u32 fmt, bool deinterlace);
++
++	void (*enable_src_buf)(struct dpu_fetchunit *fu);
++	void (*disable_src_buf)(struct dpu_fetchunit *fu);
++	bool (*is_enabled)(struct dpu_fetchunit *fu);
++
++	void (*set_framedimensions)(struct dpu_fetchunit *fu,
++				    unsigned int w, unsigned int h,
++				    bool deinterlace);
++
++	void (*set_controltrigger)(struct dpu_fetchunit *fu);
++
++	unsigned int (*get_stream_id)(struct dpu_fetchunit *fu);
++	void (*set_stream_id)(struct dpu_fetchunit *fu, unsigned int id);
++
++	void (*pin_off)(struct dpu_fetchunit *fu);
++	void (*unpin_off)(struct dpu_fetchunit *fu);
++	bool (*is_pinned_off)(struct dpu_fetchunit *fu);
++};
++
++struct dpu_fetchunit {
++	void __iomem *pec_base;
++	void __iomem *base;
++	char *name;
++	struct mutex mutex;
++	int id;
++	int sub_id;	/* for fractional fetch units */
++	int type;
++	bool inuse;
++	struct dpu_soc *dpu;
++	/* see DPU_PLANE_SRC_xxx */
++	unsigned int stream_id;
++	bool pin_off;
++	struct dprc *dprc;
++	const struct dpu_fetchunit_ops *ops;
++};
++
+ int dpu_map_inner_irq(struct dpu_soc *dpu, int irq);
+ 
+ /* Constant Frame Unit */
+@@ -467,239 +532,54 @@ void constframe_constantcolor(struct dpu_constframe *cf, unsigned int r,
+ void dpu_ed_put(struct dpu_extdst *ed);
+ 
+ /* Fetch Decode Unit */
+-struct dpu_fetchdecode;
+-int fetchdecode_pixengcfg_dynamic_src_sel(struct dpu_fetchdecode *fd,
++int fetchdecode_pixengcfg_dynamic_src_sel(struct dpu_fetchunit *fu,
+ 					  fd_dynamic_src_sel_t src);
+-void fetchdecode_shden(struct dpu_fetchdecode *fd, bool enable);
+-void fetchdecode_baddr_autoupdate(struct dpu_fetchdecode *fd, u8 layer_mask);
+-void fetchdecode_set_burstlength(struct dpu_fetchdecode *fd, dma_addr_t baddr,
+-				 bool use_prefetch);
+-void fetchdecode_baseaddress(struct dpu_fetchdecode *fd, dma_addr_t paddr);
+-void fetchdecode_source_bpp(struct dpu_fetchdecode *fd, int bpp);
+-void fetchdecode_source_stride(struct dpu_fetchdecode *fd, unsigned int width,
+-			       int bpp, unsigned int stride,
+-			       dma_addr_t baddr, bool use_prefetch);
+-void fetchdecode_src_buf_dimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				    unsigned int h, bool deinterlace);
+-void fetchdecode_set_fmt(struct dpu_fetchdecode *fd, u32 fmt, bool deinterlace);
+-void fetchdecode_layeroffset(struct dpu_fetchdecode *fd, unsigned int x,
++void fetchdecode_layeroffset(struct dpu_fetchunit *fd, unsigned int x,
+ 			     unsigned int y);
+-void fetchdecode_clipoffset(struct dpu_fetchdecode *fd, unsigned int x,
++void fetchdecode_clipoffset(struct dpu_fetchunit *fd, unsigned int x,
+ 			    unsigned int y);
+-void fetchdecode_clipdimensions(struct dpu_fetchdecode *fd, unsigned int w,
++void fetchdecode_clipdimensions(struct dpu_fetchunit *fd, unsigned int w,
+ 				unsigned int h);
+-void fetchdecode_source_buffer_enable(struct dpu_fetchdecode *fd);
+-void fetchdecode_source_buffer_disable(struct dpu_fetchdecode *fd);
+-bool fetchdecode_is_enabled(struct dpu_fetchdecode *fd);
+-void fetchdecode_framedimensions(struct dpu_fetchdecode *fd, unsigned int w,
+-				 unsigned int h, bool deinterlace);
+-void fetchdecode_rgb_constantcolor(struct dpu_fetchdecode *fd,
++void fetchdecode_rgb_constantcolor(struct dpu_fetchunit *fd,
+ 					u8 r, u8 g, u8 b, u8 a);
+-void fetchdecode_yuv_constantcolor(struct dpu_fetchdecode *fd,
++void fetchdecode_yuv_constantcolor(struct dpu_fetchunit *fd,
+ 					u8 y, u8 u, u8 v);
+-void fetchdecode_controltrigger(struct dpu_fetchdecode *fd, bool trigger);
+-int fetchdecode_fetchtype(struct dpu_fetchdecode *fd, fetchtype_t *type);
+-shadow_load_req_t fetchdecode_to_shdldreq_t(struct dpu_fetchdecode *fd);
+-u32 fetchdecode_get_vproc_mask(struct dpu_fetchdecode *fd);
+-bool fetchdecode_need_fetcheco(struct dpu_fetchdecode *fd, u32 fmt);
+-unsigned int fetchdecode_get_stream_id(struct dpu_fetchdecode *fd);
+-void fetchdecode_set_stream_id(struct dpu_fetchdecode *fd, unsigned int id);
+-void
+-fetchdecode_configure_prefetch(struct dpu_fetchdecode *fd,
+-			       unsigned int stream_id,
+-			       unsigned int width, unsigned int height,
+-			       unsigned int x_offset, unsigned int y_offset,
+-			       unsigned int stride, u32 format, u64 modifier,
+-			       unsigned long baddr, unsigned long uv_baddr,
+-			       bool start, bool aux_start,
+-			       bool fb_is_interlaced);
+-void fetchdecode_enable_prefetch(struct dpu_fetchdecode *fd);
+-void fetchdecode_disable_prefetch(struct dpu_fetchdecode *fd);
+-void fetchdecode_reg_update_prefetch(struct dpu_fetchdecode *fd);
+-void fetchdecode_prefetch_first_frame_handle(struct dpu_fetchdecode *fd);
+-void fetchdecode_prefetch_irq_handle(struct dpu_fetchdecode *fd);
+-void fetchdecode_prefetch_enable_first_frame_irq(struct dpu_fetchdecode *fd);
+-bool fetchdecode_has_prefetch(struct dpu_fetchdecode *fd);
+-bool fetchdecode_prefetch_format_supported(struct dpu_fetchdecode *fd,
+-					   u32 format, u64 modifier);
+-bool fetchdecode_prefetch_stride_supported(struct dpu_fetchdecode *fd,
+-					   unsigned int stride,
+-					   unsigned int uv_stride,
+-					   unsigned int width,
+-					   u32 format);
+-bool fetchdecode_prefetch_stride_double_check(struct dpu_fetchdecode *fd,
+-					      unsigned int stride,
+-					      unsigned int uv_stride,
+-					      unsigned int width,
+-					      u32 format,
+-					      dma_addr_t baseaddr,
+-					      dma_addr_t uv_baseaddr);
+-void fetchdecode_pin_off(struct dpu_fetchdecode *fd);
+-void fetchdecode_unpin_off(struct dpu_fetchdecode *fd);
+-bool fetchdecode_is_pinned_off(struct dpu_fetchdecode *fd);
+-struct dpu_fetchdecode *dpu_fd_get(struct dpu_soc *dpu, int id);
+-void dpu_fd_put(struct dpu_fetchdecode *fd);
++int fetchdecode_fetchtype(struct dpu_fetchunit *fd, fetchtype_t *type);
++shadow_load_req_t fetchdecode_to_shdldreq_t(struct dpu_fetchunit *fd);
++u32 fetchdecode_get_vproc_mask(struct dpu_fetchunit *fd);
++bool fetchdecode_need_fetcheco(struct dpu_fetchunit *fd, u32 fmt);
++struct dpu_fetchunit *dpu_fd_get(struct dpu_soc *dpu, int id);
++void dpu_fd_put(struct dpu_fetchunit *fu);
+ 
+ /* Fetch ECO Unit */
+-struct dpu_fetcheco;
+-void fetcheco_shden(struct dpu_fetcheco *fe, bool enable);
+-void fetcheco_set_burstlength(struct dpu_fetcheco *fe, dma_addr_t baddr,
+-			      bool use_prefetch);
+-void fetcheco_baseaddress(struct dpu_fetcheco *fe, dma_addr_t paddr);
+-void fetcheco_source_bpp(struct dpu_fetcheco *fe, int bpp);
+-void fetcheco_source_stride(struct dpu_fetcheco *fe, unsigned int width,
+-			    int bpp, unsigned int stride,
+-			    dma_addr_t baddr, bool use_prefetch);
+-void fetcheco_src_buf_dimensions(struct dpu_fetcheco *fe, unsigned int w,
+-				 unsigned int h, u32 fmt, bool deinterlace);
+-void fetcheco_set_fmt(struct dpu_fetcheco *fe, u32 fmt);
+-void fetcheco_layeroffset(struct dpu_fetcheco *fe, unsigned int x,
++void fetcheco_layeroffset(struct dpu_fetchunit *fu, unsigned int x,
+ 			  unsigned int y);
+-void fetcheco_clipoffset(struct dpu_fetcheco *fe, unsigned int x,
++void fetcheco_clipoffset(struct dpu_fetchunit *fu, unsigned int x,
+ 			 unsigned int y);
+-void fetcheco_clipdimensions(struct dpu_fetcheco *fe, unsigned int w,
++void fetcheco_clipdimensions(struct dpu_fetchunit *fu, unsigned int w,
+ 			     unsigned int h);
+-void fetcheco_source_buffer_enable(struct dpu_fetcheco *fe);
+-void fetcheco_source_buffer_disable(struct dpu_fetcheco *fe);
+-bool fetcheco_is_enabled(struct dpu_fetcheco *fe);
+-void fetcheco_framedimensions(struct dpu_fetcheco *fe, unsigned int w,
+-			      unsigned int h, bool deinterlace);
+-void fetcheco_frameresampling(struct dpu_fetcheco *fe, unsigned int x,
++void fetcheco_frameresampling(struct dpu_fetchunit *fu, unsigned int x,
+ 			      unsigned int y);
+-void fetcheco_controltrigger(struct dpu_fetcheco *fe, bool trigger);
+-int fetcheco_fetchtype(struct dpu_fetcheco *fe, fetchtype_t *type);
+-dpu_block_id_t fetcheco_get_block_id(struct dpu_fetcheco *fe);
+-unsigned int fetcheco_get_stream_id(struct dpu_fetcheco *fe);
+-void fetcheco_set_stream_id(struct dpu_fetcheco *fe, unsigned int id);
+-void fetcheco_pin_off(struct dpu_fetcheco *fe);
+-void fetcheco_unpin_off(struct dpu_fetcheco *fe);
+-bool fetcheco_is_pinned_off(struct dpu_fetcheco *fe);
+-struct dpu_fetcheco *dpu_fe_get(struct dpu_soc *dpu, int id);
+-void dpu_fe_put(struct dpu_fetcheco *fe);
++int fetcheco_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type);
++dpu_block_id_t fetcheco_get_block_id(struct dpu_fetchunit *fu);
++struct dpu_fetchunit *dpu_fe_get(struct dpu_soc *dpu, int id);
++void dpu_fe_put(struct dpu_fetchunit *fu);
+ 
+ /* Fetch Layer Unit */
+-struct dpu_fetchlayer;
+-void fetchlayer_shden(struct dpu_fetchlayer *fl, bool enable);
+-void fetchlayer_baddr_autoupdate(struct dpu_fetchlayer *fl, u8 layer_mask);
+-void fetchlayer_shdldreq_sticky(struct dpu_fetchlayer *fl, u8 layer_mask);
+-void fetchlayer_set_burstlength(struct dpu_fetchlayer *fl, dma_addr_t baddr,
+-				bool use_prefetch);
+-void fetchlayer_baseaddress(struct dpu_fetchlayer *fl, unsigned int index,
+-			    dma_addr_t paddr);
+-void fetchlayer_source_bpp(struct dpu_fetchlayer *fl, unsigned int index,
+-			   int bpp);
+-void fetchlayer_source_stride(struct dpu_fetchlayer *fl, unsigned int index,
+-			      unsigned int width, int bpp, unsigned int stride,
+-			      dma_addr_t baddr, bool use_prefetch);
+-void fetchlayer_src_buf_dimensions(struct dpu_fetchlayer *fl,
+-				   unsigned int index, unsigned int w,
+-				   unsigned int h);
+-void fetchlayer_set_fmt(struct dpu_fetchlayer *fl, unsigned int index, u32 fmt);
+-void fetchlayer_source_buffer_enable(struct dpu_fetchlayer *fl,
+-				     unsigned int index);
+-void fetchlayer_source_buffer_disable(struct dpu_fetchlayer *fl,
+-				      unsigned int index);
+-bool fetchlayer_is_enabled(struct dpu_fetchlayer *fl, unsigned int index);
+-void fetchlayer_framedimensions(struct dpu_fetchlayer *fl, unsigned int w,
+-				unsigned int h);
+-void fetchlayer_rgb_constantcolor(struct dpu_fetchlayer *fl,
++void fetchlayer_rgb_constantcolor(struct dpu_fetchunit *fu,
+ 					u8 r, u8 g, u8 b, u8 a);
+-void fetchlayer_yuv_constantcolor(struct dpu_fetchlayer *fl, u8 y, u8 u, u8 v);
+-void fetchlayer_controltrigger(struct dpu_fetchlayer *fl, bool trigger);
+-int fetchlayer_fetchtype(struct dpu_fetchlayer *fl, fetchtype_t *type);
+-unsigned int fetchlayer_get_stream_id(struct dpu_fetchlayer *fl);
+-void fetchlayer_set_stream_id(struct dpu_fetchlayer *fl, unsigned int id);
+-void
+-fetchlayer_configure_prefetch(struct dpu_fetchlayer *fl, unsigned int stream_id,
+-			      unsigned int width, unsigned int height,
+-			      unsigned int x_offset, unsigned int y_offset,
+-			      unsigned int stride, u32 format, u64 modifier,
+-			      unsigned long baddr, bool start);
+-void fetchlayer_enable_prefetch(struct dpu_fetchlayer *fl);
+-void fetchlayer_disable_prefetch(struct dpu_fetchlayer *fl);
+-void fetchlayer_reg_update_prefetch(struct dpu_fetchlayer *fl);
+-void fetchlayer_prefetch_first_frame_handle(struct dpu_fetchlayer *fl);
+-void fetchlayer_prefetch_irq_handle(struct dpu_fetchlayer *fl);
+-void fetchlayer_prefetch_enable_first_frame_irq(struct dpu_fetchlayer *fl);
+-bool fetchlayer_has_prefetch(struct dpu_fetchlayer *fl);
+-bool fetchlayer_prefetch_format_supported(struct dpu_fetchlayer *fl,
+-					  u32 format, u64 modifier);
+-bool fetchlayer_prefetch_stride_supported(struct dpu_fetchlayer *fl,
+-					  unsigned int stride,
+-					  unsigned int width,
+-					  u32 format);
+-bool fetchlayer_prefetch_stride_double_check(struct dpu_fetchlayer *fl,
+-					     unsigned int stride,
+-					     unsigned int width,
+-					     u32 format,
+-					     dma_addr_t baseaddr);
+-void fetchlayer_pin_off(struct dpu_fetchlayer *fl);
+-void fetchlayer_unpin_off(struct dpu_fetchlayer *fl);
+-bool fetchlayer_is_pinned_off(struct dpu_fetchlayer *fl);
+-struct dpu_fetchlayer *dpu_fl_get(struct dpu_soc *dpu, int id);
+-void dpu_fl_put(struct dpu_fetchlayer *fl);
++void fetchlayer_yuv_constantcolor(struct dpu_fetchunit *fu, u8 y, u8 u, u8 v);
++int fetchlayer_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type);
++struct dpu_fetchunit *dpu_fl_get(struct dpu_soc *dpu, int id);
++void dpu_fl_put(struct dpu_fetchunit *fu);
+ 
+ /* Fetch Warp Unit */
+-struct dpu_fetchwarp;
+-void fetchwarp_shden(struct dpu_fetchwarp *fw, bool enable);
+-void fetchwarp_baddr_autoupdate(struct dpu_fetchwarp *fw, u8 layer_mask);
+-void fetchwarp_shdldreq_sticky(struct dpu_fetchwarp *fw, u8 layer_mask);
+-void fetchwarp_set_burstlength(struct dpu_fetchwarp *fw, dma_addr_t baddr,
+-			       bool use_prefetch);
+-void fetchwarp_baseaddress(struct dpu_fetchwarp *fw, unsigned int index,
+-			   dma_addr_t paddr);
+-void fetchwarp_source_bpp(struct dpu_fetchwarp *fw, unsigned int index,
+-			  int bpp);
+-void fetchwarp_source_stride(struct dpu_fetchwarp *fw, unsigned int index,
+-			     unsigned int width, int bpp, unsigned int stride,
+-			     dma_addr_t baddr, bool use_prefetch);
+-void fetchwarp_src_buf_dimensions(struct dpu_fetchwarp *fw,
+-				  unsigned int index, unsigned int w,
+-				  unsigned int h);
+-void fetchwarp_set_fmt(struct dpu_fetchwarp *fw, unsigned int index, u32 fmt);
+-void fetchwarp_source_buffer_enable(struct dpu_fetchwarp *fw,
+-				    unsigned int index);
+-void fetchwarp_source_buffer_disable(struct dpu_fetchwarp *fw,
+-				     unsigned int index);
+-bool fetchwarp_is_enabled(struct dpu_fetchwarp *fw, unsigned int index);
+-void fetchwarp_framedimensions(struct dpu_fetchwarp *fw, unsigned int w,
+-			       unsigned int h);
+-void fetchwarp_rgb_constantcolor(struct dpu_fetchwarp *fw,
++void fetchwarp_rgb_constantcolor(struct dpu_fetchunit *fu,
+ 				 u8 r, u8 g, u8 b, u8 a);
+-void fetchwarp_yuv_constantcolor(struct dpu_fetchwarp *fw, u8 y, u8 u, u8 v);
+-void fetchwarp_controltrigger(struct dpu_fetchwarp *fw, bool trigger);
+-int fetchwarp_fetchtype(struct dpu_fetchwarp *fw, fetchtype_t *type);
+-unsigned int fetchwarp_get_stream_id(struct dpu_fetchwarp *fw);
+-void fetchwarp_set_stream_id(struct dpu_fetchwarp *fw, unsigned int id);
+-void
+-fetchwarp_configure_prefetch(struct dpu_fetchwarp *fw, unsigned int stream_id,
+-			     unsigned int width, unsigned int height,
+-			     unsigned int x_offset, unsigned int y_offset,
+-			     unsigned int stride, u32 format, u64 modifier,
+-			     unsigned long baddr, bool start);
+-void fetchwarp_enable_prefetch(struct dpu_fetchwarp *fw);
+-void fetchwarp_disable_prefetch(struct dpu_fetchwarp *fw);
+-void fetchwarp_reg_update_prefetch(struct dpu_fetchwarp *fw);
+-void fetchwarp_prefetch_first_frame_handle(struct dpu_fetchwarp *fw);
+-void fetchwarp_prefetch_irq_handle(struct dpu_fetchwarp *fw);
+-void fetchwarp_prefetch_enable_first_frame_irq(struct dpu_fetchwarp *fw);
+-bool fetchwarp_has_prefetch(struct dpu_fetchwarp *fw);
+-bool fetchwarp_prefetch_format_supported(struct dpu_fetchwarp *fw,
+-					 u32 format, u64 modifier);
+-bool fetchwarp_prefetch_stride_supported(struct dpu_fetchwarp *fw,
+-					 unsigned int stride,
+-					 unsigned int width,
+-					 u32 format);
+-bool fetchwarp_prefetch_stride_double_check(struct dpu_fetchwarp *fw,
+-					    unsigned int stride,
+-					    unsigned int width,
+-					    u32 format,
+-					    dma_addr_t baseaddr);
+-void fetchwarp_pin_off(struct dpu_fetchwarp *fw);
+-void fetchwarp_unpin_off(struct dpu_fetchwarp *fw);
+-bool fetchwarp_is_pinned_off(struct dpu_fetchwarp *fw);
+-struct dpu_fetchwarp *dpu_fw_get(struct dpu_soc *dpu, int id);
+-void dpu_fw_put(struct dpu_fetchwarp *fw);
++void fetchwarp_yuv_constantcolor(struct dpu_fetchunit *fu, u8 y, u8 u, u8 v);
++int fetchwarp_fetchtype(struct dpu_fetchunit *fu, fetchtype_t *type);
++struct dpu_fetchunit *dpu_fw_get(struct dpu_soc *dpu, int id);
++void dpu_fw_put(struct dpu_fetchunit *fu);
+ 
+ /* Frame Generator Unit */
+ struct dpu_framegen;
+@@ -790,9 +670,9 @@ void layerblend_pixengcfg_clken(struct dpu_layerblend *lb,
+ struct dpu_vscaler *dpu_vs_get(struct dpu_soc *dpu, int id);
+ void dpu_vs_put(struct dpu_vscaler *vs);
+ 
+-struct dpu_fetcheco *fetchdecode_get_fetcheco(struct dpu_fetchdecode *fd);
+-struct dpu_hscaler *fetchdecode_get_hscaler(struct dpu_fetchdecode *fd);
+-struct dpu_vscaler *fetchdecode_get_vscaler(struct dpu_fetchdecode *fd);
++struct dpu_fetchunit *fetchdecode_get_fetcheco(struct dpu_fetchunit *fu);
++struct dpu_hscaler *fetchdecode_get_hscaler(struct dpu_fetchunit *fu);
++struct dpu_vscaler *fetchdecode_get_vscaler(struct dpu_fetchunit *fu);
+ 
+ bool dpu_has_prefetch_fixup(struct dpu_soc *dpu);
+ 
+@@ -804,51 +684,29 @@ void layerblend_pixengcfg_clken(struct dpu_layerblend *lb,
+ u32 dpu_vproc_get_hscale_cap(u32 cap_mask);
+ u32 dpu_vproc_get_vscale_cap(u32 cap_mask);
+ 
+-bool fetchunit_has_prefetch(struct dpu_fetchdecode *fd,
+-			    struct dpu_fetchlayer *fl,
+-			    struct dpu_fetchwarp *fw);
+-bool fetchunit_prefetch_format_supported(struct dpu_fetchdecode *fd,
+-					 struct dpu_fetchlayer *fl,
+-					 struct dpu_fetchwarp *fw,
+-					 u32 format, u64 modifier);
+-bool fetchunit_prefetch_stride_supported(struct dpu_fetchdecode *fd,
+-					 struct dpu_fetchlayer *fl,
+-					 struct dpu_fetchwarp *fw,
+-					 unsigned int stride,
+-					 unsigned int uv_stride,
+-					 unsigned int width,
+-					 u32 format);
+-bool fetchunit_prefetch_stride_double_check(struct dpu_fetchdecode *fd,
+-					    struct dpu_fetchlayer *fl,
+-					    struct dpu_fetchwarp *fw,
+-					    unsigned int stride,
+-					    unsigned int uv_stride,
+-					    unsigned int width,
+-					    u32 format,
+-					    dma_addr_t baseaddr,
+-					    dma_addr_t uv_baseaddr);
+-void fetchunit_configure_prefetch(struct dpu_fetchdecode *fd,
+-				  struct dpu_fetchlayer *fl,
+-				  struct dpu_fetchwarp *fw,
+-				  unsigned int stream_id,
+-				  unsigned int width, unsigned int height,
+-				  unsigned int x_offset, unsigned int y_offset,
+-				  unsigned int stride, u32 format, u64 modifier,
+-				  unsigned long baddr, unsigned long uv_baddr,
+-				  bool start, bool aux_start,
+-				  bool fb_is_interlaced);
+-void fetchunit_enable_prefetch(struct dpu_fetchdecode *fd,
+-			       struct dpu_fetchlayer *fl,
+-			       struct dpu_fetchwarp *fw);
+-void fetchunit_reg_update_prefetch(struct dpu_fetchdecode *fd,
+-				   struct dpu_fetchlayer *fl,
+-				   struct dpu_fetchwarp *fw);
+-void fetchunit_prefetch_first_frame_handle(struct dpu_fetchdecode *fd,
+-					   struct dpu_fetchlayer *fl,
+-					   struct dpu_fetchwarp *fw);
+-void fetchunit_disable_prefetch(struct dpu_fetchdecode *fd,
+-				struct dpu_fetchlayer *fl,
+-				struct dpu_fetchwarp *fw);
++void fetchunit_get_dprc(struct dpu_fetchunit *fu, void *data);
++void fetchunit_shden(struct dpu_fetchunit *fu, bool enable);
++void fetchunit_baddr_autoupdate(struct dpu_fetchunit *fu, u8 layer_mask);
++void fetchunit_shdldreq_sticky(struct dpu_fetchunit *fu, u8 layer_mask);
++void fetchunit_set_burstlength(struct dpu_fetchunit *fu, dma_addr_t baddr,
++			       bool use_prefetch);
++void fetchunit_set_baseaddress(struct dpu_fetchunit *fu, dma_addr_t paddr);
++void fetchunit_set_src_bpp(struct dpu_fetchunit *fu, int bpp);
++void fetchunit_set_src_stride(struct dpu_fetchunit *fu,
++			      unsigned int width, int bpp, unsigned int stride,
++			      dma_addr_t baddr, bool use_prefetch);
++void fetchunit_enable_src_buf(struct dpu_fetchunit *fu);
++void fetchunit_disable_src_buf(struct dpu_fetchunit *fu);
++bool fetchunit_is_enabled(struct dpu_fetchunit *fu);
++unsigned int fetchunit_get_stream_id(struct dpu_fetchunit *fu);
++void fetchunit_set_stream_id(struct dpu_fetchunit *fu, unsigned int id);
++void fetchunit_pin_off(struct dpu_fetchunit *fu);
++void fetchunit_unpin_off(struct dpu_fetchunit *fu);
++bool fetchunit_is_pinned_off(struct dpu_fetchunit *fu);
++bool fetchunit_is_fetchdecode(struct dpu_fetchunit *fu);
++bool fetchunit_is_fetcheco(struct dpu_fetchunit *fu);
++bool fetchunit_is_fetchlayer(struct dpu_fetchunit *fu);
++bool fetchunit_is_fetchwarp(struct dpu_fetchunit *fu);
+ 
+ /* dpu blit engine */
+ struct dpu_bliteng;
+@@ -887,10 +745,10 @@ void  dpu_be_configure_prefetch(struct dpu_bliteng *dpu_be,
+ struct dpu_plane_res {
+ 	struct dpu_constframe	*cf[2];
+ 	struct dpu_extdst	*ed[2];
+-	struct dpu_fetchdecode	*fd[MAX_FD_NUM];
+-	struct dpu_fetcheco	*fe[2];
+-	struct dpu_fetchlayer	*fl[MAX_FL_NUM];
+-	struct dpu_fetchwarp	*fw[MAX_FW_NUM];
++	struct dpu_fetchunit	*fd[MAX_FD_NUM];
++	struct dpu_fetchunit	*fe[2];
++	struct dpu_fetchunit	*fl[MAX_FL_NUM];
++	struct dpu_fetchunit	*fw[MAX_FW_NUM];
+ 	struct dpu_framegen	*fg[2];
+ 	struct dpu_hscaler	*hs[2];
+ 	struct dpu_layerblend	*lb[MAX_LB_NUM];
+-- 
+1.7.9.5
+

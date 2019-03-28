@@ -1,0 +1,156 @@
+From 4fa1e4ac797be288f27b0328fe4010ce263b1d58 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Mon, 18 Jun 2018 08:58:01 +0300
+Subject: [PATCH 4079/5242] MLK-18680-4: drm: imx: dcss: activate DPR
+ completion interrupts
+
+commit  69aec7448d6bd634494cfa839abc2baf0bd36c70 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch activates DPR completion interrupts, just for tracing and
+detecting green screen issues.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/imx/dcss/dcss-dpr.c |   65 ++++++++++++++++++++++++++++++++++++++-
+ drivers/gpu/imx/dcss/dcss-dtg.c |    2 ++
+ drivers/gpu/imx/dcss/dcss-prv.h |    1 +
+ 3 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/imx/dcss/dcss-dpr.c b/drivers/gpu/imx/dcss/dcss-dpr.c
+index 7df0b9d..fee46bd 100644
+--- a/drivers/gpu/imx/dcss/dcss-dpr.c
++++ b/drivers/gpu/imx/dcss/dcss-dpr.c
+@@ -93,6 +93,9 @@
+ #define   THRES_LOW_MASK			GENMASK(6, 4)
+ #define   ABORT_SEL				BIT(7)
+ 
++#define TRACE_COMPLETION			(1LL << 48)
++#define TRACE_BUF_SUBMISSION 			(2LL << 48)
++
+ struct dcss_dpr_ch {
+ 	void __iomem *base_reg;
+ 	u32 base_ofs;
+@@ -116,6 +119,9 @@ struct dcss_dpr_ch {
+ 	u32 pitch;
+ 
+ 	bool use_dtrc;
++
++	int ch_num;
++	int irq;
+ };
+ 
+ struct dcss_dpr_priv {
+@@ -172,6 +178,49 @@ void dcss_dpr_dump_regs(struct seq_file *s, void *data)
+ }
+ #endif
+ 
++static irqreturn_t dcss_dpr_irq_handler(int irq, void *data)
++{
++	struct dcss_dpr_ch *ch = data;
++
++	dcss_trace_module(TRACE_DPR, TRACE_COMPLETION | ch->ch_num);
++
++	dcss_clr(1, ch->base_reg + DCSS_DPR_IRQ_NONMASK_STATUS);
++
++	return IRQ_HANDLED;
++}
++
++static int dcss_dpr_irq_config(struct dcss_soc *dcss, int ch_num)
++{
++	struct platform_device *pdev = to_platform_device(dcss->dev);
++	struct dcss_dpr_priv *dpr = dcss->dpr_priv;
++	struct dcss_dpr_ch *ch = &dpr->ch[ch_num];
++	int ret;
++	char irq_name[20];
++
++	sprintf(irq_name, "dpr_dc_ch%d", ch_num);
++	irq_name[10] = 0;
++
++	ch->irq = platform_get_irq_byname(pdev, irq_name);
++	if (ch->irq < 0) {
++		dev_err(dcss->dev, "dpr: can't get DPR irq\n");
++		return ch->irq;
++	}
++
++	/* mask interrupts off */
++	dcss_set(0xff, ch->base_reg + DCSS_DPR_IRQ_MASK);
++
++	ret = devm_request_irq(dcss->dev, ch->irq,
++			       dcss_dpr_irq_handler,
++			       IRQF_TRIGGER_HIGH,
++			       "dcss-dpr", ch);
++	if (ret) {
++		dev_err(dcss->dev, "dpr: irq request failed.\n");
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int dcss_dpr_ch_init_all(struct dcss_soc *dcss, unsigned long dpr_base)
+ {
+ 	struct dcss_dpr_priv *priv = dcss->dpr_priv;
+@@ -190,6 +239,10 @@ static int dcss_dpr_ch_init_all(struct dcss_soc *dcss, unsigned long dpr_base)
+ 			return -ENOMEM;
+ 		}
+ 
++		ch->ch_num = i;
++
++		dcss_dpr_irq_config(dcss, i);
++
+ #if defined(USE_CTXLD)
+ 		ch->ctx_id = CTX_SB_HP;
+ #endif
+@@ -311,7 +364,8 @@ void dcss_dpr_addr_set(struct dcss_soc *dcss, int ch_num, u32 luma_base_addr,
+ {
+ 	struct dcss_dpr_ch *ch = &dcss->dpr_priv->ch[ch_num];
+ 
+-	dcss_trace_module(TRACE_DPR, ((u64)ch_num << 32) | luma_base_addr);
++	dcss_trace_module(TRACE_DPR, TRACE_BUF_SUBMISSION |
++			  ((u64)ch_num << 32) | luma_base_addr);
+ 
+ 	if (ch->use_dtrc) {
+ 		luma_base_addr = 0x0;
+@@ -670,3 +724,12 @@ void dcss_dpr_write_sysctrl(struct dcss_soc *dcss)
+ 		}
+ 	}
+ }
++
++void dcss_dpr_irq_enable(struct dcss_soc *dcss, bool en)
++{
++	struct dcss_dpr_priv *dpr = dcss->dpr_priv;
++
++	dcss_writel(en ? 0xfe : 0xff, dpr->ch[0].base_reg + DCSS_DPR_IRQ_MASK);
++	dcss_writel(en ? 0xfe : 0xff, dpr->ch[1].base_reg + DCSS_DPR_IRQ_MASK);
++	dcss_writel(en ? 0xfe : 0xff, dpr->ch[2].base_reg + DCSS_DPR_IRQ_MASK);
++}
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 9b85c53..fc79ec9 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -481,6 +481,8 @@ void dcss_dtg_vblank_irq_enable(struct dcss_soc *dcss, bool en)
+ 	reg = dtg->base_reg + DCSS_DTG_INT_MASK;
+ 
+ 	dcss_update(val, LINE0_IRQ | LINE1_IRQ, reg);
++
++	dcss_dpr_irq_enable(dcss, en);
+ }
+ 
+ void dcss_dtg_vblank_irq_clear(struct dcss_soc *dcss)
+diff --git a/drivers/gpu/imx/dcss/dcss-prv.h b/drivers/gpu/imx/dcss/dcss-prv.h
+index 1911076..e8c6f08 100644
+--- a/drivers/gpu/imx/dcss/dcss-prv.h
++++ b/drivers/gpu/imx/dcss/dcss-prv.h
+@@ -86,6 +86,7 @@ void dcss_ctxld_write_irqsafe(struct dcss_soc *dcss, u32 ctx_id, u32 val,
+ int dcss_dpr_init(struct dcss_soc *dcss, unsigned long dpr_base);
+ void dcss_dpr_exit(struct dcss_soc *dcss);
+ void dcss_dpr_write_sysctrl(struct dcss_soc *dcss);
++void dcss_dpr_irq_enable(struct dcss_soc *dcss, bool en);
+ 
+ /* DTG */
+ int dcss_dtg_init(struct dcss_soc *dcss, unsigned long dtg_base);
+-- 
+1.7.9.5
+

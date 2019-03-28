@@ -1,0 +1,212 @@
+From 2d495207854ddd1e690496ca35ebb1ec3dcdc432 Mon Sep 17 00:00:00 2001
+From: Richard Zhu <Richard.Zhu@freescale.com>
+Date: Tue, 7 Jul 2015 15:29:01 +0800
+Subject: [PATCH 0389/5242] MLK-11444 ata: imx: cmd buf corruption errata bug
+ fix
+
+commit  044355868e44f55917727cec28654514c9929f2d from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+errata:
+When a read command returns less data than specified in the PRDs (for
+example, there are two PRDs for this command, but the device returns a
+number of bytes which is less than in the first PRD), the second PRD of
+this command is  not read out of the PRD FIFO, causing the next command
+to use this PRD erroneously.
+
+workaround
+- forces sg_tablesize = 1
+- modified the sg_io function in block/scsi_ioctl.c to use a 64k buffer
+  allocated with dma_alloc_coherent during the probe in ahci_imx
+- In order to fix the scsi/sata hang, when CD_ROM and HDD are
+  accessed simultaneously after the workaround is applied.
+  Do not go to sleep in scsi_eh_handler, when there is host failed.
+
+Signed-off-by: Richard Zhu <Richard.Zhu@freescale.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ block/blk-map.c           |   15 ++++++++++++++-
+ block/scsi_ioctl.c        |   27 +++++++++++++++++++++++----
+ drivers/ata/ahci_imx.c    |   20 ++++++++++++++++++++
+ drivers/scsi/scsi_error.c |   20 +++++++++++++++++++-
+ 4 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-map.c b/block/blk-map.c
+index db9373b..0f60cf3 100644
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -199,6 +199,12 @@ int blk_rq_unmap_user(struct bio *bio)
+ }
+ EXPORT_SYMBOL(blk_rq_unmap_user);
+ 
++#ifdef CONFIG_AHCI_IMX
++extern void *sg_io_buffer_hack;
++#else
++#define sg_io_buffer_hack NULL
++#endif
++
+ /**
+  * blk_rq_map_kern - map kernel data to a request, for passthrough requests
+  * @q:		request queue where request should be inserted
+@@ -226,7 +232,14 @@ int blk_rq_map_kern(struct request_queue *q, struct request *rq, void *kbuf,
+ 	if (!len || !kbuf)
+ 		return -EINVAL;
+ 
+-	do_copy = !blk_rq_aligned(q, addr, len) || object_is_on_stack(kbuf);
++#ifdef CONFIG_AHCI_IMX
++	if (kbuf == sg_io_buffer_hack)
++		do_copy = 0;
++	else
++#endif
++		do_copy = !blk_rq_aligned(q, addr, len)
++			|| object_is_on_stack(kbuf);
++
+ 	if (do_copy)
+ 		bio = bio_copy_kern(q, kbuf, len, gfp_mask, reading);
+ 	else
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index 533f4ae..42dd8bf 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -253,6 +253,12 @@ static int blk_fill_sghdr_rq(struct request_queue *q, struct request *rq,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_AHCI_IMX
++extern void *sg_io_buffer_hack;
++#else
++#define sg_io_buffer_hack NULL
++#endif
++
+ static int blk_complete_sghdr_rq(struct request *rq, struct sg_io_hdr *hdr,
+ 				 struct bio *bio)
+ {
+@@ -282,7 +288,12 @@ static int blk_complete_sghdr_rq(struct request *rq, struct sg_io_hdr *hdr,
+ 			ret = -EFAULT;
+ 	}
+ 
+-	r = blk_rq_unmap_user(bio);
++	if (sg_io_buffer_hack && !hdr->iovec_count)
++		r = copy_to_user(hdr->dxferp, sg_io_buffer_hack,
++				hdr->dxfer_len);
++	else
++		r = blk_rq_unmap_user(bio);
++
+ 	if (!ret)
+ 		ret = r;
+ 
+@@ -306,6 +317,9 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+ 	if (hdr->dxfer_len > (queue_max_hw_sectors(q) << 9))
+ 		return -EIO;
+ 
++	if (sg_io_buffer_hack && hdr->dxfer_len > 0x10000)
++		return -EIO;
++
+ 	if (hdr->dxfer_len)
+ 		switch (hdr->dxfer_direction) {
+ 		default:
+@@ -352,9 +366,14 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+ 
+ 		ret = blk_rq_map_user_iov(q, rq, NULL, &i, GFP_KERNEL);
+ 		kfree(iov);
+-	} else if (hdr->dxfer_len)
+-		ret = blk_rq_map_user(q, rq, NULL, hdr->dxferp, hdr->dxfer_len,
+-				      GFP_KERNEL);
++	} else if (hdr->dxfer_len) {
++		if (sg_io_buffer_hack)
++			ret = blk_rq_map_kern(q, rq, sg_io_buffer_hack,
++					hdr->dxfer_len, GFP_KERNEL);
++		else
++			ret = blk_rq_map_user(q, rq, NULL, hdr->dxferp,
++					hdr->dxfer_len, GFP_KERNEL);
++	}
+ 
+ 	if (ret)
+ 		goto out_free_cdb;
+diff --git a/drivers/ata/ahci_imx.c b/drivers/ata/ahci_imx.c
+index 6822e2f..4a747aa 100644
+--- a/drivers/ata/ahci_imx.c
++++ b/drivers/ata/ahci_imx.c
+@@ -119,6 +119,8 @@ struct imx_ahci_priv {
+ 	u32 imped_ratio;
+ };
+ 
++void *sg_io_buffer_hack;
++
+ static int ahci_imx_hotplug;
+ module_param_named(hotplug, ahci_imx_hotplug, int, 0644);
+ MODULE_PARM_DESC(hotplug, "AHCI IMX hot-plug support (0=Don't support, 1=support)");
+@@ -1181,6 +1183,24 @@ static int imx_ahci_probe(struct platform_device *pdev)
+ 	reg_val = clk_get_rate(imxpriv->ahb_clk) / 1000;
+ 	writel(reg_val, hpriv->mmio + IMX_TIMER1MS);
+ 
++	/*
++	* Due to IP bug on the Synopsis 3.00 SATA version,
++	* which is present on mx6q, and not on mx53,
++	* we should use sg_tablesize = 1 for reliable operation
++	*/
++	if (imxpriv->type == AHCI_IMX6Q) {
++		dma_addr_t dma;
++
++		ahci_platform_sht.sg_tablesize = 1;
++
++		sg_io_buffer_hack = dma_alloc_coherent(NULL, 0x10000,
++				&dma, GFP_KERNEL);
++		if (!sg_io_buffer_hack) {
++			ret = -ENOMEM;
++			goto disable_sata;
++		}
++	}
++
+ 	ret = ahci_platform_init_host(pdev, hpriv, &ahci_imx_port_info,
+ 				      &ahci_platform_sht);
+ 	if (ret)
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 2715cda..c5915ae 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -62,6 +62,12 @@
+ static int scsi_try_to_abort_cmd(struct scsi_host_template *,
+ 				 struct scsi_cmnd *);
+ 
++#ifdef CONFIG_AHCI_IMX
++extern void *sg_io_buffer_hack;
++#else
++#define sg_io_buffer_hack NULL
++#endif
++
+ void scsi_eh_wakeup(struct Scsi_Host *shost)
+ {
+ 	lockdep_assert_held(shost->host_lock);
+@@ -71,6 +77,11 @@ void scsi_eh_wakeup(struct Scsi_Host *shost)
+ 		wake_up_process(shost->ehandler);
+ 		SCSI_LOG_ERROR_RECOVERY(5, shost_printk(KERN_INFO, shost,
+ 			"Waking error handler thread\n"));
++	} else if ((shost->host_failed > 0) || (sg_io_buffer_hack != NULL)) {
++		trace_scsi_eh_wakeup(shost);
++		wake_up_process(shost->ehandler);
++		SCSI_LOG_ERROR_RECOVERY(5, shost_printk(KERN_INFO, shost,
++			"Waking error handler thread\n"));
+ 	}
+ }
+ 
+@@ -2168,8 +2179,15 @@ int scsi_error_handler(void *data)
+ 		if (kthread_should_stop())
+ 			break;
+ 
++		/*
++		 * Do not go to sleep, when there is host_failed when the
++		 * one-PRD per command workaroud is tiggered.
++		 * Because that ata/scsi subsystem maybe hang, when CD_ROM
++		 * and HDD are accessed simultaneously.
++		 */
+ 		if ((shost->host_failed == 0 && shost->host_eh_scheduled == 0) ||
+-		    shost->host_failed != atomic_read(&shost->host_busy)) {
++		    ((shost->host_failed != atomic_read(&shost->host_busy)) &&
++		    (sg_io_buffer_hack == NULL) && (shost->host_failed > 0))) {
+ 			SCSI_LOG_ERROR_RECOVERY(1,
+ 				shost_printk(KERN_INFO, shost,
+ 					     "scsi_eh_%d: sleeping\n",
+-- 
+1.7.9.5
+

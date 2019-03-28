@@ -1,0 +1,182 @@
+From 378797f4f0c9e6a65183b14d7f200b974e936b89 Mon Sep 17 00:00:00 2001
+From: Weiguang Kong <weiguang.kong@nxp.com>
+Date: Fri, 11 May 2018 12:34:10 +0800
+Subject: [PATCH 3780/5242] MLK-18279: ASoC: fsl_dsp: get the information of
+ reserved memory from dts
+
+commit  63823ab3e674068bd927ad35dbdbdc41a99d0998 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The reserved memory for dsp is defined in dts file, however, the dsp
+driver has also defined the address and size of this reserved memory,
+which is repeated and inflexible.
+
+So by cancelling the definition in dsp driver and use system API to
+get the information of reserved memory from dts dynamically to fix
+this problem.
+
+Signed-off-by: Weiguang Kong <weiguang.kong@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ arch/arm64/boot/dts/freescale/fsl-imx8qxp.dtsi |    1 +
+ sound/soc/fsl/fsl_dsp.c                        |   38 +++++++++++++++++++-----
+ sound/soc/fsl/fsl_dsp.h                        |   22 +-------------
+ sound/soc/fsl/fsl_dsp_proxy.c                  |    6 ++--
+ 4 files changed, 36 insertions(+), 31 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/freescale/fsl-imx8qxp.dtsi b/arch/arm64/boot/dts/freescale/fsl-imx8qxp.dtsi
+index e9268d7..e7cbbe5 100644
+--- a/arch/arm64/boot/dts/freescale/fsl-imx8qxp.dtsi
++++ b/arch/arm64/boot/dts/freescale/fsl-imx8qxp.dtsi
+@@ -2948,6 +2948,7 @@
+ 
+ 	dsp: dsp@586e8000 {
+ 		compatible = "fsl,imx8qxp-dsp";
++		reserved-region = <&dsp_reserved>;
+ 		reg = <0x0 0x596e8000 0x0 0x88000>;
+ 		clocks = <&clk IMX8QXP_AUD_DSP_IPG>,
+ 			<&clk IMX8QXP_AUD_OCRAM_IPG>,
+diff --git a/sound/soc/fsl/fsl_dsp.c b/sound/soc/fsl/fsl_dsp.c
+index d71795ec..3bdf600 100644
+--- a/sound/soc/fsl/fsl_dsp.c
++++ b/sound/soc/fsl/fsl_dsp.c
+@@ -739,6 +739,8 @@ int dsp_mu_init(struct fsl_dsp *dsp_priv)
+ static int fsl_dsp_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
++	struct device_node *reserved_node;
++	struct resource reserved_res;
+ 	struct fsl_dsp *dsp_priv;
+ 	const char *fw_name;
+ 	struct resource *res;
+@@ -829,14 +831,32 @@ static int fsl_dsp_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	dsp_priv->sdram_phys_addr = SDRAM_BASE_ADDR;
++	reserved_node = of_parse_phandle(np, "reserved-region", 0);
++	if (!reserved_node) {
++		dev_err(&pdev->dev, "failed to get reserved region node\n");
++		return -ENODEV;
++	}
++
++	if (of_address_to_resource(reserved_node, 0, &reserved_res)) {
++		dev_err(&pdev->dev, "failed to get reserved region address\n");
++		return -EINVAL;
++	}
++
++	dsp_priv->sdram_phys_addr = reserved_res.start;
++	dsp_priv->sdram_reserved_size = (reserved_res.end - reserved_res.start)
++									+ 1;
++	if (dsp_priv->sdram_reserved_size <= 0) {
++		dev_err(&pdev->dev, "invalid value of reserved region size\n");
++		return -EINVAL;
++	}
++
+ 	dsp_priv->sdram_vir_addr = ioremap_wc(dsp_priv->sdram_phys_addr,
+-							SDRAM_BASE_SIZE);
++						dsp_priv->sdram_reserved_size);
+ 	if (!dsp_priv->sdram_vir_addr) {
+ 		dev_err(&pdev->dev, "failed to remap sdram space for dsp firmware\n");
+ 		return -ENXIO;
+ 	}
+-	memset_io(dsp_priv->sdram_vir_addr, 0, SDRAM_BASE_SIZE);
++	memset_io(dsp_priv->sdram_vir_addr, 0, dsp_priv->sdram_reserved_size);
+ 
+ 	size = MSG_BUF_SIZE + DSP_CONFIG_SIZE;
+ 
+@@ -857,12 +877,16 @@ static int fsl_dsp_probe(struct platform_device *pdev)
+ 	dsp_priv->dsp_config_phys = buf_phys + offset;
+ 	dsp_priv->dsp_config_size = DSP_CONFIG_SIZE;
+ 
+-	/* scratch memory for dsp framework */
++	/* scratch memory for dsp framework. The sdram reserved memory
++	 * is split into two equal parts currently. The front part is
++	 * used to keep the dsp firmware, the other part is considered
++	 * as scratch memory for dsp framework.
++	 */
+ 	dsp_priv->scratch_buf_virt = dsp_priv->sdram_vir_addr +
+-						SDRAM_CODEC_LIB_OFFSET;
++					dsp_priv->sdram_reserved_size / 2;
+ 	dsp_priv->scratch_buf_phys = dsp_priv->sdram_phys_addr +
+-						SDRAM_CODEC_LIB_OFFSET;
+-	dsp_priv->scratch_buf_size = SDRAM_BASE_SIZE - SDRAM_CODEC_LIB_OFFSET;
++					dsp_priv->sdram_reserved_size / 2;
++	dsp_priv->scratch_buf_size = dsp_priv->sdram_reserved_size / 2;
+ 
+ 	/* initialize the reference counter for dsp_priv
+ 	 * structure
+diff --git a/sound/soc/fsl/fsl_dsp.h b/sound/soc/fsl/fsl_dsp.h
+index bc05f09..589cb9c 100644
+--- a/sound/soc/fsl/fsl_dsp.h
++++ b/sound/soc/fsl/fsl_dsp.h
+@@ -68,6 +68,7 @@ struct fsl_dsp {
+ 	unsigned long			sram;
+ 	void			        *sdram_vir_addr;
+ 	unsigned long			sdram_phys_addr;
++	int				sdram_reserved_size;
+ 	void				*msg_buf_virt;
+ 	dma_addr_t			 msg_buf_phys;
+ 	int				 msg_buf_size;
+@@ -108,27 +109,6 @@ struct fsl_dsp {
+ #define OUTPUT_BUF_SIZE		16384
+ #define DSP_CONFIG_SIZE    4096
+ 
+-/*external buffer
+- *  ----------------------------------------------------------------------
+- *  |  name                      | size     |   description     |
+- * -----------------------------------------------------------------------
+- *  |  scratch buffer for malloc | 0xffffff | For MEM_scratch_malloc()
+- * ------------------------------------------------------------------------
+- *  |  global structure          | 4096     | For store dsp config structure
+- * ------------------------------------------------------------------------
+- */
+-
+-#define MEMORY_REMAP_OFFSET	0x39000000
+-
+-/* reserved memory for dsp firmware and core libs to
+- * save their instruction/data section in SDRAM, the physical
+- * address range is 0x8e000000 ~ 0x8fffffff (32M bytes).
+- */
+-#define SDRAM_BASE_ADDR  0x8e000000
+-#define SDRAM_BASE_SIZE  0x1ffffff
+-#define SDRAM_CODEC_LIB_OFFSET 0x1000000
+-#define SDRAM_SCRATCH_BUF_SIZE 0xffffff
+-
+ #define SC_C_OFS_SEL    39
+ #define SC_C_OFS_AUDIO  40
+ #define SC_C_OFS_PERIPH 41
+diff --git a/sound/soc/fsl/fsl_dsp_proxy.c b/sound/soc/fsl/fsl_dsp_proxy.c
+index 77dc7c2..c507def 100644
+--- a/sound/soc/fsl/fsl_dsp_proxy.c
++++ b/sound/soc/fsl/fsl_dsp_proxy.c
+@@ -282,7 +282,7 @@ irqreturn_t fsl_dsp_mu_isr(int irq, void *dev_id)
+ /* ...NULL-address specification */
+ #define XF_PROXY_NULL           (~0U)
+ 
+-#define XF_PROXY_BADADDR  SDRAM_SCRATCH_BUF_SIZE
++#define XF_PROXY_BADADDR        (dsp_priv->scratch_buf_size)
+ 
+ /* ...shared memory translation - kernel virtual address to shared address */
+ u32 xf_proxy_b2a(struct xf_proxy *proxy, void *b)
+@@ -293,7 +293,7 @@ u32 xf_proxy_b2a(struct xf_proxy *proxy, void *b)
+ 	if (b == NULL)
+ 		return XF_PROXY_NULL;
+ 	else if ((u32)(b - dsp_priv->scratch_buf_virt) <
+-					SDRAM_SCRATCH_BUF_SIZE)
++					dsp_priv->scratch_buf_size)
+ 		return (u32)(b - dsp_priv->scratch_buf_virt);
+ 	else
+ 		return XF_PROXY_BADADDR;
+@@ -305,7 +305,7 @@ void *xf_proxy_a2b(struct xf_proxy *proxy, u32 address)
+ 	struct fsl_dsp *dsp_priv = container_of(proxy,
+ 					struct fsl_dsp, proxy);
+ 
+-	if (address < SDRAM_SCRATCH_BUF_SIZE)
++	if (address < dsp_priv->scratch_buf_size)
+ 		return dsp_priv->scratch_buf_virt + address;
+ 	else if (address == XF_PROXY_NULL)
+ 		return NULL;
+-- 
+1.7.9.5
+

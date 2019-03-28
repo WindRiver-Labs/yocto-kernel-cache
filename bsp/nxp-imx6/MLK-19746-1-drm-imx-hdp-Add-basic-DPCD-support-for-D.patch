@@ -1,0 +1,874 @@
+From ea64763fdfb5f9f6f9a3b89c1880cecff3f98243 Mon Sep 17 00:00:00 2001
+From: Oliver Brown <oliver.brown@nxp.com>
+Date: Wed, 26 Sep 2018 18:29:27 -0500
+Subject: [PATCH 4771/5242] MLK-19746-1 drm: imx: hdp: Add basic DPCD support
+ for DisplayPort
+
+commit  6b504bd474e257cf07b576760872da8b985037bd from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Adding support to use the DRM helper for DPCD query
+removed some warnings from checkpatch.
+
+Signed-off-by: Oliver Brown <oliver.brown@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/hdp/imx-dp.c  |  202 ++++++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/imx/hdp/imx-dp.h  |    1 +
+ drivers/gpu/drm/imx/hdp/imx-hdp.c |  169 ++++++++++++++++++++-----------
+ drivers/gpu/drm/imx/hdp/imx-hdp.h |   16 +--
+ 4 files changed, 300 insertions(+), 88 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/hdp/imx-dp.c b/drivers/gpu/drm/imx/hdp/imx-dp.c
+index 401c939..d2a2ed2 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-dp.c
++++ b/drivers/gpu/drm/imx/hdp/imx-dp.c
+@@ -13,9 +13,12 @@
+  */
+ #include <linux/clk.h>
+ #include <linux/kernel.h>
++#include <drm/drm_dp_helper.h>
++
+ #ifdef DEBUG_FW_LOAD
+ #include "mhdp_firmware.h"
+ #endif
++
+ #include "imx-hdp.h"
+ #include "imx-hdmi.h"
+ #include "imx-dp.h"
+@@ -75,7 +78,8 @@ int dp_fw_init(state_struct *state)
+ 	CDN_API_General_Write_Register_blocking(state,
+ 						ADDR_SOURCD_PHY +
+ 						(LANES_CONFIG << 2),
+-						0x00400000 | hdp->lane_mapping);
++						0x00400000 |
++						hdp->dp_lane_mapping);
+ 	DRM_INFO("CDN_API_General_Write_Register_blockin ... setting LANES_CONFIG\n");
+ 
+ 	return 0;
+@@ -112,6 +116,7 @@ int dp_phy_init(state_struct *state, struct drm_display_mode *mode, int format,
+ }
+ 
+ #ifdef DEBUG
++
+ void print_header(void)
+ {
+ 	/*       "0x00000000: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f"*/
+@@ -160,6 +165,14 @@ int dump_dpcd(state_struct *state)
+ 	}
+ 	print_bytes(resp_dpcd.addr, resp_dpcd.buff, resp_dpcd.size);
+ 
++	ret = CDN_API_DPTX_Read_DPCD_blocking(state, 0x10, 0x110, &resp_dpcd,
++					      CDN_BUS_TYPE_APB);
++	if (ret) {
++		DRM_INFO("_debug: function returned with status %d\n", ret);
++		return -1;
++	}
++	print_bytes(resp_dpcd.addr, resp_dpcd.buff, resp_dpcd.size);
++
+ 	ret = CDN_API_DPTX_Read_DPCD_blocking(state, 0x10, 0x200, &resp_dpcd,
+ 					      CDN_BUS_TYPE_APB);
+ 	if (ret) {
+@@ -269,6 +282,79 @@ int dp_get_training_status(state_struct *state)
+ 	return 0;
+ }
+ 
++#define aux_to_hdp(x) container_of(x, struct imx_hdp, aux)
++
++/*
++ * This function only implements native DPDC reads and writes
++ */
++static ssize_t dp_aux_transfer(struct drm_dp_aux *aux,
++		struct drm_dp_aux_msg *msg)
++{
++	struct imx_hdp *hdp = aux_to_hdp(aux);
++	bool native = msg->request & (DP_AUX_NATIVE_WRITE & DP_AUX_NATIVE_READ);
++	CDN_API_STATUS status;
++
++	DRM_DEBUG("\n");
++	DRM_INFO("%s() msg->request 0x%x msg->size 0x%x\n",
++	       __func__, msg->request, (unsigned int)msg->size);
++
++
++	/* Ignore address only message */
++	if ((msg->size == 0) || (msg->buffer == NULL)) {
++		msg->reply = native ?
++			DP_AUX_NATIVE_REPLY_ACK : DP_AUX_I2C_REPLY_ACK;
++		return msg->size;
++	}
++
++	if (!native) {
++		pr_err("%s: only native messages supported\n",
++			__func__);
++		return -EINVAL;
++	}
++
++	/* msg sanity check */
++	if (msg->size > DP_AUX_MAX_PAYLOAD_BYTES) {
++		pr_err("%s: invalid msg: size(%zu), request(%x)\n",
++			__func__, msg->size, (unsigned int)msg->request);
++		return -EINVAL;
++	}
++
++	if (msg->request == DP_AUX_NATIVE_WRITE) {
++		DPTX_Write_DPCD_response write_resp;
++
++		status = CDN_API_DPTX_Write_DPCD_blocking(&hdp->state,
++							  msg->size,
++							  msg->address,
++							  (u8 *)msg->buffer,
++							  &write_resp,
++							  CDN_BUS_TYPE_APB);
++
++		if (status != CDN_OK)
++			return -EIO;
++		/* fixme: is this right? */
++		//return  msg->size;
++	}
++
++	if (msg->request == DP_AUX_NATIVE_READ) {
++		DPTX_Read_DPCD_response read_resp;
++
++		status = CDN_API_DPTX_Read_DPCD_blocking(&hdp->state,
++						      msg->size,
++						      msg->address,
++						      &read_resp,
++						      CDN_BUS_TYPE_APB);
++		if (status != CDN_OK)
++			return -EIO;
++		memcpy(msg->buffer, read_resp.buff, read_resp.size);
++		msg->reply = DP_AUX_NATIVE_REPLY_ACK;
++#ifdef DEBUG
++		print_bytes(read_resp.addr, read_resp.buff, read_resp.size);
++#endif
++		return  msg->size;
++	}
++	return 0;
++}
++
+ /* Max Link Rate: 06h (1.62Gbps), 0Ah (2.7Gbps), 14h (5.4Gbps),
+  * 1Eh (8.1Gbps)--N/A
+  */
+@@ -297,8 +383,7 @@ void dp_mode_set(state_struct *state,
+ 	/* AUX training? */
+ 	u8 no_aux_training = 0;
+ 	/* Lane mapping */
+-	u8 lane_mapping = hdp->lane_mapping; /*  we have 4 lane, so it's OK */
+-
++	u8 lane_mapping = hdp->dp_lane_mapping;
+ 	/* Extended Host capabilities */
+ 	u8 ext_host_cap = 1;
+ 	/* Bits per sub-pixel */
+@@ -310,15 +395,47 @@ void dp_mode_set(state_struct *state,
+ 	/* Transfer Unit */
+ 	u8 transfer_unit = 64;
+ 	VIC_SYMBOL_RATE sym_rate;
+-	u8 link_rate;
++	u8 link_rate = RATE_1_6;
++	struct drm_dp_link link;
+ 
+-	if (hdp->is_edp) {
+-		/* eDP uses device tree link rate and number of lanes */
+-		link_rate = hdp->edp_link_rate;
+-		num_lanes = hdp->edp_num_lanes;
++#ifdef DEBUG
++	S_LINK_STAT rls;
++#endif
++	char linkid[6];
++
++	DRM_INFO("dp_mode_set()\n");
++
++	drm_dp_downstream_id(&hdp->aux, linkid);
++	DRM_INFO("DP link id: %s, 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n",
++		 linkid, linkid[0], linkid[1], linkid[2], linkid[3], linkid[4],
++		 linkid[5]);
++
++	drm_dp_link_probe(&hdp->aux, &link);
++	DRM_INFO("DP revision: 0x%x\n", link.revision);
++	DRM_INFO("DP rate: %d Mbps\n", link.rate/100);
++	DRM_INFO("DP number of lanes: %d\n", link.num_lanes);
++	DRM_INFO("DP capabilities: 0x%lx\n", link.capabilities);
++
++	/* always use the number of lanes from the display*/
++	num_lanes = link.num_lanes;
++
++	/* Use the lower link rate if dp_link_rate is set */
++	if (hdp->dp_link_rate != 0) {
++		link_rate = min(hdp->dp_link_rate,
++			(u32)(drm_dp_link_rate_to_bw_code(link.rate)));
++		DRM_INFO("DP actual link rate:  0x%x\n", link_rate);
++		hdp->link_rate = link_rate;
++
++		/* need change the link rate */
++		hdp->ops->phy_init(state,
++				   mode,
++				   format,
++				   color_depth);
++	}
+ 
++	if (hdp->is_edp) {
+ 		/* use the eDP supported rates */
+-		switch (max_link_rate) {
++		switch (link_rate) {
+ 		case AFE_LINK_RATE_1_6:
+ 			sym_rate = RATE_1_6;
+ 			break;
+@@ -345,9 +462,7 @@ void dp_mode_set(state_struct *state,
+ 			sym_rate = RATE_1_6;
+ 		}
+ 	} else {
+-		link_rate = max_link_rate;
+-
+-		switch (max_link_rate) {
++		switch (link_rate) {
+ 		case 0x0a:
+ 			sym_rate = RATE_2_7;
+ 			break;
+@@ -371,7 +486,6 @@ void dp_mode_set(state_struct *state,
+ 		);
+ 	DRM_INFO("CDN_API_DPTX_SetHostCap_blocking (ret = %d)\n", ret);
+ 
+-
+ 	ret = CDN_API_DPTX_Set_VIC_blocking(state,
+ 		mode,
+ 		bits_per_subpixel,
+@@ -386,14 +500,14 @@ void dp_mode_set(state_struct *state,
+ 
+ 	do {
+ 		ret = CDN_API_DPTX_TrainingControl_blocking(state, 1);
+-		DRM_DEBUG("CDN_API_DPTX_TrainingControl_blocking (ret = %d) start\n",
++		DRM_DEBUG("CDN_API_DPTX_TrainingControl_* (ret = %d) start\n",
+ 			   ret);
+ 		if (dp_get_training_status(state) == 0)
+ 			break;
+ 		training_retries--;
+ 
+ 		ret = CDN_API_DPTX_TrainingControl_blocking(state, 0);
+-		DRM_DEBUG("CDN_API_DPTX_TrainingControl_blocking (ret = %d) stop\n",
++		DRM_DEBUG("CDN_API_DPTX_TrainingControl_* (ret = %d) stop\n",
+ 			   ret);
+ 		udelay(1000);
+ 
+@@ -414,7 +528,6 @@ void dp_mode_set(state_struct *state,
+ 		 rls.preemphasis[2]);
+ 	dump_dpcd(state);
+ #endif
+-
+ }
+ 
+ int dp_get_edid_block(void *data, u8 *buf, unsigned int block, size_t len)
+@@ -441,6 +554,8 @@ int dp_get_edid_block(void *data, u8 *buf, unsigned int block, size_t len)
+ 		DRM_WARN("EDID block %x read not support\n", block);
+ 	}
+ 
++	DRM_INFO("dp_get_edid_block (ret = %d) block %d\n", ret, block);
++
+ 	memcpy(buf, edidResp.buff, 128);
+ 
+ 	return ret;
+@@ -454,6 +569,22 @@ int dp_get_hpd_state(state_struct *state, u8 *hpd)
+ 	return ret;
+ }
+ 
++void dp_phy_pix_engine_reset_t28hpc(state_struct *state)
++{
++	GENERAL_Read_Register_response regresp;
++
++	CDN_API_General_Read_Register_blocking(state, ADDR_SOURCE_CAR +
++					       (SOURCE_HDTX_CAR << 2),
++					       &regresp);
++	CDN_API_General_Write_Register_blocking(state, ADDR_SOURCE_CAR +
++						(SOURCE_HDTX_CAR << 2),
++						regresp.val & 0xFD);
++	CDN_API_General_Write_Register_blocking(state, ADDR_SOURCE_CAR +
++						(SOURCE_HDTX_CAR << 2),
++						regresp.val);
++}
++
++
+ int dp_phy_init_t28hpc(state_struct *state,
+ 		       struct drm_display_mode *mode,
+ 		       int format,
+@@ -463,21 +594,21 @@ int dp_phy_init_t28hpc(state_struct *state,
+ 	int max_link_rate = hdp->link_rate;
+ 	int num_lanes = 4;
+ 	int ret;
+-	u8 lane_mapping = hdp->lane_mapping;
++	u8 lane_mapping = hdp->dp_lane_mapping;
++
+ 	/* reset phy */
+ 	imx_hdp_call(hdp, phy_reset, 0, &hdp->mem, 0);
++	DRM_INFO("asserted HDP PHY reset\n");
+ 
+-	if (hdp->is_edp) {
+-		max_link_rate = hdp->edp_link_rate;
+-		num_lanes = hdp->edp_num_lanes;
+-	}
++	dp_phy_pix_engine_reset_t28hpc(state);
++	DRM_INFO("pixel engine reset\n");
+ 
+ 	/* Line swaping */
+ 	CDN_API_General_Write_Register_blocking(state,
+ 						ADDR_SOURCD_PHY +
+ 						(LANES_CONFIG << 2),
+ 						0x00400000 | lane_mapping);
+-	DRM_INFO("CDN_API_General_Write_Register_blocking ... setting LANES_CONFIG %x\n",
++	DRM_INFO("CDN_*_Write_Register_blocking ... setting LANES_CONFIG %x\n",
+ 		 lane_mapping);
+ 
+ 	/* PHY initialization while phy reset pin is active */
+@@ -486,7 +617,7 @@ int dp_phy_init_t28hpc(state_struct *state,
+ 
+ 	/* In this point the phy reset should be deactivated */
+ 	imx_hdp_call(hdp, phy_reset, 0, &hdp->mem, 1);
+-	DRM_INFO("deasserted reset\n");
++	DRM_INFO("deasserted HDP PHY reset\n");
+ 
+ 	/* PHY power set */
+ 	afe_power_t28hpc(state, num_lanes, (ENUM_AFE_LINK_RATE)max_link_rate);
+@@ -498,3 +629,28 @@ int dp_phy_init_t28hpc(state_struct *state,
+ 
+ 	return true;
+ }
++
++
++int dp_aux_init(state_struct *state,
++		  struct device *dev)
++{
++	struct imx_hdp *hdp = state_to_imx_hdp(state);
++	int ret;
++
++	hdp->aux.name = "imx_dp_aux";
++	hdp->aux.dev = dev;
++	hdp->aux.transfer = dp_aux_transfer;
++
++	ret = drm_dp_aux_register(&hdp->aux);
++
++	return ret;
++}
++
++int dp_aux_destroy(state_struct *state)
++{
++	struct imx_hdp *hdp = state_to_imx_hdp(state);
++
++	drm_dp_aux_unregister(&hdp->aux);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/imx/hdp/imx-dp.h b/drivers/gpu/drm/imx/hdp/imx-dp.h
+index bc2bc9b..a019347 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-dp.h
++++ b/drivers/gpu/drm/imx/hdp/imx-dp.h
+@@ -30,5 +30,6 @@ int dp_phy_init_t28hpc(state_struct *state,
+ 		       int color_depth);
+ int dp_get_edid_block(void *data, u8 *buf, u32 block, size_t len);
+ int dp_get_hpd_state(state_struct *state, u8 *hpd);
++int dp_aux_init(state_struct *state, struct device *dev);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.c b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+index 7f22ee1..e8201f0 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.c
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.c
+@@ -30,7 +30,7 @@
+ #define B0_SILICON_ID			0x11
+ 
+ struct drm_display_mode *g_mode;
+-
++uint8_t g_default_mode = 3;
+ static struct drm_display_mode edid_cea_modes[] = {
+ 	/* 3 - 720x480@60Hz */
+ 	{ DRM_MODE("720x480", DRM_MODE_TYPE_DRIVER, 27000, 720, 736,
+@@ -81,7 +81,7 @@ static void imx_hdp_state_init(struct imx_hdp *hdp)
+ 
+ 	state->mem = &hdp->mem;
+ 	state->rw = hdp->rw;
+-	state->edp = hdp->is_edp;
++	state->edp = 0;
+ }
+ 
+ #ifdef CONFIG_IMX_HDP_CEC
+@@ -101,7 +101,8 @@ static void imx_hdp_cec_init(struct imx_hdp *hdp)
+ }
+ #endif
+ 
+-static void imx8qm_pixel_link_mux(state_struct *state, struct drm_display_mode *mode)
++static void imx8qm_pixel_link_mux(state_struct *state,
++				  struct drm_display_mode *mode)
+ {
+ 	struct imx_hdp *hdp = state_to_imx_hdp(state);
+ 	u32 val;
+@@ -132,14 +133,16 @@ static int imx8qm_pixel_link_validate(state_struct *state)
+ 
+ 	sciErr = sc_ipc_open(&hdp->ipcHndl, hdp->mu_id);
+ 	if (sciErr != SC_ERR_NONE) {
+-		DRM_ERROR("sc_ipc_open failed! (sciError = %d)\n", sciErr);
++		DRM_ERROR("sc_ipc_open failed! (sciError = %d)\n",
++			  sciErr);
+ 		return -EINVAL;
+ 	}
+ 
+ 	sciErr = sc_misc_set_control(hdp->ipcHndl, SC_R_DC_0,
+ 					SC_C_PXL_LINK_MST1_VLD, 1);
+ 	if (sciErr != SC_ERR_NONE) {
+-		DRM_ERROR("SC_R_DC_0:SC_C_PXL_LINK_MST1_VLD sc_misc_set_control failed! (sciError = %d)\n", sciErr);
++		DRM_ERROR("SC_R_DC_0:SC_C_PXL_LINK_MST1_VLD sc_misc_set_control failed! (sciError = %d)\n",
++			   sciErr);
+ 		return -EINVAL;
+ 	}
+ 	if (hdp->dual_mode) {
+@@ -173,7 +176,8 @@ static int imx8qm_pixel_link_invalidate(state_struct *state)
+ 		return -EINVAL;
+ 	}
+ 
+-	sciErr = sc_misc_set_control(hdp->ipcHndl, SC_R_DC_0, SC_C_PXL_LINK_MST1_VLD, 0);
++	sciErr = sc_misc_set_control(hdp->ipcHndl, SC_R_DC_0,
++				     SC_C_PXL_LINK_MST1_VLD, 0);
+ 	if (sciErr != SC_ERR_NONE) {
+ 		DRM_ERROR("SC_R_DC_0:SC_C_PXL_LINK_MST1_VLD sc_misc_set_control failed! (sciError = %d)\n", sciErr);
+ 		return -EINVAL;
+@@ -245,6 +249,7 @@ static int imx8qm_pixel_link_sync_ctrl_disable(state_struct *state)
+ 		return -EINVAL;
+ 	}
+ 
++
+ 	if (hdp->dual_mode) {
+ 		sciErr = sc_misc_set_control(hdp->ipcHndl, SC_R_DC_0, SC_C_SYNC_CTRL, 0);
+ 		if (sciErr != SC_ERR_NONE) {
+@@ -640,7 +645,8 @@ static u8 imx_hdp_link_rate(struct drm_display_mode *mode)
+ 		return AFE_LINK_RATE_2_7;
+ }
+ 
+-static void imx_hdp_mode_setup(struct imx_hdp *hdp, struct drm_display_mode *mode)
++static void imx_hdp_mode_setup(struct imx_hdp *hdp,
++			       struct drm_display_mode *mode)
+ {
+ 	int ret;
+ 
+@@ -655,9 +661,14 @@ static void imx_hdp_mode_setup(struct imx_hdp *hdp, struct drm_display_mode *mod
+ 	imx_hdp_call(hdp, pixel_link_mux, &hdp->state, mode);
+ 
+ 	hdp->link_rate = imx_hdp_link_rate(mode);
++	if (hdp->link_rate > hdp->dp_link_rate) {
++		DRM_WARN("Link rate is too high - forcing link to lower rate\n");
++		hdp->link_rate = hdp->dp_link_rate;
++	}
+ 
+ 	/* mode set */
+-	ret = imx_hdp_call(hdp, phy_init, &hdp->state, mode, hdp->format, hdp->bpc);
++	ret = imx_hdp_call(hdp, phy_init, &hdp->state, mode, hdp->format,
++			   hdp->bpc);
+ 	if (ret < 0) {
+ 		DRM_ERROR("Failed to initialise HDP PHY\n");
+ 		return;
+@@ -777,32 +788,39 @@ static int imx_hdp_default_video_modes(struct drm_connector *connector)
+ 
+ static int imx_hdp_connector_get_modes(struct drm_connector *connector)
+ {
+-	struct imx_hdp *hdp = container_of(connector, struct imx_hdp, connector);
++	struct imx_hdp *hdp = container_of(connector, struct imx_hdp,
++					   connector);
+ 	struct edid *edid;
+ 	int num_modes = 0;
+ 
+ 	if (!hdp->no_edid) {
+-		edid = drm_do_get_edid(connector, hdp->ops->get_edid_block, &hdp->state);
++		edid = drm_do_get_edid(connector, hdp->ops->get_edid_block,
++				       &hdp->state);
+ 		if (edid) {
+-			dev_dbg(hdp->dev, "%x,%x,%x,%x,%x,%x,%x,%x\n",
+-					edid->header[0], edid->header[1], edid->header[2], edid->header[3],
+-					edid->header[4], edid->header[5], edid->header[6], edid->header[7]);
+-			drm_mode_connector_update_edid_property(connector, edid);
++			dev_info(hdp->dev, "%x,%x,%x,%x,%x,%x,%x,%x\n",
++				 edid->header[0], edid->header[1],
++				 edid->header[2], edid->header[3],
++				 edid->header[4], edid->header[5],
++				 edid->header[6], edid->header[7]);
++			drm_mode_connector_update_edid_property(connector,
++								edid);
+ 			num_modes = drm_add_edid_modes(connector, edid);
+ 			if (num_modes == 0) {
+-				dev_dbg(hdp->dev, "Invalid edid, use default video modes\n");
+-				num_modes = imx_hdp_default_video_modes(connector);
++				dev_warn(hdp->dev, "Invalid edid, use default video modes\n");
++				num_modes =
++					imx_hdp_default_video_modes(connector);
+ 			} else
+ 				/* Store the ELD */
+ 				drm_edid_to_eld(connector, edid);
+ 			kfree(edid);
+ 		} else {
+-				dev_info(hdp->dev, "failed to get edid, use default video modes\n");
+-				num_modes = imx_hdp_default_video_modes(connector);
+-				hdp->no_edid = true;
++			dev_info(hdp->dev, "failed to get edid, use default video modes\n");
++			num_modes = imx_hdp_default_video_modes(connector);
++			hdp->no_edid = true;
+ 		}
+ 	} else {
+-		dev_dbg(hdp->dev, "No EDID function, use default video mode\n");
++		dev_warn(hdp->dev,
++			 "No EDID function, use default video mode\n");
+ 		num_modes = imx_hdp_default_video_modes(connector);
+ 	}
+ 
+@@ -907,7 +925,8 @@ static int imx_hdp_set_property(struct drm_connector *connector,
+ 	.atomic_set_property = imx_hdp_set_property,
+ };
+ 
+-static const struct drm_connector_helper_funcs imx_hdp_connector_helper_funcs = {
++static const struct drm_connector_helper_funcs
++imx_hdp_connector_helper_funcs = {
+ 	.get_modes = imx_hdp_connector_get_modes,
+ 	.mode_valid = imx_hdp_connector_mode_valid,
+ };
+@@ -965,7 +984,7 @@ static void imx_hdp_imx_encoder_enable(struct drm_encoder *encoder)
+ 
+ out:
+ 	imx_hdp_call(hdp, pixel_link_validate, &hdp->state);
+-	imx_hdp_call(hdp, pixel_link_sync_ctrl_enable , &hdp->state);
++	imx_hdp_call(hdp, pixel_link_sync_ctrl_enable, &hdp->state);
+ }
+ 
+ static int imx_hdp_imx_encoder_atomic_check(struct drm_encoder *encoder,
+@@ -985,7 +1004,8 @@ static int imx_hdp_imx_encoder_atomic_check(struct drm_encoder *encoder,
+ 	return 0;
+ }
+ 
+-static const struct drm_encoder_helper_funcs imx_hdp_imx_encoder_helper_funcs = {
++static const struct drm_encoder_helper_funcs
++imx_hdp_imx_encoder_helper_funcs = {
+ 	.enable     = imx_hdp_imx_encoder_enable,
+ 	.disable    = imx_hdp_imx_encoder_disable,
+ 	.atomic_check = imx_hdp_imx_encoder_atomic_check,
+@@ -995,7 +1015,9 @@ static int imx_hdp_imx_encoder_atomic_check(struct drm_encoder *encoder,
+ 	.destroy = drm_encoder_cleanup,
+ };
+ 
+-static int imx8mq_hdp_read(struct hdp_mem *mem, unsigned int addr, unsigned int *value)
++static int imx8mq_hdp_read(struct hdp_mem *mem,
++			   unsigned int addr,
++			   unsigned int *value)
+ {
+ 	unsigned int temp;
+ 	void *tmp_addr;
+@@ -1008,7 +1030,9 @@ static int imx8mq_hdp_read(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 	return 0;
+ }
+ 
+-static int imx8mq_hdp_write(struct hdp_mem *mem, unsigned int addr, unsigned int value)
++static int imx8mq_hdp_write(struct hdp_mem *mem,
++			    unsigned int addr,
++			    unsigned int value)
+ {
+ 	void *tmp_addr;
+ 
+@@ -1019,7 +1043,9 @@ static int imx8mq_hdp_write(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 	return 0;
+ }
+ 
+-static int imx8mq_hdp_sread(struct hdp_mem *mem, unsigned int addr, unsigned int *value)
++static int imx8mq_hdp_sread(struct hdp_mem *mem,
++			    unsigned int addr,
++			    unsigned int *value)
+ {
+ 	unsigned int temp;
+ 	void *tmp_addr;
+@@ -1032,7 +1058,9 @@ static int imx8mq_hdp_sread(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 	return 0;
+ }
+ 
+-static int imx8mq_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned int value)
++static int imx8mq_hdp_swrite(struct hdp_mem *mem,
++			     unsigned int addr,
++			     unsigned int value)
+ {
+ 	void *tmp_addr;
+ 
+@@ -1043,7 +1071,9 @@ static int imx8mq_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned in
+ 	return 0;
+ }
+ 
+-static int imx8qm_hdp_read(struct hdp_mem *mem, unsigned int addr, unsigned int *value)
++static int imx8qm_hdp_read(struct hdp_mem *mem,
++			   unsigned int addr,
++			   unsigned int *value)
+ {
+ 	unsigned int temp;
+ 	void *tmp_addr;
+@@ -1051,7 +1081,7 @@ static int imx8qm_hdp_read(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 
+ 	mutex_lock(&mem->mutex);
+ 	tmp_addr = (addr & 0xfff) + mem->regs_base;
+-	off_addr = 0x8 + mem->ss_base;;
++	off_addr = 0x8 + mem->ss_base;
+ 	__raw_writel(addr >> 12, off_addr);
+ 	temp = __raw_readl((volatile unsigned int *)tmp_addr);
+ 
+@@ -1060,7 +1090,9 @@ static int imx8qm_hdp_read(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 	return 0;
+ }
+ 
+-static int imx8qm_hdp_write(struct hdp_mem *mem, unsigned int addr, unsigned int value)
++static int imx8qm_hdp_write(struct hdp_mem *mem,
++			    unsigned int addr,
++			    unsigned int value)
+ {
+ 	void *tmp_addr;
+ 	void *off_addr;
+@@ -1076,7 +1108,9 @@ static int imx8qm_hdp_write(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 	return 0;
+ }
+ 
+-static int imx8qm_hdp_sread(struct hdp_mem *mem, unsigned int addr, unsigned int *value)
++static int imx8qm_hdp_sread(struct hdp_mem *mem,
++			    unsigned int addr,
++			    unsigned int *value)
+ {
+ 	unsigned int temp;
+ 	void *tmp_addr;
+@@ -1093,7 +1127,9 @@ static int imx8qm_hdp_sread(struct hdp_mem *mem, unsigned int addr, unsigned int
+ 	return 0;
+ }
+ 
+-static int imx8qm_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned int value)
++static int imx8qm_hdp_swrite(struct hdp_mem *mem,
++			     unsigned int addr,
++			     unsigned int value)
+ {
+ 	void *tmp_addr;
+ 	void *off_addr;
+@@ -1171,12 +1207,14 @@ static int imx8qm_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned in
+ 	.audio_type = CDN_DPTX,
+ 	.ops = &imx8qm_dp_ops,
+ 	.rw = &imx8qm_rw,
++	.connector_type = DRM_MODE_CONNECTOR_DisplayPort,
+ };
+ 
+ static struct hdp_devtype imx8qm_hdmi_devtype = {
+ 	.audio_type = CDN_HDMITX_TYPHOON,
+ 	.ops = &imx8qm_hdmi_ops,
+ 	.rw = &imx8qm_rw,
++	.connector_type = DRM_MODE_CONNECTOR_HDMIA,
+ };
+ 
+ static struct hdp_rw_func imx8mq_rw = {
+@@ -1200,6 +1238,8 @@ static int imx8qm_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned in
+ 	.audio_type = CDN_HDMITX_KIRAN,
+ 	.ops = &imx8mq_ops,
+ 	.rw = &imx8mq_rw,
++	.connector_type = DRM_MODE_CONNECTOR_HDMIA,
++
+ };
+ 
+ static struct hdp_ops imx8mq_dp_ops = {
+@@ -1214,6 +1254,7 @@ static int imx8qm_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned in
+ 	.audio_type = CDN_DPTX,
+ 	.ops = &imx8mq_dp_ops,
+ 	.rw = &imx8mq_rw,
++	.connector_type = DRM_MODE_CONNECTOR_DisplayPort,
+ };
+ 
+ static const struct of_device_id imx_hdp_dt_ids[] = {
+@@ -1227,8 +1268,9 @@ static int imx8qm_hdp_swrite(struct hdp_mem *mem, unsigned int addr, unsigned in
+ 
+ static void hotplug_work_func(struct work_struct *work)
+ {
+-	struct imx_hdp *hdp = container_of(work, struct imx_hdp,
+-								hotplug_work.work);
++	struct imx_hdp *hdp = container_of(work,
++					   struct imx_hdp,
++					   hotplug_work.work);
+ 	struct drm_connector *connector = &hdp->connector;
+ 
+ 	drm_helper_hpd_irq_event(connector->dev);
+@@ -1237,7 +1279,8 @@ static void hotplug_work_func(struct work_struct *work)
+ 		/* Cable Connected */
+ 		/* For HDMI2.0 SCDC should setup again.
+ 		 * So recovery pre video mode if it is 4Kp60 */
+-		if (drm_mode_equal(&hdp->video.pre_mode, &edid_cea_modes[3]))
++		if (drm_mode_equal(&hdp->video.pre_mode,
++				   &edid_cea_modes[g_default_mode]))
+ 			imx_hdp_mode_setup(hdp, &hdp->video.pre_mode);
+ 		DRM_INFO("HDMI/DP Cable Plug In\n");
+ 		enable_irq(hdp->irq[HPD_IRQ_OUT]);
+@@ -1317,48 +1360,51 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+ 	hdp->mem.rst_base = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(hdp->mem.rst_base)) {
++	if (IS_ERR(hdp->mem.rst_base))
+ 		dev_warn(dev, "Failed to get HDP RESET base register\n");
+-	}
+ 
+ 	hdp->is_cec = of_property_read_bool(pdev->dev.of_node, "fsl,cec");
+ 
+-	hdp->is_digpll_dp_pclock = of_property_read_bool(pdev->dev.of_node, "fsl,use_digpll_pclock");
+-
+-	hdp->is_edp = of_property_read_bool(pdev->dev.of_node, "fsl,edp");
++	hdp->is_digpll_dp_pclock =
++		of_property_read_bool(pdev->dev.of_node,
++				      "fsl,use_digpll_pclock");
+ 
+ 	hdp->no_edid = of_property_read_bool(pdev->dev.of_node, "fsl,no_edid");
+ 
++	hdp->is_edp = of_property_read_bool(pdev->dev.of_node, "fsl,edp");
++
+ 	/* EDID function is not supported by iMX8QM A0 */
+ 	if (cpu_is_imx8qm() && (imx8_get_soc_revision() < B0_SILICON_ID))
+ 		hdp->no_edid = true;
+ 
+ 	ret = of_property_read_u32(pdev->dev.of_node,
+-				       "lane_mapping",
+-				       &hdp->lane_mapping);
++				       "dp-lane-mapping",
++				       &hdp->dp_lane_mapping);
+ 	if (ret) {
+-		hdp->lane_mapping = 0x1b;
++		hdp->dp_lane_mapping = 0x1b;
+ 		dev_warn(dev, "Failed to get lane_mapping - using default\n");
+ 	}
+-	dev_info(dev, "lane_mapping 0x%02x\n", hdp->lane_mapping);
++	dev_info(dev, "dp-lane-mapping 0x%02x\n", hdp->dp_lane_mapping);
+ 
+ 	ret = of_property_read_u32(pdev->dev.of_node,
+-				       "edp_link_rate",
+-				       &hdp->edp_link_rate);
++				       "dp-link-rate",
++				       &hdp->dp_link_rate);
+ 	if (ret) {
+-		hdp->edp_link_rate = 0;
+-		dev_warn(dev, "Failed to get dp_link_rate - using default\n");
+-	}
+-	dev_info(dev, "edp_link_rate 0x%02x\n", hdp->edp_link_rate);
++		hdp->dp_link_rate = AFE_LINK_RATE_1_6;
++		hdp->link_rate = AFE_LINK_RATE_1_6;
++		dev_warn(dev, "Failed to get dp-link-rate - using default\n");
++	} else
++		hdp->link_rate = hdp->dp_link_rate;
++	dev_info(dev, "dp-link-rate 0x%02x\n", hdp->dp_link_rate);
+ 
+ 	ret = of_property_read_u32(pdev->dev.of_node,
+-				       "edp_num_lanes",
+-				       &hdp->edp_num_lanes);
++				       "dp-num-lanes",
++				       &hdp->dp_num_lanes);
+ 	if (ret) {
+-		hdp->edp_num_lanes = 4;
++		hdp->dp_num_lanes = 4;
+ 		dev_warn(dev, "Failed to get dp_num_lanes - using default\n");
+ 	}
+-	dev_info(dev, "dp_num_lanes 0x%02x\n", hdp->edp_num_lanes);
++	dev_info(dev, "dp_num_lanes 0x%02x\n", hdp->dp_num_lanes);
+ 
+ 	hdp->audio_type = devtype->audio_type;
+ 	hdp->ops = devtype->ops;
+@@ -1369,7 +1415,7 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 	/* HDP controller init */
+ 	imx_hdp_state_init(hdp);
+ 
+-	hdp->link_rate = AFE_LINK_RATE_1_6;
++	hdp->dual_mode = false;
+ 
+ 	ret = imx_hdp_call(hdp, clock_init, &hdp->clks);
+ 	if (ret < 0) {
+@@ -1402,7 +1448,8 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 	/* Pixel Format - 1 RGB, 2 YCbCr 444, 3 YCbCr 420 */
+ 	/* bpp (bits per subpixel) - 8 24bpp, 10 30bpp, 12 36bpp, 16 48bpp */
+ 	/* default set hdmi to 1080p60 mode */
+-	ret = imx_hdp_call(hdp, phy_init, &hdp->state, &edid_cea_modes[2],
++	ret = imx_hdp_call(hdp, phy_init, &hdp->state,
++			   &edid_cea_modes[g_default_mode],
+ 			   hdp->format, hdp->bpc);
+ 	if (ret < 0) {
+ 		DRM_ERROR("Failed to initialise HDP PHY\n");
+@@ -1445,7 +1492,7 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 
+ 	drm_connector_init(drm, connector,
+ 			   &imx_hdp_connector_funcs,
+-			   DRM_MODE_CONNECTOR_HDMIA);
++			   devtype->connector_type);
+ 
+ 	drm_object_attach_property(&connector->base,
+ 		connector->dev->mode_config.hdr_source_metadata_property, 0);
+@@ -1454,6 +1501,8 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 
+ 	dev_set_drvdata(dev, hdp);
+ 
++	dp_aux_init(&hdp->state, dev);
++
+ 	INIT_DELAYED_WORK(&hdp->hotplug_work, hotplug_work_func);
+ 
+ 	/* Check cable states before enable irq */
+@@ -1464,7 +1513,8 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 		irq_set_status_flags(hdp->irq[HPD_IRQ_IN], IRQ_NOAUTOEN);
+ 		ret = devm_request_threaded_irq(dev, hdp->irq[HPD_IRQ_IN],
+ 						NULL, imx_hdp_irq_thread,
+-						IRQF_ONESHOT, dev_name(dev), hdp);
++						IRQF_ONESHOT, dev_name(dev),
++						hdp);
+ 		if (ret) {
+ 			dev_err(&pdev->dev, "can't claim irq %d\n",
+ 							hdp->irq[HPD_IRQ_IN]);
+@@ -1478,7 +1528,8 @@ static int imx_hdp_imx_bind(struct device *dev, struct device *master,
+ 		irq_set_status_flags(hdp->irq[HPD_IRQ_OUT], IRQ_NOAUTOEN);
+ 		ret = devm_request_threaded_irq(dev, hdp->irq[HPD_IRQ_OUT],
+ 						NULL, imx_hdp_irq_thread,
+-						IRQF_ONESHOT, dev_name(dev), hdp);
++						IRQF_ONESHOT, dev_name(dev),
++						hdp);
+ 		if (ret) {
+ 			dev_err(&pdev->dev, "can't claim irq %d\n",
+ 							hdp->irq[HPD_IRQ_OUT]);
+diff --git a/drivers/gpu/drm/imx/hdp/imx-hdp.h b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+index ab8c51d..cb8e09c 100644
+--- a/drivers/gpu/drm/imx/hdp/imx-hdp.h
++++ b/drivers/gpu/drm/imx/hdp/imx-hdp.h
+@@ -91,8 +91,10 @@
+ struct hdp_ops {
+ 	void (*fw_load)(state_struct *state);
+ 	int (*fw_init)(state_struct *state);
+-	int (*phy_init)(state_struct *state, struct drm_display_mode *mode, int format, int color_depth);
+-	void (*mode_set)(state_struct *state, struct drm_display_mode *mode, int format, int color_depth, int max_link);
++	int (*phy_init)(state_struct *state, struct drm_display_mode *mode,
++			int format, int color_depth);
++	void (*mode_set)(state_struct *state, struct drm_display_mode *mode,
++			 int format, int color_depth, int max_link);
+ 	int (*get_edid_block)(void *data, u8 *buf, u32 block, size_t len);
+ 	int (*get_hpd_state)(state_struct *state, u8 *hpd);
+ 	int (*write_hdr_metadata)(state_struct *state,
+@@ -103,7 +105,8 @@ struct hdp_ops {
+ 	int (*pixel_link_invalidate)(state_struct *state);
+ 	int (*pixel_link_sync_ctrl_enable)(state_struct *state);
+ 	int (*pixel_link_sync_ctrl_disable)(state_struct *state);
+-	void (*pixel_link_mux)(state_struct *state, struct drm_display_mode *mode);
++	void (*pixel_link_mux)(state_struct *state,
++			       struct drm_display_mode *mode);
+ 	void (*pixel_engine_reset)(state_struct *state);
+ 
+ 	int (*clock_init)(struct hdp_clks *clks);
+@@ -120,6 +123,7 @@ struct hdp_devtype {
+ 	u8 audio_type;
+ 	struct hdp_ops *ops;
+ 	struct hdp_rw_func *rw;
++	u32 connector_type;
+ };
+ 
+ struct hdp_video {
+@@ -209,9 +213,9 @@ struct imx_hdp {
+ 	u8 is_digpll_dp_pclock;
+ 	u8 no_edid;
+ 	u8 audio_type;
+-	u32 lane_mapping;
+-	u32 edp_link_rate;
+-	u32 edp_num_lanes;
++	u32 dp_lane_mapping;
++	u32 dp_link_rate;
++	u32 dp_num_lanes;
+ 
+ 	struct mutex mutex;		/* for state below and previous_mode */
+ 	enum drm_connector_force force;	/* mutex-protected force state */
+-- 
+1.7.9.5
+

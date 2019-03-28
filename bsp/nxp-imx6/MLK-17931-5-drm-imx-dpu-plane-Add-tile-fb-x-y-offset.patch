@@ -1,0 +1,227 @@
+From 85853225078ab536074d1d55d859902eecd61171 Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Wed, 28 Mar 2018 15:27:35 +0800
+Subject: [PATCH 3593/5242] MLK-17931-5 drm/imx: dpu: plane: Add tile fb x/y
+ offset support for new DPR IP
+
+commit  3b59dc5e167a9d58e542185561c5048ce1fe9cce from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+The new DPR IP contains a fixup for the in-tile cropping issue(TKT344978).
+The FRAME_2P_PIX_X/Y_CTRL(@F0h and @100h) register definitions are changed
+to be FRAME_PIX_X/Y_ULC_CTRL.  This patch uses the updated registers to
+support tile framebuffer x/y offset.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-plane.c |    9 ++++++-
+ drivers/gpu/imx/imx8_dprc.c         |   44 ++++++++++++++++++++++++++++-------
+ drivers/gpu/imx/imx8_prg.c          |   35 +++++++++++++++++++++++++++-
+ 3 files changed, 77 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-plane.c b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+index c92f8dc..44258dd 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-plane.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-plane.c
+@@ -165,6 +165,9 @@ static bool dpu_drm_plane_format_mod_supported(struct drm_plane *plane,
+ 	cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
+ 	BUG_ON(!cma_obj);
+ 
++	if (fb->modifier)
++		return cma_obj->paddr + fb->offsets[0];
++
+ 	return cma_obj->paddr + fb->offsets[0] + fb->pitches[0] * y +
+ 	       drm_format_plane_cpp(fb->format->format, 0) * x;
+ }
+@@ -180,6 +183,9 @@ static bool dpu_drm_plane_format_mod_supported(struct drm_plane *plane,
+ 	cma_obj = drm_fb_cma_get_gem_obj(fb, 1);
+ 	BUG_ON(!cma_obj);
+ 
++	if (fb->modifier)
++		return cma_obj->paddr + fb->offsets[1];
++
+ 	x /= drm_format_horz_chroma_subsampling(fb->format->format);
+ 	y /= drm_format_vert_chroma_subsampling(fb->format->format);
+ 
+@@ -234,7 +240,8 @@ static int dpu_plane_atomic_check(struct drm_plane *plane,
+ 	    fb->modifier != DRM_FORMAT_MOD_VIVANTE_SUPER_TILED)
+ 		return -EINVAL;
+ 
+-	if (fb->modifier && (src_x || src_y))
++	if (fb->modifier && (src_x || src_y) &&
++	    !dplane->has_prefetch_fixup)
+ 		return -EINVAL;
+ 
+ 	if (dplane->grp->has_vproc) {
+diff --git a/drivers/gpu/imx/imx8_dprc.c b/drivers/gpu/imx/imx8_dprc.c
+index 5bee77d..c5aea6e 100644
+--- a/drivers/gpu/imx/imx8_dprc.c
++++ b/drivers/gpu/imx/imx8_dprc.c
+@@ -109,10 +109,14 @@ enum {
+ #define FRAME_1P_PIX_X_CTRL			0xa0
+ #define FRAME_2P_PIX_X_CTRL			0xf0
+ #define NUM_X_PIX_WIDE(n)			((n) & 0xffff)
++#define FRAME_PIX_X_ULC_CTRL			0xf0
++#define CROP_ULC_X(n)				((n) & 0xffff)
+ 
+ #define FRAME_1P_PIX_Y_CTRL			0xb0
+ #define FRAME_2P_PIX_Y_CTRL			0x100
+ #define NUM_Y_PIX_HIGH(n)			((n) & 0xffff)
++#define FRAME_PIX_Y_ULC_CTRL			0x100
++#define CROP_ULC_Y(n)				((n) & 0xffff)
+ 
+ #define FRAME_1P_BASE_ADDR_CTRL0		0xc0
+ #define FRAME_2P_BASE_ADDR_CTRL0		0x110
+@@ -318,10 +322,13 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 		    bool start, bool aux_start)
+ {
+ 	const struct dprc_format_info *info = dprc_format_info(format);
++	unsigned int dprc_width = width + x_offset;
++	unsigned int dprc_height = height + y_offset;
+ 	unsigned int p1_w, p1_h, p2_w, p2_h;
+ 	unsigned int prg_stride = width * info->cpp[0];
+ 	unsigned int bpp = 8 * info->cpp[0];
+ 	unsigned int preq;
++	unsigned int mt_w = 0, mt_h = 0;	/* w/h in a micro-tile */
+ 	u32 val;
+ 
+ 	if (WARN_ON(!dprc))
+@@ -340,14 +347,14 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 	dprc_write(dprc, IRQ_CTRL_MASK, IRQ_MASK);
+ 
+ 	if (info->num_planes > 1) {
+-		p1_w = round_up(width, modifier ? 8 : 64);
+-		p1_h = modifier ? height : round_up(height, 8);
++		p1_w = round_up(dprc_width, modifier ? 8 : 64);
++		p1_h = round_up(dprc_height, 8);
+ 
+ 		p2_w = p1_w;
+ 		if (modifier)
+-			p2_h = height / info->vsub;
++			p2_h = dprc_height / info->vsub;
+ 		else
+-			p2_h = round_up((height / info->vsub), 8);
++			p2_h = round_up((dprc_height / info->vsub), 8);
+ 
+ 		preq = modifier ? BYTE_64 : BYTE_1K;
+ 
+@@ -362,26 +369,39 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 	} else {
+ 		switch (modifier) {
+ 		case DRM_FORMAT_MOD_VIVANTE_TILED:
+-			p1_w = round_up(width, info->cpp[0] == 2 ? 8 : 4);
++			p1_w = round_up(dprc_width, info->cpp[0] == 2 ? 8 : 4);
+ 			break;
+ 		case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
+-			p1_w = round_up(width, 64);
++			p1_w = round_up(dprc_width, 64);
+ 			break;
+ 		default:
+-			p1_w = round_up(width, info->cpp[0] == 2 ? 32 : 16);
++			p1_w = round_up(dprc_width,
++					info->cpp[0] == 2 ? 32 : 16);
+ 			break;
+ 		}
+-		p1_h = round_up(height, 4);
++		p1_h = round_up(dprc_height, 4);
+ 	}
+ 
+ 	dprc_write(dprc, PITCH(stride), FRAME_CTRL0);
+ 	switch (modifier) {
+ 	case DRM_FORMAT_MOD_AMPHION_TILED:
+ 		preq = BYTE_64;
++		mt_w = 8;
++		mt_h = 8;
+ 		break;
+ 	case DRM_FORMAT_MOD_VIVANTE_TILED:
+ 	case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
+-		preq = (bpp == 16) ? BYTE_64 : BYTE_128;
++		if (bpp == 16) {
++			preq = BYTE_64;
++			mt_w = 8;
++		} else {
++			if (dprc->devtype->has_fixup)
++				preq = (x_offset % 8) ? BYTE_64 : BYTE_128;
++			else
++				preq = BYTE_128;
++			mt_w = 4;
++		}
++		mt_h = 4;
+ 		break;
+ 	default:
+ 		preq = BYTE_1K;
+@@ -391,6 +411,12 @@ void dprc_configure(struct dprc *dprc, unsigned int stream_id,
+ 	dprc_write(dprc, NUM_X_PIX_WIDE(p1_w), FRAME_1P_PIX_X_CTRL);
+ 	dprc_write(dprc, NUM_Y_PIX_HIGH(p1_h), FRAME_1P_PIX_Y_CTRL);
+ 	dprc_write(dprc, baddr, FRAME_1P_BASE_ADDR_CTRL0);
++	if (dprc->devtype->has_fixup && modifier) {
++		dprc_write(dprc, CROP_ULC_X(round_down(x_offset, mt_w)),
++							FRAME_PIX_X_ULC_CTRL);
++		dprc_write(dprc, CROP_ULC_Y(round_down(y_offset, mt_h)),
++							FRAME_PIX_Y_ULC_CTRL);
++	}
+ 
+ 	val = dprc_read(dprc, RTRAM_CTRL0);
+ 	val &= ~THRES_LOW_MASK;
+diff --git a/drivers/gpu/imx/imx8_prg.c b/drivers/gpu/imx/imx8_prg.c
+index 53801fc..f558d98 100644
+--- a/drivers/gpu/imx/imx8_prg.c
++++ b/drivers/gpu/imx/imx8_prg.c
+@@ -135,6 +135,8 @@ void prg_configure(struct prg *prg, unsigned int width, unsigned int height,
+ 		   bool start)
+ {
+ 	unsigned int burst_size;
++	unsigned int mt_w = 0, mt_h = 0;	/* w/h in a micro-tile */
++	bool is_tkt342628_case = false;
+ 	u32 val;
+ 
+ 	if (WARN_ON(!prg))
+@@ -161,12 +163,43 @@ void prg_configure(struct prg *prg, unsigned int width, unsigned int height,
+ 	 * when prg stride is less or equals to burst size,
+ 	 * the auxiliary prg height needs to be a half
+ 	 */
+-	if (prg->is_auxiliary && stride <= burst_size)
++	if (prg->is_auxiliary && stride <= burst_size) {
+ 		height /= 2;
++		is_tkt342628_case = true;
++	}
++
++	/* prg finer cropping into micro-tile block - top/left start point */
++	switch (modifier) {
++	case DRM_FORMAT_MOD_NONE:
++		break;
++	case DRM_FORMAT_MOD_AMPHION_TILED:
++		mt_w = 8;
++		mt_h = 8;
++		break;
++	case DRM_FORMAT_MOD_VIVANTE_TILED:
++	case DRM_FORMAT_MOD_VIVANTE_SUPER_TILED:
++		mt_w = (bits_per_pixel == 16) ? 8 : 4;
++		mt_h = 4;
++		break;
++	default:
++		dev_err(prg->dev, "unsupported modifier 0x%016llx\n", modifier);
++		return;
++	}
++
++	if (prg->devtype->has_dprc_fixup && modifier) {
++		x_offset %= mt_w;
++		y_offset %= mt_h;
++		if (is_tkt342628_case)
++			y_offset /= 2;
++	} else {
++		x_offset = 0;
++		y_offset = 0;
++	}
+ 
+ 	prg_write(prg, STRIDE(stride), PRG_STRIDE);
+ 	prg_write(prg, WIDTH(width), PRG_WIDTH);
+ 	prg_write(prg, HEIGHT(height), PRG_HEIGHT);
++	prg_write(prg, X(x_offset) | Y(y_offset), PRG_OFFSET);
+ 	prg_write(prg, baddr, PRG_BADDR);
+ 
+ 	val = prg_read(prg, PRG_CTRL);
+-- 
+1.7.9.5
+

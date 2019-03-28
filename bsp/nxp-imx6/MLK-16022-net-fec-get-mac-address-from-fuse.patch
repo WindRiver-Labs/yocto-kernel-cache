@@ -1,0 +1,199 @@
+From 32c82b7bb95bef04e73c2355d57ba7a44cca48e4 Mon Sep 17 00:00:00 2001
+From: Fugang Duan <fugang.duan@nxp.com>
+Date: Wed, 12 Jul 2017 14:49:45 +0800
+Subject: [PATCH 2158/5242] MLK-16022 net: fec: get mac address from fuse
+
+commit  6be04119bbe6b3dbc7b5e3793cb5d0bf505328e7 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+i.MX8QM/QXP MAC address only can be program by SCU, and A core
+read fuse enet MAC address by sc APIs interface. i.MX8mScale is
+inherited from i.MX7D, can directly read fuse in A-core.
+
+Add i.MX8QM/QXP/MQ ENET MAC address check from fuse.
+
+Signed-off-by: Fugang Duan <fugang.duan@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/ethernet/freescale/fec.h       |    1 +
+ drivers/net/ethernet/freescale/fec_fixup.c |  114 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/freescale/fec_main.c  |   10 ++-
+ 3 files changed, 123 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/fec.h b/drivers/net/ethernet/freescale/fec.h
+index f983a2d..fcabe33 100644
+--- a/drivers/net/ethernet/freescale/fec.h
++++ b/drivers/net/ethernet/freescale/fec.h
+@@ -623,6 +623,7 @@ struct fec_enet_private {
+ int fec_ptp_get(struct net_device *ndev, struct ifreq *ifr);
+ void fec_enet_register_fixup(struct net_device *ndev);
+ int of_fec_enet_parse_fixup(struct device_node *np);
++void fec_enet_get_mac_from_fuse(struct device_node *np, unsigned char *mac);
+ 
+ /****************************************************************************/
+ #endif /* FEC_H */
+diff --git a/drivers/net/ethernet/freescale/fec_fixup.c b/drivers/net/ethernet/freescale/fec_fixup.c
+index 5a8497c..da9e03d 100644
+--- a/drivers/net/ethernet/freescale/fec_fixup.c
++++ b/drivers/net/ethernet/freescale/fec_fixup.c
+@@ -14,10 +14,22 @@
+ 
+ #include <linux/netdevice.h>
+ #include <linux/phy.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#ifdef CONFIG_ARCH_MXC_ARM64
++#include <soc/imx8/sc/sci.h>
++#endif
+ #include "fec.h"
+ 
+ #define PHY_ID_AR8031   0x004dd074
+ 
++#define IMX8QM_FUSE_MAC0_WORD0		452
++#define IMX8QM_FUSE_MAC0_WORD1		453
++#define IMX8QM_FUSE_MAC1_WORD0		454
++#define IMX8QM_FUSE_MAC1_WORD1		455
++#define IMX8M_OCOTP_MAC_ADDR0_OFF	0x640
++#define IMX8M_OCOTP_MAC_ADDR1_OFF	0x650
++
+ static int ar8031_phy_fixup(struct phy_device *dev)
+ {
+ 	u16 val;
+@@ -72,3 +84,105 @@ int of_fec_enet_parse_fixup(struct device_node *np)
+ 
+ 	return fixups;
+ }
++
++static void imx8mq_get_mac_from_fuse(int dev_id, unsigned char *mac)
++{
++	struct device_node *ocotp_np;
++	void __iomem *base;
++	u32 value;
++
++	ocotp_np = of_find_compatible_node(NULL, NULL, "fsl,imx7d-ocotp");
++	if (!ocotp_np) {
++		pr_warn("failed to find ocotp node\n");
++		return;
++	}
++
++	base = of_iomap(ocotp_np, 0);
++	if (!base) {
++		pr_warn("failed to map ocotp\n");
++		goto put_ocotp_node;
++	}
++
++	value = readl_relaxed(base + IMX8M_OCOTP_MAC_ADDR1_OFF);
++	mac[0] = (value >> 8);
++	mac[1] = value;
++
++	value = readl_relaxed(base + IMX8M_OCOTP_MAC_ADDR0_OFF);
++	mac[2] = value >> 24;
++	mac[3] = value >> 16;
++	mac[4] = value >> 8;
++	mac[5] = value;
++
++put_ocotp_node:
++	of_node_put(ocotp_np);
++}
++
++#ifdef CONFIG_ARCH_MXC_ARM64
++static void imx8qm_get_mac_from_fuse(int dev_id, unsigned char *mac)
++{
++	uint32_t mu_id;
++	sc_ipc_t ipc_handle;
++	sc_err_t sc_err = SC_ERR_NONE;
++	uint32_t val1 = 0, val2 = 0;
++	uint32_t word1, word2;
++
++	sc_err = sc_ipc_getMuID(&mu_id);
++	if (sc_err != SC_ERR_NONE) {
++		pr_err("FEC MAC fuse: Get MU ID failed\n");
++		return;
++	}
++
++	sc_err = sc_ipc_open(&ipc_handle, mu_id);
++	if (sc_err != SC_ERR_NONE) {
++		pr_err("FEC MAC fuse: Open MU channel failed\n");
++		return;
++	}
++
++	if (dev_id == 0) {
++		word1 = IMX8QM_FUSE_MAC0_WORD0;
++		word2 = IMX8QM_FUSE_MAC0_WORD1;
++	} else {
++		word1 = IMX8QM_FUSE_MAC1_WORD0;
++		word2 = IMX8QM_FUSE_MAC1_WORD1;
++	}
++
++	sc_err = sc_misc_otp_fuse_read(ipc_handle, word1, &val1);
++	if (sc_err != SC_ERR_NONE) {
++		pr_err("FEC MAC fuse %d read error: %d\n", word1, sc_err);
++		return;
++	}
++
++	sc_err = sc_misc_otp_fuse_read(ipc_handle, word2, &val2);
++	if (sc_err != SC_ERR_NONE) {
++		pr_err("FEC MAC fuse %d read error: %d\n", word2, sc_err);
++		return;
++	}
++
++	mac[0] = val1;
++	mac[1] = val1 >> 8;
++	mac[2] = val1 >> 16;
++	mac[3] = val1 >> 24;
++	mac[4] = val2;
++	mac[5] = val2 >> 8;
++}
++#else
++static void imx8qm_get_mac_from_fuse(int dev_id, unsigned char *mac) {}
++#endif
++
++void fec_enet_get_mac_from_fuse(struct device_node *np, unsigned char *mac)
++{
++	int idx;
++
++	if (!np)
++		return;
++
++	idx = of_alias_get_id(np, "ethernet");
++	if (idx < 0)
++		idx = 0;
++
++	if (of_machine_is_compatible("fsl,imx8qm") ||
++	    of_machine_is_compatible("fsl,imx8qxp"))
++		imx8qm_get_mac_from_fuse(idx, mac);
++	else if (of_machine_is_compatible("fsl,imx8mq"))
++		imx8mq_get_mac_from_fuse(idx, mac);
++}
+diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
+index 58b9303..eeec5f5 100644
+--- a/drivers/net/ethernet/freescale/fec_main.c
++++ b/drivers/net/ethernet/freescale/fec_main.c
+@@ -1687,7 +1687,7 @@ static void fec_get_mac(struct net_device *ndev)
+ {
+ 	struct fec_enet_private *fep = netdev_priv(ndev);
+ 	struct fec_platform_data *pdata = dev_get_platdata(&fep->pdev->dev);
+-	unsigned char *iap, tmpaddr[ETH_ALEN];
++	unsigned char *iap, tmpaddr[ETH_ALEN] = {0};
+ 
+ 	/*
+ 	 * try to get mac address in following order:
+@@ -1717,8 +1717,14 @@ static void fec_get_mac(struct net_device *ndev)
+ 		if (FEC_FLASHMAC)
+ 			iap = (unsigned char *)FEC_FLASHMAC;
+ #else
+-		if (pdata)
++		if (pdata) {
+ 			iap = (unsigned char *)&pdata->mac;
++		} else {
++			struct device_node *np = fep->pdev->dev.of_node;
++
++			fec_enet_get_mac_from_fuse(np, tmpaddr);
++			iap = &tmpaddr[0];
++		}
+ #endif
+ 	}
+ 
+-- 
+1.7.9.5
+

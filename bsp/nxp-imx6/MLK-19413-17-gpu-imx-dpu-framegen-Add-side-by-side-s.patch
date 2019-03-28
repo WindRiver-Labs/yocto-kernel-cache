@@ -1,0 +1,137 @@
+From 1ef0667d205eea255a3ab67f3805a7d1dbb38639 Mon Sep 17 00:00:00 2001
+From: Liu Ying <victor.liu@nxp.com>
+Date: Mon, 18 Sep 2017 11:17:28 +0800
+Subject: [PATCH 4528/5242] MLK-19413-17 gpu: imx: dpu: framegen: Add
+ side-by-side support
+
+commit  4e4a4ef1056c0cd7aa58ad2379ae91f8492dd207 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch adds side-by-side support for framegen so that
+two framegens can work in sync mode to participate in the
+dual display streams to drive a high pixel rate display
+via a pixel combiner.
+
+Signed-off-by: Liu Ying <victor.liu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dpu/dpu-crtc.c |    2 +-
+ drivers/gpu/imx/dpu/dpu-framegen.c |   33 +++++++++++++++++++++++++++++----
+ include/video/dpu.h                |    3 ++-
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dpu/dpu-crtc.c b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+index db2a8a0..4db11d0 100644
+--- a/drivers/gpu/drm/imx/dpu/dpu-crtc.c
++++ b/drivers/gpu/drm/imx/dpu/dpu-crtc.c
+@@ -530,7 +530,7 @@ static void dpu_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 		dev_dbg(dpu_crtc->dev, "%s: encoder type has LVDS\n", __func__);
+ 	}
+ 
+-	framegen_cfg_videomode(dpu_crtc->fg, mode,
++	framegen_cfg_videomode(dpu_crtc->fg, mode, false,
+ 			encoder_type_has_tmds, encoder_type_has_lvds);
+ 	framegen_displaymode(dpu_crtc->fg, FGDM__SEC_ON_TOP);
+ 
+diff --git a/drivers/gpu/imx/dpu/dpu-framegen.c b/drivers/gpu/imx/dpu/dpu-framegen.c
+index d15189a..a52a264 100644
+--- a/drivers/gpu/imx/dpu/dpu-framegen.c
++++ b/drivers/gpu/imx/dpu/dpu-framegen.c
+@@ -100,6 +100,7 @@ struct dpu_framegen {
+ 	bool inuse;
+ 	bool use_bypass_clk;
+ 	bool encoder_type_has_lvds;
++	bool side_by_side;
+ 	struct dpu_soc *dpu;
+ };
+ 
+@@ -305,17 +306,20 @@ void framegen_syncmode(struct dpu_framegen *fg, fgsyncmode_t mode)
+ EXPORT_SYMBOL_GPL(framegen_syncmode);
+ 
+ void
+-framegen_cfg_videomode(struct dpu_framegen *fg, struct drm_display_mode *m,
++framegen_cfg_videomode(struct dpu_framegen *fg,
++		       struct drm_display_mode *m, bool side_by_side,
+ 		       bool encoder_type_has_tmds, bool encoder_type_has_lvds)
+ {
+ 	struct dpu_soc *dpu = fg->dpu;
+ 	const struct dpu_devtype *devtype = dpu->devtype;
+ 	u32 hact, htotal, hsync, hsbp;
+ 	u32 vact, vtotal, vsync, vsbp;
++	u32 kick_row, kick_col;
+ 	u32 val;
+ 	unsigned long disp_clock_rate, pll_clock_rate = 0;
+ 	int div = 0;
+ 
++	fg->side_by_side = side_by_side;
+ 	fg->encoder_type_has_lvds = encoder_type_has_lvds;
+ 
+ 	hact = m->crtc_hdisplay;
+@@ -323,6 +327,13 @@ void framegen_syncmode(struct dpu_framegen *fg, fgsyncmode_t mode)
+ 	hsync = m->crtc_hsync_end - m->crtc_hsync_start;
+ 	hsbp = m->crtc_htotal - m->crtc_hsync_start;
+ 
++	if (side_by_side) {
++		hact /= 2;
++		htotal /= 2;
++		hsync /= 2;
++		hsbp /= 2;
++	}
++
+ 	vact = m->crtc_vdisplay;
+ 	vtotal = m->crtc_vtotal;
+ 	vsync = m->crtc_vsync_end - m->crtc_vsync_start;
+@@ -335,11 +346,21 @@ void framegen_syncmode(struct dpu_framegen *fg, fgsyncmode_t mode)
+ 	dpu_fg_write(fg, VACT(vact) | VTOTAL(vtotal), VTCFG1);
+ 	dpu_fg_write(fg, VSYNC(vsync) | VSBP(vsbp) | VSEN, VTCFG2);
+ 
++	kick_col = hact;
++	kick_row = vact;
++	/*
++	 * FrameGen as slave needs to be kicked later for
++	 * more than 64 pixels comparing to the master.
++	 */
++	if (side_by_side && framegen_is_slave(fg) &&
++	    devtype->has_syncmode_fixup)
++		kick_col += 65;
++
+ 	/* pkickconfig */
+-	dpu_fg_write(fg, COL(hact) | ROW(vact) | EN, PKICKCONFIG);
++	dpu_fg_write(fg, COL(kick_col) | ROW(kick_row) | EN, PKICKCONFIG);
+ 
+ 	/* skikconfig */
+-	dpu_fg_write(fg, COL(hact) | ROW(vact) | EN, SKICKCONFIG);
++	dpu_fg_write(fg, COL(kick_col) | ROW(kick_row) | EN, SKICKCONFIG);
+ 
+ 	/* primary position config */
+ 	dpu_fg_write(fg, STARTX(0) | STARTY(0), PACFG);
+@@ -367,7 +388,11 @@ void framegen_syncmode(struct dpu_framegen *fg, fgsyncmode_t mode)
+ 	 * will fail.
+ 	 */
+ 	if (devtype->has_disp_sel_clk && encoder_type_has_tmds) {
+-		dpu_pixel_link_set_mst_addr(dpu->id, fg->id, 1);
++		if (side_by_side)
++			dpu_pixel_link_set_mst_addr(dpu->id, fg->id,
++							fg->id ? 2 : 1);
++		else
++			dpu_pixel_link_set_mst_addr(dpu->id, fg->id, 1);
+ 
+ 		clk_set_parent(fg->clk_disp_sel, fg->clk_bypass);
+ 
+diff --git a/include/video/dpu.h b/include/video/dpu.h
+index e1177e4..4dfc253 100644
+--- a/include/video/dpu.h
++++ b/include/video/dpu.h
+@@ -608,7 +608,8 @@ void fetchwarp_rgb_constantcolor(struct dpu_fetchunit *fu,
+ void framegen_shdtokgen(struct dpu_framegen *fg);
+ void framegen_syncmode(struct dpu_framegen *fg, fgsyncmode_t mode);
+ void
+-framegen_cfg_videomode(struct dpu_framegen *fg, struct drm_display_mode *m,
++framegen_cfg_videomode(struct dpu_framegen *fg,
++		       struct drm_display_mode *m, bool side_by_side,
+ 		       bool encoder_type_has_tmds, bool encoder_type_has_lvds);
+ void framegen_pkickconfig(struct dpu_framegen *fg, bool enable);
+ void framegen_sacfg(struct dpu_framegen *fg, unsigned int x, unsigned int y);
+-- 
+1.7.9.5
+

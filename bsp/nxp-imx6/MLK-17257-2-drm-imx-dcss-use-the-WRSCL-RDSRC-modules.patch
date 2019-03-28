@@ -1,0 +1,319 @@
+From 2a14646830462b31c80d4bdf3fe624f0f07eeadb Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Tue, 19 Dec 2017 13:38:44 +0200
+Subject: [PATCH 3133/5242] MLK-17257-2: drm: imx: dcss: use the WRSCL/RDSRC
+ modules
+
+commit  7a3c40db2860b5584ae74230f2474cd37c9f80e0 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch makes the necessary changes so that, for downscaling ratios
+more than 3:1 and up to 7:1 (for video) and 5:1 (for graphics), the
+WRSCL/RDSRC path will be used. This way the DRAM bandwidth will be lower
+and spread evenly across the frame time.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/dcss/dcss-plane.c |    3 +-
+ drivers/gpu/imx/dcss/dcss-common.c    |   16 ++++
+ drivers/gpu/imx/dcss/dcss-ctxld.c     |    4 +-
+ drivers/gpu/imx/dcss/dcss-scaler.c    |  135 ++++++++++++++++++++++++---------
+ include/video/imx-dcss.h              |    3 +-
+ 5 files changed, 122 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/imx/dcss/dcss-plane.c b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+index d2cbc2f..45c19f0 100644
+--- a/drivers/gpu/drm/imx/dcss/dcss-plane.c
++++ b/drivers/gpu/drm/imx/dcss/dcss-plane.c
+@@ -232,7 +232,8 @@ static void dcss_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	dcss_scaler_setup(dcss_plane->dcss, dcss_plane->ch_num,
+ 			  pixel_format, state->src_w >> 16,
+-			  state->src_h >> 16, state->crtc_w, state->crtc_h);
++			  state->src_h >> 16, state->crtc_w, state->crtc_h,
++			  drm_mode_vrefresh(&crtc_state->mode));
+ 
+ 	/*
+ 	 * TODO: retrieve the output colorspace format from somewhere... For
+diff --git a/drivers/gpu/imx/dcss/dcss-common.c b/drivers/gpu/imx/dcss/dcss-common.c
+index 178383f..072f0ff 100644
+--- a/drivers/gpu/imx/dcss/dcss-common.c
++++ b/drivers/gpu/imx/dcss/dcss-common.c
+@@ -166,8 +166,22 @@ static int dcss_submodules_init(struct dcss_soc *dcss)
+ 	if (ret)
+ 		goto hdr10_err;
+ 
++	ret = dcss_wrscl_init(dcss, dcss_base + dcss->devtype->wrscl_ofs);
++	if (ret)
++		goto wrscl_err;
++
++	ret = dcss_rdsrc_init(dcss, dcss_base + dcss->devtype->rdsrc_ofs);
++	if (ret)
++		goto rdsrc_err;
++
+ 	return 0;
+ 
++rdsrc_err:
++	dcss_rdsrc_exit(dcss);
++
++wrscl_err:
++	dcss_wrscl_exit(dcss);
++
+ hdr10_err:
+ 	dcss_hdr10_exit(dcss);
+ 
+@@ -315,6 +329,8 @@ static int dcss_dump_regs_show(struct seq_file *s, void *data)
+ 	dcss_dtrc_dump_regs(s, s->private);
+ 	dcss_dpr_dump_regs(s, s->private);
+ 	dcss_scaler_dump_regs(s, s->private);
++	dcss_wrscl_dump_regs(s, s->private);
++	dcss_rdsrc_dump_regs(s, s->private);
+ 	dcss_dtg_dump_regs(s, s->private);
+ 	dcss_ss_dump_regs(s, s->private);
+ 	dcss_hdr10_dump_regs(s, s->private);
+diff --git a/drivers/gpu/imx/dcss/dcss-ctxld.c b/drivers/gpu/imx/dcss/dcss-ctxld.c
+index e5076f9..5ec2a12 100644
+--- a/drivers/gpu/imx/dcss/dcss-ctxld.c
++++ b/drivers/gpu/imx/dcss/dcss-ctxld.c
+@@ -480,12 +480,12 @@ void dcss_ctxld_dump(struct seq_file *s, void *data)
+ 	for (i = 0; i < ctx_db_size; i++)
+ 		seq_printf(s, "\t0x%16llx -> 0x%08x : 0x%08x\n",
+ 			   (u64)&ctx_db[i], ctx_db[i].ofs, ctx_db[i].val);
+-	seq_puts(s, "\t>>Dumping CTX_DB_HP:\n");
++	seq_puts(s, "\t>>Dumping CTX_SB_HP:\n");
+ 	for (i = 0; i < ctx_sb_hp_size; i++)
+ 		seq_printf(s, "\t0x%16llx -> 0x%08x : 0x%08x\n",
+ 			   (u64)&ctx_sb_hp[i], ctx_sb_hp[i].ofs,
+ 			   ctx_sb_hp[i].val);
+-	seq_puts(s, "\t>>Dumping CTX_DB_LP:\n");
++	seq_puts(s, "\t>>Dumping CTX_SB_LP:\n");
+ 	for (i = 0; i < ctx_sb_lp_size; i++)
+ 		seq_printf(s, "\t0x%16llx -> 0x%08x : 0x%08x\n",
+ 			   (u64)&ctx_sb_lp[i], ctx_sb_lp[i].ofs,
+diff --git a/drivers/gpu/imx/dcss/dcss-scaler.c b/drivers/gpu/imx/dcss/dcss-scaler.c
+index c8853aa..6b85e55 100644
+--- a/drivers/gpu/imx/dcss/dcss-scaler.c
++++ b/drivers/gpu/imx/dcss/dcss-scaler.c
+@@ -110,6 +110,8 @@ struct dcss_scaler_ch {
+ struct dcss_scaler_priv {
+ 	struct dcss_soc *dcss;
+ 	struct dcss_scaler_ch ch[3];
++
++	int ch_using_wrscl;
+ };
+ 
+ static void dcss_scaler_write(struct dcss_scaler_priv *scl, int ch_num,
+@@ -179,6 +181,8 @@ int dcss_scaler_init(struct dcss_soc *dcss, unsigned long scaler_base)
+ 	dcss->scaler_priv = scaler;
+ 	scaler->dcss = dcss;
+ 
++	scaler->ch_using_wrscl = -1;
++
+ 	return dcss_scaler_ch_init_all(dcss, scaler_base);
+ }
+ 
+@@ -196,10 +200,22 @@ void dcss_scaler_exit(struct dcss_soc *dcss)
+ 
+ void dcss_scaler_enable(struct dcss_soc *dcss, int ch_num, bool en)
+ {
+-	struct dcss_scaler_ch *ch = &dcss->scaler_priv->ch[ch_num];
++	struct dcss_scaler_priv *scaler = dcss->scaler_priv;
++	struct dcss_scaler_ch *ch = &scaler->ch[ch_num];
+ 	u32 scaler_ctrl;
+ 
+-	scaler_ctrl = SCALER_EN | REPEAT_EN;
++	if (scaler->ch_using_wrscl == ch_num) {
++		if (en) {
++			scaler_ctrl = SCALE2MEM_EN | MEM2OFIFO_EN | REPEAT_EN;
++		} else {
++			dcss_wrscl_enable(dcss, false);
++			dcss_rdsrc_enable(dcss, false);
++
++			scaler->ch_using_wrscl = -1;
++		}
++	} else {
++		scaler_ctrl = SCALER_EN | REPEAT_EN;
++	}
+ 
+ 	if (en)
+ 		dcss_scaler_write(dcss->scaler_priv, ch_num, ch->sdata_ctrl,
+@@ -296,7 +312,27 @@ static void dcss_scaler_res_set(struct dcss_soc *dcss, int ch_num,
+ 			  DCSS_SCALER_DST_CHR_RES);
+ }
+ 
+-static void dcss_scaler_fractions_set(struct dcss_soc *dcss, int ch_num,
++#define max_downscale(ratio)		((ratio) << 13)
++#define max_upscale(ratio)		((1 << 13) / (ratio))
++
++struct dcss_scaler_ratios {
++	u16 downscale;
++	u16 upscale;
++};
++
++static const struct dcss_scaler_ratios dcss_scaler_ratios[] = {
++	{max_downscale(3), max_upscale(5)},
++	{max_downscale(3), max_upscale(7)},
++	{max_downscale(3), max_upscale(7)},
++};
++
++static const struct dcss_scaler_ratios dcss_scaler_wrscl_ratios[] = {
++	{max_downscale(5), max_upscale(5)},
++	{max_downscale(7), max_upscale(7)},
++	{max_downscale(7), max_upscale(7)},
++};
++
++static bool dcss_scaler_fractions_set(struct dcss_soc *dcss, int ch_num,
+ 				      int src_xres, int src_yres,
+ 				      int dst_xres, int dst_yres,
+ 				      u32 pix_format)
+@@ -336,47 +372,33 @@ static void dcss_scaler_fractions_set(struct dcss_soc *dcss, int ch_num,
+ 			  DCSS_SCALER_H_CHR_START);
+ 	dcss_scaler_write(dcss->scaler_priv, ch_num, c_hinc,
+ 			  DCSS_SCALER_H_CHR_INC);
+-}
+ 
+-/*
+- * The values below are without RD_SRC/WR_SCL support. When support will be
+- * added, these need to be changed accordingly.
+- */
+-#define DCSS_SCALER_VIDEO_RATIO			3 /* 7 with RD_SRC/WR_SCL */
+-#define DCSS_SCALER_GRAPHICS_RATIO		3 /* 5 with RD_SRC/WR_SCL */
+-
+-/* convert to fixed point (###.# #### #### ####), easier to work with */
+-#define DCSS_SCALER_VIDEO_DOWN_RATIO_FP (DCSS_SCALER_VIDEO_RATIO << 13)
+-#define DCSS_SCALER_VIDEO_UP_RATIO_FP \
+-		((1 << 13) / DCSS_SCALER_VIDEO_RATIO)
+-
+-#define DCSS_SCALER_GRAPHICS_DOWN_RATIO_FP (DCSS_SCALER_GRAPHICS_RATIO << 13)
+-#define DCSS_SCALER_GRAPHICS_UP_RATIO_FP \
+-		((1 << 13) / DCSS_SCALER_GRAPHICS_RATIO)
+-
+-static const struct dcss_scaler_ratios {
+-	u16 downscale_ratio;
+-	u16 upscale_ratio;
+-} dcss_scaler_ratios_map[] = {
+-	{DCSS_SCALER_GRAPHICS_DOWN_RATIO_FP, DCSS_SCALER_GRAPHICS_UP_RATIO_FP},
+-	{DCSS_SCALER_VIDEO_DOWN_RATIO_FP,    DCSS_SCALER_VIDEO_UP_RATIO_FP},
+-	{DCSS_SCALER_VIDEO_DOWN_RATIO_FP,    DCSS_SCALER_VIDEO_UP_RATIO_FP},
+-};
++	/* return if WR_SCL is needed to scale */
++	return l_vinc > dcss_scaler_ratios[ch_num].downscale ||
++	       l_vinc < dcss_scaler_ratios[ch_num].upscale   ||
++	       l_hinc > dcss_scaler_ratios[ch_num].downscale ||
++	       l_hinc < dcss_scaler_ratios[ch_num].upscale;
++}
+ 
+ bool dcss_scaler_can_scale(struct dcss_soc *dcss, int ch_num,
+ 			   int src_xres, int src_yres,
+ 			   int dst_xres, int dst_yres)
+ {
++	struct dcss_scaler_priv *scaler = dcss->scaler_priv;
+ 	u32 vscale_fp, hscale_fp;
++	const struct dcss_scaler_ratios *ratios_map = dcss_scaler_ratios;
+ 
+ 	/* Convert to fixed point. Easier to work with. */
+ 	vscale_fp = (src_yres << 13) / dst_yres;
+ 	hscale_fp = (src_xres << 13) / dst_xres;
+ 
+-	return vscale_fp <= dcss_scaler_ratios_map[ch_num].downscale_ratio &&
+-	       vscale_fp >= dcss_scaler_ratios_map[ch_num].upscale_ratio   &&
+-	       hscale_fp <= dcss_scaler_ratios_map[ch_num].downscale_ratio &&
+-	       hscale_fp >= dcss_scaler_ratios_map[ch_num].upscale_ratio;
++	if (scaler->ch_using_wrscl == -1 || scaler->ch_using_wrscl == ch_num)
++		ratios_map = dcss_scaler_wrscl_ratios;
++
++	return vscale_fp <= ratios_map[ch_num].downscale &&
++	       vscale_fp >= ratios_map[ch_num].upscale &&
++	       hscale_fp <= ratios_map[ch_num].downscale &&
++	       hscale_fp >= ratios_map[ch_num].upscale;
+ }
+ EXPORT_SYMBOL(dcss_scaler_can_scale);
+ 
+@@ -522,8 +544,46 @@ static void dcss_scaler_set_rgb10_order(struct dcss_soc *dcss, int ch_num,
+ 	ch->sdata_ctrl |= a2r10g10b10_format << A2R10G10B10_FORMAT_POS;
+ }
+ 
++static void dcss_scaler_setup_path(struct dcss_soc *dcss, int ch_num,
++				   u32 pix_format, int dst_xres,
++				   int dst_yres, u32 vrefresh_hz,
++				   bool wrscl_needed)
++{
++	struct dcss_scaler_priv *scaler = dcss->scaler_priv;
++	u32 base_addr;
++
++	/* nothing to do if WRSCL path is needed but it's already used */
++	if (wrscl_needed && scaler->ch_using_wrscl != -1 &&
++	    scaler->ch_using_wrscl != ch_num)
++		return;
++
++	if (!wrscl_needed) {
++		/* Channel has finished using WRSCL. Release WRSCL/RDSRC. */
++		if (scaler->ch_using_wrscl == ch_num) {
++			dcss_wrscl_enable(dcss, false);
++			dcss_rdsrc_enable(dcss, false);
++
++			scaler->ch_using_wrscl = -1;
++		}
++
++		return;
++	}
++
++	base_addr = dcss_wrscl_setup(dcss, pix_format, vrefresh_hz,
++				     dst_xres, dst_yres);
++
++	dcss_rdsrc_setup(dcss, pix_format, dst_xres, dst_yres,
++			 base_addr);
++
++	dcss_wrscl_enable(dcss, true);
++	dcss_rdsrc_enable(dcss, true);
++
++	scaler->ch_using_wrscl = ch_num;
++}
++
+ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+-		       int src_xres, int src_yres, int dst_xres, int dst_yres)
++		       int src_xres, int src_yres, int dst_xres, int dst_yres,
++		       u32 vrefresh_hz)
+ {
+ 	enum dcss_color_space dcss_cs;
+ 	int planes;
+@@ -532,6 +592,7 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 	bool rtr_8line_en = false;
+ 	enum buffer_format src_format = BUF_FMT_ARGB8888_YUV444;
+ 	enum buffer_format dst_format = BUF_FMT_ARGB8888_YUV444;
++	bool wrscl_needed = false;
+ 
+ 	dcss_cs = dcss_drm_fourcc_to_colorspace(pix_format);
+ 	planes = drm_format_num_planes(pix_format);
+@@ -569,7 +630,11 @@ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+ 	dcss_scaler_format_set(dcss, ch_num, src_format, dst_format);
+ 	dcss_scaler_res_set(dcss, ch_num, src_xres, src_yres,
+ 			    dst_xres, dst_yres, pix_format);
+-	dcss_scaler_fractions_set(dcss, ch_num, src_xres, src_yres,
+-				  dst_xres, dst_yres, pix_format);
++	wrscl_needed = dcss_scaler_fractions_set(dcss, ch_num, src_xres,
++						 src_yres, dst_xres,
++						 dst_yres, pix_format);
++
++	dcss_scaler_setup_path(dcss, ch_num, pix_format, dst_xres,
++			       dst_yres, vrefresh_hz, wrscl_needed);
+ }
+ EXPORT_SYMBOL(dcss_scaler_setup);
+diff --git a/include/video/imx-dcss.h b/include/video/imx-dcss.h
+index 6f0eec4..c166eb0 100644
+--- a/include/video/imx-dcss.h
++++ b/include/video/imx-dcss.h
+@@ -76,7 +76,8 @@ void dcss_ss_sync_set(struct dcss_soc *dcss, struct videomode *vm,
+ /* SCALER */
+ void dcss_scaler_enable(struct dcss_soc *dcss, int ch_num, bool en);
+ void dcss_scaler_setup(struct dcss_soc *dcss, int ch_num, u32 pix_format,
+-		       int src_xres, int src_yres, int dst_xres, int dst_yres);
++		       int src_xres, int src_yres, int dst_xres, int dst_yres,
++		       u32 vrefresh_hz);
+ bool dcss_scaler_can_scale(struct dcss_soc *dcss, int ch_num,
+ 			   int src_xres, int src_yres,
+ 			   int dst_xres, int dst_yres);
+-- 
+1.7.9.5
+

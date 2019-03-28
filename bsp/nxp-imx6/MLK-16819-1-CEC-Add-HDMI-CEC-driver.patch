@@ -1,0 +1,751 @@
+From cd269b2326505fbb80897260e6319088273070a9 Mon Sep 17 00:00:00 2001
+From: Sandor Yu <Sandor.yu@nxp.com>
+Date: Wed, 15 Nov 2017 15:55:30 +0800
+Subject: [PATCH 2821/5242] MLK-16819-1: CEC: Add HDMI CEC driver
+
+commit  3e4d9013376b1bee559938ff92c5a648f817a140 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+Add iMX8 HDMI CEC function.
+Support CEC MSG TX and RX function.
+
+Signed-off-by: Sandor Yu <Sandor.yu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/imx/hdp/Kconfig   |    8 +
+ drivers/gpu/drm/imx/hdp/Makefile  |    2 +
+ drivers/gpu/drm/imx/hdp/imx-cec.c |  352 +++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/imx/hdp/imx-cec.h |  336 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 698 insertions(+)
+ create mode 100644 drivers/gpu/drm/imx/hdp/imx-cec.c
+ create mode 100644 drivers/gpu/drm/imx/hdp/imx-cec.h
+
+diff --git a/drivers/gpu/drm/imx/hdp/Kconfig b/drivers/gpu/drm/imx/hdp/Kconfig
+index 06854a2..e037bfb 100644
+--- a/drivers/gpu/drm/imx/hdp/Kconfig
++++ b/drivers/gpu/drm/imx/hdp/Kconfig
+@@ -9,3 +9,11 @@ config DRM_IMX_HDP
+ 	select DRM_PANEL
+ 	help
+ 	  Choose this if you want to use DP/HDMI on i.MX8.
++
++config IMX_HDP_CEC
++	bool "Enable IMX HDP CEC support"
++	depends on DRM_IMX_HDP && MEDIA_CEC_SUPPORT
++	select CEC_CORE
++	---help---
++	  When selected the imx hdmi will support the optional
++	  HDMI CEC feature.
+diff --git a/drivers/gpu/drm/imx/hdp/Makefile b/drivers/gpu/drm/imx/hdp/Makefile
+index 69f3fd5..4750aee 100644
+--- a/drivers/gpu/drm/imx/hdp/Makefile
++++ b/drivers/gpu/drm/imx/hdp/Makefile
+@@ -4,3 +4,5 @@ obj-$(CONFIG_DRM_IMX_HDP) += imx-hdp.o \
+ 			API_AFE_t28hpc_hdmitx.o \
+ 			ss28fdsoi_hdmitx_table.o \
+ 			API_AFE_mcu1_dp.o
++
++obj-$(CONFIG_IMX_HDP_CEC) += imx-cec.o \
+diff --git a/drivers/gpu/drm/imx/hdp/imx-cec.c b/drivers/gpu/drm/imx/hdp/imx-cec.c
+new file mode 100644
+index 0000000..95b1efa
+--- /dev/null
++++ b/drivers/gpu/drm/imx/hdp/imx-cec.c
+@@ -0,0 +1,352 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/timer.h>
++#include <linux/version.h>
++#include <linux/workqueue.h>
++#include <linux/kthread.h>
++#include <media/cec.h>
++#include <soc/imx8/soc.h>
++
++#include "imx-cec.h"
++
++#define CEC_NAME	"hdp-cec"
++
++#define REG_ADDR_OFF 1
++
++#define B0_SILICON_ID			0x20
++
++#define MAX_LA_IDX 4
++#define MAX_LA_VAL 15
++
++/**
++ * Maximum number of Messages in the RX Buffers.
++ */
++# define CEC_MAX_RX_MSGS 2
++
++#define set_la F_MY_LOG_ADDR0
++#define get_la F_MY_LOG_ADDR0_RD
++#define set_la_valid F_LOG_ADDR_VALID0
++#define get_la_valid F_LOG_ADDR_VALID0_RD
++
++u32 cec_read(void __iomem *base, u32 reg)
++{
++	return readl(base + (reg << 2));
++}
++
++void cec_write(void __iomem *base, u32 reg, u32 val)
++{
++	return writel(val, base + (reg << 2));
++}
++
++void cec_clear_rx_buffer(struct imx_cec_dev *cec)
++{
++	cec_write(cec->reg_base, RX_CLEAR_BUF, 1);
++	cec_write(cec->reg_base, RX_CLEAR_BUF, 0);
++}
++
++void cec_set_divider(struct imx_cec_dev *cec)
++{
++	/* Set clock divider */
++
++	if (cec->clk_div == 0) {
++		dev_warn(cec->dev,
++			 "Warning. Clock divider is 0. Changing to 1.\n");
++		cec_write(cec->reg_base, CLK_DIV_MSB, 0);
++		cec_write(cec->reg_base, CLK_DIV_LSB, 1);
++	} else {
++		cec_write(cec->reg_base, CLK_DIV_MSB,
++			  (cec->clk_div >> 8) & 0xFF);
++		cec_write(cec->reg_base, CLK_DIV_LSB, cec->clk_div & 0xFF);
++	}
++}
++
++u32 cec_read_message(struct imx_cec_dev *cec)
++{
++	struct cec_msg *msg = &cec->msg;
++	int len;
++	int i;
++
++	cec_write(cec->reg_base, RX_MSG_CMD, CEC_RX_READ);
++
++	len = cec_read(cec->reg_base, RX_MSG_LENGTH);
++	msg->len = len + 1;
++	dev_dbg(cec->dev, "RX msg len =%d\n", len);
++
++	/* Read RX MSG bytes */
++	for (i = 0; i < msg->len; ++i) {
++		msg->msg[i] = (uint8_t) cec_read(cec->reg_base,
++						 RX_MSG_DATA1 +
++						 (i * REG_ADDR_OFF));
++	}
++
++	cec_write(cec->reg_base, RX_MSG_CMD, CEC_RX_STOP);
++
++	return true;
++}
++
++u32 cec_write_message(struct imx_cec_dev *cec, struct cec_msg *msg)
++{
++	uint8_t i;
++
++	cec_write(cec->reg_base, TX_MSG_CMD, CEC_TX_STOP);
++
++	if (msg->len > CEC_MAX_MSG_SIZE) {
++		dev_err(cec->dev, "Invalid MSG size!\n");
++		return -EINVAL;
++	}
++
++	/* Write Message to register */
++	for (i = 0; i < msg->len; ++i) {
++		cec_write(cec->reg_base, TX_MSG_HEADER + (i * REG_ADDR_OFF),
++			  msg->msg[i]);
++	}
++	/* Write Message Length (payload + opcode) */
++	cec_write(cec->reg_base, TX_MSG_LENGTH, msg->len - 1);
++
++	cec_write(cec->reg_base, TX_MSG_CMD, CEC_TX_TRANSMIT);
++
++	return true;
++}
++
++void cec_abort_tx_transfer(struct imx_cec_dev *cec)
++{
++	cec_write(cec->reg_base, TX_MSG_CMD, CEC_TX_ABORT);
++	cec_write(cec->reg_base, TX_MSG_CMD, CEC_TX_STOP);
++}
++
++u32 imx_cec_set_logical_addr(struct imx_cec_dev *cec, u32 la)
++{
++	uint8_t i;
++	uint8_t la_reg;
++
++	if ((la >= MAX_LA_VAL)) {
++		dev_err(cec->dev, "Error logical Addr\n");
++		return -EINVAL;
++	}
++
++	for (i = 0; i < MAX_LA_IDX; ++i) {
++		la_reg =
++		    cec_read(cec->reg_base,
++			     LOGICAL_ADDRESS_LA0 + (i * REG_ADDR_OFF));
++
++		if (get_la_valid(la_reg))
++			continue;
++
++		if (get_la(la_reg) == la) {
++			dev_warn(cec->dev, "Warning. LA already in use.\n");
++			return true;
++		}
++
++		la = set_la(la) | set_la_valid(1);
++
++		cec_write(cec->reg_base,
++			  LOGICAL_ADDRESS_LA0 + (i * REG_ADDR_OFF), la);
++		return true;
++	}
++
++	dev_warn(cec->dev, "All LA in use\n");
++
++	return false;
++}
++
++static int cec_poll_worker(void *_cec)
++{
++	struct imx_cec_dev *cec = (struct imx_cec_dev *)_cec;
++	int num_rx_msgs, i;
++	int sts;
++
++	for (;;) {
++		if (kthread_should_stop())
++			break;
++
++		/* Check TX State */
++		sts = cec_read(cec->reg_base, TX_MSG_STATUS);
++		switch (sts) {
++		case CEC_STS_SUCCESS:
++			cec_transmit_done(cec->adap, CEC_TX_STATUS_OK, 0, 0, 0,
++					  0);
++			cec_write(cec->reg_base, TX_MSG_CMD, CEC_TX_STOP);
++			break;
++		case CEC_STS_ERROR:
++			cec_write(cec->reg_base, TX_MSG_CMD, CEC_TX_STOP);
++			cec_transmit_done(cec->adap,
++					  CEC_TX_STATUS_MAX_RETRIES |
++					  CEC_TX_STATUS_ERROR, 0, 0, 0, 1);
++			break;
++		case CEC_STS_BUSY:
++		default:
++			break;
++		}
++
++		/* Check RX State */
++		sts = cec_read(cec->reg_base, RX_MSG_STATUS);
++		num_rx_msgs = cec_read(cec->reg_base, NUM_OF_MSG_RX_BUF);
++		switch (sts) {
++		case CEC_STS_SUCCESS:
++			if (num_rx_msgs == 0xf)
++				num_rx_msgs = CEC_MAX_RX_MSGS;
++
++			if (num_rx_msgs > CEC_MAX_RX_MSGS) {
++				dev_err(cec->dev, "Error rx msg num %d\n",
++					num_rx_msgs);
++				cec_clear_rx_buffer(cec);
++				break;
++			}
++
++			/* Rx FIFO Depth 2 RX MSG */
++			for (i = 0; i < num_rx_msgs; i++) {
++				cec_read_message(cec);
++				cec->msg.rx_status = CEC_RX_STATUS_OK;
++				cec_received_msg(cec->adap, &cec->msg);
++			}
++			break;
++		default:
++			break;
++		}
++
++		if (!kthread_should_stop())
++			schedule_timeout_idle(20);
++	}
++
++	return 0;
++}
++
++static int imx_cec_adap_enable(struct cec_adapter *adap, bool enable)
++{
++	struct imx_cec_dev *cec = adap->priv;
++
++	if (enable) {
++		cec_write(cec->reg_base, DB_L_TIMER, 0x10);
++		cec_set_divider(cec);
++	} else {
++		cec_set_divider(cec);
++	}
++
++	return 0;
++}
++
++static int imx_cec_adap_log_addr(struct cec_adapter *adap, u8 addr)
++{
++	struct imx_cec_dev *cec = adap->priv;
++
++	imx_cec_set_logical_addr(cec, addr);
++	return 0;
++}
++
++static int imx_cec_adap_transmit(struct cec_adapter *adap, u8 attempts,
++				 u32 signal_free_time, struct cec_msg *msg)
++{
++	struct imx_cec_dev *cec = adap->priv;
++
++	cec_write_message(cec, msg);
++
++	return 0;
++}
++
++static const struct cec_adap_ops imx_cec_adap_ops = {
++	.adap_enable = imx_cec_adap_enable,
++	.adap_log_addr = imx_cec_adap_log_addr,
++	.adap_transmit = imx_cec_adap_transmit,
++};
++
++static int imx_cec_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct imx_cec_dev *cec;
++	int ret;
++
++	cec = devm_kzalloc(&pdev->dev, sizeof(*cec), GFP_KERNEL);
++	if (!cec)
++		return -ENOMEM;
++
++	cec->dev = dev;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	cec->reg_base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(cec->reg_base))
++		return PTR_ERR(cec->reg_base);
++
++	/* hdmi core clock is 125MHz in B0 */
++	if (imx8_get_soc_revision() == B0_SILICON_ID)
++		cec->clk_div = 1250;
++	else
++		cec->clk_div = 1330;
++
++	cec->adap = cec_allocate_adapter(&imx_cec_adap_ops, cec,
++					 CEC_NAME,
++					 CEC_CAP_PHYS_ADDR | CEC_CAP_LOG_ADDRS |
++					 CEC_CAP_TRANSMIT | CEC_CAP_PASSTHROUGH
++					 | CEC_CAP_RC, 1);
++	ret = PTR_ERR_OR_ZERO(cec->adap);
++	if (ret)
++		return ret;
++	ret = cec_register_adapter(cec->adap, &pdev->dev);
++	if (ret) {
++		cec_delete_adapter(cec->adap);
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, cec);
++
++	cec->cec_worker = kthread_create(cec_poll_worker, cec, "hdp-cec");
++	if (IS_ERR(cec->cec_worker)) {
++		dev_err(cec->dev, "failed  create hdp cec thread\n");
++	}
++	wake_up_process(cec->cec_worker);
++
++	dev_dbg(dev, "CEC successfuly probed\n");
++	return 0;
++}
++
++static int imx_cec_remove(struct platform_device *pdev)
++{
++	struct imx_cec_dev *cec = platform_get_drvdata(pdev);
++
++	if (cec->cec_worker) {
++		kthread_stop(cec->cec_worker);
++		cec->cec_worker = NULL;
++	}
++	cec_unregister_adapter(cec->adap);
++	return 0;
++}
++
++static const struct of_device_id imx_cec_match[] = {
++	{
++	 .compatible = "fsl,imx8-hdp-cec",
++	 },
++	{},
++};
++
++static struct platform_driver imx_cec_pdrv = {
++	.probe = imx_cec_probe,
++	.remove = imx_cec_remove,
++	.driver = {
++		   .name = CEC_NAME,
++		   .of_match_table = imx_cec_match,
++		   },
++};
++
++module_platform_driver(imx_cec_pdrv);
++
++MODULE_AUTHOR("Sandor.Yu@NXP.com");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("NXP IMX HDP CEC driver");
+diff --git a/drivers/gpu/drm/imx/hdp/imx-cec.h b/drivers/gpu/drm/imx/hdp/imx-cec.h
+new file mode 100644
+index 0000000..928fbb7
+--- /dev/null
++++ b/drivers/gpu/drm/imx/hdp/imx-cec.h
+@@ -0,0 +1,336 @@
++/*
++ * Copyright 2017 NXP
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef _IMX_CEC_H_
++#define _IMX_CEC_H_
++
++/* regsiter define */
++/* register TX_MSG_HEADER */
++#define TX_MSG_HEADER 0
++#define F_TX_FOLLOWER_ADDRESS(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_TX_FOLLOWER_ADDRESS_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_TX_INITIATOR_ADDRESS(x) (((x) & ((1 << 4) - 1)) << 4)
++#define F_TX_INITIATOR_ADDRESS_RD(x) (((x) & (((1 << 4) - 1) << 4)) >> 4)
++
++/* register TX_MSG_OPCODE */
++#define TX_MSG_OPCODE 1
++#define F_TX_MSG_OPCODE(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OPCODE_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP1 */
++#define TX_MSG_OP1 2
++#define F_TX_MSG_OP1(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP1_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP2 */
++#define TX_MSG_OP2 3
++#define F_TX_MSG_OP2(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP2_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP3 */
++#define TX_MSG_OP3 4
++#define F_TX_MSG_OP3(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP3_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP4 */
++#define TX_MSG_OP4 5
++#define F_TX_MSG_OP4(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP4_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP5 */
++#define TX_MSG_OP5 6
++#define F_TX_MSG_OP5(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP5_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP6 */
++#define TX_MSG_OP6 7
++#define F_TX_MSG_OP6(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP6_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP7 */
++#define TX_MSG_OP7 8
++#define F_TX_MSG_OP7(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP7_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP8 */
++#define TX_MSG_OP8 9
++#define F_TX_MSG_OP8(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP8_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP9 */
++#define TX_MSG_OP9 10
++#define F_TX_MSG_OP9(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP9_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP10 */
++#define TX_MSG_OP10 11
++#define F_TX_MSG_OP10(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP10_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP11 */
++#define TX_MSG_OP11 12
++#define F_TX_MSG_OP11(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP11_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP12 */
++#define TX_MSG_OP12 13
++#define F_TX_MSG_OP12(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP12_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP13 */
++#define TX_MSG_OP13 14
++#define F_TX_MSG_OP13(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP13_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_OP14 */
++#define TX_MSG_OP14 15
++#define F_TX_MSG_OP14(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_TX_MSG_OP14_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register TX_MSG_LENGTH */
++#define TX_MSG_LENGTH 16
++#define F_TX_MSG_LENGTH(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_TX_MSG_LENGTH_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++
++/* register TX_MSG_CMD */
++#define TX_MSG_CMD 17
++#define F_TX_MSG_CMD(x) (((x) & ((1 << 2) - 1)) << 0)
++#define F_TX_MSG_CMD_RD(x) (((x) & (((1 << 2) - 1) << 0)) >> 0)
++
++/* register TX_WRITE_BUF */
++#define TX_WRITE_BUF 18
++#define F_TX_WRITE_BUF(x) (((x) & ((1 << 1) - 1)) << 0)
++#define F_TX_WRITE_BUF_RD(x) (((x) & (((1 << 1) - 1) << 0)) >> 0)
++
++/* register TX_CLEAR_BUF */
++#define TX_CLEAR_BUF 19
++#define F_TX_CLEAR_BUF(x) (((x) & ((1 << 1) - 1)) << 0)
++#define F_TX_CLEAR_BUF_RD(x) (((x) & (((1 << 1) - 1) << 0)) >> 0)
++
++/* register RX_MSG_CMD */
++#define RX_MSG_CMD 20
++#define F_RX_MSG_CMD(x) (((x) & ((1 << 2) - 1)) << 0)
++#define F_RX_MSG_CMD_RD(x) (((x) & (((1 << 2) - 1) << 0)) >> 0)
++
++/* register RX_CLEAR_BUF */
++#define RX_CLEAR_BUF 21
++#define F_RX_CLEAR_BUF(x) (((x) & ((1 << 1) - 1)) << 0)
++#define F_RX_CLEAR_BUF_RD(x) (((x) & (((1 << 1) - 1) << 0)) >> 0)
++
++/* register LOGICAL_ADDRESS_LA0 */
++#define LOGICAL_ADDRESS_LA0 22
++#define F_MY_LOG_ADDR0(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_MY_LOG_ADDR0_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_LOG_ADDR_VALID0(x) (((x) & ((1 << 1) - 1)) << 4)
++#define F_LOG_ADDR_VALID0_RD(x) (((x) & (((1 << 1) - 1) << 4)) >> 4)
++
++/* register LOGICAL_ADDRESS_LA1 */
++#define LOGICAL_ADDRESS_LA1 23
++#define F_MY_LOG_ADDR1(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_MY_LOG_ADDR1_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_LOG_ADDR_VALID1(x) (((x) & ((1 << 1) - 1)) << 4)
++#define F_LOG_ADDR_VALID1_RD(x) (((x) & (((1 << 1) - 1) << 4)) >> 4)
++
++/* register LOGICAL_ADDRESS_LA2 */
++#define LOGICAL_ADDRESS_LA2 24
++#define F_MY_LOG_ADDR2(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_MY_LOG_ADDR2_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_LOG_ADDR_VALID2(x) (((x) & ((1 << 1) - 1)) << 4)
++#define F_LOG_ADDR_VALID2_RD(x) (((x) & (((1 << 1) - 1) << 4)) >> 4)
++
++/* register LOGICAL_ADDRESS_LA3 */
++#define LOGICAL_ADDRESS_LA3 25
++#define F_MY_LOG_ADDR3(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_MY_LOG_ADDR3_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_LOG_ADDR_VALID3(x) (((x) & ((1 << 1) - 1)) << 4)
++#define F_LOG_ADDR_VALID3_RD(x) (((x) & (((1 << 1) - 1) << 4)) >> 4)
++
++/* register LOGICAL_ADDRESS_LA4 */
++#define LOGICAL_ADDRESS_LA4 26
++#define F_MY_LOG_ADDR4(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_MY_LOG_ADDR4_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_LOG_ADDR_VALID4(x) (((x) & ((1 << 1) - 1)) << 4)
++#define F_LOG_ADDR_VALID4_RD(x) (((x) & (((1 << 1) - 1) << 4)) >> 4)
++
++/* register CLK_DIV_MSB */
++#define CLK_DIV_MSB 27
++#define F_CLK_DIV_MSB(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_CLK_DIV_MSB_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register CLK_DIV_LSB */
++#define CLK_DIV_LSB 28
++#define F_CLK_DIV_LSB(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_CLK_DIV_LSB_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register CDC_MSG */
++#define CDC_MSG 31
++#define F_CDC_MSG(x) (((x) & ((1 << 1) - 1)) << 0)
++#define F_CDC_MSG_RD(x) (((x) & (((1 << 1) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA1 */
++#define RX_MSG_DATA1 64
++#define F_RX_FOLLOWER_ADDRESS(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_RX_FOLLOWER_ADDRESS_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++#define F_RX_INITIATOR_ADDRESS(x) (((x) & ((1 << 4) - 1)) << 4)
++#define F_RX_INITIATOR_ADDRESS_RD(x) (((x) & (((1 << 4) - 1) << 4)) >> 4)
++
++/* register RX_MSG_DATA2 */
++#define RX_MSG_DATA2 65
++#define F_RX_MSG_OPCODE(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OPCODE_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA3 */
++#define RX_MSG_DATA3 66
++#define F_RX_MSG_OP1(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP1_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA4 */
++#define RX_MSG_DATA4 67
++#define F_RX_MSG_OP2(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP2_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA5 */
++#define RX_MSG_DATA5 68
++#define F_RX_MSG_OP3(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP3_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA6 */
++#define RX_MSG_DATA6 69
++#define F_RX_MSG_OP4(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP4_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA7 */
++#define RX_MSG_DATA7 70
++#define F_RX_MSG_OP5(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP5_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA8 */
++#define RX_MSG_DATA8 71
++#define F_RX_MSG_OP6(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP6_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA9 */
++#define RX_MSG_DATA9 72
++#define F_RX_MSG_OP7(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP7_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA10 */
++#define RX_MSG_DATA10 73
++#define F_RX_MSG_OP8(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP8_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA11 */
++#define RX_MSG_DATA11 74
++#define F_RX_MSG_OP9(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP9_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA12 */
++#define RX_MSG_DATA12 75
++#define F_RX_MSG_OP10(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP10_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA13 */
++#define RX_MSG_DATA13 76
++#define F_RX_MSG_OP11(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP11_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA14 */
++#define RX_MSG_DATA14 77
++#define F_RX_MSG_OP12(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP12_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA15 */
++#define RX_MSG_DATA15 78
++#define F_RX_MSG_OP13(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP13_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_DATA16 */
++#define RX_MSG_DATA16 79
++#define F_RX_MSG_OP14(x) (((x) & ((1 << 8) - 1)) << 0)
++#define F_RX_MSG_OP14_RD(x) (((x) & (((1 << 8) - 1) << 0)) >> 0)
++
++/* register RX_MSG_LENGTH */
++#define RX_MSG_LENGTH 80
++#define F_RX_MSG_LENGTH(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_RX_MSG_LENGTH_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++
++/* register RX_MSG_STATUS */
++#define RX_MSG_STATUS 81
++#define F_RX_MSG_STATUS(x) (((x) & ((1 << 2) - 1)) << 0)
++#define F_RX_MSG_STATUS_RD(x) (((x) & (((1 << 2) - 1) << 0)) >> 0)
++
++/* register NUM_OF_MSG_RX_BUF */
++#define NUM_OF_MSG_RX_BUF 82
++#define F_RX_NUM_MSG(x) (((x) & ((1 << 4) - 1)) << 0)
++#define F_RX_NUM_MSG_RD(x) (((x) & (((1 << 4) - 1) << 0)) >> 0)
++
++/* register TX_MSG_STATUS */
++#define TX_MSG_STATUS 83
++#define F_TX_MSG_STATUS(x) (((x) & ((1 << 2) - 1)) << 0)
++#define F_TX_MSG_STATUS_RD(x) (((x) & (((1 << 2) - 1) << 0)) >> 0)
++
++/* register DB_L_TIMER */
++#define DB_L_TIMER 96
++
++/* register DB_M_TIMER */
++#define DB_M_TIMER 97
++
++/* register DB_H_TIMER */
++#define DB_H_TIMER 98
++
++#define RX_OP_TIMEOUT 10000
++#define TX_OP_TIMEOUT 10000
++
++/**
++ * CEC Transceiver operation.
++ */
++enum {
++	CEC_TX_STOP,
++	CEC_TX_TRANSMIT,
++	CEC_TX_ABORT,
++	CEC_TX_ABORT_AND_TRANSMIT
++};
++
++/**
++ * CEC Transceiver status.
++ */
++enum {
++	CEC_STS_IDLE,
++	CEC_STS_BUSY,
++	CEC_STS_SUCCESS,
++	CEC_STS_ERROR
++};
++
++/**
++ * CEC Receiver operation.
++ */
++enum {
++	CEC_RX_STOP,
++	CEC_RX_READ,
++	CEC_RX_DISABLE,
++	CEC_RX_ABORT_AND_CLR_FIFO
++};
++
++struct imx_cec_dev {
++	struct cec_adapter *adap;
++	struct device *dev;
++	struct mutex lock;
++	void __iomem *reg_base;
++
++	struct cec_msg msg;
++	u32 clk_div;
++	struct task_struct *cec_worker;
++};
++
++#endif
+-- 
+1.7.9.5
+

@@ -1,0 +1,472 @@
+From effcf38809793ef12d3634595c6efabc60e41f85 Mon Sep 17 00:00:00 2001
+From: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Date: Tue, 21 Nov 2017 09:31:09 +0200
+Subject: [PATCH 2854/5242] MLK-16922-1: drm: dcss: Add DCSS core power
+ management support
+
+commit  0b90c550d4fb0346fc1874d6a9ffcc57a99d1bc7 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+This patch support for suspend/resume and runtime PM in DCSS driver
+core.
+
+Signed-off-by: Laurentiu Palcu <laurentiu.palcu@nxp.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/imx/dcss/dcss-blkctl.c |   29 +++++++----
+ drivers/gpu/imx/dcss/dcss-common.c |   97 +++++++++++++++++++++++++++++++++++-
+ drivers/gpu/imx/dcss/dcss-ctxld.c  |   68 ++++++++++++++++++++++---
+ drivers/gpu/imx/dcss/dcss-dtg.c    |    6 ++-
+ drivers/gpu/imx/dcss/dcss-hdr10.c  |   35 +++++++++----
+ drivers/gpu/imx/dcss/dcss-prv.h    |    7 +++
+ 6 files changed, 210 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/imx/dcss/dcss-blkctl.c b/drivers/gpu/imx/dcss/dcss-blkctl.c
+index 329f2c6..c5c1c02 100644
+--- a/drivers/gpu/imx/dcss/dcss-blkctl.c
++++ b/drivers/gpu/imx/dcss/dcss-blkctl.c
+@@ -16,6 +16,7 @@
+ #include <linux/io.h>
+ #include <linux/bitops.h>
+ #include <linux/of.h>
++#include <linux/delay.h>
+ #include <soc/imx8/soc.h>
+ 
+ #include "dcss-prv.h"
+@@ -75,6 +76,22 @@ static void dcss_blkctl_clk_reset(struct dcss_blkctl_priv *blkctl,
+ 		dcss_set(deassert, blkctl->base_reg + DCSS_BLKCTL_RESET_CTRL);
+ }
+ 
++void dcss_blkctl_cfg(struct dcss_soc *dcss)
++{
++	struct dcss_blkctl_priv *blkctl = dcss->blkctl_priv;
++
++	if (blkctl->hdmi_output)
++		dcss_writel(blkctl->clk_setting,
++			    blkctl->base_reg + DCSS_BLKCTL_CONTROL0);
++	else
++		dcss_writel((blkctl->clk_setting ^ HDMI_MIPI_CLK_SEL) |
++			    DISPMIX_PIXCLK_SEL,
++			    blkctl->base_reg + DCSS_BLKCTL_CONTROL0);
++
++	/* deassert clock domains resets */
++	dcss_blkctl_clk_reset(blkctl, 0, 0xffffff);
++}
++
+ int dcss_blkctl_init(struct dcss_soc *dcss, unsigned long blkctl_base)
+ {
+ 	struct device_node *node = dcss->dev->of_node;
+@@ -102,17 +119,7 @@ int dcss_blkctl_init(struct dcss_soc *dcss, unsigned long blkctl_base)
+ 	if (imx8_get_soc_revision() == B0_SILICON_ID)
+ 		blkctl->clk_setting = HDMI_MIPI_CLK_SEL;
+ 
+-	if (blkctl->hdmi_output)
+-		dcss_writel(blkctl->clk_setting,
+-			    blkctl->base_reg + DCSS_BLKCTL_CONTROL0);
+-	else
+-		dcss_writel((blkctl->clk_setting ^ HDMI_MIPI_CLK_SEL) |
+-			    DISPMIX_PIXCLK_SEL,
+-			    blkctl->base_reg + DCSS_BLKCTL_CONTROL0);
+-
+-	/* deassert clock domains resets */
+-	dcss_blkctl_clk_reset(blkctl, 0, B_CLK_RESETN | APB_CLK_RESETN |
+-				 P_CLK_RESETN | HDMI_RESETN | RTR_CLK_RESETN);
++	dcss_blkctl_cfg(dcss);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/imx/dcss/dcss-common.c b/drivers/gpu/imx/dcss/dcss-common.c
+index 3f3f1f8..c17577f 100644
+--- a/drivers/gpu/imx/dcss/dcss-common.c
++++ b/drivers/gpu/imx/dcss/dcss-common.c
+@@ -17,6 +17,8 @@
+ #include <linux/of_device.h>
+ #include <linux/of_graph.h>
+ #include <linux/clk.h>
++#include <linux/pm_runtime.h>
++#include <linux/busfreq-imx.h>
+ #include <video/imx-dcss.h>
+ 
+ #include <drm/drm_fourcc.h>
+@@ -122,9 +124,10 @@ void dcss_vblank_irq_clear(struct dcss_soc *dcss)
+ }
+ EXPORT_SYMBOL(dcss_vblank_irq_clear);
+ 
+-static int dcss_submodules_init(struct dcss_soc *dcss, unsigned long dcss_base)
++static int dcss_submodules_init(struct dcss_soc *dcss)
+ {
+ 	int ret;
++	u32 dcss_base = dcss->start_addr;
+ 
+ 	ret = dcss_blkctl_init(dcss, dcss_base + dcss->devtype->blkctl_ofs);
+ 	if (ret)
+@@ -398,7 +401,9 @@ static int dcss_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	ret = dcss_submodules_init(dcss, res->start);
++	dcss->start_addr = res->start;
++
++	ret = dcss_submodules_init(dcss);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "submodules initialization failed\n");
+ 		return ret;
+@@ -406,6 +411,12 @@ static int dcss_probe(struct platform_device *pdev)
+ 
+ 	dcss_debugfs_init(dcss);
+ 
++	pm_runtime_set_autosuspend_delay(&pdev->dev, 3000);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++
++	request_bus_freq(BUS_FREQ_HIGH);
++
+ 	return dcss_add_client_devices(dcss);
+ }
+ 
+@@ -414,6 +425,87 @@ static int dcss_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static int dcss_suspend(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct dcss_soc *dcss = platform_get_drvdata(pdev);
++	int ret;
++
++	if (pm_runtime_suspended(dev))
++		return 0;
++
++	ret = dcss_ctxld_suspend(dcss);
++	if (ret)
++		return ret;
++
++	clk_disable_unprepare(dcss->p_clk);
++
++	release_bus_freq(BUS_FREQ_HIGH);
++
++	return 0;
++}
++
++static int dcss_resume(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct dcss_soc *dcss = platform_get_drvdata(pdev);
++
++	request_bus_freq(BUS_FREQ_HIGH);
++
++	clk_prepare_enable(dcss->p_clk);
++
++	dcss_blkctl_cfg(dcss);
++	dcss_hdr10_cfg(dcss);
++
++	dcss_ctxld_resume(dcss);
++
++	return 0;
++}
++#endif
++
++#ifdef CONFIG_PM
++static int dcss_runtime_suspend(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct dcss_soc *dcss = platform_get_drvdata(pdev);
++	int ret;
++
++	ret = dcss_ctxld_suspend(dcss);
++	if (ret)
++		return ret;
++
++	clk_disable_unprepare(dcss->p_clk);
++
++	release_bus_freq(BUS_FREQ_HIGH);
++
++	return 0;
++}
++
++static int dcss_runtime_resume(struct device *dev)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct dcss_soc *dcss = platform_get_drvdata(pdev);
++
++	request_bus_freq(BUS_FREQ_HIGH);
++
++	clk_prepare_enable(dcss->p_clk);
++
++	dcss_blkctl_cfg(dcss);
++	dcss_hdr10_cfg(dcss);
++
++	dcss_ctxld_resume(dcss);
++
++	return 0;
++}
++#endif /* CONFIG_PM */
++
++static const struct dev_pm_ops dcss_pm = {
++	SET_SYSTEM_SLEEP_PM_OPS(dcss_suspend, dcss_resume)
++	SET_RUNTIME_PM_OPS(dcss_runtime_suspend,
++			   dcss_runtime_resume, NULL)
++};
++
+ static const struct of_device_id dcss_dt_ids[] = {
+ 	{ .compatible = "nxp,imx8mq-dcss", .data = &dcss_type_imx8m, },
+ 	{ /* sentinel */ }
+@@ -424,6 +516,7 @@ static int dcss_remove(struct platform_device *pdev)
+ 	.driver = {
+ 		.name = "dcss-core",
+ 		.of_match_table = dcss_dt_ids,
++		.pm = &dcss_pm,
+ 	},
+ 	.probe = dcss_probe,
+ 	.remove = dcss_remove,
+diff --git a/drivers/gpu/imx/dcss/dcss-ctxld.c b/drivers/gpu/imx/dcss/dcss-ctxld.c
+index 56752c3..c3ce95f 100644
+--- a/drivers/gpu/imx/dcss/dcss-ctxld.c
++++ b/drivers/gpu/imx/dcss/dcss-ctxld.c
+@@ -19,6 +19,7 @@
+ #include <linux/sizes.h>
+ #include <linux/io.h>
+ #include <linux/dma-mapping.h>
++#include <linux/delay.h>
+ #include <asm/cacheflush.h>
+ 
+ #include "video/imx-dcss.h"
+@@ -93,6 +94,7 @@ struct dcss_ctxld_priv {
+ 	struct dcss_soc *dcss;
+ 	void __iomem *ctxld_reg;
+ 	int irq;
++	bool irq_en;
+ 
+ 	struct dcss_ctxld_item *db[2];
+ 	struct dcss_ctxld_item *sb_hp[2];
+@@ -203,11 +205,6 @@ static int dcss_ctxld_irq_config(struct dcss_ctxld_priv *ctxld)
+ 		return ctxld->irq;
+ 	}
+ 
+-	dcss_set(RD_ERR_EN | DB_COMP_EN | SB_HP_COMP_EN | SB_LP_COMP_EN |
+-		 DB_PEND_SB_REC_EN | SB_PEND_DISP_ACTIVE_EN | AHB_ERR_EN |
+-		 RD_ERR | AHB_ERR,
+-		 ctxld->ctxld_reg + DCSS_CTXLD_CONTROL_STATUS);
+-
+ 	ret = devm_request_threaded_irq(dcss->dev, ctxld->irq,
+ 					dcss_ctxld_irq_handler,
+ 					dcss_ctxld_irq_handler_thread,
+@@ -218,9 +215,21 @@ static int dcss_ctxld_irq_config(struct dcss_ctxld_priv *ctxld)
+ 		return ret;
+ 	}
+ 
++	ctxld->irq_en = true;
++
+ 	return 0;
+ }
+ 
++void dcss_ctxld_hw_cfg(struct dcss_soc *dcss)
++{
++	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
++
++	dcss_writel(RD_ERR_EN | DB_COMP_EN | SB_HP_COMP_EN | SB_LP_COMP_EN |
++		    DB_PEND_SB_REC_EN | SB_PEND_DISP_ACTIVE_EN | AHB_ERR_EN |
++		    RD_ERR | AHB_ERR,
++		    ctxld->ctxld_reg + DCSS_CTXLD_CONTROL_STATUS);
++}
++
+ /**
+  * dcss_ctxld_alloc_ctx - Allocate context memory.
+  *
+@@ -288,12 +297,12 @@ int dcss_ctxld_init(struct dcss_soc *dcss, unsigned long ctxld_base)
+ 		return -ENOMEM;
+ 	}
+ 
+-	dcss_writel(0, priv->ctxld_reg + DCSS_CTXLD_CONTROL_STATUS);
+-
+ 	ret = dcss_ctxld_irq_config(priv);
+ 	if (!ret)
+ 		return ret;
+ 
++	dcss_ctxld_hw_cfg(dcss);
++
+ 	return 0;
+ }
+ 
+@@ -404,6 +413,51 @@ void dcss_ctxld_write(struct dcss_soc *dcss, u32 ctx_id, u32 val, u32 reg_ofs)
+ 	mutex_unlock(&ctxld->mutex);
+ }
+ 
++int dcss_ctxld_resume(struct dcss_soc *dcss)
++{
++	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
++
++	dcss_ctxld_hw_cfg(dcss);
++
++	if (!ctxld->irq_en) {
++		enable_irq(dcss->ctxld_priv->irq);
++		ctxld->irq_en = true;
++	}
++
++	return 0;
++}
++
++int dcss_ctxld_suspend(struct dcss_soc *dcss)
++{
++	int ret = 0;
++	struct dcss_ctxld_priv *ctxld = dcss->ctxld_priv;
++	int wait_time_ms = 0;
++
++	while (ctxld->in_use && wait_time_ms < 500) {
++		msleep(20);
++		wait_time_ms += 20;
++	}
++
++	if (wait_time_ms > 500)
++		return -ETIMEDOUT;
++
++	mutex_lock(&ctxld->mutex);
++
++	if (ctxld->irq_en) {
++		disable_irq_nosync(dcss->ctxld_priv->irq);
++		ctxld->irq_en = false;
++	}
++
++	/* reset context region and sizes */
++	ctxld->current_ctx = 0;
++	ctxld->ctx_size[0][CTX_DB] = 0;
++	ctxld->ctx_size[0][CTX_SB_HP] = 0;
++	ctxld->ctx_size[0][CTX_SB_LP] = 0;
++
++	mutex_unlock(&ctxld->mutex);
++	return ret;
++}
++
+ #ifdef CONFIG_DEBUG_FS
+ void dcss_ctxld_dump(struct seq_file *s, void *data)
+ {
+diff --git a/drivers/gpu/imx/dcss/dcss-dtg.c b/drivers/gpu/imx/dcss/dcss-dtg.c
+index 4060dc7..2f88063 100644
+--- a/drivers/gpu/imx/dcss/dcss-dtg.c
++++ b/drivers/gpu/imx/dcss/dcss-dtg.c
+@@ -226,6 +226,10 @@ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm)
+ 	dis_lrc_y = vm->vsync_len + vm->vfront_porch + vm->vback_porch +
+ 		    vm->vactive - 1;
+ 
++	clk_disable_unprepare(dcss->p_clk);
++	clk_set_rate(dcss->p_clk, vm->pixelclock);
++	clk_prepare_enable(dcss->p_clk);
++
+ 	dcss_dtg_write(dtg, ((dtg_lrc_y << TC_Y_POS) | dtg_lrc_x),
+ 		       DCSS_DTG_TC_DTG);
+ 	dcss_dtg_write(dtg, ((dis_ulc_y << TC_Y_POS) | dis_ulc_x),
+@@ -239,8 +243,6 @@ void dcss_dtg_sync_set(struct dcss_soc *dcss, struct videomode *vm)
+ 	dcss_dtg_write(dtg,
+ 		       ((dis_ulc_y << TC_CTXLD_DB_Y_POS) & TC_CTXLD_DB_Y_MASK),
+ 		       DCSS_DTG_TC_CTXLD);
+-
+-	clk_set_rate(dcss->p_clk, vm->pixelclock);
+ }
+ EXPORT_SYMBOL(dcss_dtg_sync_set);
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-hdr10.c b/drivers/gpu/imx/dcss/dcss-hdr10.c
+index 573db32..6e4d208 100644
+--- a/drivers/gpu/imx/dcss/dcss-hdr10.c
++++ b/drivers/gpu/imx/dcss/dcss-hdr10.c
+@@ -226,13 +226,33 @@ static void dcss_hdr10_lut_fill(struct dcss_soc *dcss, int ch_num,
+ 	}
+ }
+ 
++void dcss_hdr10_cfg(struct dcss_soc *dcss)
++{
++	struct dcss_hdr10_priv *hdr10 = dcss->hdr10_priv;
++	struct dcss_hdr10_ch *ch;
++	int i;
++	u16 *lut;
++
++	for (i = 0; i < 4; i++) {
++		ch = &hdr10->ch[i];
++
++		lut = i < 3 ? dcss_hdr10_comp_lut : dcss_hdr10_opipe;
++
++		dcss_hdr10_lut_fill(dcss, i, 0, lut);
++		dcss_hdr10_lut_fill(dcss, i, 1, lut);
++		dcss_hdr10_lut_fill(dcss, i, 2, lut);
++
++		ch->old_out_cs = DCSS_COLORSPACE_UNKNOWN;
++		ch->old_in_cs = DCSS_COLORSPACE_UNKNOWN;
++	}
++}
++
+ static int dcss_hdr10_ch_init_all(struct dcss_soc *dcss,
+ 				  unsigned long hdr10_base)
+ {
+ 	struct dcss_hdr10_priv *hdr10 = dcss->hdr10_priv;
+ 	struct dcss_hdr10_ch *ch;
+ 	int i;
+-	u16 *lut;
+ 
+ 	for (i = 0; i < 4; i++) {
+ 		ch = &hdr10->ch[i];
+@@ -248,17 +268,12 @@ static int dcss_hdr10_ch_init_all(struct dcss_soc *dcss,
+ #if defined(USE_CTXLD)
+ 		ch->ctx_id = CTX_SB_HP;
+ #endif
+-
+-		lut = i < 3 ? dcss_hdr10_comp_lut : dcss_hdr10_opipe;
+-
+-		dcss_hdr10_lut_fill(dcss, i, 0, lut);
+-		dcss_hdr10_lut_fill(dcss, i, 1, lut);
+-		dcss_hdr10_lut_fill(dcss, i, 2, lut);
+-
+-		ch->old_out_cs = DCSS_COLORSPACE_UNKNOWN;
+-		ch->old_in_cs = DCSS_COLORSPACE_UNKNOWN;
+ 	}
+ 
++#ifndef CONFIG_PM
++	dcss_hdr10_cfg(dcss);
++#endif
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/imx/dcss/dcss-prv.h b/drivers/gpu/imx/dcss/dcss-prv.h
+index b2edde1..894cc4f 100644
+--- a/drivers/gpu/imx/dcss/dcss-prv.h
++++ b/drivers/gpu/imx/dcss/dcss-prv.h
+@@ -32,6 +32,8 @@ struct dcss_soc {
+ 	struct device *dev;
+ 	const struct dcss_devtype *devtype;
+ 
++	u32 start_addr;
++
+ 	struct dcss_blkctl_priv *blkctl_priv;
+ 	struct dcss_ctxld_priv *ctxld_priv;
+ 	struct dcss_dpr_priv *dpr_priv;
+@@ -53,15 +55,19 @@ struct dcss_soc {
+ 
+ /* BLKCTL */
+ int dcss_blkctl_init(struct dcss_soc *dcss, unsigned long blkctl_base);
++void dcss_blkctl_cfg(struct dcss_soc *dcss);
+ void dcss_blkctl_exit(struct dcss_soc *dcss);
+ 
+ /* CTXLD */
+ int dcss_ctxld_init(struct dcss_soc *dcss, unsigned long ctxld_base);
++void dcss_ctxld_hw_cfg(struct dcss_soc *dcss);
+ void dcss_ctxld_exit(struct dcss_soc *dcss);
+ void dcss_ctxld_write(struct dcss_soc *dcss, u32 ctx_id, u32 val, u32 reg_idx);
+ void dcss_ctxld_update(struct dcss_soc *dcss, u32 ctx_id, u32 val, u32 mask,
+ 		       u32 reg_idx);
+ void dcss_ctxld_dump(struct seq_file *s, void *data);
++int dcss_ctxld_resume(struct dcss_soc *dcss);
++int dcss_ctxld_suspend(struct dcss_soc *dcss);
+ 
+ /* DPR */
+ int dcss_dpr_init(struct dcss_soc *dcss, unsigned long dpr_base);
+@@ -80,6 +86,7 @@ void dcss_ctxld_update(struct dcss_soc *dcss, u32 ctx_id, u32 val, u32 mask,
+ /* HDR10 */
+ int dcss_hdr10_init(struct dcss_soc *dcss, unsigned long hdr10_base);
+ void dcss_hdr10_exit(struct dcss_soc *dcss);
++void dcss_hdr10_cfg(struct dcss_soc *dcss);
+ 
+ /* SCALER */
+ int dcss_scaler_init(struct dcss_soc *dcss, unsigned long scaler_base);
+-- 
+1.7.9.5
+
