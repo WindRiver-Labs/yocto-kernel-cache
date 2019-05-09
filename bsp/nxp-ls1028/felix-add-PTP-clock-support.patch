@@ -1,0 +1,337 @@
+From c0c88b5a17ca8448c4a2d4dd6065515a0258547a Mon Sep 17 00:00:00 2001
+From: Yangbo Lu <yangbo.lu@nxp.com>
+Date: Fri, 4 Jan 2019 11:59:40 +0800
+Subject: [PATCH 436/706] felix: add PTP clock support
+
+This patch is to add PTP clock support for Felix switch.
+
+Signed-off-by: Yangbo Lu <yangbo.lu@nxp.com>
+(cherry picked from commit b9f6a37be7bb2a9a7632e5c80ae6cca62958ec8d)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/mscc/Kconfig       |   7 ++
+ drivers/net/ethernet/mscc/Makefile      |   3 +
+ drivers/net/ethernet/mscc/felix_board.c |   6 +
+ drivers/net/ethernet/mscc/felix_ptp.c   | 153 ++++++++++++++++++++++++
+ drivers/net/ethernet/mscc/felix_regs.c  |   3 +
+ drivers/net/ethernet/mscc/ocelot.h      |  19 +++
+ drivers/net/ethernet/mscc/ocelot_ptp.h  |  26 ++++
+ 7 files changed, 217 insertions(+)
+ create mode 100644 drivers/net/ethernet/mscc/felix_ptp.c
+
+diff --git a/drivers/net/ethernet/mscc/Kconfig b/drivers/net/ethernet/mscc/Kconfig
+index 006b7d0fa37f..33294a41d6de 100644
+--- a/drivers/net/ethernet/mscc/Kconfig
++++ b/drivers/net/ethernet/mscc/Kconfig
+@@ -35,6 +35,13 @@ config MSCC_FELIX_SWITCH
+ 	  This driver supports the Felix network switch device, connected as a
+ 	  PCI device.
+ 
++config MSCC_FELIX_SWITCH_PTP_CLOCK
++	bool "FELIX switch PTP clock support"
++	depends on MSCC_FELIX_SWITCH
++	select PTP_1588_CLOCK
++	help
++	  This driver supports PTP clock on Felix switch.
++
+ config MSCC_FELIX_SWITCH_TSN
+ 	tristate "TSN on FELIX switch driver"
+ 	depends on MSCC_FELIX_SWITCH
+diff --git a/drivers/net/ethernet/mscc/Makefile b/drivers/net/ethernet/mscc/Makefile
+index 047b89645638..6e730d482492 100644
+--- a/drivers/net/ethernet/mscc/Makefile
++++ b/drivers/net/ethernet/mscc/Makefile
+@@ -5,4 +5,7 @@ obj-$(CONFIG_MSCC_OCELOT_SWITCH_OCELOT) += ocelot_board.o ocelot_regs.o
+ 
+ obj-$(CONFIG_MSCC_FELIX_SWITCH) += mscc_felix.o
+ mscc_felix-y := felix_regs.o felix_board.o
++ifeq ($(CONFIG_MSCC_FELIX_SWITCH_PTP_CLOCK),y)
++	mscc_felix-y += felix_ptp.o
++endif
+ obj-$(CONFIG_MSCC_FELIX_SWITCH_TSN) += tsn_switch.o
+diff --git a/drivers/net/ethernet/mscc/felix_board.c b/drivers/net/ethernet/mscc/felix_board.c
+index 64697d76a16d..aff7ee41a7dd 100644
+--- a/drivers/net/ethernet/mscc/felix_board.c
++++ b/drivers/net/ethernet/mscc/felix_board.c
+@@ -559,6 +559,10 @@ static int felix_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_chip_init;
+ 
++	err = felix_ptp_init(ocelot);
++	if (err)
++		goto err_ptp_init;
++
+ 	ocelot_write(ocelot, SYS_RAM_INIT_RAM_INIT, SYS_RAM_INIT);
+ 
+ 	timeout = 50000;
+@@ -580,6 +584,8 @@ static int felix_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return 0;
+ 
+ err_ports_init:
++	felix_ptp_remove(ocelot);
++err_ptp_init:
+ err_chip_init:
+ 	pci_iounmap(pdev, regs);
+ err_iomap:
+diff --git a/drivers/net/ethernet/mscc/felix_ptp.c b/drivers/net/ethernet/mscc/felix_ptp.c
+new file mode 100644
+index 000000000000..9a2b1e8125db
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/felix_ptp.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/* Felix switch PTP clock driver
++ *
++ * Copyright 2019 NXP
++ */
++
++#include "ocelot.h"
++
++static int felix_ptp_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 val, tod_ns, tod_sec_lsb, tod_sec_msb;
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_SAVE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	tod_sec_msb = ocelot_read_rix(ocelot, PTP_TOD_SEC_MSB, TOD_ACC_PIN);
++	tod_sec_lsb = ocelot_read_rix(ocelot, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++	tod_ns = ocelot_read_rix(ocelot, PTP_TOD_NSEC, TOD_ACC_PIN);
++
++	ts->tv_sec = ((u64)(tod_sec_msb & SEC_MSB_MASK) << 32) | tod_sec_lsb;
++	ts->tv_nsec = tod_ns & NSEC_MASK;
++
++	/* Deal with negative values -1 and -2 */
++	if (ts->tv_nsec == 0x3fffffff) {
++		ts->tv_sec -= 1;
++		ts->tv_nsec = 999999999;
++	} else if (ts->tv_nsec == 0x3ffffffe) {
++		ts->tv_sec -= 1;
++		ts->tv_nsec = 999999998;
++	}
++
++	return 0;
++}
++
++static int felix_ptp_settime(struct ptp_clock_info *ptp,
++			     const struct timespec64 *ts)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 val, tod_ns, tod_sec_lsb, tod_sec_msb;
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_IDLE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	tod_ns = ts->tv_nsec & NSEC_MASK;
++	tod_sec_msb = (u32)(ts->tv_sec >> 32) & SEC_MSB_MASK;
++	tod_sec_lsb = (u32)ts->tv_sec;
++
++	ocelot_write_rix(ocelot, tod_ns, PTP_TOD_NSEC, TOD_ACC_PIN);
++	ocelot_write_rix(ocelot, tod_sec_msb, PTP_TOD_SEC_MSB, TOD_ACC_PIN);
++	ocelot_write_rix(ocelot, tod_sec_lsb, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_LOAD);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	return 0;
++}
++
++static int felix_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
++{
++	struct timespec64 ts;
++	struct timespec64 offset;
++
++	offset = ns_to_timespec64(delta);
++
++	felix_ptp_gettime(ptp, &ts);
++	ts = timespec64_add(ts, offset);
++	felix_ptp_settime(ptp, &ts);
++
++	return 0;
++}
++
++static int felix_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u64 adj;
++	u32 reg_adjfreq = 0, reg_adjcfg = PTP_CLK_ADJ_ENA;
++
++	if (!ppb)
++		goto no_adj;
++
++	if (ppb < 0) {
++		reg_adjcfg |= PTP_CLK_ADJ_DIR;
++		ppb = -ppb;
++	}
++
++	adj = PSEC_PER_SEC;
++	do_div(adj, ppb);
++
++	if (adj >= (1L << 30)) {
++		reg_adjfreq |= PTP_CLK_ADJ_UNIT_NS;
++		do_div(adj, 1000);
++	}
++
++	if (adj >= (1L << 30))
++		goto no_adj;
++
++	reg_adjfreq |= adj;
++
++	ocelot_write(ocelot, reg_adjfreq, PTP_CLK_ADJ_FRQ);
++	ocelot_write(ocelot, reg_adjcfg, PTP_CLK_ADJ_CFG);
++	return 0;
++
++no_adj:
++	ocelot_write(ocelot, 0, PTP_CLK_ADJ_CFG);
++	return 0;
++}
++
++static const struct ptp_clock_info felix_ptp_caps = {
++	.owner		= THIS_MODULE,
++	.name		= "felix ptp clock",
++	.max_adj	= 0x7fffffff,
++	.n_alarm	= 0,
++	.n_ext_ts	= 0,
++	.n_per_out	= 0,
++	.n_pins		= 0,
++	.pps		= 0,
++	.gettime64	= felix_ptp_gettime,
++	.settime64	= felix_ptp_settime,
++	.adjtime	= felix_ptp_adjtime,
++	.adjfreq	= felix_ptp_adjfreq,
++};
++
++int felix_ptp_init(struct ocelot *ocelot)
++{
++	/* Reset and enable ptp clock */
++	regmap_field_write(ocelot->regfields[PTP_MISC_CFG_ENA], 0);
++	regmap_field_write(ocelot->regfields[PTP_SYS_CLK_CFG_PER_NS],
++			   SYS_CLK_PER_NS);
++	regmap_field_write(ocelot->regfields[PTP_SYS_CLK_CFG_PER_PS100],
++			   SYS_CLK_PER_PS100);
++	regmap_field_write(ocelot->regfields[PTP_MISC_CFG_ENA], 1);
++
++	ocelot->ptp_caps = felix_ptp_caps;
++
++	ocelot->clock = ptp_clock_register(&ocelot->ptp_caps, ocelot->dev);
++	if (IS_ERR(ocelot->clock))
++		return PTR_ERR(ocelot->clock);
++
++	ocelot->phc_index = ptp_clock_index(ocelot->clock);
++	return 0;
++}
++
++void felix_ptp_remove(struct ocelot *ocelot)
++{
++	ptp_clock_unregister(ocelot->clock);
++}
+diff --git a/drivers/net/ethernet/mscc/felix_regs.c b/drivers/net/ethernet/mscc/felix_regs.c
+index dfca87702915..9b7e50bcb490 100644
+--- a/drivers/net/ethernet/mscc/felix_regs.c
++++ b/drivers/net/ethernet/mscc/felix_regs.c
+@@ -332,6 +332,9 @@ static const struct reg_field felix_regfields[] = {
+ 	[ANA_TABLES_MACACCESS_B_DOM] = REG_FIELD(ANA_TABLES_MACACCESS, 16, 16),
+ 	[ANA_TABLES_MACTINDX_BUCKET] = REG_FIELD(ANA_TABLES_MACTINDX, 11, 12),
+ 	[ANA_TABLES_MACTINDX_M_INDEX] = REG_FIELD(ANA_TABLES_MACTINDX, 0, 10),
++	[PTP_MISC_CFG_ENA] = REG_FIELD(PTP_MISC_CFG, 2, 2),
++	[PTP_SYS_CLK_CFG_PER_NS] = REG_FIELD(PTP_SYS_CLK_CFG, 4, 8),
++	[PTP_SYS_CLK_CFG_PER_PS100] = REG_FIELD(PTP_SYS_CLK_CFG, 0, 3),
+ 	[QSYS_TIMED_FRAME_ENTRY_TFRM_VLD] =
+ 		REG_FIELD(QSYS_TIMED_FRAME_ENTRY, 19, 19),
+ 	[QSYS_TIMED_FRAME_ENTRY_TFRM_FP] =
+diff --git a/drivers/net/ethernet/mscc/ocelot.h b/drivers/net/ethernet/mscc/ocelot.h
+index 35b56906f1b5..d253727274cb 100644
+--- a/drivers/net/ethernet/mscc/ocelot.h
++++ b/drivers/net/ethernet/mscc/ocelot.h
+@@ -13,6 +13,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
++#include <linux/ptp_clock_kernel.h>
+ #include <net/tsn.h>
+ #include "ocelot_ana.h"
+ #include "ocelot_dev.h"
+@@ -469,6 +470,9 @@ enum ocelot_regfield {
+ 	ANA_TABLES_MACACCESS_B_DOM,
+ 	ANA_TABLES_MACTINDX_BUCKET,
+ 	ANA_TABLES_MACTINDX_M_INDEX,
++	PTP_MISC_CFG_ENA,
++	PTP_SYS_CLK_CFG_PER_NS,
++	PTP_SYS_CLK_CFG_PER_PS100,
+ 	QSYS_TIMED_FRAME_ENTRY_TFRM_VLD,
+ 	QSYS_TIMED_FRAME_ENTRY_TFRM_FP,
+ 	QSYS_TIMED_FRAME_ENTRY_TFRM_PORTNO,
+@@ -552,6 +556,10 @@ struct ocelot {
+ 	struct workqueue_struct *stats_queue;
+ 
+ 	void (*port_adjust_link)(struct net_device *dev);
++
++	struct ptp_clock_info ptp_caps;
++	struct ptp_clock *clock;
++	int phc_index;
+ };
+ 
+ struct ocelot_port {
+@@ -620,6 +628,17 @@ int ocelot_chip_init(struct ocelot *ocelot);
+ int ocelot_probe_port(struct ocelot *ocelot, u8 port,
+ 		      void __iomem *regs,
+ 		      struct phy_device *phy);
++#ifdef CONFIG_MSCC_FELIX_SWITCH_PTP_CLOCK
++int felix_ptp_init(struct ocelot *ocelot);
++void felix_ptp_remove(struct ocelot *ocelot);
++#else
++static inline int felix_ptp_init(struct ocelot *ocelot)
++{
++	return 0;
++}
++
++static inline void felix_ptp_remove(struct ocelot *ocelot) { }
++#endif
+ 
+ extern struct notifier_block ocelot_netdevice_nb;
+ 
+diff --git a/drivers/net/ethernet/mscc/ocelot_ptp.h b/drivers/net/ethernet/mscc/ocelot_ptp.h
+index 138bc5651fbb..d3c7f35e7ae6 100644
+--- a/drivers/net/ethernet/mscc/ocelot_ptp.h
++++ b/drivers/net/ethernet/mscc/ocelot_ptp.h
+@@ -14,4 +14,30 @@
+ #define PTP_PIN_WF_HIGH_PERIOD_RSZ	PTP_PIN_CFG_RSZ
+ #define PTP_PIN_WF_LOW_PERIOD_RSZ	PTP_PIN_CFG_RSZ
+ 
++#define PTP_PIN_CFG_DOM			BIT(0)
++#define PTP_PIN_CFG_SYNC		BIT(2)
++#define PTP_PIN_CFG_ACTION(x)		((x) << 3)
++#define PTP_PIN_CFG_ACTION_MASK		PTP_PIN_CFG_ACTION(0x7)
++
++#define PTP_CLK_ADJ_DIR			BIT(1)
++#define PTP_CLK_ADJ_ENA			BIT(0)
++
++#define PTP_CLK_ADJ_UNIT_NS		BIT(30)
++
++enum {
++	PTP_PIN_ACTION_IDLE = 0,
++	PTP_PIN_ACTION_LOAD,
++	PTP_PIN_ACTION_SAVE,
++	PTP_PIN_ACTION_CLOCK,
++	PTP_PIN_ACTION_DELTA,
++};
++
++#define SEC_MSB_MASK           0x0000ffff
++#define NSEC_MASK              0x3fffffff
++
++// System clock period 6.4 ns (Frequency 156.25MHz)
++#define SYS_CLK_PER_NS		0x6
++#define SYS_CLK_PER_PS100	0x4
++
++#define PSEC_PER_SEC		1000000000000LL
+ #endif
+-- 
+2.17.1
+

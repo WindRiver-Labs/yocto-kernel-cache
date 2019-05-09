@@ -1,0 +1,135 @@
+From 040f56655a3decbbfbdee31a6b713a01b4828863 Mon Sep 17 00:00:00 2001
+From: Camelia Groza <camelia.groza@nxp.com>
+Date: Thu, 7 Mar 2019 18:21:59 +0800
+Subject: [PATCH 658/706] enetc: tsn: set mqprio as tsn priority selection
+
+When mqprio is set priority as the queue selection. Queues priority set 0~7.
+When mqprio is not set, queue selection as linux default descipline. And
+Queues priority default all 0.
+
+Signed-off-by: Po Liu <Po.Liu@nxp.com>
+(cherry picked from commit e4ff3b3c3a080535e86891b9b680df91219f856a)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c  | 70 +++++++++++++++++--
+ drivers/net/ethernet/freescale/enetc/enetc.h  |  3 +-
+ .../net/ethernet/freescale/enetc/enetc_pf.c   |  1 +
+ 3 files changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index 2f22e3bf7b00..13aa62098a87 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -1118,11 +1118,6 @@ static void enetc_setup_txbdr(struct enetc_hw *hw, struct enetc_bdr *tx_ring)
+ 	if (tx_ring->ndev->features & NETIF_F_HW_VLAN_CTAG_TX)
+ 		tbmr |= ENETC_TBMR_VIH;
+ 
+-	if (enetc_tsn_is_enabled()) {
+-		tbmr &= ~ENETC_TBMR_PRIO_MASK;
+-		tbmr |= ENETC_TBMR_PRIO_SET(idx % 8);
+-	}
+-
+ 	/* enable ring */
+ 	enetc_txbdr_wr(hw, idx, ENETC_TBMR, tbmr);
+ 
+@@ -1423,6 +1418,71 @@ int enetc_close(struct net_device *ndev)
+ 	return 0;
+ }
+ 
++int enetc_setup_tc(struct net_device *ndev, enum tc_setup_type type,
++		   void *type_data)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct tc_mqprio_qopt *mqprio = type_data;
++	struct enetc_bdr *tx_ring;
++	int i;
++	u8 num_tc;
++	u32 val;
++
++	if (type != TC_SETUP_MQPRIO)
++		return -EOPNOTSUPP;
++
++	mqprio->hw = TC_MQPRIO_HW_OFFLOAD_TCS;
++	num_tc = mqprio->num_tc;
++
++	if (!num_tc) {
++		netdev_reset_tc(ndev);
++		netif_set_real_num_tx_queues(ndev, ENETC_MAX_NUM_TXQS);
++
++		/* Reset all ring priorities to 0 */
++		for (i = 0; i < priv->num_tx_rings; i++) {
++			tx_ring = priv->tx_ring[i];
++			val = enetc_txbdr_rd(&priv->si->hw, tx_ring->index,
++					     ENETC_TBMR);
++			val &= ~ENETC_TBMR_PRIO_MASK;
++			enetc_txbdr_wr(&priv->si->hw, tx_ring->index,
++				       ENETC_TBMR, val);
++		}
++
++		return 0;
++	}
++
++	/* Check if we have enough BD rings available to accommodate all TCs */
++	if (num_tc > priv->num_tx_rings) {
++		netdev_err(ndev, "Max %d traffic classes supported\n",
++			   priv->num_tx_rings);
++		return -EINVAL;
++	}
++
++	/* For the moment, we use only one BD ring per TC.
++	 *
++	 * Configure num_tc BD rings with increasing priorities.
++	 */
++	for (i = 0; i < num_tc; i++) {
++		tx_ring = priv->tx_ring[i];
++		val = enetc_txbdr_rd(&priv->si->hw, tx_ring->index, ENETC_TBMR);
++		/* Clear the old priority and set the new one */
++		val &= ~ENETC_TBMR_PRIO_MASK;
++		val |= ENETC_TBMR_PRIO_SET(i);
++		enetc_txbdr_wr(&priv->si->hw, tx_ring->index, ENETC_TBMR, val);
++	}
++
++	/* Reset the number of netdev queues based on the TC count */
++	netif_set_real_num_tx_queues(ndev, num_tc);
++
++	netdev_set_num_tc(ndev, num_tc);
++
++	/* Each TC is associated with ENETC_TXQ_PER_TC netdev queues */
++	for (i = 0; i < num_tc; i++)
++		netdev_set_tc_queue(ndev, i, 1, i);
++
++	return 0;
++}
++
+ struct net_device_stats *enetc_get_stats(struct net_device *ndev)
+ {
+ 	struct enetc_ndev_priv *priv = netdev_priv(ndev);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 1101466531ae..4e64615f3af8 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -259,7 +259,8 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ void enetc_set_rss_key(struct enetc_hw *hw, const u8 *bytes);
+ int enetc_get_rss_table(struct enetc_si *si, u32 *table, int count);
+ int enetc_set_rss_table(struct enetc_si *si, const u32 *table, int count);
+-
++int enetc_setup_tc(struct net_device *ndev, enum tc_setup_type type,
++		   void *type_data);
+ #ifdef CONFIG_ENETC_TSN
+ void enetc_tsn_pf_init(struct net_device *netdev, struct pci_dev *pdev);
+ void enetc_tsn_pf_deinit(struct net_device *netdev);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index 2b0bf49fa65a..a82523c7e060 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -696,6 +696,7 @@ static int enetc_pf_set_features(struct net_device *ndev,
+ static const struct net_device_ops enetc_ndev_ops = {
+ 	.ndo_open		= enetc_open,
+ 	.ndo_stop		= enetc_close,
++	.ndo_setup_tc		= enetc_setup_tc,
+ 	.ndo_start_xmit		= enetc_xmit,
+ 	.ndo_get_stats		= enetc_get_stats,
+ 	.ndo_set_mac_address	= enetc_pf_set_mac_addr,
+-- 
+2.17.1
+

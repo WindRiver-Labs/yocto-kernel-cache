@@ -1,0 +1,152 @@
+From 4fa9b04fb6b3fbc78a3d476d11a7d6f943c6927d Mon Sep 17 00:00:00 2001
+From: Ioana Ciornei <ioana.ciornei@nxp.com>
+Date: Tue, 4 Dec 2018 11:20:29 +0000
+Subject: [PATCH 585/706] soc: fsl: dpio: use a cpumask to identify which cpus
+ are unused
+
+The current implementation of the dpio driver uses a static next_cpu
+variable to keep track of the index of the next cpu available. This
+approach does not handle well unbinding and binding dpio devices in a
+random order. For example, unbinding a dpio and then binding it again
+with the driver, will generate the below error:
+
+$ echo dpio.5 > /sys/bus/fsl-mc/drivers/fsl_mc_dpio/unbind
+$ echo dpio.5 > /sys/bus/fsl-mc/drivers/fsl_mc_dpio/bind
+[  103.946380] fsl_mc_dpio dpio.5: probe failed. Number of DPIOs exceeds
+NR_CPUS.
+[  103.955157] fsl_mc_dpio dpio.5: fsl_mc_driver_probe failed: -34
+-bash: echo: write error: No such device
+
+Fix this error by keeping a global cpumask of unused cpus that will be
+updated at every dpaa2_dpio_[probe,remove].
+
+Signed-off-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+Signed-off-by: Li Yang <leoyang.li@nxp.com>
+(cherry picked from commit 991e873223e9bcfaf10a0074eec1507c1ddfb6ab)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/soc/fsl/dpio/dpio-driver.c  | 25 ++++++++++++++++---------
+ drivers/soc/fsl/dpio/dpio-service.c | 13 +++++++++++++
+ include/soc/fsl/dpaa2-io.h          |  2 ++
+ 3 files changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/soc/fsl/dpio/dpio-driver.c b/drivers/soc/fsl/dpio/dpio-driver.c
+index e58fcc9096e8..832175cac739 100644
+--- a/drivers/soc/fsl/dpio/dpio-driver.c
++++ b/drivers/soc/fsl/dpio/dpio-driver.c
+@@ -30,6 +30,8 @@ struct dpio_priv {
+ 	struct dpaa2_io *io;
+ };
+ 
++static cpumask_var_t cpus_unused_mask;
++
+ static irqreturn_t dpio_irq_handler(int irq_num, void *arg)
+ {
+ 	struct device *dev = (struct device *)arg;
+@@ -86,7 +88,7 @@ static int dpaa2_dpio_probe(struct fsl_mc_device *dpio_dev)
+ 	struct dpio_priv *priv;
+ 	int err = -ENOMEM;
+ 	struct device *dev = &dpio_dev->dev;
+-	static int next_cpu = -1;
++	int possible_next_cpu;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+@@ -128,17 +130,14 @@ static int dpaa2_dpio_probe(struct fsl_mc_device *dpio_dev)
+ 	desc.dpio_id = dpio_dev->obj_desc.id;
+ 
+ 	/* get the cpu to use for the affinity hint */
+-	if (next_cpu == -1)
+-		next_cpu = cpumask_first(cpu_online_mask);
+-	else
+-		next_cpu = cpumask_next(next_cpu, cpu_online_mask);
+-
+-	if (!cpu_possible(next_cpu)) {
++	possible_next_cpu = cpumask_first(cpus_unused_mask);
++	if (possible_next_cpu >= nr_cpu_ids) {
+ 		dev_err(dev, "probe failed. Number of DPIOs exceeds NR_CPUS.\n");
+ 		err = -ERANGE;
+ 		goto err_allocate_irqs;
+ 	}
+-	desc.cpu = next_cpu;
++	desc.cpu = possible_next_cpu;
++	cpumask_clear_cpu(possible_next_cpu, cpus_unused_mask);
+ 
+ 	/*
+ 	 * Set the CENA regs to be the cache inhibited area of the portal to
+@@ -211,7 +210,7 @@ static int dpaa2_dpio_remove(struct fsl_mc_device *dpio_dev)
+ {
+ 	struct device *dev;
+ 	struct dpio_priv *priv;
+-	int err;
++	int err = 0, cpu;
+ 
+ 	dev = &dpio_dev->dev;
+ 	priv = dev_get_drvdata(dev);
+@@ -220,6 +219,9 @@ static int dpaa2_dpio_remove(struct fsl_mc_device *dpio_dev)
+ 
+ 	dpio_teardown_irqs(dpio_dev);
+ 
++	cpu = dpaa2_io_get_cpu(priv->io);
++	cpumask_set_cpu(cpu, cpus_unused_mask);
++
+ 	err = fsl_mc_portal_allocate(dpio_dev, 0, &dpio_dev->mc_io);
+ 	if (err) {
+ 		dev_err(dev, "MC portal allocation failed\n");
+@@ -267,11 +269,16 @@ static struct fsl_mc_driver dpaa2_dpio_driver = {
+ 
+ static int dpio_driver_init(void)
+ {
++	if (!zalloc_cpumask_var(&cpus_unused_mask, GFP_KERNEL))
++		return -ENOMEM;
++	cpumask_copy(cpus_unused_mask, cpu_online_mask);
++
+ 	return fsl_mc_driver_register(&dpaa2_dpio_driver);
+ }
+ 
+ static void dpio_driver_exit(void)
+ {
++	free_cpumask_var(cpus_unused_mask);
+ 	fsl_mc_driver_unregister(&dpaa2_dpio_driver);
+ }
+ module_init(dpio_driver_init);
+diff --git a/drivers/soc/fsl/dpio/dpio-service.c b/drivers/soc/fsl/dpio/dpio-service.c
+index ab046f241d32..c02bfb18a1f0 100644
+--- a/drivers/soc/fsl/dpio/dpio-service.c
++++ b/drivers/soc/fsl/dpio/dpio-service.c
+@@ -214,6 +214,19 @@ irqreturn_t dpaa2_io_irq(struct dpaa2_io *obj)
+ 	return IRQ_HANDLED;
+ }
+ 
++/**
++ * dpaa2_io_get_cpu() - get the cpu associated with a given DPIO object
++ *
++ * @d: the given DPIO object.
++ *
++ * Return the cpu associated with the DPIO object
++ */
++int dpaa2_io_get_cpu(struct dpaa2_io *d)
++{
++	return d->dpio_desc.cpu;
++}
++EXPORT_SYMBOL(dpaa2_io_get_cpu);
++
+ /**
+  * dpaa2_io_service_register() - Prepare for servicing of FQDAN or CDAN
+  *                               notifications on the given DPIO service.
+diff --git a/include/soc/fsl/dpaa2-io.h b/include/soc/fsl/dpaa2-io.h
+index 3fbd71c27ba3..243119c53cdf 100644
+--- a/include/soc/fsl/dpaa2-io.h
++++ b/include/soc/fsl/dpaa2-io.h
+@@ -90,6 +90,8 @@ struct dpaa2_io_notification_ctx {
+ 	void *dpio_private;
+ };
+ 
++int dpaa2_io_get_cpu(struct dpaa2_io *d);
++
+ int dpaa2_io_service_register(struct dpaa2_io *service,
+ 			      struct dpaa2_io_notification_ctx *ctx);
+ void dpaa2_io_service_deregister(struct dpaa2_io *service,
+-- 
+2.17.1
+

@@ -1,0 +1,156 @@
+From 84298c483c3a0355ea31432bad06889e592b5c1d Mon Sep 17 00:00:00 2001
+From: Catalin Horghidan <catalin.horghidan@nxp.com>
+Date: Thu, 28 Feb 2019 17:38:04 +0200
+Subject: [PATCH 656/706] felix: move CPU port cofiguration in DT
+
+Add a new 'cpu-ethernet' property to denote the switch CPU port.
+Only a single switch port ethernet node can include this property.
+The Felix switch allows only a single CPU port.
+The value represents a phandle to the peer ethernet device node.
+
+E.g. to declare port #4 as CPU port and PF2 as peer eth device
+we can write something like this:
+
+pci@0,5 {
+	port@4 {
+		reg = <4>;
+		cpu-ethernet = <&enetc_port2>;
+		phy-connection-type = "internal";
+		fixed-link {
+			speed = <1000>;
+			full-duplex;
+		};
+	};
+};
+
+enetc_port2: pci@0,2 {
+	reg = <0x000200 0 0 0 0>;
+	phy-connection-type = "internal";
+	fixed-link {
+		speed = <1000>;
+		full-duplex;
+	};
+};
+
+Signed-off-by: Catalin Horghidan <catalin.horghidan@nxp.com>
+(cherry picked from commit c27dc7b61dde7ccf73aa45ad18ed4c3a1ec95806)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ .../arm64/boot/dts/freescale/fsl-ls1028a.dtsi |  4 +-
+ drivers/net/ethernet/mscc/felix_board.c       | 39 ++++++++++---------
+ 2 files changed, 23 insertions(+), 20 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/freescale/fsl-ls1028a.dtsi b/arch/arm64/boot/dts/freescale/fsl-ls1028a.dtsi
+index 0b72187e7060..980279315c2b 100755
+--- a/arch/arm64/boot/dts/freescale/fsl-ls1028a.dtsi
++++ b/arch/arm64/boot/dts/freescale/fsl-ls1028a.dtsi
+@@ -727,6 +727,7 @@
+ 				#address-cells = <1>;
+ 				#size-cells = <0>;
+ 
++				/* external ports */
+ 				switch_port0: port@0 {
+ 					reg = <0>;
+ 				};
+@@ -739,9 +740,10 @@
+ 				switch_port3: port@3 {
+ 					reg = <3>;
+ 				};
+-				/* external cpu ports */
++				/* internal to-cpu ports */
+ 				port@4 {
+ 					reg = <4>;
++					cpu-ethernet = <&enetc_port2>;
+ 					phy-connection-type = "internal";
+ 					fixed-link {
+ 						speed = <1000>;
+diff --git a/drivers/net/ethernet/mscc/felix_board.c b/drivers/net/ethernet/mscc/felix_board.c
+index 1abb0fa275df..8e9d99f21f71 100644
+--- a/drivers/net/ethernet/mscc/felix_board.c
++++ b/drivers/net/ethernet/mscc/felix_board.c
+@@ -10,6 +10,7 @@
+ #include <linux/phy_fixed.h>
+ #include <linux/phy.h>
+ #include <linux/of_mdio.h>
++#include <linux/of_net.h>
+ #include <net/sock.h>
+ 
+ #include "ocelot.h"
+@@ -19,8 +20,7 @@ static const char felix_driver_string[] = "Felix Switch Driver";
+ #define DRV_VERSION "0.3"
+ static const char felix_driver_version[] = DRV_VERSION;
+ 
+-#define FELIX_MAX_NUM_PHY_PORTS	5
+-#define FELIX_EXT_CPU_PORT_ID	4
++#define FELIX_MAX_NUM_PHY_PORTS	6
+ #define PORT_RES_START		(GCB + 1)
+ 
+ #define PCI_DEVICE_ID_FELIX_PF5	0xEEF0
+@@ -30,10 +30,6 @@ static const char felix_driver_version[] = DRV_VERSION;
+ 
+ #define FELIX_INIT_TIMEOUT	50000
+ 
+-/* pair PCI device */
+-char *pair_eth = "\0";
+-module_param(pair_eth, charp, 0000);
+-
+ static struct pci_device_id felix_ids[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_FREESCALE, PCI_DEVICE_ID_FELIX_PF5) },
+ 	{ 0, }
+@@ -319,7 +315,8 @@ static void felix_register_rx_handler(struct ocelot *ocelot,
+ 
+ 	/* must obtain rtnl mutex first */
+ 	rtnl_lock();
+-	if (!netdev_is_rx_handler_busy(pair_ndev))
++	if (netif_device_present(pair_ndev) &&
++	    !netdev_is_rx_handler_busy(pair_ndev))
+ 		err = netdev_rx_handler_register(pair_ndev,
+ 						 felix_frm_ext_handler, ocelot);
+ 	rtnl_unlock();
+@@ -435,27 +432,31 @@ static int felix_ports_init(struct pci_dev *pdev)
+ 	struct device_node *np = ocelot->dev->of_node;
+ 	struct net_device *pair_ndev = NULL;
+ 	struct device_node *phy_node = NULL;
+-	struct device_node *portnp = NULL;
++	struct device_node *portnp, *ethnp;
+ 	struct phy_device *phydev = NULL;
+ 	struct resource *felix_res;
+ 	void __iomem *port_regs;
+ 	u32 port;
+ 	int err;
+ 
+-	if (pair_eth)
+-		pair_ndev = dev_get_by_name(&init_net, pair_eth);
+-
+-	if (pair_ndev && !netif_device_present(pair_ndev))
+-		return -EINVAL;
+-
+-	if (pair_ndev) {
+-		ocelot->cpu_port_id = FELIX_EXT_CPU_PORT_ID;
++	portnp = of_find_node_with_property(np, "cpu-ethernet");
++	if (portnp) {
++		ethnp = of_parse_phandle(portnp, "cpu-ethernet", 0);
++		if (!ethnp)
++			return -EINVAL;
++		pair_ndev = of_find_net_device_by_node(ethnp);
++		if (!pair_ndev)
++			return -EPROBE_DEFER;
++		if (of_property_read_u32(portnp, "reg", &port))
++			return -EINVAL;
++
++		ocelot->cpu_port_id = port;
+ 		ocelot->num_cpu_ports = 1;
+-	} else {
+-		ocelot->cpu_port_id = FELIX_MAX_NUM_PHY_PORTS;
+-		ocelot->num_cpu_ports = 0;
+ 	}
+ 
++	if (!pair_ndev)
++		ocelot->cpu_port_id = FELIX_MAX_NUM_PHY_PORTS;
++
+ 	ocelot->num_phys_ports = FELIX_MAX_NUM_PHY_PORTS;
+ 	ocelot->ports = devm_kcalloc(ocelot->dev, ocelot->num_phys_ports,
+ 				     sizeof(struct ocelot_port *), GFP_KERNEL);
+-- 
+2.17.1
+

@@ -1,0 +1,462 @@
+From e871e7f27173d82f531770877091b6e46741883d Mon Sep 17 00:00:00 2001
+From: Yangbo Lu <yangbo.lu@nxp.com>
+Date: Mon, 24 Dec 2018 16:43:13 +0800
+Subject: [PATCH 445/706] enetc_ptp: rework driver to reuse ptp_qoriq driver
+
+Reworked enetc_ptp driver to reuse functions of ptp_qoriq
+driver. Device tree node had been supported by reusing.
+
+Signed-off-by: Yangbo Lu <yangbo.lu@nxp.com>
+(cherry picked from commit 837bef5f3e09966f640377c9b3b112728b88c644)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/Kconfig  |   2 +-
+ .../net/ethernet/freescale/enetc/enetc_ptp.c  | 295 ++----------------
+ .../net/ethernet/freescale/enetc/enetc_ptp.h  |  51 ---
+ include/linux/fsl/ptp_qoriq.h                 |   2 +
+ 4 files changed, 31 insertions(+), 319 deletions(-)
+ delete mode 100644 drivers/net/ethernet/freescale/enetc/enetc_ptp.h
+
+diff --git a/drivers/net/ethernet/freescale/enetc/Kconfig b/drivers/net/ethernet/freescale/enetc/Kconfig
+index 02d07d48de87..844423365214 100644
+--- a/drivers/net/ethernet/freescale/enetc/Kconfig
++++ b/drivers/net/ethernet/freescale/enetc/Kconfig
+@@ -14,7 +14,7 @@ config FSL_ENETC_VF
+ config FSL_ENETC_PTP_CLOCK
+ 	tristate "ENETC PTP clock driver"
+ 	depends on FSL_ENETC || FSL_ENETC_VF
+-	select PTP_1588_CLOCK
++	select PTP_1588_CLOCK_QORIQ
+ 	---help---
+ 	  This driver adds support for using the ENETC 1588 timer
+ 	  as a PTP clock. This clock is only useful if your PTP
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_ptp.c b/drivers/net/ethernet/freescale/enetc/enetc_ptp.c
+index 5617b3d7788c..fb17b9e5506d 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_ptp.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_ptp.c
+@@ -2,204 +2,14 @@
+ /* Copyright 2018 NXP */
+ 
+ #include <linux/module.h>
+-#include <linux/ptp_clock_kernel.h>
++#include <linux/interrupt.h>
++#include <linux/fsl/ptp_qoriq.h>
+ 
+-#include "enetc_ptp.h"
++#include "enetc.h"
+ 
+ int enetc_phc_index = ENETC_PHC_INDEX_DEFAULT;
+ EXPORT_SYMBOL(enetc_phc_index);
+ 
+-struct enetc_ptp_config {
+-	u32	ck_sel;
+-	u32	tclk_period;
+-	u32	tmr_add;
+-	u32	tmr_prsc;
+-	u32	tmr_fiper1;
+-	u32	tmr_fiper2;
+-	u32	tmr_fiper3;
+-};
+-
+-struct enetc_ptp {
+-	void __iomem *regs;
+-	struct ptp_clock *clock;
+-	struct ptp_clock_info caps;
+-	struct enetc_ptp_config *config;
+-	spinlock_t lock; /* protects regs */
+-};
+-
+-static u64 tmr_cnt_read(struct enetc_ptp *ptp)
+-{
+-	u64 ns;
+-	u32 lo, hi;
+-
+-	lo = enetc_rd_reg(ptp->regs + TMR_CNT_L);
+-	hi = enetc_rd_reg(ptp->regs + TMR_CNT_H);
+-	ns = (u64)hi << 32;
+-	ns |= lo;
+-	return ns;
+-}
+-
+-static void tmr_cnt_write(struct enetc_ptp *ptp, u64 ns)
+-{
+-	u32 hi = ns >> 32;
+-	u32 lo = ns & 0xffffffff;
+-
+-	enetc_wr_reg(ptp->regs + TMR_CNT_L, lo);
+-	enetc_wr_reg(ptp->regs + TMR_CNT_H, hi);
+-}
+-
+-static void set_alarm(struct enetc_ptp *ptp)
+-{
+-	u64 ns;
+-	u32 lo, hi;
+-
+-	ns = tmr_cnt_read(ptp) + 1500000000ULL;
+-	ns = div_u64(ns, 1000000000UL) * 1000000000ULL;
+-	ns -= ptp->config->tclk_period;
+-	hi = ns >> 32;
+-	lo = ns & 0xffffffff;
+-	enetc_wr_reg(ptp->regs + TMR_ALARM_1_L, lo);
+-	enetc_wr_reg(ptp->regs + TMR_ALARM_1_H, hi);
+-}
+-
+-static void set_fipers(struct enetc_ptp *ptp)
+-{
+-	set_alarm(ptp);
+-	enetc_wr_reg(ptp->regs + TMR_FIPER_1, ptp->config->tmr_fiper1);
+-	enetc_wr_reg(ptp->regs + TMR_FIPER_2, ptp->config->tmr_fiper2);
+-	enetc_wr_reg(ptp->regs + TMR_FIPER_3, ptp->config->tmr_fiper3);
+-}
+-
+-static int enetc_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
+-{
+-	u64 adj, diff;
+-	u32 tmr_add;
+-	int neg_adj = 0;
+-	struct enetc_ptp *ptp_timer = container_of(ptp, struct enetc_ptp, caps);
+-
+-	if (scaled_ppm < 0) {
+-		neg_adj = 1;
+-		scaled_ppm = -scaled_ppm;
+-	}
+-	tmr_add = ptp_timer->config->tmr_add;
+-	adj = tmr_add;
+-
+-	/* calculate diff as adj*(scaled_ppm/65536)/1000000
+-	 * and round() to the nearest integer
+-	 */
+-	adj *= scaled_ppm;
+-	diff = div_u64(adj, 8000000);
+-	diff = (diff >> 13) + ((diff >> 12) & 1);
+-
+-	tmr_add = neg_adj ? tmr_add - diff : tmr_add + diff;
+-
+-	enetc_wr_reg(ptp_timer->regs + TMR_ADD, tmr_add);
+-
+-	return 0;
+-}
+-
+-static int enetc_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
+-{
+-	s64 now;
+-	unsigned long flags;
+-	struct enetc_ptp *ptp_timer = container_of(ptp, struct enetc_ptp, caps);
+-
+-	spin_lock_irqsave(&ptp_timer->lock, flags);
+-
+-	now = tmr_cnt_read(ptp_timer);
+-	now += delta;
+-	tmr_cnt_write(ptp_timer, now);
+-	set_fipers(ptp_timer);
+-
+-	spin_unlock_irqrestore(&ptp_timer->lock, flags);
+-
+-	return 0;
+-}
+-
+-static int enetc_ptp_gettime(struct ptp_clock_info *ptp,
+-			     struct timespec64 *ts)
+-{
+-	u64 ns;
+-	unsigned long flags;
+-	struct enetc_ptp *ptp_timer = container_of(ptp, struct enetc_ptp, caps);
+-
+-	spin_lock_irqsave(&ptp_timer->lock, flags);
+-
+-	ns = tmr_cnt_read(ptp_timer);
+-
+-	spin_unlock_irqrestore(&ptp_timer->lock, flags);
+-
+-	*ts = ns_to_timespec64(ns);
+-
+-	return 0;
+-}
+-
+-static int enetc_ptp_settime(struct ptp_clock_info *ptp,
+-			     const struct timespec64 *ts)
+-{
+-	u64 ns;
+-	unsigned long flags;
+-	struct enetc_ptp *ptp_timer = container_of(ptp, struct enetc_ptp, caps);
+-
+-	ns = timespec64_to_ns(ts);
+-
+-	spin_lock_irqsave(&ptp_timer->lock, flags);
+-
+-	tmr_cnt_write(ptp_timer, ns);
+-	set_fipers(ptp_timer);
+-
+-	spin_unlock_irqrestore(&ptp_timer->lock, flags);
+-
+-	return 0;
+-}
+-
+-static int enetc_ptp_enable(struct ptp_clock_info *ptp,
+-			    struct ptp_clock_request *rq, int on)
+-{
+-	struct enetc_ptp *ptp_timer = container_of(ptp, struct enetc_ptp, caps);
+-	unsigned long flags;
+-	u32 bit, mask;
+-
+-	switch (rq->type) {
+-	case PTP_CLK_REQ_EXTTS:
+-		switch (rq->extts.index) {
+-		case 0:
+-			bit = ETS1EN;
+-			break;
+-		case 1:
+-			bit = ETS2EN;
+-			break;
+-		default:
+-			return -EINVAL;
+-		}
+-		spin_lock_irqsave(&ptp_timer->lock, flags);
+-		mask = enetc_rd_reg(ptp_timer->regs + TMR_TEMASK);
+-		if (on)
+-			mask |= bit;
+-		else
+-			mask &= ~bit;
+-		enetc_wr_reg(ptp_timer->regs + TMR_TEMASK, mask);
+-		spin_unlock_irqrestore(&ptp_timer->lock, flags);
+-		return 0;
+-
+-	case PTP_CLK_REQ_PPS:
+-		spin_lock_irqsave(&ptp_timer->lock, flags);
+-		mask = enetc_rd_reg(ptp_timer->regs + TMR_TEMASK);
+-		if (on)
+-			mask |= PP1EN;
+-		else
+-			mask &= ~PP1EN;
+-		enetc_wr_reg(ptp_timer->regs + TMR_TEMASK, mask);
+-		spin_unlock_irqrestore(&ptp_timer->lock, flags);
+-		return 0;
+-
+-	default:
+-		break;
+-	}
+-
+-	return -EOPNOTSUPP;
+-}
+-
+ static struct ptp_clock_info enetc_ptp_caps = {
+ 	.owner		= THIS_MODULE,
+ 	.name		= "ENETC PTP clock",
+@@ -209,56 +19,19 @@ static struct ptp_clock_info enetc_ptp_caps = {
+ 	.n_per_out	= 3,
+ 	.n_pins		= 0,
+ 	.pps		= 1,
+-	.adjfine	= enetc_ptp_adjfine,
+-	.adjtime	= enetc_ptp_adjtime,
+-	.gettime64	= enetc_ptp_gettime,
+-	.settime64	= enetc_ptp_settime,
+-	.enable		= enetc_ptp_enable,
+-};
+-
+-static void enetc_ptp_init(struct enetc_ptp *ptp)
+-{
+-	u32 tclk = ptp->config->tclk_period;
+-	u32 ck_sel = ptp->config->ck_sel;
+-	u32 tmr_ctrl;
+-	unsigned long flags;
+-
+-	tmr_ctrl = (tclk & TCLK_PERIOD_MASK) << TCLK_PERIOD_SHIFT |
+-		   (ck_sel & CK_SEL_MASK);
+-	tmr_ctrl |= FRD | FS;
+-
+-	spin_lock_irqsave(&ptp->lock, flags);
+-
+-	enetc_wr_reg(ptp->regs + TMR_CTRL, tmr_ctrl);
+-	enetc_wr_reg(ptp->regs + TMR_ADD, ptp->config->tmr_add);
+-	enetc_wr_reg(ptp->regs + TMR_PRSC, ptp->config->tmr_prsc);
+-	enetc_wr_reg(ptp->regs + TMR_FIPER_1, ptp->config->tmr_fiper1);
+-	enetc_wr_reg(ptp->regs + TMR_FIPER_2, ptp->config->tmr_fiper2);
+-	enetc_wr_reg(ptp->regs + TMR_FIPER_3, ptp->config->tmr_fiper3);
+-	set_alarm(ptp);
+-
+-	enetc_wr_reg(ptp->regs + TMR_CTRL, tmr_ctrl | TE);
+-
+-	spin_unlock_irqrestore(&ptp->lock, flags);
+-}
+-
+-/* Reference clock frequency:	400MHz
+- * Nominal frequency:		200MHz
+- */
+-static struct enetc_ptp_config ptp_config = {
+-	.ck_sel = 1,
+-	.tclk_period = 5,
+-	.tmr_add = 0x80000000,
+-	.tmr_prsc = 2,
+-	.tmr_fiper1 = 999999995,
+-	.tmr_fiper2 = 99995,
+-	.tmr_fiper3 = 99995,
++	.adjfine	= ptp_qoriq_adjfine,
++	.adjtime	= ptp_qoriq_adjtime,
++	.gettime64	= ptp_qoriq_gettime,
++	.settime64	= ptp_qoriq_settime,
++	.enable		= ptp_qoriq_enable,
+ };
+ 
+ static int enetc_ptp_probe(struct pci_dev *pdev,
+ 			   const struct pci_device_id *ent)
+ {
+-	struct enetc_ptp *ptp;
++	struct device *ptp_dev = &pdev->dev;
++	struct qoriq_ptp *qoriq_ptp;
++	void __iomem *base;
+ 	int err, len;
+ 
+ 	err = pci_enable_device_mem(pdev);
+@@ -286,45 +59,34 @@ static int enetc_ptp_probe(struct pci_dev *pdev,
+ 
+ 	pci_set_master(pdev);
+ 
+-	ptp = kzalloc(sizeof(*ptp), GFP_KERNEL);
+-	if (!ptp) {
++	qoriq_ptp = kzalloc(sizeof(*qoriq_ptp), GFP_KERNEL);
++	if (!qoriq_ptp) {
+ 		err = -ENOMEM;
+ 		goto err_alloc_ptp;
+ 	}
+ 
+ 	len = pci_resource_len(pdev, ENETC_BAR_REGS);
+ 
+-	spin_lock_init(&ptp->lock);
+-
+-	ptp->regs = ioremap(pci_resource_start(pdev, ENETC_BAR_REGS), len);
+-	if (!ptp->regs) {
++	base = ioremap(pci_resource_start(pdev, ENETC_BAR_REGS), len);
++	if (!base) {
+ 		err = -ENXIO;
+ 		dev_err(&pdev->dev, "ioremap() failed\n");
+ 		goto err_ioremap;
+ 	}
+ 
+-	ptp->config = &ptp_config;
+-
+-	enetc_ptp_init(ptp);
+-
+-	ptp->caps = enetc_ptp_caps;
+-
+-	ptp->clock = ptp_clock_register(&ptp->caps, &pdev->dev);
+-	if (IS_ERR(ptp->clock)) {
+-		err = PTR_ERR(ptp->clock);
++	err = qoriq_ptp_init(ptp_dev, qoriq_ptp, base, enetc_ptp_caps);
++	if (err)
+ 		goto err_no_clock;
+-	}
+ 
+-	enetc_phc_index = ptp_clock_index(ptp->clock);
+-
+-	pci_set_drvdata(pdev, ptp);
++	enetc_phc_index = qoriq_ptp->phc_index;
++	pci_set_drvdata(pdev, qoriq_ptp);
+ 
+ 	return 0;
+ 
+ err_no_clock:
+-	iounmap(ptp->regs);
++	iounmap(base);
+ err_ioremap:
+-	kfree(ptp);
++	kfree(qoriq_ptp);
+ err_alloc_ptp:
+ 	pci_release_mem_regions(pdev);
+ err_pci_mem_reg:
+@@ -336,16 +98,15 @@ static int enetc_ptp_probe(struct pci_dev *pdev,
+ 
+ static void enetc_ptp_remove(struct pci_dev *pdev)
+ {
+-	struct enetc_ptp *ptp = pci_get_drvdata(pdev);
+-
+-	enetc_wr_reg(ptp->regs + TMR_TEVENT, 0);
+-	enetc_wr_reg(ptp->regs + TMR_CTRL, 0);
++	struct qoriq_ptp *qoriq_ptp = pci_get_drvdata(pdev);
++	struct qoriq_ptp_registers *regs = &qoriq_ptp->regs;
+ 
+-	enetc_phc_index = ENETC_PHC_INDEX_DEFAULT;
+-	ptp_clock_unregister(ptp->clock);
++	qoriq_write(qoriq_ptp, &regs->ctrl_regs->tmr_temask, 0);
++	qoriq_write(qoriq_ptp, &regs->ctrl_regs->tmr_ctrl,   0);
+ 
+-	iounmap(ptp->regs);
+-	kfree(ptp);
++	ptp_clock_unregister(qoriq_ptp->clock);
++	iounmap(qoriq_ptp->base);
++	kfree(qoriq_ptp);
+ 
+ 	pci_release_mem_regions(pdev);
+ 	pci_disable_device(pdev);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_ptp.h b/drivers/net/ethernet/freescale/enetc/enetc_ptp.h
+deleted file mode 100644
+index 084f8e8150c0..000000000000
+--- a/drivers/net/ethernet/freescale/enetc/enetc_ptp.h
++++ /dev/null
+@@ -1,51 +0,0 @@
+-/* SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause) */
+-/* Copyright 2018 NXP */
+-
+-#include "enetc.h"
+-
+-#define ENETC_DEV_ID_PTP	0xee02
+-
+-/* Registers definition */
+-#define TMR_ID			0x0
+-#define TMR_ID_2		0x4
+-#define TMR_CTRL		0x80
+-#define TMR_TEVENT		0x84
+-#define TMR_TEMASK		0x88
+-#define TMR_MSIVEC		0x8c
+-#define TMR_STAT		0x94
+-#define TMR_CNT_H		0x98
+-#define TMR_CNT_L		0x9c
+-#define TMR_ADD			0xa0
+-#define TMR_ACC			0xa4
+-#define TMR_PRSC		0xa8
+-#define TMR_ECTRL		0xac
+-#define TMR_OFF_H		0xb0
+-#define TMR_OFF_L		0xb4
+-#define TMR_ALARM_1_H		0xb8
+-#define TMR_ALARM_1_L		0xbc
+-#define TMR_ALARM_2_H		0xc0
+-#define TMR_ALARM_2_L		0xc4
+-#define TMR_FIPER_1		0xd0
+-#define TMR_FIPER_2		0xd4
+-#define TMR_FIPER_3		0xd8
+-#define TMR_ETTS_1_H		0xe0
+-#define TMR_ETTS_1_L		0xe4
+-#define TMR_ETTS_2_H		0xe8
+-#define TMR_ETTS_2_L		0xec
+-#define TMR_CUR_TIME_H		0xf0
+-#define TMR_CUR_TIME_L		0xf4
+-
+-/* Bits definition for the TMR_CTRL register */
+-#define FS			BIT(28)
+-#define FRD			BIT(14)
+-#define TE			BIT(2)
+-#define TCLK_PERIOD_MASK	0x3ff
+-#define TCLK_PERIOD_SHIFT	16
+-#define CK_SEL_MASK		0x3
+-
+-/* Bits definition for the TMR_TEMASK register */
+-#define ETS2EN                BIT(25)
+-#define ETS1EN                BIT(24)
+-#define PP1EN                 BIT(7)
+-#define PP2EN                 BIT(6)
+-#define PP3EN                 BIT(5)
+diff --git a/include/linux/fsl/ptp_qoriq.h b/include/linux/fsl/ptp_qoriq.h
+index ed5d55f7d5de..0393dd06a781 100644
+--- a/include/linux/fsl/ptp_qoriq.h
++++ b/include/linux/fsl/ptp_qoriq.h
+@@ -134,6 +134,8 @@ struct qoriq_ptp_registers {
+ #define DEFAULT_FIPER1_PERIOD	1000000000
+ #define DEFAULT_FIPER2_PERIOD	100000
+ 
++#define ENETC_DEV_ID_PTP	0xee02
++
+ struct qoriq_ptp {
+ 	void __iomem *base;
+ 	struct qoriq_ptp_registers regs;
+-- 
+2.17.1
+

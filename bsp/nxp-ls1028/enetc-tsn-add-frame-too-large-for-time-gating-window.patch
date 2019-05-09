@@ -1,0 +1,185 @@
+From 16695457ea791d2aae6d25bd05ebad8249239f95 Mon Sep 17 00:00:00 2001
+From: Po Liu <Po.Liu@nxp.com>
+Date: Mon, 11 Mar 2019 14:54:07 +0800
+Subject: [PATCH 668/706] enetc: tsn: add frame too large for time gating
+ window counter
+
+Add the Qbv frame too large for time gating window drop counter
+for each queue.
+Restrict wb descr accesses only for PFs that have QVB capability
+when TSN is actually enabled, as the counter only makes sense
+in these cases, and so avoid perf penalty for accessing wb descr
+for the other cases.
+
+Signed-off-by: Po Liu <Po.Liu@nxp.com>
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit d21ef285bb09068c3ced2d8784375aab05c476cb)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c    | 17 +++++++++++++----
+ drivers/net/ethernet/freescale/enetc/enetc.h    |  6 +++++-
+ .../ethernet/freescale/enetc/enetc_ethtool.c    |  5 ++++-
+ drivers/net/ethernet/freescale/enetc/enetc_hw.h |  2 ++
+ drivers/net/ethernet/freescale/enetc/enetc_pf.c |  3 +++
+ 5 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index a1f9ea406ecb..c9680bcddda7 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -141,7 +141,8 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
+ 	do_tstamp = (hw_features & ENETC_F_TX_TSTAMP) &&
+ 		    (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP);
+ 	tx_swbd->do_tstamp = do_tstamp;
+-	tx_swbd->check_wb = tx_swbd->do_tstamp;
++	tx_swbd->qbv_en = hw_features & ENETC_F_QBV;
++	tx_swbd->check_wb = tx_swbd->do_tstamp || tx_swbd->qbv_en;
+ 
+ 	if (do_vlan || do_tstamp)
+ 		flags |= ENETC_TXBD_FLAGS_EX;
+@@ -328,8 +329,8 @@ static void enetc_tstamp_tx(struct sk_buff *skb, u64 tstamp)
+ 
+ static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ {
++	int tx_frm_cnt = 0, tx_byte_cnt = 0, tx_win_drop = 0;
+ 	struct net_device *ndev = tx_ring->ndev;
+-	int tx_frm_cnt = 0, tx_byte_cnt = 0;
+ 	struct enetc_tx_swbd *tx_swbd;
+ 	int i, bds_to_clean;
+ 	bool do_tstamp;
+@@ -356,6 +357,10 @@ static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ 						    &tstamp);
+ 				do_tstamp = true;
+ 			}
++
++			if (tx_swbd->qbv_en &&
++			    txbd->wb.status & ENETC_TXBD_STATS_WIN)
++				tx_win_drop++;
+ 		}
+ no_wb:
+ 		if (likely(tx_swbd->dma))
+@@ -395,6 +400,7 @@ static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ 	tx_ring->next_to_clean = i;
+ 	tx_ring->stats.packets += tx_frm_cnt;
+ 	tx_ring->stats.bytes += tx_byte_cnt;
++	tx_ring->stats.win_drop += tx_win_drop;
+ 
+ 	if (unlikely(tx_frm_cnt && netif_carrier_ok(ndev) &&
+ 		     __netif_subqueue_stopped(ndev, tx_ring->index) &&
+@@ -735,9 +741,12 @@ void enetc_get_si_caps(struct enetc_si *si)
+ 	si->num_rss = 0;
+ 	val = enetc_rd(hw, ENETC_SIPCAPR0);
+ 	if (val & ENETC_SIPCAPR0_RSS) {
+-		val = enetc_rd(hw, ENETC_SIRSSCAPR);
+-		si->num_rss = ENETC_SIRSSCAPR_GET_NUM_RSS(val);
++		u32 rsscap = enetc_rd(hw, ENETC_SIRSSCAPR);
++
++		si->num_rss = ENETC_SIRSSCAPR_GET_NUM_RSS(rsscap);
+ 	}
++	if (val & ENETC_SIPCAPR0_QBV)
++		si->hw_features |= ENETC_SI_F_QBV;
+ }
+ 
+ static int enetc_dma_alloc_bdr(struct enetc_bdr *r, size_t bd_size)
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 128e5ccf65fa..9899b6175df7 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -26,6 +26,7 @@ struct enetc_tx_swbd {
+ 	u8 is_dma_page:1;
+ 	u8 check_wb:1;
+ 	u8 do_tstamp:1;
++	u8 qbv_en:1;
+ };
+ 
+ #define ENETC_RX_MAXFRM_SIZE	ENETC_MAC_MAXFRM_SIZE
+@@ -44,6 +45,7 @@ struct enetc_ring_stats {
+ 	unsigned int packets;
+ 	unsigned int bytes;
+ 	unsigned int rx_alloc_errs;
++	unsigned int win_drop;
+ };
+ 
+ #define ENETC_BDR_DEFAULT_SIZE	1024
+@@ -157,10 +159,11 @@ struct enetc_si {
+ 	int num_fs_entries;
+ 	int num_rss; /* number of RSS buckets */
+ 	unsigned short pad;
++#define ENETC_SI_F_QBV	BIT(0)
++	int hw_features;
+ #ifdef CONFIG_ENETC_TSN
+ 	 struct enetc_cbs *ecbs;
+ #endif
+-
+ };
+ 
+ #define ENETC_SI_ALIGN	32
+@@ -200,6 +203,7 @@ struct enetc_cls_rule {
+ enum enetc_hw_features {
+ 	ENETC_F_RX_TSTAMP	= BIT(0),
+ 	ENETC_F_TX_TSTAMP	= BIT(1),
++	ENETC_F_QBV		= BIT(2),
+ };
+ 
+ struct enetc_ndev_priv {
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c b/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+index cf6e2b2b1614..a339c8889a7e 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+@@ -190,6 +190,7 @@ static const char rx_ring_stats[][ETH_GSTRING_LEN] = {
+ 
+ static const char tx_ring_stats[][ETH_GSTRING_LEN] = {
+ 	"Tx ring %2d frames",
++	"Tx window drop %2d frames",
+ };
+ 
+ static int enetc_get_sset_count(struct net_device *ndev, int sset)
+@@ -255,8 +256,10 @@ static void enetc_get_ethtool_stats(struct net_device *ndev,
+ 	for (i = 0; i < ARRAY_SIZE(enetc_si_counters); i++)
+ 		data[o++] = enetc_rd64(hw, enetc_si_counters[i].reg);
+ 
+-	for (i = 0; i < priv->num_tx_rings; i++)
++	for (i = 0; i < priv->num_tx_rings; i++) {
+ 		data[o++] = priv->tx_ring[i]->stats.packets;
++		data[o++] = priv->tx_ring[i]->stats.win_drop;
++	}
+ 
+ 	for (i = 0; i < priv->num_rx_rings; i++) {
+ 		data[o++] = priv->rx_ring[i]->stats.packets;
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index c57ddede4d89..2c934e91611e 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -17,6 +17,7 @@
+ #define ENETC_SICTR0	0x18
+ #define ENETC_SICTR1	0x1c
+ #define ENETC_SIPCAPR0	0x20
++#define ENETC_SIPCAPR0_QBV	BIT(4)
+ #define ENETC_SIPCAPR0_RSS	BIT(8)
+ #define ENETC_SIPCAPR1	0x24
+ #define ENETC_SITGTGR	0x30
+@@ -375,6 +376,7 @@ union enetc_tx_bd {
+ #define ENETC_TXBD_FLAGS_CSUM	BIT(3)
+ #define ENETC_TXBD_FLAGS_EX	BIT(6)
+ #define ENETC_TXBD_FLAGS_F	BIT(7)
++#define ENETC_TXBD_STATS_WIN	BIT(7)
+ 
+ static inline void enetc_clear_tx_bd(union enetc_tx_bd *txbd)
+ {
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index a82523c7e060..ee1f8d8d98c7 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -746,6 +746,9 @@ static void enetc_pf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+ 
+ 	ndev->priv_flags |= IFF_UNICAST_FLT;
+ 
++	if (enetc_tsn_is_enabled() && (si->hw_features & ENETC_SI_F_QBV))
++		priv->hw_features |= ENETC_F_QBV;
++
+ 	/* pick up primary MAC address from SI */
+ 	enetc_get_primary_mac_addr(&si->hw, ndev->dev_addr);
+ }
+-- 
+2.17.1
+

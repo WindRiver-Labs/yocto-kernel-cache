@@ -1,0 +1,417 @@
+From e0d7968474c028d9009e6d11d978d0cca786dffa Mon Sep 17 00:00:00 2001
+From: Yangbo Lu <yangbo.lu@nxp.com>
+Date: Mon, 30 Jul 2018 15:42:36 +0800
+Subject: [PATCH 181/706] enetc: support hardware timestamping
+
+This patch is to support getting hardware time stamps on the
+Ethernet packets using the SO_TIMESTAMPING API. Because the
+RX BD ring dynamic allocation hasn't been supported and it's
+too expensive to use extended RX BDs if timestamping isn't
+used, the option CONFIG_ENETC_HW_TIMESTAMPING was used to
+control hardware timestamping/extended RX BDs to be enabled
+or not.
+
+Signed-off-by: Yangbo Lu <yangbo.lu@nxp.com>
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit b6417d73a9c35baf8a51dff7e68c68a116204a97)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/Kconfig  |  12 ++
+ drivers/net/ethernet/freescale/enetc/enetc.c  | 154 +++++++++++++++++-
+ drivers/net/ethernet/freescale/enetc/enetc.h  |   3 +
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  18 ++
+ .../net/ethernet/freescale/enetc/enetc_pf.c   |   1 +
+ .../net/ethernet/freescale/enetc/enetc_vf.c   |   1 +
+ 6 files changed, 184 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/Kconfig b/drivers/net/ethernet/freescale/enetc/Kconfig
+index 610797fdb78f..caa827b1f339 100644
+--- a/drivers/net/ethernet/freescale/enetc/Kconfig
++++ b/drivers/net/ethernet/freescale/enetc/Kconfig
+@@ -23,6 +23,18 @@ config FSL_ENETC_PTP_CLOCK
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called fsl-enetc-ptp.
+ 
++config FSL_ENETC_HW_TIMESTAMPING
++	bool "ENETC hardware timestamping support"
++	depends on FSL_ENETC || FSL_ENETC_VF
++	select FSL_ENETC_PTP_CLOCK
++	---help---
++	  Enable hardware timestamping support on the Ethernet packets
++	  using the SO_TIMESTAMPING API. Because the RX BD ring dynamic
++	  allocation hasn't been supported and it's too expensive to use
++	  extended RX BDs if timestamping isn't used, the option was used
++	  to control hardware timestamping/extended RX BDs to be enabled
++	  or not.
++
+ if FSL_ENETC
+ 
+ config ENETC_TSN
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index 86b948bda015..93b8ea9c535d 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -37,7 +37,8 @@
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
+ 
+-static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb);
++static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
++			      bool ts);
+ static void enetc_unmap_tx_buff(struct enetc_bdr *tx_ring,
+ 				struct enetc_tx_swbd *tx_swbd);
+ static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring);
+@@ -112,7 +113,7 @@ netdev_tx_t enetc_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 		return NETDEV_TX_BUSY;
+ 	}
+ 
+-	count = enetc_map_tx_buffs(tx_ring, skb);
++	count = enetc_map_tx_buffs(tx_ring, skb, priv->tx_tstamp);
+ 	if (unlikely(!count)) {
+ 		dev_kfree_skb_any(skb);
+ 		return NETDEV_TX_OK;
+@@ -161,7 +162,8 @@ static bool enetc_tx_csum(struct sk_buff *skb, union enetc_tx_bd *txbd)
+ 	return true;
+ }
+ 
+-static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb)
++static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
++			      bool ts)
+ {
+ 	unsigned int nr_frags = skb_shinfo(skb)->nr_frags;
+ 	struct enetc_tx_swbd *tx_swbd;
+@@ -192,7 +194,7 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb)
+ 	count++;
+ 
+ 	do_vlan = skb_vlan_tag_present(skb);
+-	do_ts = skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP;
++	do_ts = ts && (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP);
+ 
+ 	if (do_vlan || do_ts)
+ 		flags |= ENETC_TXBD_FLAGS_EX;
+@@ -226,8 +228,8 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb)
+ 		}
+ 
+ 		if (do_ts) {
+-			// TODO: Tx timestamp offload h/w settings
+ 			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++			txbd->ext.e_flags |= ENETC_TXBD_E_FLAGS_TWO_STEP_PTP;
+ 		}
+ 
+ 		if (!nr_frags)
+@@ -349,20 +351,65 @@ static int enetc_bd_ready_count(struct enetc_bdr *tx_ring, int ci)
+ 	return pi >= ci ? pi - ci : tx_ring->bd_count - ci + pi;
+ }
+ 
++static void enetc_get_tx_tstamp(struct enetc_hw *hw, union enetc_tx_bd *txbd,
++				u64 *tstamp)
++{
++	u32 lo, hi;
++
++	if (txbd->flags & ENETC_TXBD_FLAGS_TSTMP) {
++		lo = enetc_rd(hw, ENETC_SICTR0);
++		hi = enetc_rd(hw, ENETC_SICTR1);
++		if (lo <= txbd->ext.ts)
++			hi -= 1;
++		*tstamp = (u64)hi << 32 | txbd->ext.ts;
++	}
++}
++
++static void enetc_tstamp_tx(struct sk_buff *skb, u64 tstamp)
++{
++	struct skb_shared_hwtstamps shhwtstamps;
++
++	if (skb_shinfo(skb)->tx_flags & SKBTX_IN_PROGRESS) {
++		memset(&shhwtstamps, 0, sizeof(shhwtstamps));
++		shhwtstamps.hwtstamp = ns_to_ktime(tstamp);
++		skb_tstamp_tx(skb, &shhwtstamps);
++	}
++}
++
+ static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring)
+ {
+ 	struct net_device *ndev = tx_ring->ndev;
+ 	int tx_frm_cnt = 0, tx_byte_cnt = 0;
+ 	struct enetc_tx_swbd *tx_swbd;
++	struct enetc_ndev_priv *priv;
+ 	int i, bds_to_clean;
++	bool do_ts, first;
++	u64 tstamp = 0;
++
++	priv = netdev_priv(ndev);
++	do_ts = priv->tx_tstamp;
+ 
+ 	i = tx_ring->next_to_clean;
+ 	tx_swbd = &tx_ring->tx_swbd[i];
++	first = true;
+ 	bds_to_clean = enetc_bd_ready_count(tx_ring, i);
+ 
+ 	while (bds_to_clean) {
+ 		bool is_eof = !!tx_swbd->skb;
+ 
++		if (unlikely(do_ts)) {
++			if (unlikely(first)) {
++				union enetc_tx_bd *txbd;
++
++				txbd = ENETC_TXBD(*tx_ring, i);
++				enetc_get_tx_tstamp(&priv->si->hw, txbd,
++						    &tstamp);
++
++			} else if (is_eof) {
++				enetc_tstamp_tx(tx_swbd->skb, tstamp);
++			}
++		}
++
+ 		enetc_unmap_tx_buff(tx_ring, tx_swbd);
+ 		tx_byte_cnt += tx_swbd->len;
+ 
+@@ -374,8 +421,11 @@ static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring)
+ 			tx_swbd = tx_ring->tx_swbd;
+ 		}
+ 
++		/* BD iteration loop end */
++		first = false;
+ 		if (is_eof) {
+ 			tx_frm_cnt++;
++			first = true;
+ 			/* re-arm interrupt source */
+ 			enetc_wr_reg(tx_ring->idr, BIT(tx_ring->index) |
+ 				     BIT(16 + tx_ring->index));
+@@ -468,6 +518,30 @@ static int enetc_refill_rx_ring(struct enetc_bdr *rx_ring, const int buff_cnt)
+ 	return j;
+ }
+ 
++#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
++static void enetc_get_rx_tstamp(struct net_device *ndev,
++				union enetc_rx_bd *rxbd,
++				struct sk_buff *skb)
++{
++	struct skb_shared_hwtstamps *shhwtstamps = skb_hwtstamps(skb);
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct enetc_hw *hw = &priv->si->hw;
++	u32 lo, hi;
++	u64 tstamp;
++
++	if (rxbd->r.flags & ENETC_RXBD_FLAG_TSTMP) {
++		lo = enetc_rd(hw, ENETC_SICTR0);
++		hi = enetc_rd(hw, ENETC_SICTR1);
++		if (lo <= rxbd->r.ts)
++			hi -= 1;
++
++		tstamp = (u64)hi << 32 | rxbd->r.ts;
++		memset(shhwtstamps, 0, sizeof(*shhwtstamps));
++		shhwtstamps->hwtstamp = ns_to_ktime(tstamp);
++	}
++}
++#endif
++
+ static void enetc_get_offloads(struct enetc_bdr *rx_ring,
+ 			       union enetc_rx_bd *rxbd, struct sk_buff *skb)
+ {
+@@ -485,6 +559,9 @@ static void enetc_get_offloads(struct enetc_bdr *rx_ring,
+ 	if (rxbd->r.flags & ENETC_RXBD_FLAG_VLAN)
+ 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+ 				       rxbd->r.vlan_opt);
++#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
++	enetc_get_rx_tstamp(rx_ring->ndev, rxbd, skb);
++#endif
+ }
+ 
+ #define ENETC_RXBD_BUNDLE 16 /* recommended # of BDs to update at once */
+@@ -1080,6 +1157,8 @@ static void enetc_setup_rxbdr(struct enetc_hw *hw, struct enetc_bdr *rx_ring)
+ 	rbmr = ENETC_RBMR_EN;
+ 	if (rx_ring->ndev->features & NETIF_F_HW_VLAN_CTAG_RX)
+ 		rbmr |= ENETC_RBMR_VTE;
++	if (enetc_has_extended_rxbds())
++		rbmr |= ENETC_RBMR_BDS;
+ 
+ 	rx_ring->rcir = hw->reg + ENETC_BDR(RX, idx, ENETC_RBCIR);
+ 	rx_ring->idr = hw->reg + ENETC_SIRXIDR;
+@@ -1371,6 +1450,71 @@ int enetc_set_features(struct net_device *ndev,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
++static int enetc_hwtstamp_set(struct net_device *ndev, struct ifreq *ifr)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct hwtstamp_config config;
++
++	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
++		return -EFAULT;
++
++	switch (config.tx_type) {
++	case HWTSTAMP_TX_OFF:
++		priv->tx_tstamp = false;
++		break;
++	case HWTSTAMP_TX_ON:
++		priv->tx_tstamp = true;
++		break;
++	default:
++		return -ERANGE;
++	}
++
++	switch (config.rx_filter) {
++	case HWTSTAMP_FILTER_NONE:
++		priv->rx_tstamp = false;
++		break;
++	default:
++		priv->rx_tstamp = true;
++		config.rx_filter = HWTSTAMP_FILTER_ALL;
++	}
++
++	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
++	       -EFAULT : 0;
++}
++
++static int enetc_hwtstamp_get(struct net_device *ndev, struct ifreq *ifr)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct hwtstamp_config config;
++
++	config.flags = 0;
++
++	if (priv->tx_tstamp)
++		config.tx_type = HWTSTAMP_TX_ON;
++	else
++		config.tx_type = HWTSTAMP_TX_OFF;
++
++	config.rx_filter = (priv->rx_tstamp ?
++			    HWTSTAMP_FILTER_ALL : HWTSTAMP_FILTER_NONE);
++
++	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
++	       -EFAULT : 0;
++}
++#endif
++
++int enetc_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
++{
++#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
++	if (cmd == SIOCSHWTSTAMP)
++		return enetc_hwtstamp_set(dev, rq);
++	if (cmd == SIOCGHWTSTAMP)
++		return enetc_hwtstamp_get(dev, rq);
++#endif
++
++	return -EINVAL;
++}
++
+ int enetc_alloc_msix(struct enetc_ndev_priv *priv)
+ {
+ 	struct pci_dev *pdev = priv->si->pdev;
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 0f772683a93d..032638c9b511 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -195,6 +195,8 @@ struct enetc_ndev_priv {
+ 	u16 rx_bd_count, tx_bd_count;
+ 
+ 	u16 msg_enable;
++	/* HW timestamping en flags */
++	bool tx_tstamp, rx_tstamp;
+ 
+ 	struct enetc_bdr *tx_ring[16];
+ 	struct enetc_bdr *rx_ring[16];
+@@ -239,6 +241,7 @@ int enetc_open(struct net_device *ndev);
+ int enetc_close(struct net_device *ndev);
+ netdev_tx_t enetc_xmit(struct sk_buff *skb, struct net_device *ndev);
+ struct net_device_stats *enetc_get_stats(struct net_device *ndev);
++int enetc_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);
+ int enetc_set_features(struct net_device *ndev,
+ 		       netdev_features_t features);
+ int enetc_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index 44717bbffe53..5c45294ce298 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -62,6 +62,9 @@
+ #define ENETC_SICAR_WR_COHERENT	0x00006727
+ #define ENETC_SICAR_MSI	0x00300030 /* rd/wr device, no snoop, no alloc */
+ 
++#define ENETC_SICTR0	0x18
++#define ENETC_SICTR1	0x1c
++
+ #define ENETC_SIPMAR0	0x80
+ #define ENETC_SIPMAR1	0x84
+ 
+@@ -130,6 +133,7 @@ enum enetc_bdr_type {TX, RX};
+ #define ENETC_BDR(t, i, r)	(0x8000 + (t) * 0x100 + ENETC_BDR_OFF(i) + (r))
+ /*** RX BDR reg offsets */
+ #define ENETC_RBMR	0
++#define ENETC_RBMR_BDS	BIT(2)
+ #define ENETC_RBMR_VTE	BIT(5)
+ #define ENETC_RBMR_EN	BIT(31)
+ 
+@@ -391,6 +395,9 @@ union enetc_tx_bd {
+ #define ENETC_TXBD_L3_START_MASK	GENMASK(6, 0)
+ #define ENETC_TXBD_L3_SET_HSIZE(val)	((((val) >> 2) & 0x7f) << 8)
+ 
++/* Extension flags */
++#define ENETC_TXBD_E_FLAGS_TWO_STEP_PTP	BIT(2)
++
+ static inline __le16 enetc_txbd_l3_csoff(int start, int hdr_sz, u16 l3_flags)
+ {
+ 	return cpu_to_le16(l3_flags | ENETC_TXBD_L3_SET_HSIZE(hdr_sz) |
+@@ -401,10 +408,16 @@ static inline __le16 enetc_txbd_l3_csoff(int start, int hdr_sz, u16 l3_flags)
+ #define ENETC_TXBD_L4_UDP	BIT(5)
+ #define ENETC_TXBD_L4_TCP	BIT(6)
+ 
++// TODO: Add support for dynamic allocation of BD rings to replace #ifdefs
++#define enetc_has_extended_rxbds() IS_ENABLED(CONFIG_FSL_ENETC_HW_TIMESTAMPING)
++
+ union enetc_rx_bd {
+ 	struct {
+ 		__le64 addr;
+ 		u8 reserved[8];
++#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
++		u8 reserved1[16];
++#endif
+ 	} w;
+ 	struct {
+ 		__le16 inet_csum;
+@@ -419,6 +432,10 @@ union enetc_rx_bd {
+ 			};
+ 			__le32 lstatus;
+ 		};
++#ifdef CONFIG_FSL_ENETC_HW_TIMESTAMPING
++		__le32 ts;
++		u8 reserved[12];
++#endif
+ 	} r;
+ };
+ 
+@@ -427,6 +444,7 @@ union enetc_rx_bd {
+ #define ENETC_RXBD_ERR_MASK	0xff
+ #define ENETC_RXBD_LSTATUS(flags)	((flags) << 16)
+ #define ENETC_RXBD_FLAG_VLAN	BIT(9)
++#define ENETC_RXBD_FLAG_TSTMP	BIT(10)
+ 
+ #define ENETC_MAC_ADDR_FILT_CNT	8 /* # of supported entries per port */
+ #define EMETC_MAC_ADDR_FILT_RES	3 /* # of reserved entries at the beginning */
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index 8308074d3a93..e373f3930d4e 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -655,6 +655,7 @@ static const struct net_device_ops enetc_ndev_ops = {
+ 	.ndo_set_vf_spoofchk	= enetc_pf_set_vf_spoofchk,
+ 	.ndo_set_features	= enetc_pf_set_features,
+ 	.ndo_setup_tc		= enetc_setup_tc,
++	.ndo_do_ioctl		= enetc_ioctl,
+ };
+ 
+ static void enetc_pf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_vf.c b/drivers/net/ethernet/freescale/enetc/enetc_vf.c
+index b0cbd3e39e50..a988c424404a 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_vf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_vf.c
+@@ -139,6 +139,7 @@ static const struct net_device_ops enetc_ndev_ops = {
+ 	.ndo_get_stats		= enetc_get_stats,
+ 	.ndo_set_mac_address	= enetc_vf_set_mac_addr,
+ 	.ndo_setup_tc		= enetc_setup_tc,
++	.ndo_do_ioctl		= enetc_ioctl,
+ };
+ 
+ static void enetc_vf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+-- 
+2.17.1
+

@@ -1,0 +1,352 @@
+From 52b343039588069686989e7f83c580cbf4801601 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Horia=20Geant=C4=83?= <horia.geanta@nxp.com>
+Date: Thu, 28 Sep 2017 16:00:53 +0300
+Subject: [PATCH 547/706] crypto: caam - export ahash shared descriptor
+ generation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Upcoming caam/qi2 driver will support ahash algorithms,
+thus move ahash descriptors generation in a shared location.
+
+Signed-off-by: Horia Geantă <horia.geanta@nxp.com>
+(cherry picked from commit 9bf27b32479e1cdd2789a41c5871afa78a8c16ad)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/crypto/caam/Kconfig         |   3 +
+ drivers/crypto/caam/Makefile        |   1 +
+ drivers/crypto/caam/caamhash.c      |  79 +++-----------------
+ drivers/crypto/caam/caamhash_desc.c | 108 ++++++++++++++++++++++++++++
+ drivers/crypto/caam/caamhash_desc.h |  49 +++++++++++++
+ 5 files changed, 170 insertions(+), 70 deletions(-)
+ create mode 100644 drivers/crypto/caam/caamhash_desc.c
+ create mode 100644 drivers/crypto/caam/caamhash_desc.h
+
+diff --git a/drivers/crypto/caam/Kconfig b/drivers/crypto/caam/Kconfig
+index 1eb852765469..f2f668624e2c 100644
+--- a/drivers/crypto/caam/Kconfig
++++ b/drivers/crypto/caam/Kconfig
+@@ -152,3 +152,6 @@ config CRYPTO_DEV_FSL_CAAM_DEBUG
+ config CRYPTO_DEV_FSL_CAAM_CRYPTO_API_DESC
+ 	def_tristate (CRYPTO_DEV_FSL_CAAM_CRYPTO_API || \
+ 		      CRYPTO_DEV_FSL_CAAM_CRYPTO_API_QI)
++
++config CRYPTO_DEV_FSL_CAAM_AHASH_API_DESC
++	def_tristate (CRYPTO_DEV_FSL_CAAM_AHASH_API)
+diff --git a/drivers/crypto/caam/Makefile b/drivers/crypto/caam/Makefile
+index cb652ee7dfc8..b8233a1522bb 100644
+--- a/drivers/crypto/caam/Makefile
++++ b/drivers/crypto/caam/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_CRYPTO_API) += caamalg.o
+ obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_CRYPTO_API_QI) += caamalg_qi.o
+ obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_CRYPTO_API_DESC) += caamalg_desc.o
+ obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_AHASH_API) += caamhash.o
++obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_AHASH_API_DESC) += caamhash_desc.o
+ obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_RNG_API) += caamrng.o
+ obj-$(CONFIG_CRYPTO_DEV_FSL_CAAM_PKC_API) += caam_pkc.o
+ 
+diff --git a/drivers/crypto/caam/caamhash.c b/drivers/crypto/caam/caamhash.c
+index 089d40557a4b..fc330df7c479 100644
+--- a/drivers/crypto/caam/caamhash.c
++++ b/drivers/crypto/caam/caamhash.c
+@@ -62,6 +62,7 @@
+ #include "error.h"
+ #include "sg_sw_sec4.h"
+ #include "key_gen.h"
++#include "caamhash_desc.h"
+ 
+ #define CAAM_CRA_PRIORITY		3000
+ 
+@@ -71,14 +72,6 @@
+ #define CAAM_MAX_HASH_BLOCK_SIZE	SHA512_BLOCK_SIZE
+ #define CAAM_MAX_HASH_DIGEST_SIZE	SHA512_DIGEST_SIZE
+ 
+-/* length of descriptors text */
+-#define DESC_AHASH_BASE			(3 * CAAM_CMD_SZ)
+-#define DESC_AHASH_UPDATE_LEN		(6 * CAAM_CMD_SZ)
+-#define DESC_AHASH_UPDATE_FIRST_LEN	(DESC_AHASH_BASE + 4 * CAAM_CMD_SZ)
+-#define DESC_AHASH_FINAL_LEN		(DESC_AHASH_BASE + 5 * CAAM_CMD_SZ)
+-#define DESC_AHASH_FINUP_LEN		(DESC_AHASH_BASE + 5 * CAAM_CMD_SZ)
+-#define DESC_AHASH_DIGEST_LEN		(DESC_AHASH_BASE + 4 * CAAM_CMD_SZ)
+-
+ #define DESC_HASH_MAX_USED_BYTES	(DESC_AHASH_FINAL_LEN + \
+ 					 CAAM_MAX_HASH_KEY_SIZE)
+ #define DESC_HASH_MAX_USED_LEN		(DESC_HASH_MAX_USED_BYTES / CAAM_CMD_SZ)
+@@ -235,60 +228,6 @@ static inline int ctx_map_to_sec4_sg(struct device *jrdev,
+ 	return 0;
+ }
+ 
+-/*
+- * For ahash update, final and finup (import_ctx = true)
+- *     import context, read and write to seqout
+- * For ahash firsts and digest (import_ctx = false)
+- *     read and write to seqout
+- */
+-static inline void ahash_gen_sh_desc(u32 *desc, u32 state, int digestsize,
+-				     struct caam_hash_ctx *ctx, bool import_ctx,
+-				     int era)
+-{
+-	u32 op = ctx->adata.algtype;
+-	u32 *skip_key_load;
+-
+-	init_sh_desc(desc, HDR_SHARE_SERIAL);
+-
+-	/* Append key if it has been set; ahash update excluded */
+-	if ((state != OP_ALG_AS_UPDATE) && (ctx->adata.keylen)) {
+-		/* Skip key loading if already shared */
+-		skip_key_load = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
+-					    JUMP_COND_SHRD);
+-
+-		if (era < 6)
+-			append_key_as_imm(desc, ctx->key, ctx->adata.keylen_pad,
+-					  ctx->adata.keylen, CLASS_2 |
+-					  KEY_DEST_MDHA_SPLIT | KEY_ENC);
+-		else
+-			append_proto_dkp(desc, &ctx->adata);
+-
+-		set_jump_tgt_here(desc, skip_key_load);
+-
+-		op |= OP_ALG_AAI_HMAC_PRECOMP;
+-	}
+-
+-	/* If needed, import context from software */
+-	if (import_ctx)
+-		append_seq_load(desc, ctx->ctx_len, LDST_CLASS_2_CCB |
+-				LDST_SRCDST_BYTE_CONTEXT);
+-
+-	/* Class 2 operation */
+-	append_operation(desc, op | state | OP_ALG_ENCRYPT);
+-
+-	/*
+-	 * Load from buf and/or src and write to req->result or state->context
+-	 * Calculate remaining bytes to read
+-	 */
+-	append_math_add(desc, VARSEQINLEN, SEQINLEN, REG0, CAAM_CMD_SZ);
+-	/* Read remaining bytes */
+-	append_seq_fifo_load(desc, 0, FIFOLD_CLASS_CLASS2 | FIFOLD_TYPE_LAST2 |
+-			     FIFOLD_TYPE_MSG | KEY_VLF);
+-	/* Store class2 context bytes */
+-	append_seq_store(desc, digestsize, LDST_CLASS_2_CCB |
+-			 LDST_SRCDST_BYTE_CONTEXT);
+-}
+-
+ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ {
+ 	struct caam_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+@@ -301,8 +240,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_update shared descriptor */
+ 	desc = ctx->sh_desc_update;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_UPDATE, ctx->ctx_len, ctx, true,
+-			  ctrlpriv->era);
++	cnstr_shdsc_ahash(desc, &ctx->adata, OP_ALG_AS_UPDATE, ctx->ctx_len,
++			  ctx->ctx_len, true, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_update_dma,
+ 				   desc_bytes(desc), ctx->dir);
+ #ifdef DEBUG
+@@ -313,8 +252,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_update_first shared descriptor */
+ 	desc = ctx->sh_desc_update_first;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_INIT, ctx->ctx_len, ctx, false,
+-			  ctrlpriv->era);
++	cnstr_shdsc_ahash(desc, &ctx->adata, OP_ALG_AS_INIT, ctx->ctx_len,
++			  ctx->ctx_len, false, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_update_first_dma,
+ 				   desc_bytes(desc), ctx->dir);
+ #ifdef DEBUG
+@@ -325,8 +264,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_final shared descriptor */
+ 	desc = ctx->sh_desc_fin;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_FINALIZE, digestsize, ctx, true,
+-			  ctrlpriv->era);
++	cnstr_shdsc_ahash(desc, &ctx->adata, OP_ALG_AS_FINALIZE, digestsize,
++			  ctx->ctx_len, true, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_fin_dma,
+ 				   desc_bytes(desc), ctx->dir);
+ #ifdef DEBUG
+@@ -337,8 +276,8 @@ static int ahash_set_sh_desc(struct crypto_ahash *ahash)
+ 
+ 	/* ahash_digest shared descriptor */
+ 	desc = ctx->sh_desc_digest;
+-	ahash_gen_sh_desc(desc, OP_ALG_AS_INITFINAL, digestsize, ctx, false,
+-			  ctrlpriv->era);
++	cnstr_shdsc_ahash(desc, &ctx->adata, OP_ALG_AS_INITFINAL, digestsize,
++			  ctx->ctx_len, false, ctrlpriv->era);
+ 	dma_sync_single_for_device(jrdev, ctx->sh_desc_digest_dma,
+ 				   desc_bytes(desc), ctx->dir);
+ #ifdef DEBUG
+diff --git a/drivers/crypto/caam/caamhash_desc.c b/drivers/crypto/caam/caamhash_desc.c
+new file mode 100644
+index 000000000000..af39a189ee34
+--- /dev/null
++++ b/drivers/crypto/caam/caamhash_desc.c
+@@ -0,0 +1,108 @@
++/*
++ * Shared descriptors for ahash algorithms
++ *
++ * Copyright 2017 NXP
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *	 notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *	 notice, this list of conditions and the following disclaimer in the
++ *	 documentation and/or other materials provided with the distribution.
++ *     * Neither the names of the above-listed copyright holders nor the
++ *	 names of any contributors may be used to endorse or promote products
++ *	 derived from this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "compat.h"
++#include "desc_constr.h"
++#include "caamhash_desc.h"
++
++/**
++ * cnstr_shdsc_ahash - ahash shared descriptor
++ * @desc: pointer to buffer used for descriptor construction
++ * @adata: pointer to authentication transform definitions.
++ *         A split key is required for SEC Era < 6; the size of the split key
++ *         is specified in this case.
++ *         Valid algorithm values - one of OP_ALG_ALGSEL_{MD5, SHA1, SHA224,
++ *         SHA256, SHA384, SHA512}.
++ * @state: algorithm state OP_ALG_AS_{INIT, FINALIZE, INITFINALIZE, UPDATE}
++ * @digestsize: algorithm's digest size
++ * @ctx_len: size of Context Register
++ * @import_ctx: true if previous Context Register needs to be restored
++ *              must be true for ahash update and final
++ *              must be false for for ahash first and digest
++ * @era: SEC Era
++ */
++void cnstr_shdsc_ahash(u32 * const desc, struct alginfo *adata, u32 state,
++		       int digestsize, int ctx_len, bool import_ctx, int era)
++{
++	u32 op = adata->algtype;
++
++	init_sh_desc(desc, HDR_SHARE_SERIAL);
++
++	/* Append key if it has been set; ahash update excluded */
++	if (state != OP_ALG_AS_UPDATE && adata->keylen) {
++		u32 *skip_key_load;
++
++		/* Skip key loading if already shared */
++		skip_key_load = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
++					    JUMP_COND_SHRD);
++
++		if (era < 6)
++			append_key_as_imm(desc, adata->key_virt,
++					  adata->keylen_pad,
++					  adata->keylen, CLASS_2 |
++					  KEY_DEST_MDHA_SPLIT | KEY_ENC);
++		else
++			append_proto_dkp(desc, adata);
++
++		set_jump_tgt_here(desc, skip_key_load);
++
++		op |= OP_ALG_AAI_HMAC_PRECOMP;
++	}
++
++	/* If needed, import context from software */
++	if (import_ctx)
++		append_seq_load(desc, ctx_len, LDST_CLASS_2_CCB |
++				LDST_SRCDST_BYTE_CONTEXT);
++
++	/* Class 2 operation */
++	append_operation(desc, op | state | OP_ALG_ENCRYPT);
++
++	/*
++	 * Load from buf and/or src and write to req->result or state->context
++	 * Calculate remaining bytes to read
++	 */
++	append_math_add(desc, VARSEQINLEN, SEQINLEN, REG0, CAAM_CMD_SZ);
++	/* Read remaining bytes */
++	append_seq_fifo_load(desc, 0, FIFOLD_CLASS_CLASS2 | FIFOLD_TYPE_LAST2 |
++			     FIFOLD_TYPE_MSG | KEY_VLF);
++	/* Store class2 context bytes */
++	append_seq_store(desc, digestsize, LDST_CLASS_2_CCB |
++			 LDST_SRCDST_BYTE_CONTEXT);
++}
++EXPORT_SYMBOL(cnstr_shdsc_ahash);
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_DESCRIPTION("FSL CAAM ahash descriptors support");
++MODULE_AUTHOR("NXP Semiconductors");
+diff --git a/drivers/crypto/caam/caamhash_desc.h b/drivers/crypto/caam/caamhash_desc.h
+new file mode 100644
+index 000000000000..b0a9a542730a
+--- /dev/null
++++ b/drivers/crypto/caam/caamhash_desc.h
+@@ -0,0 +1,49 @@
++/*
++ * Shared descriptors for ahash algorithms
++ *
++ * Copyright 2017 NXP
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *	 notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *	 notice, this list of conditions and the following disclaimer in the
++ *	 documentation and/or other materials provided with the distribution.
++ *     * Neither the names of the above-listed copyright holders nor the
++ *	 names of any contributors may be used to endorse or promote products
++ *	 derived from this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _CAAMHASH_DESC_H_
++#define _CAAMHASH_DESC_H_
++
++/* length of descriptors text */
++#define DESC_AHASH_BASE			(3 * CAAM_CMD_SZ)
++#define DESC_AHASH_UPDATE_LEN		(6 * CAAM_CMD_SZ)
++#define DESC_AHASH_UPDATE_FIRST_LEN	(DESC_AHASH_BASE + 4 * CAAM_CMD_SZ)
++#define DESC_AHASH_FINAL_LEN		(DESC_AHASH_BASE + 5 * CAAM_CMD_SZ)
++#define DESC_AHASH_DIGEST_LEN		(DESC_AHASH_BASE + 4 * CAAM_CMD_SZ)
++
++void cnstr_shdsc_ahash(u32 * const desc, struct alginfo *adata, u32 state,
++		       int digestsize, int ctx_len, bool import_ctx, int era);
++
++#endif /* _CAAMHASH_DESC_H_ */
+-- 
+2.17.1
+

@@ -1,0 +1,285 @@
+From b47a856fa7e32c9de5f789b1a97ab2fc7a7a1103 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@nxp.com>
+Date: Mon, 8 Oct 2018 19:03:06 +0300
+Subject: [PATCH 318/706] enetc: Cleanup CBDR code, drop unused async support
+ and fix coverity issue
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit ef58169b54e3f651f19252e053338f511aae9f9f)
+(cherry picked from commit 57c7ddede91c4b0acdf442be30c1e5ba7188141e)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.h  | 15 +--
+ .../net/ethernet/freescale/enetc/enetc_cbdr.c | 93 ++++++-------------
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  1 -
+ .../net/ethernet/freescale/enetc/enetc_pf.c   | 13 ++-
+ 4 files changed, 43 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 02b3f5dcac7e..ba0ce46a080d 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -251,19 +251,10 @@ struct enetc_msg_cmd_set_primary_mac {
+ 	struct sockaddr mac;
+ };
+ 
+-#define ENETC_RING_UNUSED(R)	(((R)->next_to_clean - (R)->next_to_use - 1 \
+-				 + (R)->bd_count) % (R)->bd_count)
+-
+ #define ENETC_CBD(R, i)	(&(((struct enetc_cbd *)((R).bd_base))[i]))
+ 
+ #define ENETC_CBDR_TIMEOUT	1000 /* usecs */
+ 
+-enum enetc_cbdr_stat {
+-	ENETC_CMD_OK,
+-	ENETC_CMD_BUSY,
+-	ENETC_CMD_TIMEOUT,
+-};
+-
+ /* SI common */
+ int enetc_pci_probe(struct pci_dev *pdev, const char *name, int sizeof_priv);
+ void enetc_pci_remove(struct pci_dev *pdev);
+@@ -289,9 +280,9 @@ int enetc_setup_tc(struct net_device *ndev, enum tc_setup_type type,
+ void enetc_set_ethtool_ops(struct net_device *ndev);
+ 
+ /* control buffer descriptor ring (CBDR) */
+-void enetc_set_mac_flt_entry(struct enetc_si *si, int index,
+-			     char *mac_addr, int si_map);
+-void enetc_clear_mac_flt_entry(struct enetc_si *si, int index);
++int enetc_set_mac_flt_entry(struct enetc_si *si, int index,
++			    char *mac_addr, int si_map);
++int enetc_clear_mac_flt_entry(struct enetc_si *si, int index);
+ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 		       int index);
+ void enetc_set_rss_key(struct enetc_hw *hw, const u8 *bytes);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+index 5dfb7c26a2d3..d41ac71be93b 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+@@ -34,17 +34,20 @@
+ 
+ #include "enetc.h"
+ 
+-static int enetc_clean_cbdr(struct enetc_si *si)
++static void enetc_clean_cbdr(struct enetc_si *si)
+ {
+ 	struct enetc_cbdr *ring = &si->cbd_ring;
+ 	struct enetc_cbd *dest_cbd;
+-	int i, err = 0;
++	int i, status;
+ 
+ 	i = ring->next_to_clean;
+ 
+ 	while (enetc_rd_reg(ring->cisr) != i) {
+ 		dest_cbd = ENETC_CBD(*ring, i);
+-		err = dest_cbd->status_flags & ENETC_CBD_STATUS_MASK;
++		status = dest_cbd->status_flags & ENETC_CBD_STATUS_MASK;
++		if (status)
++			dev_warn(&si->pdev->dev, "CMD err %04x for cmd %04x\n",
++				 status, dest_cbd->cmd);
+ 
+ 		memset(dest_cbd, 0, sizeof(*dest_cbd));
+ 
+@@ -52,26 +55,23 @@ static int enetc_clean_cbdr(struct enetc_si *si)
+ 	}
+ 
+ 	ring->next_to_clean = i;
+-	return err;
+ }
+ 
+-static int enetc_send_cmd(struct enetc_si *si, struct enetc_cbd *cbd,
+-			  bool async)
++#define ENETC_RING_UNUSED(R)	(((R)->next_to_clean - (R)->next_to_use - 1 \
++				 + (R)->bd_count) % (R)->bd_count)
++
++static int enetc_send_cmd(struct enetc_si *si, struct enetc_cbd *cbd)
+ {
+ 	struct enetc_cbdr *ring = &si->cbd_ring;
++	int timeout = ENETC_CBDR_TIMEOUT;
+ 	struct enetc_cbd *dest_cbd;
+-	int i, err;
++	int i;
+ 
+-	if (!ring->bd_base)
++	if (unlikely(!ring->bd_base))
+ 		return -EIO;
+ 
+-	if (async && !ENETC_RING_UNUSED(ring)) {
+-		// TODO: support true async mode, with interrupts
+-		// and separate cleanup task
+-
++	if (unlikely(!ENETC_RING_UNUSED(ring)))
+ 		enetc_clean_cbdr(si);
+-		return ENETC_CMD_BUSY;
+-	}
+ 
+ 	i = ring->next_to_use;
+ 	dest_cbd = ENETC_CBD(*ring, i);
+@@ -84,70 +84,46 @@ static int enetc_send_cmd(struct enetc_si *si, struct enetc_cbd *cbd,
+ 	/* let H/W know BD ring has been updated */
+ 	enetc_wr_reg(ring->cir, i);
+ 
+-	if (!async) {
+-		int timeout = ENETC_CBDR_TIMEOUT;
+-
+-		do {
+-			if (enetc_rd_reg(ring->cisr) == i)
+-				break;
+-			udelay(10);
+-			timeout -= 10;
+-		} while (timeout);
++	do {
++		if (enetc_rd_reg(ring->cisr) == i)
++			break;
++		udelay(10);
++		timeout -= 10;
++	} while (timeout);
+ 
+-		if (!timeout)
+-			return ENETC_CMD_TIMEOUT;
+-	}
++	if (!timeout)
++		return -EBUSY;
+ 
+-	if (!async) {
+-		err = enetc_clean_cbdr(si);
+-		if (err) {
+-			dev_warn(&si->pdev->dev, "CMD err %04x for cmd %04x\n",
+-				err, cbd->cmd);
+-		}
+-	}
++	enetc_clean_cbdr(si);
+ 
+-	return ENETC_CMD_OK;
++	return 0;
+ }
+ 
+-void enetc_clear_mac_flt_entry(struct enetc_si *si, int index)
++int enetc_clear_mac_flt_entry(struct enetc_si *si, int index)
+ {
+ 	struct enetc_cbd cbd;
+-	bool async = false;
+-	int ret;
+ 
+ 	memset(&cbd, 0, sizeof(cbd));
+ 
+ 	cbd.cls = 1;
+ 	cbd.status_flags = ENETC_CBD_FLAGS_SF;
+-	if (async)
+-		cbd.status_flags |= ENETC_CBD_FLAGS_IE;
+-
+ 	cbd.index = cpu_to_le16(index);
+ 
+-	ret = enetc_send_cmd(si, &cbd, async);
+-	if (ret) {
+-		pr_err("MAC filter clear failed (%d)!\n", ret);
+-		WARN_ON(1);
+-	}
++	return enetc_send_cmd(si, &cbd);
+ }
+ 
+-void enetc_set_mac_flt_entry(struct enetc_si *si, int index,
++int enetc_set_mac_flt_entry(struct enetc_si *si, int index,
+ 			     char *mac_addr, int si_map)
+ {
+ 	struct enetc_cbd cbd;
+-	bool async = false;
+ 	u32 upper;
+ 	u16 lower;
+-	int ret;
+ 
+ 	memset(&cbd, 0, sizeof(cbd));
+ 
+ 	/* fill up the "set" descriptor */
+ 	cbd.cls = 1;
+ 	cbd.status_flags = ENETC_CBD_FLAGS_SF;
+-	if (async)
+-		cbd.status_flags |= ENETC_CBD_FLAGS_IE;
+-
+ 	cbd.index = cpu_to_le16(index);
+ 	cbd.opt[3] = cpu_to_le32(si_map);
+ 	/* enable entry */
+@@ -158,12 +134,7 @@ void enetc_set_mac_flt_entry(struct enetc_si *si, int index,
+ 	cbd.addr[0] = upper;
+ 	cbd.addr[1] = lower;
+ 
+-	ret = enetc_send_cmd(si, &cbd, async);
+-	if (ret) {
+-		pr_err("MAC filter update failed (%d)!\n", ret);
+-		WARN_ON(1);
+-		// TODO: fallback to promisc mode
+-	}
++	return enetc_send_cmd(si, &cbd);
+ }
+ 
+ #define RFSE_ALIGN	64
+@@ -174,7 +145,6 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 	struct enetc_cbd cbd = {.cmd = 0};
+ 	dma_addr_t dma, dma_align;
+ 	void *tmp, *tmp_align;
+-	bool async = false;
+ 	int err;
+ 
+ 	/* fill up the "set" descriptor */
+@@ -198,10 +168,7 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 	cbd.addr[0] = cpu_to_le32(lower_32_bits(dma_align));
+ 	cbd.addr[1] = cpu_to_le32(upper_32_bits(dma_align));
+ 
+-	if (async)
+-		cbd.status_flags |= ENETC_CBD_FLAGS_IE;
+-
+-	err = enetc_send_cmd(si, &cbd, async);
++	err = enetc_send_cmd(si, &cbd);
+ 	if (err)
+ 		netdev_err(si->ndev, "FS entry add failed (%d)!", err);
+ 
+@@ -245,7 +212,7 @@ static int enetc_cmd_rss_table(struct enetc_si *si, u32 *table, int count,
+ 	cbd.addr[0] = cpu_to_le32(lower_32_bits(dma_align));
+ 	cbd.addr[1] = cpu_to_le32(upper_32_bits(dma_align));
+ 
+-	err = enetc_send_cmd(si, &cbd, false);
++	err = enetc_send_cmd(si, &cbd);
+ 	if (err)
+ 		netdev_err(si->ndev, "RSS cmd failed (%d)!", err);
+ 
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index 7e1e2c0dec0f..7b19b7eec17e 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -487,7 +487,6 @@ struct enetc_cbd {
+ #endif
+ 
+ #define ENETC_CBD_FLAGS_SF	BIT(7) /* short format */
+-#define ENETC_CBD_FLAGS_IE	BIT(6) /* interrupt enable */
+ #define ENETC_CBD_STATUS_MASK	0xf
+ 
+ struct enetc_cmd_rfse {
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index 13eb2ab3d508..a0cc2d5eb338 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -216,11 +216,18 @@ static void enetc_sync_mac_filters(struct enetc_pf *pf)
+ 
+ 		/* exact match filter */
+ 		if (em) {
++			int err;
++
+ 			enetc_clear_mac_ht_flt(&si->hw, 0, UC);
+ 
+-			enetc_set_mac_flt_entry(si, pos, f->mac_addr,
+-						BIT(0));
+-			continue;
++			err = enetc_set_mac_flt_entry(si, pos, f->mac_addr,
++						      BIT(0));
++			if (!err)
++				continue;
++
++			/* fallback to HT filtering */
++			dev_warn(&si->pdev->dev, "fallback to HT filt (%d)\n",
++				 err);
+ 		}
+ 
+ 		/* hash table filter, clear EM filter for UC entries */
+-- 
+2.17.1
+

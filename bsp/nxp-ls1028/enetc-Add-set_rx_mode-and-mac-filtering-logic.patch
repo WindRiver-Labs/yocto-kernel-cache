@@ -1,0 +1,506 @@
+From 12e463b43991ad0c0a23e8ad96fb684477dca692 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@nxp.com>
+Date: Mon, 2 Oct 2017 15:53:23 +0300
+Subject: [PATCH 062/706] enetc: Add set_rx_mode and mac filtering logic
+
+* add control bd ring support, for MAC filtering;
+* max available mac filter table entries per port: 8;
+* current policy (subject to change in the future):
+	- 2 entries reserved per SI. 1 - UC and 1 - MC;
+	- is there's only one UC resp. MC address to filter
+	the use exact macth entry (EM), for multiple addresses
+	use hashing table entry;
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit 60be414dabbe8c537eafd7a0b7542b29d4d7dbcf)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/Makefile |   2 +-
+ drivers/net/ethernet/freescale/enetc/enetc.c  | 149 ++++++++++++++++++
+ drivers/net/ethernet/freescale/enetc/enetc.h  |  28 ++++
+ .../net/ethernet/freescale/enetc/enetc_cbdr.c | 132 ++++++++++++++++
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  34 ++++
+ 5 files changed, 344 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+
+diff --git a/drivers/net/ethernet/freescale/enetc/Makefile b/drivers/net/ethernet/freescale/enetc/Makefile
+index 0d10b7872b4b..4b458c60e053 100644
+--- a/drivers/net/ethernet/freescale/enetc/Makefile
++++ b/drivers/net/ethernet/freescale/enetc/Makefile
+@@ -1,2 +1,2 @@
+ obj-$(CONFIG_FSL_ENETC) += fsl-enetc.o
+-fsl-enetc-objs := enetc.o enetc_ethtool.o
++fsl-enetc-objs := enetc.o enetc_cbdr.o enetc_ethtool.o
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index aea1334acbc4..f672006c1963 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -514,6 +514,9 @@ static void enetc_sw_init(struct enetc_ndev_priv *priv)
+ 	/* support queue pairs only for now */
+ 	priv->num_tx_rings = priv->num_rx_rings;
+ 	priv->num_int_vectors = priv->num_rx_rings;
++
++	/* si specific */
++	priv->si->cbd_ring.bd_count = 64; //TODO: use defines for defaults
+ }
+ 
+ static int enetc_alloc_txbdr(struct enetc_bdr *txr)
+@@ -697,6 +700,46 @@ static void enetc_free_rxtx_rings(struct enetc_ndev_priv *priv)
+ 		enetc_free_tx_ring(priv->tx_ring[i]);
+ }
+ 
++static int enetc_alloc_cbdr(struct device *dev, struct enetc_cbdr *cbdr)
++{
++	int size = cbdr->bd_count * sizeof(struct enetc_cbd);
++
++	cbdr->bd_base = dma_zalloc_coherent(dev, size, &cbdr->bd_dma_base,
++					    GFP_KERNEL);
++	if (!cbdr->bd_base)
++		return -ENOMEM;
++
++	cbdr->next_to_clean = 0;
++	cbdr->next_to_use = 0;
++
++	return 0;
++}
++
++static void enetc_free_cbdr(struct device *dev, struct enetc_cbdr *cbdr)
++{
++	int size = cbdr->bd_count * sizeof(struct enetc_cbd);
++
++	dma_free_coherent(dev, size, cbdr->bd_base, cbdr->bd_dma_base);
++	cbdr->bd_base = NULL;
++}
++
++static int enetc_alloc_si_resources(struct enetc_ndev_priv *priv)
++{
++	struct enetc_si *si = priv->si;
++	int err;
++
++	err = enetc_alloc_cbdr(priv->dev, &si->cbd_ring);
++
++	return err;
++}
++
++static void enetc_free_si_resources(struct enetc_ndev_priv *priv)
++{
++	struct enetc_si *si = priv->si;
++
++	enetc_free_cbdr(priv->dev, &si->cbd_ring);
++}
++
+ static void enetc_setup_txbdr(struct enetc_hw *hw, struct enetc_bdr *tx_ring)
+ {
+ 	int idx = tx_ring->index;
+@@ -758,6 +801,23 @@ static void enetc_setup_rxbdr(struct enetc_hw *hw, struct enetc_bdr *rx_ring)
+ 	enetc_refill_rx_ring(rx_ring, enetc_bd_unused(rx_ring));
+ }
+ 
++static void enetc_setup_cbdr(struct enetc_hw *hw, struct enetc_cbdr *cbdr)
++{
++	WARN_ON(lower_32_bits(cbdr->bd_dma_base) & 0x1f);
++
++	enetc_wr(hw, ENETC_SICBDRBAR0, lower_32_bits(cbdr->bd_dma_base));
++	enetc_wr(hw, ENETC_SICBDRBAR1, upper_32_bits(cbdr->bd_dma_base));
++	enetc_wr(hw, ENETC_SICBDRLENR, ENETC_RTBLENR_LEN(cbdr->bd_count));
++
++	/* enable ring */
++	enetc_wr(hw, ENETC_SICBDRMR, BIT(31));
++
++	enetc_wr(hw, ENETC_SICBDRCIR, 0);
++	enetc_wr(hw, ENETC_SICBDRCISR, 0);
++	cbdr->cir = hw->reg + ENETC_SICBDRCIR;
++	cbdr->cisr = hw->reg + ENETC_SICBDRCISR;
++}
++
+ static void enetc_setup_bdrs(struct enetc_ndev_priv *priv)
+ {
+ 	int i;
+@@ -767,6 +827,8 @@ static void enetc_setup_bdrs(struct enetc_ndev_priv *priv)
+ 
+ 	for (i = 0; i < priv->num_rx_rings; i++)
+ 		enetc_setup_rxbdr(&priv->si->hw, priv->rx_ring[i]);
++
++	enetc_setup_cbdr(&priv->si->hw, &priv->si->cbd_ring);
+ }
+ 
+ static void enetc_configure_port_mac(struct enetc_si *si)
+@@ -877,6 +939,10 @@ static int enetc_open(struct net_device *ndev)
+ 	if (err)
+ 		goto err_alloc_rx;
+ 
++	err = enetc_alloc_si_resources(priv);
++	if (err)
++		goto err_alloc_si_res;
++
+ 	enetc_setup_bdrs(priv);
+ 
+ 	err = enetc_setup_irqs(priv);
+@@ -903,6 +969,8 @@ static int enetc_open(struct net_device *ndev)
+ err_set_queues:
+ 	enetc_free_irqs(priv);
+ err_setup_irqs:
++	enetc_free_si_resources(priv);
++err_alloc_si_res:
+ 	enetc_free_rx_resources(priv);
+ err_alloc_rx:
+ 	enetc_free_tx_resources(priv);
+@@ -931,6 +999,7 @@ static int enetc_close(struct net_device *ndev)
+ 	enetc_free_rxtx_rings(priv);
+ 	enetc_free_rx_resources(priv);
+ 	enetc_free_tx_resources(priv);
++	enetc_free_si_resources(priv);
+ 
+ 	return 0;
+ }
+@@ -974,20 +1043,99 @@ static void enetc_set_isol_vlan(struct enetc_hw *hw, int si, u16 vlan, u8 qos)
+ 	enetc_port_wr(hw, ENETC_PSIIVLANR(si), val);
+ }
+ 
++static int enetc_mac_addr_hash_idx(const u8 *addr)
++{
++	int i, n = 5;
++	int res = 0;
++
++	for (i = 0; i < n; i++)
++		res |= (__sw_hweight8(addr[i]) & 0x1) << (n - i);
++	res |= __sw_hweight8(addr[n]) & 0x1;
++
++	return res;
++}
++
++static void enetc_reset_mac_addr_filter(struct enetc_mac_filter *filter)
++{
++	filter->mac_addr_cnt = 0;
++
++	bitmap_zero(filter->mac_hash_table,
++		    ENETC_MADDR_HASH_TBL_SZ);
++}
++
++static void enetc_add_mac_addr_em_filter(struct enetc_mac_filter *filter,
++					 const unsigned char *addr)
++{
++	/* add exact match addr */
++	ether_addr_copy(filter->mac_addr, addr);
++	filter->mac_addr_cnt++;
++}
++
++static void enetc_add_mac_addr_ht_filter(struct enetc_mac_filter *filter,
++					 const unsigned char *addr)
++{
++	int idx = enetc_mac_addr_hash_idx(addr);
++
++	/* add hash table entry */
++	__set_bit(idx, filter->mac_hash_table);
++	filter->mac_addr_cnt++;
++}
++
+ static void enetc_set_rx_mode(struct net_device *ndev)
+ {
+ 	struct enetc_ndev_priv *priv = netdev_priv(ndev);
+ 	struct enetc_hw *hw = &priv->si->hw;
++	bool uprom = false, mprom = false;
++	struct enetc_mac_filter *filter;
++	struct netdev_hw_addr *ha;
+ 	u32 psipmr = 0;
++	bool em;
+ 
+ 	if (ndev->flags & IFF_PROMISC) {
+ 		/* enable promisc mode for SI0 (PF) */
+ 		psipmr = ENETC_PSIPMR_SET_UP(0) | ENETC_PSIPMR_SET_MP(0);
++		uprom = true;
++		mprom = true;
+ 	} else if (ndev->flags & IFF_ALLMULTI) {
+ 		/* enable multi cast promisc mode for SI0 (PF) */
+ 		psipmr = ENETC_PSIPMR_SET_MP(0);
++		mprom = true;
+ 	}
+ 
++	/* first 2 filter entries belong to PF */
++	if (!uprom) {
++		/* Update unicast filters */
++		filter = &priv->si->mac_filter[UC];
++		enetc_reset_mac_addr_filter(filter);
++
++		em = (netdev_uc_count(ndev) == 1);
++		netdev_for_each_uc_addr(ha, ndev) {
++			if (em)
++				enetc_add_mac_addr_em_filter(filter, ha->addr);
++			else
++				enetc_add_mac_addr_ht_filter(filter, ha->addr);
++		}
++	}
++
++	if (!mprom) {
++		/* Update multicast filters */
++		filter = &priv->si->mac_filter[MC];
++		enetc_reset_mac_addr_filter(filter);
++
++		em = (netdev_mc_count(ndev) == 1);
++		netdev_for_each_mc_addr(ha, ndev) {
++			if (!is_multicast_ether_addr(ha->addr))
++				continue;
++			if (em)
++				enetc_add_mac_addr_em_filter(filter, ha->addr);
++			else
++				enetc_add_mac_addr_ht_filter(filter, ha->addr);
++		}
++	}
++
++	if (!uprom || !mprom)
++		enetc_sync_mac_filters(priv->si, 0); /* update PF entries */
++
+ 	psipmr |= enetc_port_rd(hw, ENETC_PSIPMR) &
+ 		  ~(ENETC_PSIPMR_SET_UP(0) | ENETC_PSIPMR_SET_MP(0));
+ 	enetc_port_wr(hw, ENETC_PSIPMR, psipmr);
+@@ -1083,6 +1231,7 @@ static void enetc_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+ 	ndev->watchdog_timeo = 5 * HZ;
+ 
+ 	ndev->features = NETIF_F_HIGHDMA | NETIF_F_SG;
++	ndev->priv_flags |= IFF_UNICAST_FLT;
+ }
+ 
+ static void enetc_port_setup_primary_mac_address(struct enetc_ndev_priv *priv)
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 9415bf0725c3..2bf8d2ffedc2 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -73,9 +73,32 @@ static inline int enetc_bd_unused(struct enetc_bdr *bdr)
+ 	return bdr->bd_count + bdr->next_to_clean - bdr->next_to_use - 1;
+ }
+ 
++/* Control BD ring */
++struct enetc_cbdr {
++	void *bd_base; /* points to Rx or Tx BD ring */
++	void __iomem *cir;
++	void __iomem *cisr;
++
++	int bd_count; /* # of BDs */
++	int next_to_use;
++	int next_to_clean;
++
++	dma_addr_t bd_dma_base;
++};
++
+ #define ENETC_TXBD(BDR, i) (&(((struct enetc_tx_bd *)((BDR).bd_base))[i]))
+ #define ENETC_RXBD(BDR, i) (&(((union enetc_rx_bd *)((BDR).bd_base))[i]))
+ 
++#define ENETC_MADDR_HASH_TBL_SZ	64
++enum enetc_mac_addr_type {UC, MC, MADDR_TYPE};
++struct enetc_mac_filter {
++	union {
++		char mac_addr[ETH_ALEN];
++		DECLARE_BITMAP(mac_hash_table, ENETC_MADDR_HASH_TBL_SZ);
++	};
++	int mac_addr_cnt;
++};
++
+ /* PCI IEP device data */
+ struct enetc_si {
+ 	struct pci_dev *pdev;
+@@ -84,6 +107,9 @@ struct enetc_si {
+ 	struct net_device *ndev; /* back ref. */
+ 
+ 	int num_vfs; /* number of active VFs, after sriov_init */
++	struct enetc_mac_filter mac_filter[ENETC_MAC_ADDR_FILT_CNT];
++
++	struct enetc_cbdr cbd_ring;
+ };
+ 
+ #define ENETC_MAX_NUM_TXQS	8
+@@ -114,3 +140,5 @@ struct enetc_ndev_priv {
+ };
+ 
+ void enetc_set_ethtool_ops(struct net_device *ndev);
++
++void enetc_sync_mac_filters(struct enetc_si *si, int si_idx);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+new file mode 100644
+index 000000000000..1ed32c5988f2
+--- /dev/null
++++ b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+@@ -0,0 +1,132 @@
++#include "enetc.h"
++
++#define ENETC_RING_UNUSED(R)	(((R)->next_to_clean - (R)->next_to_use - 1 \
++				 + (R)->bd_count) % (R)->bd_count)
++
++#define ENETC_CBD(R, i)	(&(((struct enetc_cbd *)((R).bd_base))[i]))
++
++#define ENETC_CBDR_TIMEOUT	1000 /* usecs */
++
++enum enetc_cbdr_stat {
++	ENETC_CMD_OK,
++	ENETC_CMD_BUSY,
++	ENETC_CMD_TIMEOUT,
++};
++
++static void enetc_clean_cbdr(struct enetc_si *si)
++{
++	struct enetc_cbdr *ring = &si->cbd_ring;
++	struct enetc_cbd *dest_cbd;
++	int i;
++
++	i = ring->next_to_clean;
++
++	while (enetc_rd_reg(ring->cisr) != i) {
++		dest_cbd = ENETC_CBD(*ring, i);
++		if (dest_cbd->status_flags & ENETC_CBD_STATUS_MASK)
++			WARN_ON(1);
++
++		memset(dest_cbd, 0, sizeof(*dest_cbd));
++
++		i = (i + 1) % ring->bd_count;
++	}
++
++	ring->next_to_clean = i;
++}
++
++static int enetc_send_cmd(struct enetc_si *si, struct enetc_cbd *cbd,
++			  bool async)
++{
++	struct enetc_cbdr *ring = &si->cbd_ring;
++	struct enetc_cbd *dest_cbd;
++	int i;
++
++	if (async && !ENETC_RING_UNUSED(ring)) {
++		// TODO: support true async mode, with interrupts
++		// and separate cleanup task
++
++		enetc_clean_cbdr(si);
++		return ENETC_CMD_BUSY;
++	}
++
++	i = ring->next_to_use;
++	dest_cbd = ENETC_CBD(*ring, i);
++
++	/* copy command to the ring */
++	*dest_cbd = *cbd;
++	i = (i + 1) % ring->bd_count;
++
++	ring->next_to_use = i;
++	/* let H/W know BD ring has been updated */
++	enetc_wr_reg(ring->cir, i);
++
++	if (!async) {
++		int timeout = ENETC_CBDR_TIMEOUT;
++
++		do {
++			if (enetc_rd_reg(ring->cisr) == i)
++				break;
++			udelay(10);
++			timeout -= 10;
++		} while (timeout);
++
++		if (!timeout)
++			return ENETC_CMD_TIMEOUT;
++	}
++
++	if (!async)
++		enetc_clean_cbdr(si);
++
++	return ENETC_CMD_OK;
++}
++
++/* MAC Address Filter Table Entry Set Descriptor */
++void enetc_sync_mac_filters(struct enetc_si *si, int si_idx)
++{
++	struct enetc_mac_filter *f = si->mac_filter;
++	struct enetc_cbd cbd;
++	bool async = false;
++	int i, ret;
++
++	for (i = si_idx; i < si_idx + MADDR_TYPE; i++, f++) {
++		bool enable = !!f->mac_addr_cnt;
++		bool em = (f->mac_addr_cnt == 1); /* exact match */
++		bool mc = (i == MC); /* mcast filter */
++
++		WARN_ON(i - si_idx > ENETC_MAC_FILT_PER_SI);
++
++		memset(&cbd, 0, sizeof(cbd));
++
++		/* fill up the "set" descriptor */
++		cbd.cls = 1;
++		cbd.status_flags = ENETC_CBD_FLAGS_SF;
++		if (async)
++			cbd.status_flags |= ENETC_CBD_FLAGS_IE;
++		cbd.index = cpu_to_le16(i);
++		cbd.opt[3] = cpu_to_le32(si_idx);
++		cbd.opt[0] = cpu_to_le32((mc ? BIT(1) : 0) |
++					 (em ? BIT(0) : 0));
++		if (enable)
++			cbd.opt[0] |= BIT(31);
++
++		if (em) {
++			u16 upper = ntohs(*(const u16 *)f->mac_addr);
++			u32 lower = ntohl(*(const u32 *)(f->mac_addr + 2));
++
++			cbd.addr[0] = cpu_to_le32(lower);
++			cbd.addr[1] = cpu_to_le16(upper);
++		} else {
++			u32 *hash = (u32 *)f->mac_hash_table;
++
++			cbd.addr[0] = cpu_to_le32(*(u32 *)hash);
++			cbd.addr[1] = cpu_to_le32(*(u32 *)(hash + 1));
++		}
++
++		ret = enetc_send_cmd(si, &cbd, async);
++		if (ret) {
++			pr_err("MAC filter update failed (%d)!", ret);
++			WARN_ON(1);
++			// TODO: fallback to promisc mode
++		}
++	}
++}
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index 82734c958e79..a14d9ffddda7 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -14,6 +14,15 @@
+ #define ENETC_SIPMAR0	0x80
+ #define ENETC_SIPMAR1	0x84
+ 
++/* Control BDR regs */
++#define ENETC_SICBDRMR		0x800
++#define ENETC_SICBDRSR		0x804	/* RO */
++#define ENETC_SICBDRBAR0	0x810
++#define ENETC_SICBDRBAR1	0x814
++#define ENETC_SICBDRCIR		0x818
++#define ENETC_SICBDRCISR	0x81c
++#define ENETC_SICBDRLENR	0x820
++
+ #define ENETC_SICAPR0	0x900
+ #define ENETC_SICAPR1	0x904
+ 
+@@ -161,3 +170,28 @@ union enetc_rx_bd {
+ #define ENETC_RXBD_LSTATUS_F	BIT(31)
+ #define ENETC_RXBD_ERR_MASK	0xff
+ #define ENETC_RXBD_LSTATUS(flags)	((flags) << 16)
++
++#define ENETC_MAC_ADDR_FILT_CNT	8 /* # of supported entries per port */
++#define ENETC_MAX_NUM_VFS	2
++#define ENETC_MAC_FILT_PER_SI	(ENETC_MAC_ADDR_FILT_CNT / \
++				(ENETC_MAX_NUM_VFS + 1))
++
++struct enetc_cbd {
++	union {
++		struct {
++			__le32 addr[2];
++			__le32 opt[4];
++		};
++		__le32 data[6];
++	};
++	__le16 index;
++	__le16 length;
++	u8 cmd;
++	u8 cls;
++	u8 _res;
++	u8 status_flags;
++};
++
++#define ENETC_CBD_FLAGS_SF	BIT(7) /* short format */
++#define ENETC_CBD_FLAGS_IE	BIT(6) /* interrupt enable */
++#define ENETC_CBD_STATUS_MASK	0xf
+-- 
+2.17.1
+

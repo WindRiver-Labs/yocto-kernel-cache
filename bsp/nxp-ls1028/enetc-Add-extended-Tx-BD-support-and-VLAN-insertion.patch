@@ -1,0 +1,222 @@
+From d310be820b42a2990afd41b45aa73b47ec4ae394 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@nxp.com>
+Date: Fri, 19 Jan 2018 12:33:53 +0200
+Subject: [PATCH 100/706] enetc: Add extended Tx BD support and VLAN insertion
+
+Add NETIF_F_HW_VLAN_CTAG_TX support for PF anf VF.
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit f3b07b2097dd3a77d0a4934fcee3098ffd9ed06e)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c  | 53 +++++++++++++++----
+ drivers/net/ethernet/freescale/enetc/enetc.h  |  2 +-
+ .../net/ethernet/freescale/enetc/enetc_hw.h   | 31 +++++++----
+ .../net/ethernet/freescale/enetc/enetc_pf.c   |  3 +-
+ .../net/ethernet/freescale/enetc/enetc_vf.c   |  4 +-
+ 5 files changed, 71 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index 0401838bb74e..e34052575f34 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -63,7 +63,8 @@ static irqreturn_t enetc_msix(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-#define ENETC_FREE_TXBD_NEEDED MAX_SKB_FRAGS
++/* max number of fragments + optional extension BD */
++#define ENETC_FREE_TXBD_NEEDED (MAX_SKB_FRAGS + 1)
+ 
+ netdev_tx_t enetc_xmit(struct sk_buff *skb, struct net_device *ndev)
+ {
+@@ -94,7 +95,7 @@ netdev_tx_t enetc_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 	return NETDEV_TX_OK;
+ }
+ 
+-static bool enetc_tx_csum(struct sk_buff *skb, struct enetc_tx_bd *txbd)
++static bool enetc_tx_csum(struct sk_buff *skb, union enetc_tx_bd *txbd)
+ {
+ 	int l3_start, l3_hsize, l4_hsize;
+ 	u16 l3_flags, l4_flags;
+@@ -138,11 +139,11 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb)
+ 	struct enetc_tx_swbd *tx_swbd;
+ 	struct skb_frag_struct *frag;
+ 	int len = skb_headlen(skb);
+-	struct enetc_tx_bd *txbd;
++	union enetc_tx_bd *txbd;
+ 	int i, start, count = 0;
++	bool do_vlan, do_ts;
+ 	unsigned int f;
+ 	dma_addr_t dma;
+-	bool do_csum;
+ 	u8 flags = 0;
+ 
+ 	i = tx_ring->next_to_use;
+@@ -162,14 +163,48 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb)
+ 	tx_swbd->is_dma_page = 0;
+ 	count++;
+ 
+-	do_csum = enetc_tx_csum(skb, txbd);
+-	if (do_csum)
++	do_vlan = skb_vlan_tag_present(skb);
++	do_ts = skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP;
++
++	if (do_vlan || do_ts)
++		flags |= ENETC_TXBD_FLAGS_EX;
++
++	if (enetc_tx_csum(skb, txbd))
+ 		flags |= ENETC_TXBD_FLAGS_CSUM | ENETC_TXBD_FLAGS_L4CS;
+ 
+ 	/* first BD needs frm_len set */
+ 	txbd->frm_len = cpu_to_le16(skb->len);
+ 	/* last BD needs 'F' bit set */
+-	txbd->flags = nr_frags ? flags : flags | ENETC_TXBD_FLAGS_F;
++	if (!nr_frags)
++		flags |= ENETC_TXBD_FLAGS_F;
++	txbd->flags = flags;
++
++	if (flags & ENETC_TXBD_FLAGS_EX) {
++		/* add extension BD for VLAN and/or timestamping */
++		tx_swbd++;
++		txbd++;
++		i++;
++		if (unlikely(i == tx_ring->bd_count)) {
++			i = 0;
++			tx_swbd = tx_ring->tx_swbd;
++			txbd = ENETC_TXBD(*tx_ring, 0);
++		}
++
++		if (do_vlan) {
++			txbd->ext.vid = cpu_to_le16(skb_vlan_tag_get(skb));
++			txbd->ext.tpid = 0; /* < C-TAG */
++			txbd->ext.e_flags |= 1; /* < do VLAN */
++		}
++
++		if (do_ts) {
++			// TODO: Tx timestamp offload h/w settings
++			skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++		}
++
++		/* set 'F' if last */
++		txbd->ext.flags = flags & ENETC_TXBD_FLAGS_F;
++		count++;
++	}
+ 
+ 	frag = &skb_shinfo(skb)->frags[0];
+ 	for (f = 0; f < nr_frags; f++, frag++) {
+@@ -641,7 +676,7 @@ static int enetc_alloc_txbdr(struct enetc_bdr *txr)
+ 	if (!txr->tx_swbd)
+ 		return -ENOMEM;
+ 
+-	size = txr->bd_count * sizeof(struct enetc_tx_bd);
++	size = txr->bd_count * sizeof(union enetc_tx_bd);
+ 	txr->bd_base = dma_zalloc_coherent(txr->dev, size, &txr->bd_dma_base,
+ 					   GFP_KERNEL);
+ 	if (!txr->bd_base) {
+@@ -659,7 +694,7 @@ static void enetc_free_txbdr(struct enetc_bdr *txr)
+ {
+ 	int size;
+ 
+-	size = txr->bd_count * sizeof(struct enetc_tx_bd);
++	size = txr->bd_count * sizeof(union enetc_tx_bd);
+ 
+ 	dma_free_coherent(txr->dev, size, txr->bd_base, txr->bd_dma_base);
+ 	txr->bd_base = NULL;
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 592f798fa43c..169094ca070d 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -126,7 +126,7 @@ struct enetc_cbdr {
+ 	dma_addr_t bd_dma_base;
+ };
+ 
+-#define ENETC_TXBD(BDR, i) (&(((struct enetc_tx_bd *)((BDR).bd_base))[i]))
++#define ENETC_TXBD(BDR, i) (&(((union enetc_tx_bd *)((BDR).bd_base))[i]))
+ #define ENETC_RXBD(BDR, i) (&(((union enetc_rx_bd *)((BDR).bd_base))[i]))
+ 
+ #define ENETC_MADDR_HASH_TBL_SZ	64
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index 800795ad0300..4868db9a5e51 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -231,22 +231,33 @@ struct enetc_hw {
+ 				enetc_bdr_wr(hw, RX, n, off, val)
+ 
+ /* Buffer Descriptors (BD) */
+-struct enetc_tx_bd {
+-	__le64 addr;
+-	__le16 buf_len;
+-	__le16 frm_len;
+-	union {
+-		struct {
+-			__le16 l3_csoff;
+-			u8 l4_csoff;
+-			u8 flags;
+-		}; /* default layout */
++union enetc_tx_bd {
++	struct {
++		__le64 addr;
++		__le16 buf_len;
++		__le16 frm_len;
++		union {
++			struct {
++				__le16 l3_csoff;
++				u8 l4_csoff;
++				u8 flags;
++			}; /* default layout */
++		};
+ 	};
++	struct {
++		__le32 ts;
++		__le16 tpid;
++		__le16 vid;
++		u8 reserved[6];
++		u8 e_flags;
++		u8 flags;
++	} ext; /* Tx BD extension */
+ };
+ 
+ #define ENETC_TXBD_FLAGS_L4CS	BIT(0)
+ #define ENETC_TXBD_FLAGS_CSUM	BIT(3)
+ #define ENETC_TXBD_FLAGS_TSTMP	BIT(4)
++#define ENETC_TXBD_FLAGS_EX	BIT(6)
+ #define ENETC_TXBD_FLAGS_F	BIT(7)
+ 
+ /* L3 csum flags */
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index 74bc746965ef..922e7ce63e26 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -404,9 +404,10 @@ static void enetc_pf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+ 	ndev->max_mtu = ENETC_MAX_MTU;
+ 
+ 	ndev->hw_features = NETIF_F_RXCSUM | NETIF_F_HW_CSUM |
+-			    NETIF_F_LOOPBACK;
++			    NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_LOOPBACK;
+ 	ndev->features = NETIF_F_HIGHDMA | NETIF_F_SG |
+ 			 NETIF_F_RXCSUM | NETIF_F_HW_CSUM |
++			 NETIF_F_HW_VLAN_CTAG_TX |
+ 			 NETIF_F_HW_VLAN_CTAG_RX; /* < has to stay on for now */
+ 
+ 	ndev->priv_flags |= IFF_UNICAST_FLT;
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_vf.c b/drivers/net/ethernet/freescale/enetc/enetc_vf.c
+index cfa7bf32884c..8046c562bcf2 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_vf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_vf.c
+@@ -155,9 +155,11 @@ static void enetc_vf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+ 	ndev->min_mtu = ETH_MIN_MTU;
+ 	ndev->max_mtu = ENETC_MAX_MTU;
+ 
+-	ndev->hw_features = NETIF_F_RXCSUM | NETIF_F_HW_CSUM;
++	ndev->hw_features = NETIF_F_RXCSUM | NETIF_F_HW_CSUM |
++			    NETIF_F_HW_VLAN_CTAG_TX;
+ 	ndev->features = NETIF_F_HIGHDMA | NETIF_F_SG |
+ 			 NETIF_F_RXCSUM | NETIF_F_HW_CSUM |
++			 NETIF_F_HW_VLAN_CTAG_TX |
+ 			 NETIF_F_HW_VLAN_CTAG_RX; /* < has to stay on for now */
+ 
+ 	ndev->priv_flags |= IFF_UNICAST_FLT;
+-- 
+2.17.1
+

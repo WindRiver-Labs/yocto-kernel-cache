@@ -1,0 +1,234 @@
+From e1f3ba100388bb6cae5749f276472190ca71dd9a Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@nxp.com>
+Date: Thu, 15 Nov 2018 17:02:44 +0200
+Subject: [PATCH 474/706] enetc: Call register_netdev as late as possible,
+ refactoring
+
+This removes the risk of a race at probe, once the netdevice gets
+registered. This is a requirement that the upstream maintainers
+always verify during review, and point it out if not implemented.
+Note that request_irq must be moved to open(), to be able to call
+it after register_netdev().
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit 6bc8a48e5daefa950de182f5b35c106dc554b97f)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c  | 46 +++++++++++++------
+ drivers/net/ethernet/freescale/enetc/enetc.h  |  2 -
+ .../net/ethernet/freescale/enetc/enetc_pf.c   | 35 +++++++-------
+ .../net/ethernet/freescale/enetc/enetc_vf.c   |  7 ---
+ 4 files changed, 51 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index e4db0a0e0602..b8d613fd9359 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -1199,7 +1199,7 @@ static void enetc_clear_bdrs(struct enetc_ndev_priv *priv)
+ 	udelay(1);
+ }
+ 
+-int enetc_setup_irqs(struct enetc_ndev_priv *priv)
++static int enetc_setup_irqs(struct enetc_ndev_priv *priv)
+ {
+ 	struct pci_dev *pdev = priv->si->pdev;
+ 	int i, j, err;
+@@ -1239,7 +1239,7 @@ int enetc_setup_irqs(struct enetc_ndev_priv *priv)
+ 	return err;
+ }
+ 
+-void enetc_free_irqs(struct enetc_ndev_priv *priv)
++static void enetc_free_irqs(struct enetc_ndev_priv *priv)
+ {
+ 	struct pci_dev *pdev = priv->si->pdev;
+ 	int i;
+@@ -1283,23 +1283,38 @@ static void adjust_link(struct net_device *ndev)
+ 	phy_print_status(phydev);
+ }
+ 
++static int enetc_phy_connect(struct net_device *ndev)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct phy_device *phydev;
++
++	if (!priv->phy_node)
++		return 0; /* phy-less mode */
++
++	phydev = of_phy_connect(ndev, priv->phy_node, &adjust_link,
++				0, priv->if_mode);
++	if (!phydev) {
++		dev_err(&ndev->dev, "could not attach to PHY\n");
++		return -ENODEV;
++	}
++
++	phy_attached_info(phydev);
++
++	return 0;
++}
++
+ int enetc_open(struct net_device *ndev)
+ {
+ 	struct enetc_ndev_priv *priv = netdev_priv(ndev);
+ 	int i, err;
+ 
+-	if (priv->phy_node) {
+-		struct phy_device *phydev;
+-
+-		phydev = of_phy_connect(ndev, priv->phy_node, &adjust_link,
+-					0, priv->if_mode);
+-		if (!phydev) {
+-			dev_err(&ndev->dev, "could not attach to PHY\n");
+-			return -ENODEV;
+-		}
++	err = enetc_setup_irqs(priv);
++	if (err)
++		return err;
+ 
+-		phy_attached_info(phydev);
+-	}
++	err = enetc_phy_connect(ndev);
++	if (err)
++		goto err_phy_connect;
+ 
+ 	err = enetc_alloc_tx_resources(priv);
+ 	if (err)
+@@ -1338,6 +1353,10 @@ int enetc_open(struct net_device *ndev)
+ err_alloc_rx:
+ 	enetc_free_tx_resources(priv);
+ err_alloc_tx:
++	if (ndev->phydev)
++		phy_disconnect(ndev->phydev);
++err_phy_connect:
++	enetc_free_irqs(priv);
+ 
+ 	return err;
+ }
+@@ -1367,6 +1386,7 @@ int enetc_close(struct net_device *ndev)
+ 	enetc_free_rxtx_rings(priv);
+ 	enetc_free_rx_resources(priv);
+ 	enetc_free_tx_resources(priv);
++	enetc_free_irqs(priv);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 323816cc8049..2b5dd77f4441 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -233,8 +233,6 @@ int enetc_pci_probe(struct pci_dev *pdev, const char *name, int sizeof_priv);
+ void enetc_pci_remove(struct pci_dev *pdev);
+ int enetc_alloc_msix(struct enetc_ndev_priv *priv);
+ void enetc_free_msix(struct enetc_ndev_priv *priv);
+-int enetc_setup_irqs(struct enetc_ndev_priv *priv);
+-void enetc_free_irqs(struct enetc_ndev_priv *priv);
+ void enetc_get_si_caps(struct enetc_si *si);
+ void enetc_init_si_rings_params(struct enetc_ndev_priv *priv);
+ int enetc_alloc_si_resources(struct enetc_ndev_priv *priv);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index 6f89aabc465d..9b8b198c6ac8 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -722,6 +722,16 @@ static int enetc_of_get_phy(struct enetc_ndev_priv *priv)
+ 	return 0;
+ }
+ 
++static void enetc_of_put_phy(struct enetc_ndev_priv *priv)
++{
++	struct device_node *np = priv->dev->of_node;
++
++	if (np && of_phy_is_fixed_link(np))
++		of_phy_deregister_fixed_link(np);
++	if (priv->phy_node)
++		of_node_put(priv->phy_node);
++}
++
+ static int enetc_pf_probe(struct pci_dev *pdev,
+ 			  const struct pci_device_id *ent)
+ {
+@@ -782,30 +792,25 @@ static int enetc_pf_probe(struct pci_dev *pdev,
+ 		goto err_alloc_msix;
+ 	}
+ 
+-	err = register_netdev(ndev);
+-	if (err)
+-		goto err_reg_netdev;
+-
+-	enetc_tsn_pf_init(ndev, pdev);
+-
+-	err = enetc_setup_irqs(priv);
+-	if (err)
+-		goto err_setup_irq;
+-
+ 	err = enetc_of_get_phy(priv);
+ 	if (err)
+ 		dev_warn(&pdev->dev, "Fallback to PHY-less operation\n");
+ 
++	err = register_netdev(ndev);
++	if (err)
++		goto err_reg_netdev;
++
+ 	netif_carrier_off(ndev);
+ 
+ 	netif_info(priv, probe, ndev, "%s v%s\n",
+ 		   enetc_drv_name, enetc_drv_ver);
+ 
++	enetc_tsn_pf_init(ndev, pdev);
++
+ 	return 0;
+ 
+-err_setup_irq:
+-	unregister_netdev(ndev);
+ err_reg_netdev:
++	enetc_of_put_phy(priv);
+ 	enetc_free_msix(priv);
+ err_alloc_msix:
+ 	enetc_free_si_resources(priv);
+@@ -836,12 +841,8 @@ static void enetc_pf_remove(struct pci_dev *pdev)
+ 
+ 	unregister_netdev(si->ndev);
+ 
+-	if (pdev->dev.of_node && of_phy_is_fixed_link(pdev->dev.of_node))
+-		of_phy_deregister_fixed_link(pdev->dev.of_node);
+-	if (priv->phy_node)
+-		of_node_put(priv->phy_node);
++	enetc_of_put_phy(priv);
+ 
+-	enetc_free_irqs(priv);
+ 	enetc_free_msix(priv);
+ 
+ 	enetc_free_si_resources(priv);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_vf.c b/drivers/net/ethernet/freescale/enetc/enetc_vf.c
+index e8b094d231df..a43664c1bb17 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_vf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_vf.c
+@@ -199,10 +199,6 @@ static int enetc_vf_probe(struct pci_dev *pdev,
+ 	if (err)
+ 		goto err_reg_netdev;
+ 
+-	err = enetc_setup_irqs(priv);
+-	if (err)
+-		goto err_setup_irq;
+-
+ 	netif_carrier_off(ndev);
+ 
+ 	netif_info(priv, probe, ndev, "%s v%s\n",
+@@ -210,8 +206,6 @@ static int enetc_vf_probe(struct pci_dev *pdev,
+ 
+ 	return 0;
+ 
+-err_setup_irq:
+-	unregister_netdev(ndev);
+ err_reg_netdev:
+ 	enetc_free_msix(priv);
+ err_alloc_msix:
+@@ -235,7 +229,6 @@ static void enetc_vf_remove(struct pci_dev *pdev)
+ 		   enetc_drv_name, enetc_drv_ver);
+ 	unregister_netdev(si->ndev);
+ 
+-	enetc_free_irqs(priv);
+ 	enetc_free_msix(priv);
+ 
+ 	enetc_free_si_resources(priv);
+-- 
+2.17.1
+

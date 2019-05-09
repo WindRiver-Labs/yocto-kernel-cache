@@ -1,0 +1,123 @@
+From 49179f66cd432d399c1c534cfe85ce1e253206be Mon Sep 17 00:00:00 2001
+From: Alex Marginean <alexandru.marginean@nxp.com>
+Date: Wed, 13 Jun 2018 19:27:30 +0300
+Subject: [PATCH 165/706] enetc: RFS updates
+
+Fixed command structure, it changed in recent BGs.
+Fixed command alignment, HW errors out if structure is not aligned.
+Fixed reading number of RFS entries from caps.
+Populated RSS/RFS ops in vf_ethtool_ops.
+
+Signed-off-by: Alex Marginean <alexandru.marginean@nxp.com>
+(cherry picked from commit 908b2c58c2b10caa4a5ad825711c76988d64028d)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ .../net/ethernet/freescale/enetc/enetc_cbdr.c | 20 ++++++++++++-------
+ .../ethernet/freescale/enetc/enetc_ethtool.c  |  5 +++++
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  5 +++++
+ .../net/ethernet/freescale/enetc/enetc_pf.c   |  2 +-
+ 4 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+index 1ab67aff6d46..6915ee805264 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+@@ -167,7 +167,10 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ {
+ 	struct enetc_cbd cbd = {.cmd = 0};
+ 	bool async = false;
+-	dma_addr_t dma;
++	dma_addr_t dma, dma_align;
++	const int align = 64;
++	void *tmp, *tmp_align;
++	int len = sizeof(*rfse) + align - 1;
+ 	int err;
+ 
+ 	/* fill up the "set" descriptor */
+@@ -177,15 +180,18 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 	cbd.length = cpu_to_le16(sizeof(*rfse));
+ 	cbd.opt[3] = cpu_to_le32(0); /* SI */
+ 
+-	dma = dma_map_single(&si->pdev->dev, rfse, cbd.length,
+-			     DMA_TO_DEVICE);
+-	if (dma_mapping_error(&si->pdev->dev, dma)) {
++	tmp = dma_alloc_coherent(&si->pdev->dev, len, &dma, DMA_TO_DEVICE);
++	if (!tmp) {
+ 		netdev_err(si->ndev, "DMA mapping of RFS entry failed!\n");
+ 		return -ENOMEM;
+ 	}
+ 
+-	cbd.addr[0] = lower_32_bits(dma);
+-	cbd.addr[1] = upper_32_bits(dma);
++	dma_align = ALIGN(dma, align);
++	tmp_align = PTR_ALIGN(tmp, align);
++	memcpy(tmp_align, rfse, sizeof(*rfse));
++
++	cbd.addr[0] = lower_32_bits(dma_align);
++	cbd.addr[1] = upper_32_bits(dma_align);
+ 
+ 	if (async)
+ 		cbd.status_flags |= ENETC_CBD_FLAGS_IE;
+@@ -193,7 +199,7 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 	err = enetc_send_cmd(si, &cbd, async);
+ 	if (err)
+ 		netdev_err(si->ndev, "FS entry add failed (%d)!", err);
+-	dma_unmap_single(&si->pdev->dev, dma, cbd.length, DMA_TO_DEVICE);
++	dma_free_coherent(&si->pdev->dev, len, tmp, dma);
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c b/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+index 41eca2bb865f..c8592ce4827e 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+@@ -577,6 +577,11 @@ const struct ethtool_ops enetc_vf_ethtool_ops = {
+ 	.get_sset_count = enetc_get_sset_count,
+ 	.get_strings = enetc_get_strings,
+ 	.get_ethtool_stats = enetc_get_ethtool_stats,
++	.get_rxnfc = enetc_get_rxnfc,
++	.set_rxnfc = enetc_set_rxnfc,
++	.get_rxfh_indir_size = enetc_get_rxfh_indir_size,
++	.get_rxfh = enetc_get_rxfh,
++	.set_rxfh = enetc_set_rxfh,
+ 	.get_ringparam = enetc_get_ringparam,
+ };
+ 
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index a10db5830036..a72003214242 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -454,12 +454,17 @@ struct enetc_cmd_rfse {
+ 	u32 dip_m[4];
+ 	u16 ethtype_h;
+ 	u16 ethtype_m;
++	u16 ethtype4_h;
++	u16 ethtype4_m;
+ 	u16 sport_h;
+ 	u16 sport_m;
+ 	u16 dport_h;
+ 	u16 dport_m;
+ 	u16 vlan_h;
+ 	u16 vlan_m;
++	u8 proto_h;
++	u8 proto_m;
++	u16 flags;
+ 	u16 result;
+ 	u16 mode;
+ };
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index 5698914f2733..a7bfc60fb14a 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -452,7 +452,7 @@ static void enetc_port_alloc_rfs(struct enetc_si *si)
+ 
+ 	/* split RFS entries between functions */
+ 	num_entries = enetc_port_rd(hw, ENETC_PRFSCAPR) & 0xf;
+-	num_entries = 32 * (1 << num_entries);
++	num_entries = 16 * (1 + num_entries);
+ 	vf_entries = num_entries / (pf->total_vfs + 1);
+ 
+ 	for (i = 0; i < pf->total_vfs; i++)
+-- 
+2.17.1
+

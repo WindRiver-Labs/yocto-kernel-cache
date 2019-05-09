@@ -1,0 +1,174 @@
+From 46901852616ab05492cc2609c7ff0cf3bd5dd213 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@nxp.com>
+Date: Thu, 15 Nov 2018 11:45:47 +0200
+Subject: [PATCH 491/706] enetc: Add tx cleanup budget and use
+ napi_consume_skb()
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit 49bc7b882a8e2338b4e84cab6d6eb59168417baf)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c | 59 ++++++++++++--------
+ drivers/net/ethernet/freescale/enetc/enetc.h |  1 +
+ 2 files changed, 36 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index baf9fd003d4f..0eb352410877 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -10,7 +10,7 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
+ 			      bool tstamp);
+ static void enetc_unmap_tx_buff(struct enetc_bdr *tx_ring,
+ 				struct enetc_tx_swbd *tx_swbd);
+-static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring);
++static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget);
+ 
+ static struct sk_buff *enetc_map_rx_buff_to_skb(struct enetc_bdr *rx_ring,
+ 						int i, u16 size);
+@@ -108,6 +108,18 @@ static bool enetc_tx_csum(struct sk_buff *skb, union enetc_tx_bd *txbd)
+ 	return true;
+ }
+ 
++static void enetc_free_tx_skb(struct enetc_bdr *tx_ring,
++			      struct enetc_tx_swbd *tx_swbd)
++{
++	if (tx_swbd->dma)
++		enetc_unmap_tx_buff(tx_ring, tx_swbd);
++
++	if (tx_swbd->skb) {
++		dev_kfree_skb_any(tx_swbd->skb);
++		tx_swbd->skb = NULL;
++	}
++}
++
+ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
+ 			      bool tstamp)
+ {
+@@ -224,7 +236,7 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
+ 
+ 	do {
+ 		tx_swbd = &tx_ring->tx_swbd[i];
+-		enetc_unmap_tx_buff(tx_ring, tx_swbd);
++		enetc_free_tx_skb(tx_ring, tx_swbd);
+ 		if (i == 0)
+ 			i = tx_ring->bd_count;
+ 		i--;
+@@ -241,9 +253,9 @@ static int enetc_poll(struct napi_struct *napi, int budget)
+ 	int work_done;
+ 	int i;
+ 
+-	// TODO: Add Tx ring budget (cleanup limit)
+ 	for (i = 0; i < v->count_tx_rings; i++)
+-		enetc_clean_tx_ring(&v->tx_ring[i]);
++		if (!enetc_clean_tx_ring(&v->tx_ring[i], budget))
++			complete = false;
+ 
+ 	work_done = enetc_clean_rx_ring(&v->rx_ring, napi, budget);
+ 	if (work_done == budget)
+@@ -267,20 +279,13 @@ static int enetc_poll(struct napi_struct *napi, int budget)
+ static void enetc_unmap_tx_buff(struct enetc_bdr *tx_ring,
+ 				struct enetc_tx_swbd *tx_swbd)
+ {
+-	if (tx_swbd->dma) {
+-		if (tx_swbd->is_dma_page)
+-			dma_unmap_page(tx_ring->dev, tx_swbd->dma,
+-				       tx_swbd->len, DMA_TO_DEVICE);
+-		else
+-			dma_unmap_single(tx_ring->dev, tx_swbd->dma,
+-					 tx_swbd->len, DMA_TO_DEVICE);
+-		tx_swbd->dma = 0;
+-	}
+-
+-	if (tx_swbd->skb) {
+-		dev_kfree_skb_any(tx_swbd->skb);
+-		tx_swbd->skb = NULL;
+-	}
++	if (tx_swbd->is_dma_page)
++		dma_unmap_page(tx_ring->dev, tx_swbd->dma,
++			       tx_swbd->len, DMA_TO_DEVICE);
++	else
++		dma_unmap_single(tx_ring->dev, tx_swbd->dma,
++				 tx_swbd->len, DMA_TO_DEVICE);
++	tx_swbd->dma = 0;
+ }
+ 
+ static int enetc_bd_ready_count(struct enetc_bdr *tx_ring, int ci)
+@@ -315,7 +320,7 @@ static void enetc_tstamp_tx(struct sk_buff *skb, u64 tstamp)
+ 	}
+ }
+ 
+-static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring)
++static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ {
+ 	struct net_device *ndev = tx_ring->ndev;
+ 	int tx_frm_cnt = 0, tx_byte_cnt = 0;
+@@ -335,7 +340,7 @@ static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring)
+ 	first = true;
+ 	bds_to_clean = enetc_bd_ready_count(tx_ring, i);
+ 
+-	while (bds_to_clean) {
++	while (bds_to_clean && tx_frm_cnt < ENETC_DEFAULT_TX_WORK) {
+ 		bool is_eof = !!tx_swbd->skb;
+ 
+ 		if (unlikely(do_tstamp)) {
+@@ -348,11 +353,17 @@ static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring)
+ 			}
+ 		}
+ 
+-		enetc_unmap_tx_buff(tx_ring, tx_swbd);
+ 		/* clear BD fields that may leak */
+ 		txbd->frm_len = 0;
+ 		txbd->buf_len = 0;
+ 		txbd->lstatus = 0;
++
++		enetc_unmap_tx_buff(tx_ring, tx_swbd);
++		if (is_eof) {
++			napi_consume_skb(tx_swbd->skb, napi_budget);
++			tx_swbd->skb = NULL;
++		}
++
+ 		tx_byte_cnt += tx_swbd->len;
+ 
+ 		bds_to_clean--;
+@@ -389,7 +400,7 @@ static int enetc_clean_tx_ring(struct enetc_bdr *tx_ring)
+ 		netif_wake_subqueue(ndev, tx_ring->index);
+ 	}
+ 
+-	return tx_frm_cnt;
++	return tx_frm_cnt != ENETC_DEFAULT_TX_WORK;
+ }
+ 
+ static bool enetc_new_page(struct enetc_bdr *rx_ring,
+@@ -769,7 +780,7 @@ static void enetc_free_txbdr(struct enetc_bdr *txr)
+ 	int size, i;
+ 
+ 	for (i = 0; i < txr->bd_count; i++)
+-		enetc_unmap_tx_buff(txr, &txr->tx_swbd[i]);
++		enetc_free_tx_skb(txr, &txr->tx_swbd[i]);
+ 
+ 	size = txr->bd_count * sizeof(union enetc_tx_bd);
+ 
+@@ -880,7 +891,7 @@ static void enetc_free_tx_ring(struct enetc_bdr *tx_ring)
+ 	for (i = 0; i < tx_ring->bd_count; i++) {
+ 		struct enetc_tx_swbd *tx_swbd = &tx_ring->tx_swbd[i];
+ 
+-		enetc_unmap_tx_buff(tx_ring, tx_swbd);
++		enetc_free_tx_skb(tx_ring, tx_swbd);
+ 	}
+ 
+ 	tx_ring->next_to_clean = 0;
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index 55874752ea9c..1101466531ae 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -45,6 +45,7 @@ struct enetc_ring_stats {
+ };
+ 
+ #define ENETC_BDR_DEFAULT_SIZE	1024
++#define ENETC_DEFAULT_TX_WORK	256
+ 
+ struct enetc_bdr {
+ 	struct device *dev; /* for DMA mapping */
+-- 
+2.17.1
+

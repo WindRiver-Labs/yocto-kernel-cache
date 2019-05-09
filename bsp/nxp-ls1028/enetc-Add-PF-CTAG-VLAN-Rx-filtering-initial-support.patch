@@ -1,0 +1,179 @@
+From dc2a31d36910a6505e2c2f546bc34f2761f205a1 Mon Sep 17 00:00:00 2001
+From: Claudiu Manoil <claudiu.manoil@nxp.com>
+Date: Thu, 22 Mar 2018 15:25:52 +0200
+Subject: [PATCH 124/706] enetc: Add PF CTAG VLAN Rx filtering initial support
+
+Signed-off-by: Claudiu Manoil <claudiu.manoil@nxp.com>
+(cherry picked from commit c2d8b4ac811b0f93f5dfab60861a88be40ccdfd9)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  3 +
+ .../net/ethernet/freescale/enetc/enetc_pf.c   | 88 ++++++++++++++++++-
+ .../net/ethernet/freescale/enetc/enetc_pf.h   |  4 +
+ 3 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index b3a6a4fff7c0..da25236a8ff2 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -219,6 +219,9 @@ enum enetc_bdr_type {TX, RX};
+ #define ENETC_PSIMMHFR0(n)	(0x01d08 + (n) * 0x10)
+ #define ENETC_PSIMMHFR1(n)	(0x01d0c + (n) * 0x10)
+ 
++#define ENETC_PSIVHFR0(n)	(0x01e00 + (n) * 8) /* n = SI index */
++#define ENETC_PSIVHFR1(n)	(0x01e04 + (n) * 8) /* n = SI index */
++
+ /* MAC counters */
+ #define ENETC_PM0_REOCT		0x8100
+ #define ENETC_PM0_RALN		0x8110
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.c b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+index acb009614632..1655639fde8b 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.c
+@@ -81,12 +81,28 @@ static bool enetc_si_vlan_promisc_is_on(struct enetc_pf *pf, int si_idx)
+ 	return pf->vlan_promisc_simap & BIT(si_idx);
+ }
+ 
++static bool enetc_vlan_filter_is_on(struct enetc_pf *pf)
++{
++	int i;
++
++	for_each_set_bit(i, pf->active_vlans, VLAN_N_VID)
++		return true;
++
++	return false;
++}
++
+ static void enetc_enable_si_vlan_promisc(struct enetc_pf *pf, int si_idx)
+ {
+ 	pf->vlan_promisc_simap |= BIT(si_idx);
+ 	enetc_set_vlan_promisc(&pf->si->hw, pf->vlan_promisc_simap);
+ }
+ 
++static void enetc_disable_si_vlan_promisc(struct enetc_pf *pf, int si_idx)
++{
++	pf->vlan_promisc_simap &= ~BIT(si_idx);
++	enetc_set_vlan_promisc(&pf->si->hw, pf->vlan_promisc_simap);
++}
++
+ static void enetc_set_isol_vlan(struct enetc_hw *hw, int si, u16 vlan, u8 qos)
+ {
+ 	u32 val = 0;
+@@ -264,6 +280,73 @@ static void enetc_pf_set_rx_mode(struct net_device *ndev)
+ 	enetc_port_wr(hw, ENETC_PSIPMR, psipmr);
+ }
+ 
++static void enetc_set_vlan_ht_filter(struct enetc_hw *hw, int si_idx,
++				     u32 *hash)
++{
++	enetc_port_wr(hw, ENETC_PSIVHFR0(si_idx), *hash);
++	enetc_port_wr(hw, ENETC_PSIVHFR1(si_idx), *(hash + 1));
++}
++
++static int enetc_vid_hash_idx(unsigned int vid)
++{
++	int res = 0;
++	int i;
++
++	for (i = 0; i < 6; i++)
++		res |= (__sw_hweight8(vid & (BIT(i) | BIT(i + 6))) & 0x1) << i;
++
++	return res;
++}
++
++static void enetc_sync_vlan_ht_filter(struct enetc_pf *pf, bool rehash)
++{
++	int i;
++
++	if (rehash) {
++		bitmap_zero(pf->vlan_ht_filter, ENETC_VLAN_HT_SIZE);
++
++		for_each_set_bit(i, pf->active_vlans, VLAN_N_VID) {
++			int hidx = enetc_vid_hash_idx(i);
++
++			__set_bit(hidx, pf->vlan_ht_filter);
++		}
++	}
++
++	enetc_set_vlan_ht_filter(&pf->si->hw, 0, (u32 *)pf->vlan_ht_filter);
++}
++
++static int enetc_vlan_rx_add_vid(struct net_device *ndev, __be16 prot, u16 vid)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct enetc_pf *pf = enetc_si_priv(priv->si);
++	int idx;
++
++	if (enetc_si_vlan_promisc_is_on(pf, 0))
++		enetc_disable_si_vlan_promisc(pf, 0);
++
++	__set_bit(vid, pf->active_vlans);
++
++	idx = enetc_vid_hash_idx(vid);
++	if (!__test_and_set_bit(idx, pf->vlan_ht_filter))
++		enetc_sync_vlan_ht_filter(pf, false);
++
++	return 0;
++}
++
++static int enetc_vlan_rx_del_vid(struct net_device *ndev, __be16 prot, u16 vid)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct enetc_pf *pf = enetc_si_priv(priv->si);
++
++	__clear_bit(vid, pf->active_vlans);
++	enetc_sync_vlan_ht_filter(pf, true);
++
++	if (!enetc_vlan_filter_is_on(pf))
++		enetc_enable_si_vlan_promisc(pf, 0);
++
++	return 0;
++}
++
+ static void enetc_set_loopback(struct net_device *ndev, bool en)
+ {
+ 	struct enetc_ndev_priv *priv = netdev_priv(ndev);
+@@ -510,6 +593,8 @@ static const struct net_device_ops enetc_ndev_ops = {
+ 	.ndo_get_stats		= enetc_get_stats,
+ 	.ndo_set_mac_address	= enetc_pf_set_mac_addr,
+ 	.ndo_set_rx_mode	= enetc_pf_set_rx_mode,
++	.ndo_vlan_rx_add_vid	= enetc_vlan_rx_add_vid,
++	.ndo_vlan_rx_kill_vid	= enetc_vlan_rx_del_vid,
+ 	.ndo_set_vf_mac		= enetc_pf_set_vf_mac,
+ 	.ndo_set_vf_vlan	= enetc_pf_set_vf_vlan,
+ 	.ndo_set_vf_spoofchk	= enetc_pf_set_vf_spoofchk,
+@@ -540,7 +625,8 @@ static void enetc_pf_netdev_setup(struct enetc_si *si, struct net_device *ndev,
+ 	ndev->features = NETIF_F_HIGHDMA | NETIF_F_SG |
+ 			 NETIF_F_RXCSUM | NETIF_F_HW_CSUM |
+ 			 NETIF_F_HW_VLAN_CTAG_TX |
+-			 NETIF_F_HW_VLAN_CTAG_RX;
++			 NETIF_F_HW_VLAN_CTAG_RX |
++			 NETIF_F_HW_VLAN_CTAG_FILTER;
+ 
+ 	ndev->priv_flags |= IFF_UNICAST_FLT;
+ 
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_pf.h b/drivers/net/ethernet/freescale/enetc/enetc_pf.h
+index cb7368c2438d..ddaa69aaf4d4 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_pf.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_pf.h
+@@ -48,6 +48,8 @@ struct enetc_mac_filter {
+ 	int mac_addr_cnt;
+ };
+ 
++#define ENETC_VLAN_HT_SIZE	64
++
+ struct enetc_pf {
+ 	struct enetc_si *si;
+ 	int num_vfs; /* number of active VFs, after sriov_init */
+@@ -60,6 +62,8 @@ struct enetc_pf {
+ 	char msg_int_name[IFNAMSIZ + 8];
+ 
+ 	char vlan_promisc_simap; /* bitmap of SIs in VLAN promisc mode */
++	DECLARE_BITMAP(vlan_ht_filter, ENETC_VLAN_HT_SIZE);
++	DECLARE_BITMAP(active_vlans, VLAN_N_VID);
+ };
+ 
+ int enetc_msg_psi_init(struct enetc_pf *pf);
+-- 
+2.17.1
+

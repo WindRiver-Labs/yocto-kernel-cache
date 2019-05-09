@@ -1,0 +1,168 @@
+From 66627ad9002122e882ea36ba800a666ca6f3398f Mon Sep 17 00:00:00 2001
+From: Liviu Dudau <Liviu.Dudau@arm.com>
+Date: Fri, 15 Jun 2018 16:56:09 +0100
+Subject: [PATCH 247/706] drm/mali-dp: Improve writeback handling for DP500.
+
+Mali DP500 operates in continuous writeback mode (writes frame content
+until stopped) and it needs special handling in order to behave like
+a one-shot writeback engine. The original state machine added for DP500
+was a bit fragile, as it did not handle correctly cases where a new
+atomic commit was in progress when the SE IRQ happens and it would
+commit some partial updates.
+
+Improve the handling by adding a parameter to the set_config_valid()
+function to clear the config valid bit in hardware before starting a
+new commit and by introducing a MW_RESTART state in the writeback
+state machine to cater for the case where a new writeback commit
+gets submitted while the last one is still being active.
+
+Reported-by: Brian Starkey <brian.starkey@arm.com>
+Reviewed-by: Brian Starkey <brian.starkey@arm.com>
+Signed-off-by: Liviu Dudau <liviu.dudau@arm.com>
+(cherry picked from commit 0735cfdf0af4d4ffc3743fb75b9ad929dfd37206)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/gpu/drm/arm/malidp_drv.c |  3 ++-
+ drivers/gpu/drm/arm/malidp_hw.c  | 39 +++++++++++++++++++++++---------
+ drivers/gpu/drm/arm/malidp_hw.h  | 11 +++++----
+ 3 files changed, 36 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/arm/malidp_drv.c b/drivers/gpu/drm/arm/malidp_drv.c
+index c8707e75b0a8..f2af5eb8508e 100644
+--- a/drivers/gpu/drm/arm/malidp_drv.c
++++ b/drivers/gpu/drm/arm/malidp_drv.c
+@@ -171,7 +171,7 @@ static int malidp_set_and_wait_config_valid(struct drm_device *drm)
+ 	struct malidp_hw_device *hwdev = malidp->dev;
+ 	int ret;
+ 
+-	hwdev->hw->set_config_valid(hwdev);
++	hwdev->hw->set_config_valid(hwdev, 1);
+ 	/* don't wait for config_valid flag if we are in config mode */
+ 	if (hwdev->hw->in_config_mode(hwdev)) {
+ 		atomic_set(&malidp->config_valid, MALIDP_CONFIG_VALID_DONE);
+@@ -230,6 +230,7 @@ static void malidp_atomic_commit_tail(struct drm_atomic_state *state)
+ 	 * know that we are updating registers
+ 	 */
+ 	atomic_set(&malidp->config_valid, MALIDP_CONFIG_START);
++	malidp->dev->hw->set_config_valid(malidp->dev, 0);
+ 
+ 	drm_atomic_helper_commit_modeset_disables(drm, state);
+ 
+diff --git a/drivers/gpu/drm/arm/malidp_hw.c b/drivers/gpu/drm/arm/malidp_hw.c
+index 449b7ef0a77f..b5c645cf4d1c 100644
+--- a/drivers/gpu/drm/arm/malidp_hw.c
++++ b/drivers/gpu/drm/arm/malidp_hw.c
+@@ -27,7 +27,8 @@ enum {
+ 	MW_NOT_ENABLED = 0,	/* SE writeback not enabled */
+ 	MW_ONESHOT,		/* SE in one-shot mode for writeback */
+ 	MW_START,		/* SE started writeback */
+-	MW_STOP,		/* SE finished writeback */
++	MW_RESTART,		/* SE will start another writeback after this one */
++	MW_STOP,		/* SE needs to stop after this writeback */
+ };
+ 
+ static const struct malidp_format_id malidp500_de_formats[] = {
+@@ -231,9 +232,12 @@ static bool malidp500_in_config_mode(struct malidp_hw_device *hwdev)
+ 	return false;
+ }
+ 
+-static void malidp500_set_config_valid(struct malidp_hw_device *hwdev)
++static void malidp500_set_config_valid(struct malidp_hw_device *hwdev, u8 value)
+ {
+-	malidp_hw_setbits(hwdev, MALIDP_CFG_VALID, MALIDP500_CONFIG_VALID);
++	if (value)
++		malidp_hw_setbits(hwdev, MALIDP_CFG_VALID, MALIDP500_CONFIG_VALID);
++	else
++		malidp_hw_clearbits(hwdev, MALIDP_CFG_VALID, MALIDP500_CONFIG_VALID);
+ }
+ 
+ static void malidp500_modeset(struct malidp_hw_device *hwdev, struct videomode *mode)
+@@ -386,7 +390,11 @@ static int malidp500_enable_memwrite(struct malidp_hw_device *hwdev,
+ 	/* enable the scaling engine block */
+ 	malidp_hw_setbits(hwdev, MALIDP_SCALE_ENGINE_EN, de_base + MALIDP_DE_DISPLAY_FUNC);
+ 
+-	hwdev->mw_state = MW_START;
++	/* restart the writeback if already enabled */
++	if (hwdev->mw_state != MW_NOT_ENABLED)
++		hwdev->mw_state = MW_RESTART;
++	else
++		hwdev->mw_state = MW_START;
+ 
+ 	malidp_hw_write(hwdev, fmt_id, base + MALIDP_MW_FORMAT);
+ 	switch (num_planes) {
+@@ -415,7 +423,7 @@ static void malidp500_disable_memwrite(struct malidp_hw_device *hwdev)
+ {
+ 	u32 base = malidp_get_block_base(hwdev, MALIDP_DE_BLOCK);
+ 
+-	if (hwdev->mw_state == MW_START)
++	if (hwdev->mw_state == MW_START || hwdev->mw_state == MW_RESTART)
+ 		hwdev->mw_state = MW_STOP;
+ 	malidp_hw_clearbits(hwdev, MALIDP_SE_MEMWRITE_EN, MALIDP500_SE_CONTROL);
+ 	malidp_hw_clearbits(hwdev, MALIDP_SCALE_ENGINE_EN, base + MALIDP_DE_DISPLAY_FUNC);
+@@ -500,9 +508,12 @@ static bool malidp550_in_config_mode(struct malidp_hw_device *hwdev)
+ 	return false;
+ }
+ 
+-static void malidp550_set_config_valid(struct malidp_hw_device *hwdev)
++static void malidp550_set_config_valid(struct malidp_hw_device *hwdev, u8 value)
+ {
+-	malidp_hw_setbits(hwdev, MALIDP_CFG_VALID, MALIDP550_CONFIG_VALID);
++	if (value)
++		malidp_hw_setbits(hwdev, MALIDP_CFG_VALID, MALIDP550_CONFIG_VALID);
++	else
++		malidp_hw_clearbits(hwdev, MALIDP_CFG_VALID, MALIDP550_CONFIG_VALID);
+ }
+ 
+ static void malidp550_modeset(struct malidp_hw_device *hwdev, struct videomode *mode)
+@@ -1005,15 +1016,21 @@ static irqreturn_t malidp_se_irq(int irq, void *arg)
+ 			/* disable writeback after stop */
+ 			hwdev->mw_state = MW_NOT_ENABLED;
+ 			break;
++		case MW_RESTART:
++			drm_writeback_signal_completion(&malidp->mw_connector, 0);
++			/* fall through to a new start */
+ 		case MW_START:
+ 			/* writeback started, need to emulate one-shot mode */
+ 			hw->disable_memwrite(hwdev);
+ 			/*
+-			 * only set config_valid HW bit if there is no
+-			 * other update in progress
++			 * only set config_valid HW bit if there is no other update
++			 * in progress or if we raced ahead of the DE IRQ handler
++			 * and config_valid flag will not be update until later
+ 			 */
+-			if (atomic_read(&malidp->config_valid) != MALIDP_CONFIG_START)
+-				hw->set_config_valid(hwdev);
++			status = malidp_hw_read(hwdev, hw->map.dc_base + MALIDP_REG_STATUS);
++			if ((atomic_read(&malidp->config_valid) != MALIDP_CONFIG_START) ||
++			    (status & hw->map.dc_irq_map.vsync_irq))
++				hw->set_config_valid(hwdev, 1);
+ 			break;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/arm/malidp_hw.h b/drivers/gpu/drm/arm/malidp_hw.h
+index c479738b81af..bd41aa6974a0 100644
+--- a/drivers/gpu/drm/arm/malidp_hw.h
++++ b/drivers/gpu/drm/arm/malidp_hw.h
+@@ -152,12 +152,13 @@ struct malidp_hw {
+ 	bool (*in_config_mode)(struct malidp_hw_device *hwdev);
+ 
+ 	/*
+-	 * Set configuration valid flag for hardware parameters that can
+-	 * be changed outside the configuration mode. Hardware will use
+-	 * the new settings when config valid is set after the end of the
+-	 * current buffer scanout
++	 * Set/clear configuration valid flag for hardware parameters that can
++	 * be changed outside the configuration mode to the given value.
++	 * Hardware will use the new settings when config valid is set,
++	 * after the end of the current buffer scanout, and will ignore
++	 * any new values for those parameters if config valid flag is cleared
+ 	 */
+-	void (*set_config_valid)(struct malidp_hw_device *hwdev);
++	void (*set_config_valid)(struct malidp_hw_device *hwdev, u8 value);
+ 
+ 	/*
+ 	 * Set a new mode in hardware. Requires the hardware to be in
+-- 
+2.17.1
+

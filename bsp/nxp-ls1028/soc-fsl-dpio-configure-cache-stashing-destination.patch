@@ -1,0 +1,183 @@
+From 8a3f33758d6f0a0e13a61cd81adf133c49181a78 Mon Sep 17 00:00:00 2001
+From: Ioana Ciornei <ioana.ciornei@nxp.com>
+Date: Sat, 23 Feb 2019 08:48:52 +0000
+Subject: [PATCH 594/706] soc: fsl: dpio: configure cache stashing destination
+
+Depending on the SoC version and the CPU id, configure the cache
+stashing destination for a specific dpio.
+
+Signed-off-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+Signed-off-by: Li Yang <leoyang.li@nxp.com>
+(cherry picked from commit 51da14e96e9b5187bd42148e37628e59486e267f)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/soc/fsl/Kconfig            |  1 +
+ drivers/soc/fsl/dpio/dpio-cmd.h    |  5 +++
+ drivers/soc/fsl/dpio/dpio-driver.c | 52 ++++++++++++++++++++++++++++++
+ drivers/soc/fsl/dpio/dpio.c        | 16 +++++++++
+ drivers/soc/fsl/dpio/dpio.h        |  5 +++
+ 5 files changed, 79 insertions(+)
+
+diff --git a/drivers/soc/fsl/Kconfig b/drivers/soc/fsl/Kconfig
+index 15ebbeee4a96..d891e94317ce 100644
+--- a/drivers/soc/fsl/Kconfig
++++ b/drivers/soc/fsl/Kconfig
+@@ -32,6 +32,7 @@ endif
+ config FSL_MC_DPIO
+         tristate "QorIQ DPAA2 DPIO driver"
+         depends on FSL_MC_BUS
++        select SOC_BUS
+         help
+ 	  Driver for the DPAA2 DPIO object.  A DPIO provides queue and
+ 	  buffer management facilities for software to interact with
+diff --git a/drivers/soc/fsl/dpio/dpio-cmd.h b/drivers/soc/fsl/dpio/dpio-cmd.h
+index 5814d2f395a4..e13fd3ac1939 100644
+--- a/drivers/soc/fsl/dpio/dpio-cmd.h
++++ b/drivers/soc/fsl/dpio/dpio-cmd.h
+@@ -26,6 +26,7 @@
+ #define DPIO_CMDID_DISABLE				DPIO_CMD(0x003)
+ #define DPIO_CMDID_GET_ATTR				DPIO_CMD(0x004)
+ #define DPIO_CMDID_RESET				DPIO_CMD(0x005)
++#define DPIO_CMDID_SET_STASHING_DEST			DPIO_CMD(0x120)
+ 
+ struct dpio_cmd_open {
+ 	__le32 dpio_id;
+@@ -47,4 +48,8 @@ struct dpio_rsp_get_attr {
+ 	__le32 qbman_version;
+ };
+ 
++struct dpio_stashing_dest {
++	u8 sdest;
++};
++
+ #endif /* _FSL_DPIO_CMD_H */
+diff --git a/drivers/soc/fsl/dpio/dpio-driver.c b/drivers/soc/fsl/dpio/dpio-driver.c
+index a28799b62d53..c0cdc8946031 100644
+--- a/drivers/soc/fsl/dpio/dpio-driver.c
++++ b/drivers/soc/fsl/dpio/dpio-driver.c
+@@ -14,6 +14,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/delay.h>
+ #include <linux/io.h>
++#include <linux/sys_soc.h>
+ 
+ #include <linux/fsl/mc.h>
+ #include <soc/fsl/dpaa2-io.h>
+@@ -32,6 +33,46 @@ struct dpio_priv {
+ 
+ static cpumask_var_t cpus_unused_mask;
+ 
++static const struct soc_device_attribute ls1088a_soc[] = {
++	{.family = "QorIQ LS1088A"},
++	{ /* sentinel */ }
++};
++
++static const struct soc_device_attribute ls2080a_soc[] = {
++	{.family = "QorIQ LS2080A"},
++	{ /* sentinel */ }
++};
++
++static const struct soc_device_attribute ls2088a_soc[] = {
++	{.family = "QorIQ LS2088A"},
++	{ /* sentinel */ }
++};
++
++static const struct soc_device_attribute lx2160a_soc[] = {
++	{.family = "QorIQ LX2160A"},
++	{ /* sentinel */ }
++};
++
++static int dpaa2_dpio_get_cluster_sdest(struct fsl_mc_device *dpio_dev, int cpu)
++{
++	int cluster_base, cluster_size;
++
++	if (soc_device_match(ls1088a_soc)) {
++		cluster_base = 2;
++		cluster_size = 4;
++	} else if (soc_device_match(ls2080a_soc) ||
++		   soc_device_match(ls2088a_soc) ||
++		   soc_device_match(lx2160a_soc)) {
++		cluster_base = 0;
++		cluster_size = 2;
++	} else {
++		dev_err(&dpio_dev->dev, "unknown SoC version\n");
++		return -1;
++	}
++
++	return cluster_base + cpu / cluster_size;
++}
++
+ static irqreturn_t dpio_irq_handler(int irq_num, void *arg)
+ {
+ 	struct device *dev = (struct device *)arg;
+@@ -89,6 +130,7 @@ static int dpaa2_dpio_probe(struct fsl_mc_device *dpio_dev)
+ 	int err = -ENOMEM;
+ 	struct device *dev = &dpio_dev->dev;
+ 	int possible_next_cpu;
++	int sdest;
+ 
+ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+@@ -145,6 +187,16 @@ static int dpaa2_dpio_probe(struct fsl_mc_device *dpio_dev)
+ 	desc.cpu = possible_next_cpu;
+ 	cpumask_clear_cpu(possible_next_cpu, cpus_unused_mask);
+ 
++	sdest = dpaa2_dpio_get_cluster_sdest(dpio_dev, desc.cpu);
++	if (sdest >= 0) {
++		err = dpio_set_stashing_destination(dpio_dev->mc_io, 0,
++						    dpio_dev->mc_handle,
++						    sdest);
++		if (err)
++			dev_err(dev, "dpio_set_stashing_destination failed for cpu%d\n",
++				desc.cpu);
++	}
++
+ 	/*
+ 	 * Set the CENA regs to be the cache inhibited area of the portal to
+ 	 * avoid coherency issues if a user migrates to another core.
+diff --git a/drivers/soc/fsl/dpio/dpio.c b/drivers/soc/fsl/dpio/dpio.c
+index 521bc6946317..af74c597a675 100644
+--- a/drivers/soc/fsl/dpio/dpio.c
++++ b/drivers/soc/fsl/dpio/dpio.c
+@@ -166,6 +166,22 @@ int dpio_get_attributes(struct fsl_mc_io *mc_io,
+ 	return 0;
+ }
+ 
++int dpio_set_stashing_destination(struct fsl_mc_io *mc_io,
++				  u32 cmd_flags,
++				  u16 token,
++				  u8 sdest)
++{
++	struct fsl_mc_command cmd = { 0 };
++	struct dpio_stashing_dest *dpio_cmd;
++
++	cmd.header = mc_encode_cmd_header(DPIO_CMDID_SET_STASHING_DEST,
++					  cmd_flags, token);
++	dpio_cmd = (struct dpio_stashing_dest *)cmd.params;
++	dpio_cmd->sdest = sdest;
++
++	return mc_send_command(mc_io, &cmd);
++}
++
+ /**
+  * dpio_get_api_version - Get Data Path I/O API version
+  * @mc_io:	Pointer to MC portal's DPIO object
+diff --git a/drivers/soc/fsl/dpio/dpio.h b/drivers/soc/fsl/dpio/dpio.h
+index b2ac4ba4fb8e..da06f7258098 100644
+--- a/drivers/soc/fsl/dpio/dpio.h
++++ b/drivers/soc/fsl/dpio/dpio.h
+@@ -75,6 +75,11 @@ int dpio_get_attributes(struct fsl_mc_io	*mc_io,
+ 			u16		token,
+ 			struct dpio_attr	*attr);
+ 
++int dpio_set_stashing_destination(struct fsl_mc_io *mc_io,
++				  u32 cmd_flags,
++				  u16 token,
++				  u8 dest);
++
+ int dpio_get_api_version(struct fsl_mc_io *mc_io,
+ 			 u32 cmd_flags,
+ 			 u16 *major_ver,
+-- 
+2.17.1
+

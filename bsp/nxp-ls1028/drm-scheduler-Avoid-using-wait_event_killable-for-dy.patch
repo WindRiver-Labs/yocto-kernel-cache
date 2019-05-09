@@ -1,0 +1,208 @@
+From ef85ae0d7f4027e1d7826b45ddadd1a28891f0b0 Mon Sep 17 00:00:00 2001
+From: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Date: Wed, 30 May 2018 15:11:01 -0400
+Subject: [PATCH 223/706] drm/scheduler: Avoid using wait_event_killable for
+ dying process (V4)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Dying process might be blocked from receiving any more signals
+so avoid using it.
+
+Also retire enity->fini_status and just check the SW queue,
+if it's not empty do the fallback cleanup.
+
+Also handle entity->last_scheduled == NULL use case which
+happens when HW ring is already hangged whem a  new entity
+tried to enqeue jobs.
+
+v2:
+Return the remaining timeout and use that as parameter for the next call.
+This way when we need to cleanup multiple queues we don't wait for the
+entire TO period for each queue but rather in total.
+Styling comments.
+Rebase.
+
+v3:
+Update types from unsigned to long.
+Work with jiffies instead of ms.
+Return 0 when TO expires.
+Rebase.
+
+v4:
+Remove unnecessary timeout calculation.
+
+Signed-off-by: Andrey Grodzovsky <andrey.grodzovsky@amd.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 741f01e636b72ff3f81204fd595ac1078907671b)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/gpu/drm/scheduler/gpu_scheduler.c | 67 +++++++++++++++++------
+ include/drm/gpu_scheduler.h               |  7 ++-
+ 2 files changed, 53 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/scheduler/gpu_scheduler.c b/drivers/gpu/drm/scheduler/gpu_scheduler.c
+index 8c1e80c9b674..6a316701da73 100644
+--- a/drivers/gpu/drm/scheduler/gpu_scheduler.c
++++ b/drivers/gpu/drm/scheduler/gpu_scheduler.c
+@@ -181,7 +181,6 @@ int drm_sched_entity_init(struct drm_gpu_scheduler *sched,
+ 	entity->rq = rq;
+ 	entity->sched = sched;
+ 	entity->guilty = guilty;
+-	entity->fini_status = 0;
+ 	entity->last_scheduled = NULL;
+ 
+ 	spin_lock_init(&entity->rq_lock);
+@@ -219,7 +218,8 @@ static bool drm_sched_entity_is_initialized(struct drm_gpu_scheduler *sched,
+ static bool drm_sched_entity_is_idle(struct drm_sched_entity *entity)
+ {
+ 	rmb();
+-	if (spsc_queue_peek(&entity->job_queue) == NULL)
++
++	if (!entity->rq || spsc_queue_peek(&entity->job_queue) == NULL)
+ 		return true;
+ 
+ 	return false;
+@@ -260,25 +260,39 @@ static void drm_sched_entity_kill_jobs_cb(struct dma_fence *f,
+  *
+  * @sched: scheduler instance
+  * @entity: scheduler entity
++ * @timeout: time to wait in for Q to become empty in jiffies.
+  *
+  * Splitting drm_sched_entity_fini() into two functions, The first one does the waiting,
+  * removes the entity from the runqueue and returns an error when the process was killed.
++ *
++ * Returns the remaining time in jiffies left from the input timeout
+  */
+-void drm_sched_entity_do_release(struct drm_gpu_scheduler *sched,
+-			   struct drm_sched_entity *entity)
++long drm_sched_entity_do_release(struct drm_gpu_scheduler *sched,
++			   struct drm_sched_entity *entity, long timeout)
+ {
++	long ret = timeout;
++
+ 	if (!drm_sched_entity_is_initialized(sched, entity))
+-		return;
++		return ret;
+ 	/**
+ 	 * The client will not queue more IBs during this fini, consume existing
+ 	 * queued IBs or discard them on SIGKILL
+ 	*/
+-	if ((current->flags & PF_SIGNALED) && current->exit_code == SIGKILL)
+-		entity->fini_status = -ERESTARTSYS;
+-	else
+-		entity->fini_status = wait_event_killable(sched->job_scheduled,
+-					drm_sched_entity_is_idle(entity));
+-	drm_sched_entity_set_rq(entity, NULL);
++	if (current->flags & PF_EXITING) {
++		if (timeout)
++			ret = wait_event_timeout(
++					sched->job_scheduled,
++					drm_sched_entity_is_idle(entity),
++					timeout);
++	} else
++		wait_event_killable(sched->job_scheduled, drm_sched_entity_is_idle(entity));
++
++
++	/* For killed process disable any more IBs enqueue right now */
++	if ((current->flags & PF_EXITING) && (current->exit_code == SIGKILL))
++		drm_sched_entity_set_rq(entity, NULL);
++
++	return ret;
+ }
+ EXPORT_SYMBOL(drm_sched_entity_do_release);
+ 
+@@ -290,11 +304,18 @@ EXPORT_SYMBOL(drm_sched_entity_do_release);
+  *
+  * This should be called after @drm_sched_entity_do_release. It goes over the
+  * entity and signals all jobs with an error code if the process was killed.
++ *
+  */
+ void drm_sched_entity_cleanup(struct drm_gpu_scheduler *sched,
+ 			   struct drm_sched_entity *entity)
+ {
+-	if (entity->fini_status) {
++
++	drm_sched_entity_set_rq(entity, NULL);
++
++	/* Consumption of existing IBs wasn't completed. Forcefully
++	 * remove them here.
++	 */
++	if (spsc_queue_peek(&entity->job_queue)) {
+ 		struct drm_sched_job *job;
+ 		int r;
+ 
+@@ -314,12 +335,22 @@ void drm_sched_entity_cleanup(struct drm_gpu_scheduler *sched,
+ 			struct drm_sched_fence *s_fence = job->s_fence;
+ 			drm_sched_fence_scheduled(s_fence);
+ 			dma_fence_set_error(&s_fence->finished, -ESRCH);
+-			r = dma_fence_add_callback(entity->last_scheduled, &job->finish_cb,
+-							drm_sched_entity_kill_jobs_cb);
+-			if (r == -ENOENT)
++
++			/*
++			 * When pipe is hanged by older entity, new entity might
++			 * not even have chance to submit it's first job to HW
++			 * and so entity->last_scheduled will remain NULL
++			 */
++			if (!entity->last_scheduled) {
+ 				drm_sched_entity_kill_jobs_cb(NULL, &job->finish_cb);
+-			else if (r)
+-				DRM_ERROR("fence add callback failed (%d)\n", r);
++			} else {
++				r = dma_fence_add_callback(entity->last_scheduled, &job->finish_cb,
++								drm_sched_entity_kill_jobs_cb);
++				if (r == -ENOENT)
++					drm_sched_entity_kill_jobs_cb(NULL, &job->finish_cb);
++				else if (r)
++					DRM_ERROR("fence add callback failed (%d)\n", r);
++			}
+ 		}
+ 	}
+ 
+@@ -339,7 +370,7 @@ EXPORT_SYMBOL(drm_sched_entity_cleanup);
+ void drm_sched_entity_fini(struct drm_gpu_scheduler *sched,
+ 				struct drm_sched_entity *entity)
+ {
+-	drm_sched_entity_do_release(sched, entity);
++	drm_sched_entity_do_release(sched, entity, MAX_WAIT_SCHED_ENTITY_Q_EMPTY);
+ 	drm_sched_entity_cleanup(sched, entity);
+ }
+ EXPORT_SYMBOL(drm_sched_entity_fini);
+diff --git a/include/drm/gpu_scheduler.h b/include/drm/gpu_scheduler.h
+index 496442f12bff..7c2dfd6cc1af 100644
+--- a/include/drm/gpu_scheduler.h
++++ b/include/drm/gpu_scheduler.h
+@@ -27,6 +27,8 @@
+ #include <drm/spsc_queue.h>
+ #include <linux/dma-fence.h>
+ 
++#define MAX_WAIT_SCHED_ENTITY_Q_EMPTY msecs_to_jiffies(1000)
++
+ struct drm_gpu_scheduler;
+ struct drm_sched_rq;
+ 
+@@ -84,7 +86,6 @@ struct drm_sched_entity {
+ 	struct dma_fence		*dependency;
+ 	struct dma_fence_cb		cb;
+ 	atomic_t			*guilty;
+-	int                             fini_status;
+ 	struct dma_fence                *last_scheduled;
+ };
+ 
+@@ -283,8 +284,8 @@ int drm_sched_entity_init(struct drm_gpu_scheduler *sched,
+ 			  struct drm_sched_entity *entity,
+ 			  struct drm_sched_rq *rq,
+ 			  atomic_t *guilty);
+-void drm_sched_entity_do_release(struct drm_gpu_scheduler *sched,
+-			   struct drm_sched_entity *entity);
++long drm_sched_entity_do_release(struct drm_gpu_scheduler *sched,
++			   struct drm_sched_entity *entity, long timeout);
+ void drm_sched_entity_cleanup(struct drm_gpu_scheduler *sched,
+ 			   struct drm_sched_entity *entity);
+ void drm_sched_entity_fini(struct drm_gpu_scheduler *sched,
+-- 
+2.17.1
+

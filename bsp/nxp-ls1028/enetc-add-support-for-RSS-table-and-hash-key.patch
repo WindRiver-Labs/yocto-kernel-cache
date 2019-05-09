@@ -1,0 +1,190 @@
+From dcf6c18fe311507cc25e485edfc2c2d7ae7d096b Mon Sep 17 00:00:00 2001
+From: Alex Marginean <alexandru.marginean@freescale.com>
+Date: Wed, 25 Oct 2017 19:20:50 +0300
+Subject: [PATCH 082/706] enetc: add support for RSS table and hash key
+
+Set RSS table using:
+$ ethtool -X ethX [equal n | weight n .. | default]
+set hash key using:
+$ ethtool -X ethX hkey nn:nn:...:nn (40 bytes of nn's)
+
+Signed-off-by: Alex Marginean <alexandru.marginean@freescale.com>
+(cherry picked from commit a2dc89983f3109cf394bee8544ef54842f93ab9e)
+Signed-off-by: Zumeng Chen <zumeng.chen@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.h  |  2 +
+ .../net/ethernet/freescale/enetc/enetc_cbdr.c | 36 ++++++++++
+ .../ethernet/freescale/enetc/enetc_ethtool.c  | 67 +++++++++++++++++++
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  3 +
+ 4 files changed, 108 insertions(+)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.h b/drivers/net/ethernet/freescale/enetc/enetc.h
+index dc016b2cc0aa..a983625a5d94 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc.h
+@@ -161,6 +161,7 @@ struct enetc_ndev_priv {
+ 	struct enetc_bdr *rx_ring[16];
+ 
+ 	struct enetc_cls_rule *cls_rules;
++	u16 rss_table[64]; /* < TODO: remove and use HW results */
+ };
+ 
+ void enetc_set_ethtool_ops(struct net_device *ndev);
+@@ -168,3 +169,4 @@ void enetc_set_ethtool_ops(struct net_device *ndev);
+ void enetc_sync_mac_filters(struct enetc_si *si, int si_idx);
+ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 		       int index);
++int enetc_set_rss_table(struct enetc_si *si, u16 *table, int len);
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+index 3edeca24e524..93607f1acb78 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_cbdr.c
+@@ -41,6 +41,9 @@ static int enetc_send_cmd(struct enetc_si *si, struct enetc_cbd *cbd,
+ 	struct enetc_cbd *dest_cbd;
+ 	int i;
+ 
++	if (!ring->bd_base)
++		return -EIO;
++
+ 	if (async && !ENETC_RING_UNUSED(ring)) {
+ 		// TODO: support true async mode, with interrupts
+ 		// and separate cleanup task
+@@ -167,3 +170,36 @@ int enetc_set_fs_entry(struct enetc_si *si, struct enetc_cmd_rfse *rfse,
+ 
+ 	return err;
+ }
++
++/* Set RSS table */
++int enetc_set_rss_table(struct enetc_si *si, u16 *table, int len)
++{
++	struct enetc_cbd cbd = {.cmd = 0};
++	dma_addr_t dma;
++	int err;
++
++	if (len < 0x80)
++		/* HW only takes in a full 64 entry/128B table */
++		return -EINVAL;
++
++	/* fill up the "set" descriptor */
++	cbd.cmd = 1;
++	cbd.cls = 3;
++	cbd.length = len;
++
++	dma = dma_map_single(&si->pdev->dev, table, len, DMA_TO_DEVICE);
++	if (dma_mapping_error(&si->pdev->dev, dma)) {
++		netdev_err(si->ndev, "DMA mapping of RSS table failed!\n");
++		return -ENOMEM;
++	}
++
++	cbd.addr[0] = (u32)dma;
++	cbd.addr[1] = (u32)(dma >> 32);
++
++	err = enetc_send_cmd(si, &cbd, false);
++	if (err)
++		netdev_err(si->ndev, "RSS table update failed (%d)!", err);
++	dma_unmap_single(&si->pdev->dev, dma, cbd.length, DMA_TO_DEVICE);
++
++	return err;
++}
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c b/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+index d874a88fe3e5..e7135ccea7b8 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc_ethtool.c
+@@ -345,6 +345,69 @@ static int enetc_set_rxnfc(struct net_device *ndev, struct ethtool_rxnfc *rxnfc)
+ 	return 0;
+ }
+ 
++static u32 enetc_get_rxfh_key_size(struct net_device *ndev)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++
++	/* return the size of the RX flow hash key.  PF only */
++	return (priv->si->hw.port) ? ENETC_RSSHASH_KEY_SIZE : 0;
++}
++
++static u32 enetc_get_rxfh_indir_size(struct net_device *ndev)
++{
++	/* return the size of the RX flow hash indirection table */
++
++	return 64; /* TODO: use capabilities after moved to SI */
++}
++
++static int enetc_get_rxfh(struct net_device *ndev, u32 *indir, u8 *key,
++			  u8 *hfunc)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct enetc_hw *hw = &priv->si->hw;
++	int i;
++
++	/* return hash function */
++	if (hfunc)
++		*hfunc = ETH_RSS_HASH_TOP;
++
++	/* return RSS table */
++	if (indir)
++		for (i = 0; i < ARRAY_SIZE(priv->rss_table); i++)
++			indir[i] = priv->rss_table[i];
++
++	/* return hash key */
++	if (key && hw->port)
++		for (i = 0; i < ENETC_RSSHASH_KEY_SIZE / 4; i++)
++			((u32 *)key)[i] = enetc_port_rd(hw, ENETC_PRSSK(i));
++
++	return 0;
++}
++
++static int enetc_set_rxfh(struct net_device *ndev, const u32 *indir,
++			  const u8 *key, const u8 hfunc)
++{
++	struct enetc_ndev_priv *priv = netdev_priv(ndev);
++	struct enetc_hw *hw = &priv->si->hw;
++	int err = 0;
++	int i;
++
++	/* set hash key, if PF */
++	if (key && hw->port)
++		for (i = 0; i < ENETC_RSSHASH_KEY_SIZE / 4; i++)
++			enetc_port_wr(hw, ENETC_PRSSK(i), ((u32 *)key)[i]);
++
++	/* set RSS table */
++	if (indir) {
++		for (i = 0; i < 64; i++)
++			priv->rss_table[i] = (u16)indir[i];
++		err = enetc_set_rss_table(priv->si, priv->rss_table,
++					  sizeof(priv->rss_table));
++	}
++
++	return err;
++}
++
+ const struct ethtool_ops enetc_ethtool_ops = {
+ 	.get_regs_len = enetc_get_reglen,
+ 	.get_regs = enetc_get_regs,
+@@ -353,6 +416,10 @@ const struct ethtool_ops enetc_ethtool_ops = {
+ 	.get_ethtool_stats = enetc_get_ethtool_stats,
+ 	.get_rxnfc = enetc_get_rxnfc,
+ 	.set_rxnfc = enetc_set_rxnfc,
++	.get_rxfh_key_size = enetc_get_rxfh_key_size,
++	.get_rxfh_indir_size = enetc_get_rxfh_indir_size,
++	.get_rxfh = enetc_get_rxfh,
++	.set_rxfh = enetc_set_rxfh,
+ };
+ 
+ void enetc_set_ethtool_ops(struct net_device *ndev)
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index 0b7ace2b372f..699d476df6f3 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -102,6 +102,9 @@ enum enetc_bdr_type {TX, RX};
+ #define ENETC_PVCFGR_SET_TXBDR(val)	((val) & 0xff)
+ #define ENETC_PVCFGR_SET_RXBDR(val)	(((val) & 0xff) << 16)
+ 
++#define ENETC_RSSHASH_KEY_SIZE	40
++#define ENETC_PRSSK(n)		(0x01410 + (n) * 4) /* n = [0..9] */
++
+ #define ENETC_PRFSMR		0x01800
+ #define ENETC_PRFSMR_RFSE	BIT(31)
+ #define ENETC_PRFSCAPR		0x01804
+-- 
+2.17.1
+
