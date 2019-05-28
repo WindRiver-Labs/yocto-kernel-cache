@@ -1,0 +1,331 @@
+From 9f9325c88d06f99e4b424bb7acb603445cbb2189 Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Tue, 18 Sep 2018 12:12:18 +0530
+Subject: [PATCH 0207/1051] soc: octeontx2: Add workaround for errata NDC-35094
+
+NDC writes back cache data to memory on a NIX (NPA) NDC sync
+and also invalidates cache data on a NIX (NPA) LF reset.
+
+Due to the errata, an NDC sync may flush incorrect data, and an
+NDC sync or LF reset may signal completion too early.
+
+The workaround is to block all NDC requests until the sync
+/reset operation is completed for that particular LF and
+also add sufficient delay for completion.
+
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/Makefile  |   2 +-
+ drivers/soc/marvell/octeontx2/rvu.c     |   4 +
+ drivers/soc/marvell/octeontx2/rvu.h     |  20 +++
+ drivers/soc/marvell/octeontx2/rvu_ndc.c | 183 ++++++++++++++++++++++++
+ drivers/soc/marvell/octeontx2/rvu_nix.c |   5 +-
+ drivers/soc/marvell/octeontx2/rvu_reg.h |   1 +
+ 6 files changed, 211 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/soc/marvell/octeontx2/rvu_ndc.c
+
+diff --git a/drivers/soc/marvell/octeontx2/Makefile b/drivers/soc/marvell/octeontx2/Makefile
+index 4a1a118d75a7..9ef1b15d3202 100644
+--- a/drivers/soc/marvell/octeontx2/Makefile
++++ b/drivers/soc/marvell/octeontx2/Makefile
+@@ -8,5 +8,5 @@ obj-$(CONFIG_OCTEONTX2_AF) += octeontx2_af.o
+ 
+ octeontx2_cgx-y := cgx.o
+ octeontx2_af-y := rvu.o mbox.o rvu_cgx.o rvu_npa.o rvu_sso.o \
+-		  rvu_nix.o rvu_reg.o rvu_npc.o rvu_debugfs.o \
++		  rvu_nix.o rvu_reg.o rvu_npc.o rvu_ndc.o rvu_debugfs.o \
+ 		  rvu_validation.o
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index ed368f36327a..207648c5c69e 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -381,6 +381,10 @@ int rvu_lf_reset(struct rvu *rvu, struct rvu_block *block, int lf)
+ 	if (!block->implemented)
+ 		return 0;
+ 
++	if (((block->type == BLKTYPE_NIX || block->type == BLKTYPE_NPA)) &&
++	    (is_rvu_9xxx_A0(rvu)))
++		return rvu_lf_reset_ndc_errata_workaround(rvu, block, lf);
++
+ 	rvu_write64(rvu, block->addr, block->lfreset_reg, lf | BIT_ULL(12));
+ 	err = rvu_poll_reg(rvu, block->addr, block->lfreset_reg, BIT_ULL(12),
+ 			   true);
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index 9ddf92778c67..8fea6ab19af6 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -11,11 +11,15 @@
+ #ifndef RVU_H
+ #define RVU_H
+ 
++#include <linux/pci.h>
+ #include "rvu_struct.h"
+ #include "common.h"
+ #include "mbox.h"
+ #include "rvu_validation.h"
+ 
++/* Subsystem Device ID */
++#define PCI_SUBSYS_DEVID_96XX			0xB200
++
+ /* PCI device IDs */
+ #define	PCI_DEVID_OCTEONTX2_RVU_AF		0xA065
+ 
+@@ -303,6 +307,14 @@ static inline u64 rvupf_read64(struct rvu *rvu, u64 offset)
+ 	return readq(rvu->pfreg_base + offset);
+ }
+ 
++static inline bool is_rvu_9xxx_A0(struct rvu *rvu)
++{
++	struct pci_dev *pdev = rvu->pdev;
++
++	return (pdev->revision == 0x00) &&
++		(pdev->subsystem_device == PCI_SUBSYS_DEVID_96XX);
++}
++
+ /* Function Prototypes
+  * RVU
+  */
+@@ -324,6 +336,8 @@ void rvu_get_pf_numvfs(struct rvu *rvu, int pf, int *numvfs, int *hwvf);
+ bool is_block_implemented(struct rvu_hwinfo *hw, int blkaddr);
+ int rvu_get_lf(struct rvu *rvu, struct rvu_block *block, u16 pcifunc, u16 slot);
+ int rvu_lf_reset(struct rvu *rvu, struct rvu_block *block, int lf);
++int rvu_lf_reset_ndc_errata_workaround(struct rvu *rvu, struct rvu_block *block,
++				   int lf);
+ int rvu_get_blkaddr(struct rvu *rvu, int blktype, u16 pcifunc);
+ int rvu_poll_reg(struct rvu *rvu, u64 block, u64 offset, u64 mask, bool zero);
+ 
+@@ -534,6 +548,12 @@ int rvu_mbox_handler_NPC_MCAM_ALLOC_AND_WRITE_ENTRY(struct rvu *rvu,
+ int rvu_mbox_handler_NPC_GET_KEX_CFG(struct rvu *rvu, struct msg_req *req,
+ 				     struct npc_get_kex_cfg_rsp *rsp);
+ 
++/* NDC APIs */
++int rvu_ndc_sync(struct rvu *rvu, int lfblkid, int lfidx, u64 lfoffset,
++		 int ndcblkid);
++
++int rvu_ndc_sync_errata_workaround(struct rvu *rvu, int lfblkaddr, int lfidx,
++				   u64 lfoffset, int ndcblkaddr);
+ #ifdef CONFIG_DEBUG_FS
+ void rvu_dbg_init(struct rvu *rvu);
+ void rvu_dbg_exit(struct rvu *rvu);
+diff --git a/drivers/soc/marvell/octeontx2/rvu_ndc.c b/drivers/soc/marvell/octeontx2/rvu_ndc.c
+new file mode 100644
+index 000000000000..7cad5c1c6f07
+--- /dev/null
++++ b/drivers/soc/marvell/octeontx2/rvu_ndc.c
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 RVU Admin Function driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/pci.h>
++
++#include "rvu.h"
++#include "rvu_reg.h"
++
++static int ndc_errata_35094_preop(struct rvu *rvu, int blkaddr)
++{
++	u64 port_rc[6], port_wc[6];
++	int port, retry_count;
++	bool retry;
++	u64 val;
++
++	/* Enable full backpressure to stall all NDC requests */
++	val = rvu_read64(rvu, blkaddr, NDC_AF_BP_TEST(0));
++	val |= BIT_ULL(61);
++	val &= ~GENMASK_ULL(23, 16);
++	rvu_write64(rvu, blkaddr, NDC_AF_BP_TEST(0), val);
++
++	val = rvu_read64(rvu, blkaddr, NDC_AF_BP_TEST_ENABLE);
++	val |= GENMASK_ULL(43, 40);
++	rvu_write64(rvu, blkaddr, NDC_AF_BP_TEST_ENABLE, val);
++
++	/* Wait for OUTSTD_PC read and write count to be contstant
++	 * over a period of 5 us
++	 */
++	retry_count = 0;
++	do {
++		retry = false;
++
++		/* Take snapshot */
++		for (port = 0; port < 6; port++) {
++			port_rc[port] =  rvu_read64(rvu, blkaddr,
++						 NDC_AF_PORTX_RTX_RWX_OSTDN_PC
++						 (port, CACHING,
++						  NDC_READ_TRANS));
++
++			port_wc[port] =  rvu_read64(rvu, blkaddr,
++						 NDC_AF_PORTX_RTX_RWX_OSTDN_PC
++						 (port, CACHING,
++						  NDC_WRITE_TRANS));
++		}
++
++		udelay(5);
++
++		/* Verify for any change after the wait period */
++		for (port = 0; port < 6; port++) {
++			val =  rvu_read64(rvu, blkaddr,
++						NDC_AF_PORTX_RTX_RWX_OSTDN_PC
++						 (port, CACHING,
++						  NDC_READ_TRANS));
++			if (val ^ port_rc[port]) {
++				retry = true;
++				break;
++			}
++
++			val =  rvu_read64(rvu, blkaddr,
++						 NDC_AF_PORTX_RTX_RWX_OSTDN_PC
++						 (port, CACHING,
++						  NDC_WRITE_TRANS));
++			if (val ^ port_wc[port]) {
++				retry = true;
++				break;
++			}
++		}
++
++		retry_count++;
++		if (retry_count > 200) /* time out of ~1ms */
++			return -EIO;
++
++	} while (retry);
++
++	return 0;
++}
++
++static int ndc_errata_35094_preop_blk(struct rvu *rvu, int blktype)
++{
++	int err = 0;
++
++	if (blktype == BLKTYPE_NIX) {
++		err = ndc_errata_35094_preop(rvu, BLKADDR_NDC_NIX0_RX);
++		if (err)
++			return err;
++		return ndc_errata_35094_preop(rvu, BLKADDR_NDC_NIX0_TX);
++	} else if (blktype == BLKTYPE_NPA) {
++		return ndc_errata_35094_preop(rvu, BLKADDR_NDC_NPA0);
++	}
++
++	return 0;
++}
++
++static void ndc_errata_35094_postop1(struct rvu *rvu, int blkaddr)
++{
++	u64 val;
++
++	val = rvu_read64(rvu, blkaddr, NDC_AF_BP_TEST_ENABLE);
++	val &= ~GENMASK_ULL(43, 40);
++	rvu_write64(rvu, blkaddr, NDC_AF_BP_TEST_ENABLE, val);
++}
++
++static void ndc_errata_35094_postop1_blk(struct rvu *rvu, int blktype)
++{
++	if (blktype == BLKTYPE_NIX) {
++		ndc_errata_35094_postop1(rvu, BLKADDR_NDC_NIX0_RX);
++		ndc_errata_35094_postop1(rvu, BLKADDR_NDC_NIX0_TX);
++	} else if (blktype == BLKTYPE_NPA) {
++		ndc_errata_35094_postop1(rvu, BLKADDR_NDC_NPA0);
++	}
++}
++
++static void ndc_errata_35094_postop2(void)
++{
++	udelay(50);
++}
++
++int rvu_ndc_sync_errata_workaround(struct rvu *rvu, int lfblkaddr, int lfidx,
++				   u64 lfoffset, int ndcblkaddr)
++{
++	int err;
++
++	err = ndc_errata_35094_preop(rvu, ndcblkaddr);
++	if (err)
++		return err;
++
++	/* Sync cached info for this LF in NDC to LLC/DRAM */
++	rvu_write64(rvu, lfblkaddr, lfoffset, BIT_ULL(12) | lfidx);
++
++	ndc_errata_35094_postop1(rvu, ndcblkaddr);
++
++	err = rvu_poll_reg(rvu, lfblkaddr, lfoffset, BIT_ULL(12), true);
++
++	ndc_errata_35094_postop2();
++
++	return err;
++}
++
++int rvu_lf_reset_ndc_errata_workaround(struct rvu *rvu, struct rvu_block *block,
++				   int lf)
++{
++	int err;
++
++	err = ndc_errata_35094_preop_blk(rvu, block->type);
++	if (err)
++		return err;
++
++	/* Do LF reset operation */
++	rvu_write64(rvu, block->addr, block->lfreset_reg, lf | BIT_ULL(12));
++
++	ndc_errata_35094_postop1_blk(rvu, block->type);
++
++	err = rvu_poll_reg(rvu, block->addr, block->lfreset_reg, BIT_ULL(12),
++			   true);
++
++	ndc_errata_35094_postop2();
++
++	return err;
++}
++
++int rvu_ndc_sync(struct rvu *rvu, int lfblkaddr, int lfidx,
++		 u64 lfoffset, int ndcblkaddr)
++{
++	int err;
++
++	if (is_rvu_9xxx_A0(rvu))
++		return rvu_ndc_sync_errata_workaround(rvu, lfblkaddr, lfidx,
++						      lfoffset, ndcblkaddr);
++
++	/* Sync cached info for this LF in NDC to LLC/DRAM */
++	rvu_write64(rvu, lfblkaddr, lfoffset, BIT_ULL(12) | lfidx);
++
++	err = rvu_poll_reg(rvu, lfblkaddr, lfoffset, BIT_ULL(12), true);
++
++	return err;
++}
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+index 1650254ded7b..f07606ba8476 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_nix.c
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -1241,9 +1241,8 @@ static int nix_txschq_free(struct rvu *rvu, u16 pcifunc)
+ 	}
+ 	mutex_unlock(&rvu->rsrc_lock);
+ 
+-	/* Sync cached info for this LF in NDC-TX to LLC/DRAM */
+-	rvu_write64(rvu, blkaddr, NIX_AF_NDC_TX_SYNC, BIT_ULL(12) | nixlf);
+-	err = rvu_poll_reg(rvu, blkaddr, NIX_AF_NDC_TX_SYNC, BIT_ULL(12), true);
++	err = rvu_ndc_sync(rvu, blkaddr, nixlf, NIX_AF_NDC_TX_SYNC,
++			   BLKADDR_NDC_NIX0_TX);
+ 	if (err)
+ 		dev_err(rvu->dev, "NDC-TX sync failed for NIXLF %d\n", nixlf);
+ 
+diff --git a/drivers/soc/marvell/octeontx2/rvu_reg.h b/drivers/soc/marvell/octeontx2/rvu_reg.h
+index 2cc8daac1102..f85a950b97ba 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_reg.h
++++ b/drivers/soc/marvell/octeontx2/rvu_reg.h
+@@ -601,6 +601,7 @@
+ #define NDC_AF_INTR_ENA_W1C		(0x00070)
+ #define NDC_AF_ACTIVE_PC		(0x00078)
+ #define NDC_AF_BP_TEST_ENABLE		(0x001F8)
++#define NDC_AF_BP_TEST(a)		(0x00200 | (a) << 3)
+ #define NDC_AF_BLK_RST			(0x002F0)
+ #define NDC_PRIV_AF_INT_CFG		(0x002F8)
+ #define NDC_AF_HASHX(a)			(0x00300 | (a) << 3)
+-- 
+2.17.1
+

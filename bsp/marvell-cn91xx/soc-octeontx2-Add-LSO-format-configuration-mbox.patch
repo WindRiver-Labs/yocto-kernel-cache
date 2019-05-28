@@ -1,0 +1,229 @@
+From 96bb5143b01ffabb35378820946198b0e1101bdc Mon Sep 17 00:00:00 2001
+From: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Date: Fri, 26 Oct 2018 12:27:15 +0530
+Subject: [PATCH 0358/1051] soc: octeontx2: Add LSO format configuration mbox
+
+Add mbox interface to dynamically reserve and
+configure LSO format.
+
+This commit also fixes 'sizem1' for NIX_LSOALG_TCP_FLAGS
+to '1' i.e 2 Bytes.
+
+Signed-off-by: Nithin Dabilpuram <ndabilpuram@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/mbox.h    | 17 +++++-
+ drivers/soc/marvell/octeontx2/rvu.h     | 10 +++-
+ drivers/soc/marvell/octeontx2/rvu_nix.c | 72 ++++++++++++++++++++++---
+ 3 files changed, 91 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index e5ad5175daa6..674e3bb11c36 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -199,7 +199,8 @@ M(NIX_SET_HW_FRS,	0x800c, nix_frs_cfg, msg_rsp)			\
+ M(NIX_LF_START_RX,	0x800d, msg_req, msg_rsp)			\
+ M(NIX_LF_STOP_RX,	0x800e, msg_req, msg_rsp)			\
+ M(NIX_MARK_FORMAT_CFG,	0x800f, nix_mark_format_cfg, nix_mark_format_cfg_rsp)\
+-M(NIX_SET_RX_CFG,  0x8010, nix_rx_cfg, msg_rsp)
++M(NIX_SET_RX_CFG,  0x8010, nix_rx_cfg, msg_rsp)				\
++M(NIX_LSO_FORMAT_CFG,   0x8011, nix_lso_format_cfg, nix_lso_format_cfg_rsp)
+ 
+ /* Messages initiated by AF (range 0xC00 - 0xDFF) */
+ #define MBOX_UP_CGX_MESSAGES						\
+@@ -431,6 +432,7 @@ enum nix_af_status {
+ 	NIX_AF_ERR_RSS_NOSPC_FIELD  = -415,
+ 	NIX_AF_ERR_RSS_NOSPC_ALGO   = -416,
+ 	NIX_AF_ERR_MARK_CFG_FAIL    = -417,
++	NIX_AF_ERR_LSO_CFG_FAIL     = -418,
+ };
+ 
+ /* For NIX LF context alloc and init */
+@@ -635,6 +637,19 @@ struct nix_frs_cfg {
+ 	u16	minlen;
+ };
+ 
++struct nix_lso_format_cfg {
++	struct mbox_msghdr hdr;
++	u64 field_mask;
++#define NIX_LSO_FIELD_MAX	8
++	u64 fields[NIX_LSO_FIELD_MAX];
++};
++
++struct nix_lso_format_cfg_rsp {
++	struct mbox_msghdr hdr;
++	u8 lso_format_idx;
++};
++
++
+ /* SSO mailbox error codes
+  * Range 501 - 600.
+  */
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index a8636c30257d..2645d248ed4d 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -210,11 +210,17 @@ struct nix_flowkey {
+ 	int in_use;
+ };
+ 
++struct nix_lso {
++	u8 total;
++	u8 in_use;
++};
++
+ struct nix_hw {
+ 	struct nix_txsch txsch[NIX_TXSCH_LVL_CNT]; /* Tx schedulers */
+ 	struct nix_mcast mcast;
+ 	struct nix_flowkey flowkey;
+ 	struct nix_mark_format mark_format;
++	struct nix_lso lso;
+ };
+ 
+ struct rvu_hwinfo {
+@@ -504,7 +510,9 @@ int rvu_mbox_handler_NIX_MARK_FORMAT_CFG(struct rvu *rvu,
+ 					 struct nix_mark_format_cfg_rsp *rsp);
+ int rvu_mbox_handler_NIX_SET_RX_CFG(struct rvu *rvu, struct nix_rx_cfg *req,
+ 				struct msg_rsp *rsp);
+-
++int rvu_mbox_handler_NIX_LSO_FORMAT_CFG(struct rvu *rvu,
++					struct nix_lso_format_cfg *req,
++					struct nix_lso_format_cfg_rsp *rsp);
+ 
+ /* NPC APIs */
+ int rvu_npc_init(struct rvu *rvu);
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+index 29c1ff51e1d3..f1e29b79855d 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_nix.c
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -297,17 +297,21 @@ static void nix_setup_lso_tso_l4(struct rvu *rvu, int blkaddr,
+ 	/* TCP's flags field */
+ 	field.layer = NIX_TXLAYER_OL4;
+ 	field.offset = 12;
+-	field.sizem1 = 0; /* not needed */
++	field.sizem1 = 1; /* 2 bytes */
+ 	field.alg = NIX_LSOALG_TCP_FLAGS;
+ 	rvu_write64(rvu, blkaddr,
+ 		    NIX_AF_LSO_FORMATX_FIELDX(format, (*fidx)++),
+ 		    *(u64 *)&field);
+ }
+ 
+-static void nix_setup_lso(struct rvu *rvu, int blkaddr)
++static void nix_setup_lso(struct rvu *rvu, struct nix_hw *nix_hw, int blkaddr)
+ {
+ 	u64 cfg, idx, fidx = 0;
+ 
++	/* Get max HW supported format indices */
++	cfg = (rvu_read64(rvu, blkaddr, NIX_AF_CONST1) >> 48) & 0xFF;
++	nix_hw->lso.total = cfg;
++
+ 	/* Enable LSO */
+ 	cfg = rvu_read64(rvu, blkaddr, NIX_AF_LSO_CFG);
+ 	/* For TSO, set first and middle segment flags to
+@@ -317,7 +321,10 @@ static void nix_setup_lso(struct rvu *rvu, int blkaddr)
+ 	cfg |= (0xFFF2ULL << 32) | (0xFFF2ULL << 16);
+ 	rvu_write64(rvu, blkaddr, NIX_AF_LSO_CFG, cfg | BIT_ULL(63));
+ 
+-	/* Configure format fields for TCPv4 segmentation offload */
++	/* Setup default static LSO formats
++	 *
++	 * Configure format fields for TCPv4 segmentation offload
++	 */
+ 	idx = NIX_LSO_FORMAT_IDX_TSOV4;
+ 	nix_setup_lso_tso_l3(rvu, blkaddr, idx, true, &fidx);
+ 	nix_setup_lso_tso_l4(rvu, blkaddr, idx, &fidx);
+@@ -327,6 +334,7 @@ static void nix_setup_lso(struct rvu *rvu, int blkaddr)
+ 		rvu_write64(rvu, blkaddr,
+ 			    NIX_AF_LSO_FORMATX_FIELDX(idx, fidx), 0x0ULL);
+ 	}
++	nix_hw->lso.in_use++;
+ 
+ 	/* Configure format fields for TCPv6 segmentation offload */
+ 	idx = NIX_LSO_FORMAT_IDX_TSOV6;
+@@ -339,6 +347,7 @@ static void nix_setup_lso(struct rvu *rvu, int blkaddr)
+ 		rvu_write64(rvu, blkaddr,
+ 			    NIX_AF_LSO_FORMATX_FIELDX(idx, fidx), 0x0ULL);
+ 	}
++	nix_hw->lso.in_use++;
+ }
+ 
+ static void nix_ctx_free(struct rvu *rvu, struct rvu_pfvf *pfvf)
+@@ -2684,9 +2693,6 @@ int rvu_nix_init(struct rvu *rvu)
+ 	/* Restore CINT timer delay to HW reset values */
+ 	rvu_write64(rvu, blkaddr, NIX_AF_CINT_DELAY, 0x0ULL);
+ 
+-	/* Configure segmentation offload formats */
+-	nix_setup_lso(rvu, blkaddr);
+-
+ 	if (blkaddr == BLKADDR_NIX0) {
+ 		hw->nix0 = devm_kzalloc(rvu->dev,
+ 					sizeof(struct nix_hw), GFP_KERNEL);
+@@ -2705,6 +2711,9 @@ int rvu_nix_init(struct rvu *rvu)
+ 		if (err)
+ 			return err;
+ 
++		/* Configure segmentation offload formats */
++		nix_setup_lso(rvu, hw->nix0, blkaddr);
++
+ 		/* Config Outer/Inner L2, IP, TCP, UDP and SCTP NPC layer info.
+ 		 * This helps HW protocol checker to identify headers
+ 		 * and validate length and checksums.
+@@ -2849,3 +2858,54 @@ int rvu_mbox_handler_NIX_LF_STOP_RX(struct rvu *rvu, struct msg_req *req,
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ 	return 0;
+ }
++
++int rvu_mbox_handler_NIX_LSO_FORMAT_CFG(struct rvu *rvu,
++					struct nix_lso_format_cfg *req,
++					struct nix_lso_format_cfg_rsp *rsp)
++{
++	u16 pcifunc = req->hdr.pcifunc;
++	struct nix_hw *nix_hw;
++	struct rvu_pfvf *pfvf;
++	int blkaddr, idx, f;
++	u64 reg;
++
++	pfvf = rvu_get_pfvf(rvu, pcifunc);
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
++	if (!pfvf->nixlf || (blkaddr < 0))
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	nix_hw = get_nix_hw(rvu->hw, blkaddr);
++	if (!nix_hw)
++		return -EINVAL;
++
++	/* Find existing matching LSO format, if any */
++	for (idx = 0; idx < nix_hw->lso.in_use; idx++) {
++		for (f = 0; f < NIX_LSO_FIELD_MAX; f++) {
++			reg = rvu_read64(rvu, blkaddr,
++					 NIX_AF_LSO_FORMATX_FIELDX(idx, f));
++			if (req->fields[f] != (reg & req->field_mask))
++				break;
++		}
++
++		if (f == NIX_LSO_FIELD_MAX)
++			break;
++	}
++
++	if (idx < nix_hw->lso.in_use) {
++		/* Match found */
++		rsp->lso_format_idx = idx;
++		return 0;
++	}
++
++	if (nix_hw->lso.in_use == nix_hw->lso.total)
++		return NIX_AF_ERR_LSO_CFG_FAIL;
++
++	rsp->lso_format_idx = nix_hw->lso.in_use++;
++
++	for (f = 0; f < NIX_LSO_FIELD_MAX; f++)
++		rvu_write64(rvu, blkaddr,
++			    NIX_AF_LSO_FORMATX_FIELDX(rsp->lso_format_idx, f),
++			    req->fields[f]);
++
++	return 0;
++}
+-- 
+2.17.1
+

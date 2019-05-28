@@ -1,0 +1,124 @@
+From 4bb10c7558838645605053fff58a177156213f83 Mon Sep 17 00:00:00 2001
+From: Christina Jacob <Christina.Jacob@cavium.com>
+Date: Fri, 19 Oct 2018 10:07:36 +0300
+Subject: [PATCH 0339/1051] net: thunderx: Doubling max_queues only when there
+ is an xdp program attached
+
+To provide queues for xdp on T81/T83, max queues is doubled when there
+is an xdp program attached.
+Fixing the bug where pre-set maximum in ethtool is wrongly shown as
+double the actually available.
+Fixed unnecessary interrupts getting registered on trying to set tx/rx to
+more than actually available max queues using ethtool.
+
+Signed-off-by: Christina Jacob <Christina.Jacob@cavium.com>
+Signed-off-by: Yury Norov <ynorov@marvell.com>
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06.
+Just some minor context mods in order to port to wrlinux]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/cavium/thunder/nicvf_ethtool.c   | 14 +++++-----
+ .../net/ethernet/cavium/thunder/nicvf_main.c  | 27 ++++++++++---------
+ 2 files changed, 22 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c b/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c
+index 3638c5bb2174..f8be127a8000 100644
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_ethtool.c
+@@ -710,9 +710,8 @@ static void nicvf_get_channels(struct net_device *dev,
+ 	struct nicvf *nic = netdev_priv(dev);
+ 
+ 	memset(channel, 0, sizeof(*channel));
+-
+-	channel->max_rx = nic->max_queues;
+-	channel->max_tx = nic->max_queues;
++	channel->max_rx = nic->xdp_prog ? nic->max_queues / 2 : nic->max_queues;
++	channel->max_tx = nic->xdp_prog ? nic->max_queues / 2 : nic->max_queues;
+ 
+ 	channel->rx_count = nic->rx_queues;
+ 	channel->tx_count = nic->tx_queues;
+@@ -722,16 +721,17 @@ static void nicvf_get_channels(struct net_device *dev,
+ static int nicvf_set_channels(struct net_device *dev,
+ 			      struct ethtool_channels *channel)
+ {
++	u8 cqcount, txq_count, max_queues = 0;
+ 	struct nicvf *nic = netdev_priv(dev);
+-	int err = 0;
+ 	bool if_up = netif_running(dev);
+-	u8 cqcount, txq_count;
++	int err = 0;
+ 
++	max_queues = nic->xdp_prog ? nic->max_queues / 2 : nic->max_queues;
+ 	if (!channel->rx_count || !channel->tx_count)
+ 		return -EINVAL;
+-	if (channel->rx_count > nic->max_queues)
++	if (channel->rx_count > max_queues)
+ 		return -EINVAL;
+-	if (channel->tx_count > nic->max_queues)
++	if (channel->tx_count > max_queues)
+ 		return -EINVAL;
+ 
+ 	if (nic->xdp_prog &&
+diff --git a/drivers/net/ethernet/cavium/thunder/nicvf_main.c b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+index 91680420e15f..a80a53a0dcd4 100644
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_main.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+@@ -1918,6 +1918,17 @@ static int nicvf_xdp_setup(struct nicvf *nic, struct bpf_prog *prog)
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (if_up)
++		nicvf_stop(nic->netdev);
++
++	old_prog = xchg(&nic->xdp_prog, prog);
++	/* Detach old prog, if any */
++	if (old_prog) {
++		bpf_prog_put(old_prog);
++		if (!nic->t88)
++			nic->max_queues = nic->max_queues / 2;
++	}
++
+ 	/* ALL SQs attached to CQs i.e same as RQs, are treated as
+ 	 * XDP Tx queues and more Tx queues are allocated for
+ 	 * network stack to send pkts out.
+@@ -1925,23 +1936,17 @@ static int nicvf_xdp_setup(struct nicvf *nic, struct bpf_prog *prog)
+ 	 * No of Tx queues are either same as Rx queues or whatever
+ 	 * is left in max no of queues possible.
+ 	 */
+-	if ((nic->rx_queues + nic->tx_queues) > nic->max_queues) {
++	if ((nic->rx_queues + nic->tx_queues) > nic->max_queues * 2) {
+ 		netdev_warn(dev,
+ 			    "Failed to attach BPF prog, RXQs + TXQs > Max %d\n",
+-			    nic->max_queues);
++			    nic->max_queues * 2);
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (if_up)
+-		nicvf_stop(nic->netdev);
+-
+-	old_prog = xchg(&nic->xdp_prog, prog);
+-	/* Detach old prog, if any */
+-	if (old_prog)
+-		bpf_prog_put(old_prog);
+-
+ 	if (nic->xdp_prog) {
+ 		/* Attach BPF program */
++		if (!nic->t88)
++			nic->max_queues = nic->max_queues * 2;
+ 		nic->xdp_prog = bpf_prog_add(nic->xdp_prog, nic->rx_queues - 1);
+ 		if (!IS_ERR(nic->xdp_prog)) {
+ 			bpf_attached = true;
+@@ -2249,8 +2254,6 @@ static int nicvf_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	/* If no of CPUs are too low, there won't be any queues left
+ 	 * for XDP_TX, hence double it.
+ 	 */
+-	if (!nic->t88)
+-		nic->max_queues *= 2;
+ 	nic->ptp_clock = ptp_clock;
+ 
+ 	/* MAP VF's configuration registers */
+-- 
+2.17.1
+

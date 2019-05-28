@@ -1,0 +1,307 @@
+From 5f12a31f6f093c4a48b7daf7beafc1c6c3d6acef Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 16 Aug 2018 18:23:33 +0530
+Subject: [PATCH 0048/1051] soc: octeontx2: NPA block LF initialization
+
+Upon receiving NPA_LF_ALLOC mbox message allocate memory for
+NPALF's aura, pool and qint contexts and configure the same
+to HW. Enable caching of contexts into NPA NDC.
+
+Return pool related info like stack size, num pointers per
+stack page e.t.c to the mbox msg sender.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/common.h  |  22 ++++
+ drivers/soc/marvell/octeontx2/mbox.h    |  31 ++++++
+ drivers/soc/marvell/octeontx2/rvu.c     |  13 +++
+ drivers/soc/marvell/octeontx2/rvu.h     |  11 ++
+ drivers/soc/marvell/octeontx2/rvu_npa.c | 133 ++++++++++++++++++++++++
+ 5 files changed, 210 insertions(+)
+
+diff --git a/drivers/soc/marvell/octeontx2/common.h b/drivers/soc/marvell/octeontx2/common.h
+index cd5a9730f67d..76c0aa5e872e 100644
+--- a/drivers/soc/marvell/octeontx2/common.h
++++ b/drivers/soc/marvell/octeontx2/common.h
+@@ -57,4 +57,26 @@ struct admin_queue {
+ 	spinlock_t	lock; /* Serialize inst enqueue from PFs */
+ };
+ 
++/* NPA aura count */
++enum npa_aura_sz {
++	NPA_AURA_SZ_0,
++	NPA_AURA_SZ_128,
++	NPA_AURA_SZ_256,
++	NPA_AURA_SZ_512,
++	NPA_AURA_SZ_1K,
++	NPA_AURA_SZ_2K,
++	NPA_AURA_SZ_4K,
++	NPA_AURA_SZ_8K,
++	NPA_AURA_SZ_16K,
++	NPA_AURA_SZ_32K,
++	NPA_AURA_SZ_64K,
++	NPA_AURA_SZ_128K,
++	NPA_AURA_SZ_256K,
++	NPA_AURA_SZ_512K,
++	NPA_AURA_SZ_1M,
++	NPA_AURA_SZ_MAX,
++};
++
++#define NPA_AURA_COUNT(x)	(1ULL << ((x) + 6))
++
+ #endif /* COMMON_H */
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 8f6777dc803e..25e977be4e2a 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -138,6 +138,8 @@ M(CGX_GET_LINKINFO,	0x209, msg_req, cgx_link_info_msg)		\
+ M(CGX_INTLBK_ENABLE,	0x20A, msg_req, msg_rsp)			\
+ M(CGX_INTLBK_DISABLE,	0x20B, msg_req, msg_rsp)			\
+ /* NPA mbox IDs (range 0x400 - 0x5FF) */				\
++M(NPA_LF_ALLOC,		0x400, npa_lf_alloc_req, npa_lf_alloc_rsp)	\
++M(NPA_LF_FREE,		0x401, msg_req, msg_rsp)			\
+ /* SSO/SSOW mbox IDs (range 0x600 - 0x7FF) */				\
+ /* TIM mbox IDs (range 0x800 - 0x9FF) */				\
+ /* CPT mbox IDs (range 0xA00 - 0xBFF) */				\
+@@ -258,4 +260,33 @@ struct cgx_link_info_msg {
+ 	struct cgx_link_user_info link_info;
+ };
+ 
++/* NPA mbox message formats */
++
++/* NPA mailbox error codes
++ * Range 301 - 400.
++ */
++enum npa_af_status {
++	NPA_AF_ERR_PARAM            = -301,
++	NPA_AF_ERR_AQ_FULL          = -302,
++	NPA_AF_ERR_AQ_ENQUEUE       = -303,
++	NPA_AF_ERR_AF_LF_INVALID    = -304,
++	NPA_AF_ERR_AF_LF_ALLOC      = -305,
++	NPA_AF_ERR_LF_RESET         = -306,
++};
++
++/* For NPA LF context alloc and init */
++struct npa_lf_alloc_req {
++	struct mbox_msghdr hdr;
++	int node;
++	int aura_sz;  /* No of auras */
++	u32 nr_pools; /* No of pools */
++};
++
++struct npa_lf_alloc_rsp {
++	struct mbox_msghdr hdr;
++	u32 stack_pg_ptrs;  /* No of ptrs per stack page */
++	u32 stack_pg_bytes; /* Size of stack page */
++	u16 qints; /* NPA_AF_CONST::QINTS */
++};
++
+ #endif /* MBOX_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index b2ec1273e4be..9a4e2b15b97e 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -361,6 +361,19 @@ static void rvu_check_block_implemented(struct rvu *rvu)
+ 	}
+ }
+ 
++int rvu_lf_reset(struct rvu *rvu, struct rvu_block *block, int lf)
++{
++	int err;
++
++	if (!block->implemented)
++		return 0;
++
++	rvu_write64(rvu, block->addr, block->lfreset_reg, lf | BIT_ULL(12));
++	err = rvu_poll_reg(rvu, block->addr, block->lfreset_reg, BIT_ULL(12),
++			   true);
++	return err;
++}
++
+ static void rvu_block_reset(struct rvu *rvu, int blkaddr, u64 rst_reg)
+ {
+ 	struct rvu_block *block = &rvu->hw->block[blkaddr];
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index 8e652915fdd0..0d08172be19f 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -72,6 +72,11 @@ struct rvu_pfvf {
+ 	struct rsrc_bmap msix;      /* Bitmap for MSIX vector alloc */
+ #define MSIX_BLKLF(blkaddr, lf) (((blkaddr) << 8) | ((lf) & 0xFF))
+ 	u16		 *msix_lfmap; /* Vector to block LF mapping */
++
++	/* NPA contexts */
++	struct qmem	*aura_ctx;
++	struct qmem	*pool_ctx;
++	struct qmem	*npa_qints_ctx;
+ };
+ 
+ struct rvu_hwinfo {
+@@ -154,6 +159,7 @@ struct rvu_pfvf *rvu_get_pfvf(struct rvu *rvu, int pcifunc);
+ void rvu_get_pf_numvfs(struct rvu *rvu, int pf, int *numvfs, int *hwvf);
+ bool is_block_implemented(struct rvu_hwinfo *hw, int blkaddr);
+ int rvu_get_lf(struct rvu *rvu, struct rvu_block *block, u16 pcifunc, u16 slot);
++int rvu_lf_reset(struct rvu *rvu, struct rvu_block *block, int lf);
+ int rvu_get_blkaddr(struct rvu *rvu, int blktype, u16 pcifunc);
+ int rvu_poll_reg(struct rvu *rvu, u64 block, u64 offset, u64 mask, bool zero);
+ 
+@@ -205,5 +211,10 @@ int rvu_mbox_handler_CGX_INTLBK_DISABLE(struct rvu *rvu, struct msg_req *req,
+ 					struct msg_rsp *rsp);
+ 
+ /* NPA APIs */
++int rvu_mbox_handler_NPA_LF_ALLOC(struct rvu *rvu,
++				  struct npa_lf_alloc_req *req,
++				  struct npa_lf_alloc_rsp *rsp);
++int rvu_mbox_handler_NPA_LF_FREE(struct rvu *rvu, struct msg_req *req,
++				 struct msg_rsp *rsp);
+ int rvu_npa_init(struct rvu *rvu);
+ #endif /* RVU_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu_npa.c b/drivers/soc/marvell/octeontx2/rvu_npa.c
+index 148879c8d700..dc3ec866f86b 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_npa.c
++++ b/drivers/soc/marvell/octeontx2/rvu_npa.c
+@@ -15,6 +15,139 @@
+ #include "rvu_reg.h"
+ #include "rvu.h"
+ 
++static void npa_ctx_free(struct rvu *rvu, struct rvu_pfvf *pfvf)
++{
++	qmem_free(rvu->dev, pfvf->aura_ctx);
++	pfvf->aura_ctx = NULL;
++
++	qmem_free(rvu->dev, pfvf->pool_ctx);
++	pfvf->pool_ctx = NULL;
++
++	qmem_free(rvu->dev, pfvf->npa_qints_ctx);
++	pfvf->npa_qints_ctx = NULL;
++}
++
++int rvu_mbox_handler_NPA_LF_ALLOC(struct rvu *rvu,
++				  struct npa_lf_alloc_req *req,
++				  struct npa_lf_alloc_rsp *rsp)
++{
++	int npalf, qints, hwctx_size, err, rc = 0;
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	struct rvu_block *block;
++	struct rvu_pfvf *pfvf;
++	u64 cfg, ctx_cfg;
++	int blkaddr;
++
++	if ((req->aura_sz > NPA_AURA_SZ_MAX) ||
++	    (req->aura_sz == NPA_AURA_SZ_0) || !req->nr_pools)
++		return NPA_AF_ERR_PARAM;
++
++	pfvf = rvu_get_pfvf(rvu, pcifunc);
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, pcifunc);
++	if (!pfvf->npalf || (blkaddr < 0))
++		return NPA_AF_ERR_AF_LF_INVALID;
++
++	block = &hw->block[blkaddr];
++	npalf = rvu_get_lf(rvu, block, pcifunc, 0);
++	if (npalf < 0)
++		return NPA_AF_ERR_AF_LF_INVALID;
++
++	/* Reset this NPA LF */
++	err = rvu_lf_reset(rvu, block, npalf);
++	if (err) {
++		dev_err(rvu->dev, "Failed to reset NPALF%d\n", npalf);
++		return NPA_AF_ERR_LF_RESET;
++	}
++
++	ctx_cfg = rvu_read64(rvu, blkaddr, NPA_AF_CONST1);
++
++	/* Alloc memory for aura HW contexts */
++	hwctx_size = 1UL << (ctx_cfg & 0xF);
++	err = qmem_alloc(rvu->dev, &pfvf->aura_ctx,
++			 NPA_AURA_COUNT(req->aura_sz), hwctx_size);
++	if (err)
++		goto free_mem;
++
++	/* Alloc memory for pool HW contexts */
++	hwctx_size = 1UL << ((ctx_cfg >> 4) & 0xF);
++	err = qmem_alloc(rvu->dev, &pfvf->pool_ctx, req->nr_pools, hwctx_size);
++	if (err)
++		goto free_mem;
++
++	/* Get no of queue interrupts supported */
++	cfg = rvu_read64(rvu, blkaddr, NPA_AF_CONST);
++	qints = (cfg >> 28) & 0xFFF;
++
++	/* Alloc memory for Qints HW contexts */
++	hwctx_size = 1UL << ((ctx_cfg >> 8) & 0xF);
++	err = qmem_alloc(rvu->dev, &pfvf->npa_qints_ctx, qints, hwctx_size);
++	if (err)
++		goto free_mem;
++
++	cfg = rvu_read64(rvu, blkaddr, NPA_AF_LFX_AURAS_CFG(npalf));
++	/* Clear way partition mask and set aura offset to '0' */
++	cfg &= ~(BIT_ULL(34) - 1);
++	/* Set aura size & enable caching of contexts */
++	cfg |= (req->aura_sz << 16) | BIT_ULL(34);
++	rvu_write64(rvu, blkaddr, NPA_AF_LFX_AURAS_CFG(npalf), cfg);
++
++	/* Configure aura HW context's base */
++	rvu_write64(rvu, blkaddr, NPA_AF_LFX_LOC_AURAS_BASE(npalf),
++		    (u64)pfvf->aura_ctx->iova);
++
++	/* Enable caching of qints hw context */
++	rvu_write64(rvu, blkaddr, NPA_AF_LFX_QINTS_CFG(npalf), BIT_ULL(36));
++	rvu_write64(rvu, blkaddr, NPA_AF_LFX_QINTS_BASE(npalf),
++		    (u64)pfvf->npa_qints_ctx->iova);
++
++	goto exit;
++
++free_mem:
++	npa_ctx_free(rvu, pfvf);
++	rc = -ENOMEM;
++
++exit:
++	/* set stack page info */
++	cfg = rvu_read64(rvu, blkaddr, NPA_AF_CONST);
++	rsp->stack_pg_ptrs = (cfg >> 8) & 0xFF;
++	rsp->stack_pg_bytes = cfg & 0xFF;
++	rsp->qints = (cfg >> 28) & 0xFFF;
++	return rc;
++}
++
++int rvu_mbox_handler_NPA_LF_FREE(struct rvu *rvu, struct msg_req *req,
++				 struct msg_rsp *rsp)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	struct rvu_block *block;
++	struct rvu_pfvf *pfvf;
++	int npalf, err;
++	int blkaddr;
++
++	pfvf = rvu_get_pfvf(rvu, pcifunc);
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, pcifunc);
++	if (!pfvf->npalf || (blkaddr < 0))
++		return NPA_AF_ERR_AF_LF_INVALID;
++
++	block = &hw->block[blkaddr];
++	npalf = rvu_get_lf(rvu, block, pcifunc, 0);
++	if (npalf < 0)
++		return NPA_AF_ERR_AF_LF_INVALID;
++
++	/* Reset this NPA LF */
++	err = rvu_lf_reset(rvu, block, npalf);
++	if (err) {
++		dev_err(rvu->dev, "Failed to reset NPALF%d\n", npalf);
++		return NPA_AF_ERR_LF_RESET;
++	}
++
++	npa_ctx_free(rvu, pfvf);
++
++	return 0;
++}
++
+ static int npa_aq_init(struct rvu *rvu, struct rvu_block *block)
+ {
+ 	u64 cfg;
+-- 
+2.17.1
+

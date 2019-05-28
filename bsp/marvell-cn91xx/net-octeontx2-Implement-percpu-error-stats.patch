@@ -1,0 +1,223 @@
+From eafcc9cd6add1ad8ec547f45bdc09d0f2862ba3b Mon Sep 17 00:00:00 2001
+From: Aleksey Makarov <amakarov@marvell.com>
+Date: Fri, 12 Oct 2018 08:00:57 +0300
+Subject: [PATCH 0239/1051] net: octeontx2: Implement percpu error stats
+
+Implement some percpu error statictics.
+
+Signed-off-by: Aleksey Makarov <amakarov@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/otx2_common.h  |  8 +++++
+ .../ethernet/marvell/octeontx2/otx2_ethtool.c | 30 +++++++++++++++--
+ .../net/ethernet/marvell/octeontx2/otx2_pf.c  | 32 +++++++++++++------
+ 3 files changed, 58 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+index 9607f24ce2fb..40d3db9ff5dd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+@@ -79,6 +79,13 @@ struct  otx2_dev_stats {
+ 	u64 tx_drops;
+ };
+ 
++struct  otx2_pcpu_stats {
++	u64 rq_drops;
++	u64 rq_red_drops;
++
++	struct u64_stats_sync syncp;
++};
++
+ /* RSS configuration */
+ struct otx2_rss_info {
+ 	bool enable;
+@@ -100,6 +107,7 @@ struct  mbox {
+ struct otx2_hw {
+ 	struct pci_dev		*pdev;
+ 	struct otx2_dev_stats	dev_stats;
++	struct otx2_pcpu_stats  __percpu *pcpu_stats;
+ 	struct otx2_rss_info	rss_info;
+ 	u16                     rx_queues;
+ 	u16                     tx_queues;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c
+index c6c85725f7aa..4fd55bea864f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c
+@@ -32,6 +32,11 @@ struct otx2_stat {
+ 	.index = offsetof(struct otx2_dev_stats, stat) / sizeof(u64), \
+ }
+ 
++#define OTX2_PCPU_STAT(stat) { \
++	.name = #stat, \
++	.index = offsetof(struct otx2_pcpu_stats, stat) / sizeof(u64), \
++}
++
+ static const struct otx2_stat otx2_dev_stats[] = {
+ 	OTX2_DEV_STAT(rx_bytes),
+ 	OTX2_DEV_STAT(rx_frames),
+@@ -48,12 +53,18 @@ static const struct otx2_stat otx2_dev_stats[] = {
+ 	OTX2_DEV_STAT(tx_drops),
+ };
+ 
++static const struct otx2_stat otx2_pcpu_stats[] = {
++	OTX2_PCPU_STAT(rq_drops),
++	OTX2_PCPU_STAT(rq_red_drops),
++};
++
+ static const struct otx2_stat otx2_queue_stats[] = {
+ 	{ "bytes", 0 },
+ 	{ "frames", 1 },
+ };
+ 
+ static const unsigned int otx2_n_dev_stats = ARRAY_SIZE(otx2_dev_stats);
++static const unsigned int otx2_n_pcpu_stats = ARRAY_SIZE(otx2_pcpu_stats);
+ static const unsigned int otx2_n_queue_stats = ARRAY_SIZE(otx2_queue_stats);
+ 
+ static void otx2_get_drvinfo(struct net_device *netdev,
+@@ -99,6 +110,12 @@ static void otx2_get_strings(struct net_device *netdev, u32 sset, u8 *data)
+ 		memcpy(data, otx2_dev_stats[stats].name, ETH_GSTRING_LEN);
+ 		data += ETH_GSTRING_LEN;
+ 	}
++
++	for (stats = 0; stats < otx2_n_pcpu_stats; stats++) {
++		memcpy(data, otx2_pcpu_stats[stats].name, ETH_GSTRING_LEN);
++		data += ETH_GSTRING_LEN;
++	}
++
+ 	otx2_get_qset_strings(pfvf, &data, 0);
+ 
+ 	for (stats = 0; stats < CGX_RX_STATS_COUNT; stats++) {
+@@ -147,12 +164,21 @@ static void otx2_get_ethtool_stats(struct net_device *netdev,
+ 				   struct ethtool_stats *stats, u64 *data)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+-	int stat;
++	int stat, cpu;
+ 
+ 	otx2_get_dev_stats(pfvf);
+ 	for (stat = 0; stat < otx2_n_dev_stats; stat++)
+ 		*(data++) = ((u64 *)&pfvf->hw.dev_stats)
+ 				[otx2_dev_stats[stat].index];
++	for (stat = 0; stat < otx2_n_pcpu_stats; stat++) {
++		u64 tmp_stats = 0;
++
++		for_each_possible_cpu(cpu)
++			tmp_stats +=
++				((u64 *)per_cpu_ptr(pfvf->hw.pcpu_stats, cpu))
++					[otx2_pcpu_stats[stat].index];
++		*(data++) = tmp_stats;
++	}
+ 	otx2_get_qset_stats(pfvf, stats, &data);
+ 	otx2_update_lmac_stats(pfvf);
+ 	for (stat = 0; stat < CGX_RX_STATS_COUNT; stat++)
+@@ -171,7 +197,7 @@ static int otx2_get_sset_count(struct net_device *netdev, int sset)
+ 
+ 	qstats_count = otx2_n_queue_stats *
+ 		       (pfvf->hw.rx_queues + pfvf->hw.tx_queues);
+-	return otx2_n_dev_stats + qstats_count +
++	return otx2_n_dev_stats + otx2_n_pcpu_stats + qstats_count +
+ 		CGX_RX_STATS_COUNT + CGX_TX_STATS_COUNT;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+index b6d84453582f..aa0d38625960 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+@@ -443,16 +443,13 @@ static irqreturn_t otx2_q_intr_handler(int irq, void *data)
+ 		if (val & BIT_ULL(42)) {
+ 			dev_err(pf->dev, "RQ%lld: error reading NIX_LF_RQ_OP_INT\n",
+ 				qidx);
++			schedule_work(&pf->reset_task);
+ 		} else {
+ 			if (val & BIT_ULL(NIX_RQINT_DROP))
+-				dev_err(pf->dev, "RQ%lld: RX packet was dropped",
+-					qidx);
++				this_cpu_inc(pf->hw.pcpu_stats->rq_drops);
+ 			if (val & BIT_ULL(NIX_RQINT_RED))
+-				dev_err(pf->dev, "RQ%lld: RX packet was RED dropped",
+-					qidx);
++				this_cpu_inc(pf->hw.pcpu_stats->rq_red_drops);
+ 		}
+-
+-		schedule_work(&pf->reset_task);
+ 	}
+ 
+ 	/* SQ */
+@@ -664,9 +661,14 @@ int otx2_open(struct net_device *netdev)
+ 	struct otx2_nic *pf = netdev_priv(netdev);
+ 	struct otx2_cq_poll *cq_poll = NULL;
+ 	struct otx2_qset *qset = &pf->qset;
+-	int err = 0, qidx, vec;
++	int err = 0, qidx, vec, cpu;
+ 	char *irq_name;
+ 
++	/* Clear percpu stats */
++	for_each_possible_cpu(cpu)
++		memset(per_cpu_ptr(pf->hw.pcpu_stats, cpu), 0,
++		       sizeof(struct otx2_pcpu_stats));
++
+ 	netif_carrier_off(netdev);
+ 
+ 	pf->qset.cq_cnt = pf->hw.rx_queues + pf->hw.tx_queues;
+@@ -1001,18 +1003,24 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err < 0)
+ 		goto err_free_netdev;
+ 
++	hw->pcpu_stats = netdev_alloc_pcpu_stats(struct otx2_pcpu_stats);
++	if (!hw->pcpu_stats) {
++		err = -ENOMEM;
++		goto err_free_irq_vectors;
++	}
++
+ 	/* Map CSRs */
+ 	pf->reg_base = pcim_iomap(pdev, PCI_CFG_REG_BAR_NUM, 0);
+ 	if (!pf->reg_base) {
+ 		dev_err(dev, "Unable to map physical function CSRs, aborting\n");
+ 		err = -ENOMEM;
+-		goto err_free_irq_vectors;
++		goto err_free_pcpu_stats;
+ 	}
+ 
+ 	/* Init PF <=> AF mailbox stuff */
+ 	err = otx2_pfaf_mbox_init(pf);
+ 	if (err)
+-		goto err_free_irq_vectors;
++		goto err_free_pcpu_stats;
+ 
+ 	/* Register mailbox interrupt */
+ 	err = otx2_register_mbox_intr(pf);
+@@ -1083,6 +1091,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	otx2_disable_mbox_intr(pf);
+ err_mbox_destroy:
+ 	otx2_pfaf_mbox_destroy(pf);
++err_free_pcpu_stats:
++	free_percpu(hw->pcpu_stats);
+ err_free_irq_vectors:
+ 	pci_free_irq_vectors(hw->pdev);
+ err_free_netdev:
+@@ -1097,18 +1107,20 @@ static void otx2_remove(struct pci_dev *pdev)
+ {
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct otx2_nic *pf;
++	struct otx2_hw *hw;
+ 
+ 	if (!netdev)
+ 		return;
+ 
+ 	pf = netdev_priv(netdev);
++	hw = &pf->hw;
+ 	unregister_netdev(netdev);
+ 
+ 	otx2_disable_mbox_intr(pf);
+ 
+ 	otx2_detach_resources(&pf->mbox);
+ 	otx2_pfaf_mbox_destroy(pf);
+-
++	free_percpu(hw->pcpu_stats);
+ 	pci_free_irq_vectors(pf->pdev);
+ 	pci_set_drvdata(pdev, NULL);
+ 	free_netdev(netdev);
+-- 
+2.17.1
+

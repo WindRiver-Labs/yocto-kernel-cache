@@ -1,0 +1,153 @@
+From d02237c214589e043672e8613e1ec0d3fa5c0eb0 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Fri, 10 Aug 2018 12:34:59 +0530
+Subject: [PATCH 0113/1051] net: octeontx2: Set irq affinity hints for CQ
+ interrupts
+
+This patch sets IRQ affinity hints for CQ interrupts
+i.e CINTs.
+
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/otx2_common.c  | 52 ++++++++++++++++---
+ .../ethernet/marvell/octeontx2/otx2_common.h  |  2 +
+ .../net/ethernet/marvell/octeontx2/otx2_pf.c  |  2 +
+ 3 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+index b5fdc1fc99be..31cc8291aaff 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+@@ -15,6 +15,33 @@
+ #include "otx2_common.h"
+ #include "otx2_struct.h"
+ 
++void otx2_set_irq_affinity(struct otx2_nic *pfvf)
++{
++	struct otx2_hw *hw = &pfvf->hw;
++	int vec, cpu, irq, cint;
++
++	vec = hw->nix_msixoff + NIX_LF_CINT_VEC_START;
++	cpu = cpumask_first(cpu_online_mask);
++
++	/* CQ interrupts */
++	for (cint = 0; cint < pfvf->hw.cint_cnt; cint++, vec++) {
++		if (!hw->irq_allocated[vec])
++			continue;
++
++		if (!alloc_cpumask_var(&hw->affinity_mask[vec], GFP_KERNEL))
++			return;
++
++		cpumask_set_cpu(cpu, hw->affinity_mask[vec]);
++
++		irq = pci_irq_vector(pfvf->pdev, vec);
++		irq_set_affinity_hint(irq, hw->affinity_mask[vec]);
++
++		cpu = cpumask_next(cpu, cpu_online_mask);
++		if (unlikely(cpu >= nr_cpu_ids))
++			cpu = 0;
++	}
++}
++
+ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool)
+ {
+ 	dma_addr_t iova;
+@@ -735,6 +762,9 @@ void otx2_disable_msix(struct otx2_nic *pfvf)
+ 		if (irq < (hw->nix_msixoff + NIX_LF_CINT_VEC_START)) {
+ 			free_irq(pci_irq_vector(pfvf->pdev, irq), pfvf);
+ 		} else {
++			irq_set_affinity_hint(pci_irq_vector(pfvf->pdev, irq),
++					      NULL);
++			free_cpumask_var(hw->affinity_mask[irq]);
+ 			free_irq(pci_irq_vector(pfvf->pdev, irq),
+ 				 &qset->napi[qidx++]);
+ 		}
+@@ -744,6 +774,7 @@ void otx2_disable_msix(struct otx2_nic *pfvf)
+ 
+ freemem:
+ 	hw->num_vec = 0;
++	kfree(hw->affinity_mask);
+ 	kfree(hw->irq_allocated);
+ 	kfree(hw->irq_name);
+ 	hw->irq_allocated = NULL;
+@@ -752,7 +783,7 @@ void otx2_disable_msix(struct otx2_nic *pfvf)
+ 
+ int otx2_enable_msix(struct otx2_hw *hw)
+ {
+-	int ret;
++	int ret = -ENOMEM;
+ 
+ 	hw->num_vec = pci_msix_vec_count(hw->pdev);
+ 
+@@ -761,10 +792,13 @@ int otx2_enable_msix(struct otx2_hw *hw)
+ 		return -ENOMEM;
+ 
+ 	hw->irq_allocated = kcalloc(hw->num_vec, sizeof(bool), GFP_KERNEL);
+-	if (!hw->irq_allocated) {
+-		kfree(hw->irq_name);
+-		return -ENOMEM;
+-	}
++	if (!hw->irq_allocated)
++		goto freemem;
++
++	hw->affinity_mask = kcalloc(hw->num_vec, sizeof(cpumask_var_t),
++				    GFP_KERNEL);
++	if (!hw->affinity_mask)
++		goto freemem;
+ 
+ 	/* Enable MSI-X */
+ 	ret = pci_alloc_irq_vectors(hw->pdev, hw->num_vec, hw->num_vec,
+@@ -773,9 +807,13 @@ int otx2_enable_msix(struct otx2_hw *hw)
+ 		dev_err(&hw->pdev->dev,
+ 			"Request for #%d msix vectors failed, ret %d\n",
+ 			hw->num_vec, ret);
+-		kfree(hw->irq_allocated);
+-		kfree(hw->irq_name);
++		goto freemem;
+ 	}
+ 
+ 	return 0;
++freemem:
++	kfree(hw->affinity_mask);
++	kfree(hw->irq_allocated);
++	kfree(hw->irq_name);
++	return ret;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+index 1633fd101e03..65db17cf30af 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+@@ -58,6 +58,7 @@ struct otx2_hw {
+ 	u16			nix_msixoff; /* Offset of NIX vectors */
+ 	bool			*irq_allocated;
+ 	char			*irq_name;
++	cpumask_var_t           *affinity_mask;
+ 
+ 	u8			cint_cnt; /* CQ interrupt count */
+ 	u16		txschq_list[NIX_TXSCH_LVL_CNT][MAX_TXSCHQ_PER_FUNC];
+@@ -223,6 +224,7 @@ void otx2_ctx_disable(struct mbox *mbox, int type, bool npa);
+ 
+ int otx2_napi_handler(struct otx2_cq_queue *cq,
+ 		      struct otx2_nic *pfvf, int budget);
++void otx2_set_irq_affinity(struct otx2_nic *pfvf);
+ 
+ /* Mbox handlers */
+ void mbox_handler_MSIX_OFFSET(struct otx2_nic *pfvf,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+index f9e4ecafc9bf..70e9ec3854fc 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+@@ -518,6 +518,8 @@ static int otx2_open(struct net_device *netdev)
+ 		otx2_write64(pf, NIX_LF_CINTX_ENA_W1S(qidx), BIT_ULL(0));
+ 	}
+ 
++	otx2_set_irq_affinity(pf);
++
+ 	err = otx2_rxtx_enable(pf, true);
+ 	if (err)
+ 		goto cleanup;
+-- 
+2.17.1
+

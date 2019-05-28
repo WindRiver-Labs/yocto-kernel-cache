@@ -1,0 +1,159 @@
+From b1128c6441afe376117becb4536acf5d95931a42 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Mon, 10 Dec 2018 00:55:30 +0530
+Subject: [PATCH 0857/1051] net: octeontx2: Add mbox bounce buffer
+
+This patch implements mbox bounce buffer for PF/VF.
+PF/VF prepares all the mbox messages in the bounce buffer instead of
+directly in hw mbox memory.
+
+The mbox bounce buffer is introduced to address unalignment access
+to mbox memory when the device is in a virtual environment.
+
+Change-Id: If704c513e4d99662f51d0fa79d356ae20d67e576
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/1764
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/otx2_common.h  | 47 +++++++++++++++++++
+ .../net/ethernet/marvell/octeontx2/otx2_pf.c  |  8 ++++
+ .../net/ethernet/marvell/octeontx2/otx2_vf.c  |  8 ++++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+index cb07495ae9d4..133477f26682 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+@@ -107,6 +107,7 @@ struct  mbox {
+ 	struct otx2_mbox	mbox_up;
+ 	struct work_struct	mbox_up_wrk;
+ 	struct otx2_nic		*pfvf;
++	void *bbuf_base; /* Bounce buffer for mbox memory */
+ };
+ 
+ struct otx2_hw {
+@@ -327,6 +328,52 @@ otx2_mbox_up_handler_ ## _fn_name(struct otx2_nic *pfvf,		\
+ MBOX_UP_CGX_MESSAGES
+ #undef M
+ 
++/* Mbox bounce buffer APIs */
++static inline int otx2_mbox_bbuf_init(struct mbox *mbox, struct pci_dev *pdev)
++{
++	struct otx2_mbox_dev *mdev;
++	struct otx2_mbox *otx2_mbox;
++
++	mbox->bbuf_base = devm_kmalloc(&pdev->dev, MBOX_SIZE, GFP_KERNEL);
++	if (!mbox->bbuf_base)
++		return -ENOMEM;
++
++	/* Overwrite mbox mbase to point to bounce buffer, so that PF/VF
++	 * prepare all mbox messages in bounce buffer instead of directly
++	 * in hw mbox memory.
++	 */
++	otx2_mbox = &mbox->mbox;
++	mdev = &otx2_mbox->dev[0];
++	mdev->mbase = mbox->bbuf_base;
++
++	otx2_mbox = &mbox->mbox_up;
++	mdev = &otx2_mbox->dev[0];
++	mdev->mbase = mbox->bbuf_base;
++	return 0;
++}
++
++static inline void otx2_sync_mbox_bbuf(struct otx2_mbox *mbox, int devid)
++{
++	u16 msgs_offset = ALIGN(sizeof(struct mbox_hdr), MBOX_MSG_ALIGN);
++	void *hw_mbase = mbox->hwbase + (devid * MBOX_SIZE);
++	struct otx2_mbox_dev *mdev = &mbox->dev[devid];
++	struct mbox_hdr *hdr;
++	u64 msg_size;
++
++	if (mdev->mbase == hw_mbase)
++		return;
++
++	hdr = hw_mbase + mbox->rx_start;
++	msg_size = hdr->msg_size;
++
++	if (msg_size > mbox->rx_size - msgs_offset)
++		msg_size = mbox->rx_size - msgs_offset;
++
++	/* Copy mbox messages from mbox memory to bounce buffer */
++	memcpy(mdev->mbase + mbox->rx_start,
++	       hw_mbase + mbox->rx_start, msg_size + msgs_offset);
++}
++
+ #define	RVU_PFVF_PF_SHIFT	10
+ #define	RVU_PFVF_PF_MASK	0x3F
+ #define	RVU_PFVF_FUNC_SHIFT	0
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+index dad9e7efadf9..ad64b7d543d0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+@@ -218,6 +218,8 @@ static irqreturn_t otx2_pfaf_mbox_intr_handler(int irq, void *pf_irq)
+ 	/* Check for AF => PF response messages */
+ 	mbox = &pf->mbox.mbox;
+ 	mdev = &mbox->dev[0];
++	otx2_sync_mbox_bbuf(mbox, 0);
++
+ 	hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
+ 	if (hdr->num_msgs)
+ 		queue_work(pf->mbox_wq, &pf->mbox.mbox_wrk);
+@@ -225,6 +227,8 @@ static irqreturn_t otx2_pfaf_mbox_intr_handler(int irq, void *pf_irq)
+ 	/* Check for AF => PF notification messages */
+ 	mbox = &pf->mbox.mbox_up;
+ 	mdev = &mbox->dev[0];
++	otx2_sync_mbox_bbuf(mbox, 0);
++
+ 	hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
+ 	if (hdr->num_msgs)
+ 		queue_work(pf->mbox_wq, &pf->mbox.mbox_up_wrk);
+@@ -334,6 +338,10 @@ static int otx2_pfaf_mbox_init(struct otx2_nic *pf)
+ 	if (err)
+ 		goto exit;
+ 
++	err = otx2_mbox_bbuf_init(mbox, pf->pdev);
++	if (err)
++		goto exit;
++
+ 	INIT_WORK(&mbox->mbox_wrk, otx2_pfaf_mbox_handler);
+ 	INIT_WORK(&mbox->mbox_up_wrk, otx2_pfaf_mbox_up_handler);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_vf.c
+index 5b1ba3995ca3..0c2fbf2c950f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_vf.c
+@@ -126,6 +126,8 @@ static irqreturn_t otx2vf_vfaf_mbox_intr_handler(int irq, void *vf_irq)
+ 	/* Check for PF => VF response messages */
+ 	mbox = &vf->mbox.mbox;
+ 	mdev = &mbox->dev[0];
++	otx2_sync_mbox_bbuf(mbox, 0);
++
+ 	hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
+ 	if (hdr->num_msgs)
+ 		queue_work(vf->mbox_wq, &vf->mbox.mbox_wrk);
+@@ -133,6 +135,8 @@ static irqreturn_t otx2vf_vfaf_mbox_intr_handler(int irq, void *vf_irq)
+ 	/* Check for PF => VF notification messages */
+ 	mbox = &vf->mbox.mbox_up;
+ 	mdev = &mbox->dev[0];
++	otx2_sync_mbox_bbuf(mbox, 0);
++
+ 	hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
+ 	if (hdr->num_msgs)
+ 		queue_work(vf->mbox_wq, &vf->mbox.mbox_up_wrk);
+@@ -242,6 +246,10 @@ static int otx2vf_vfaf_mbox_init(struct otx2_nic *vf)
+ 	if (err)
+ 		goto exit;
+ 
++	err = otx2_mbox_bbuf_init(mbox, vf->pdev);
++	if (err)
++		goto exit;
++
+ 	INIT_WORK(&mbox->mbox_wrk, otx2vf_vfaf_mbox_handler);
+ 	INIT_WORK(&mbox->mbox_up_wrk, otx2vf_vfaf_mbox_up_handler);
+ 
+-- 
+2.17.1
+

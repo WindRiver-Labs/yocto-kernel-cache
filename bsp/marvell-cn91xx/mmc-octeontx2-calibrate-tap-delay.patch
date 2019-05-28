@@ -1,0 +1,167 @@
+From 03a58642bbaccf48b06c6eb6e91c092c99b3edf3 Mon Sep 17 00:00:00 2001
+From: Sujeet Baranwal <sujeet.baranwal@cavium.com>
+Date: Tue, 27 Nov 2018 04:01:11 +0300
+Subject: [PATCH 0780/1051] mmc: octeontx2: calibrate tap delay
+
+The eMMC/SD interface supports a variety of devices
+with board configurations and different timing
+requirements. Timing is specified via the MIO_EMM_TIMING
+register which controls the programmable delay lines.
+Each delay line can be programmed to one of 64 taps.
+The MIO_EMM_CALB register is used to calibrate these
+delay lines and allows software to calculate how much
+delay each tap represents. The results of the calibration
+can be found in the MIO_EMM_TAP register.
+
+Signed-off-by: Sujeet Baranwal <sujeet.baranwal@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/mmc/host/cavium-thunderx.c | 55 ++++++++++++++++++++++++++++++
+ drivers/mmc/host/cavium.h          | 19 +++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/drivers/mmc/host/cavium-thunderx.c b/drivers/mmc/host/cavium-thunderx.c
+index f25dc71a346a..2afe6b2cd17b 100644
+--- a/drivers/mmc/host/cavium-thunderx.c
++++ b/drivers/mmc/host/cavium-thunderx.c
+@@ -15,6 +15,7 @@
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/pci.h>
++#include <linux/delay.h>
+ #include "cavium.h"
+ 
+ static void thunder_mmc_acquire_bus(struct cvm_mmc_host *host)
+@@ -53,6 +54,54 @@ static int thunder_mmc_register_interrupts(struct cvm_mmc_host *host,
+ 	return 0;
+ }
+ 
++/* calibration evaluates the per tap delay */
++void thunder_calibrate_mmc(struct cvm_mmc_host *host)
++{
++	u64 emm_cfg, tap;
++	u32 retries = 10, tap_delay;
++
++	if (is_mmc_8xxx(host))
++		return;
++
++	if (is_mmc_otx2_A0(host)) {
++		/*
++		 * Operation of up to 100 MHz may be achieved by skipping the
++		 * steps that establish the tap delays and instead assuming
++		 * that MIO_EMM_TAP[DELAY] returns 0x4 indicating 78 pS/tap.
++		 */
++		tap_delay = 4;
++	} else {
++		/* MIO_EMM_CFG[BUS_ENA] must be zero for calibration */
++		emm_cfg = readq(host->base + MIO_EMM_CFG(host));
++		if (emm_cfg & MIO_EMM_CFG_BUS_ENA) {
++			pr_err("failure: bus is not disabled\n");
++			return;
++		}
++
++		/* Start calibration */
++		writeq(START_CALIBRATION, host->base + MIO_EMM_CALB(host));
++
++		do {
++			/* wait for approximately 300 coprocessor clock */
++			udelay(5);
++			tap = readq(host->base + MIO_EMM_TAP(host));
++		} while (!tap && retries--);
++
++		if (!retries)
++			pr_debug("retries exhausted, calibration failed\n");
++
++		/* calculate the per-tap delay */
++		tap_delay = tap & MIO_EMM_TAP_DELAY;
++	}
++
++	/*
++	 * The delay value should be multiplied by 10 ns(or 10000 ps)
++	 * and then divided by no of taps to determine the estimated
++	 * delay in pico second. The nominal value is 125 ps per tap.
++	 */
++	host->per_tap_delay =  (tap_delay * PS_10000) / TOTAL_NO_OF_TAPS;
++}
++
+ static int thunder_mmc_probe(struct pci_dev *pdev,
+ 			     const struct pci_device_id *id)
+ {
+@@ -126,6 +175,12 @@ static int thunder_mmc_probe(struct pci_dev *pdev,
+ 	if (ret)
+ 		goto error;
+ 
++	/* Run the calibration to calculate per tap delay that would be
++	 * used to evaluate values. These values would be programmed in
++	 * MIO_EMM_TIMING.
++	 */
++	thunder_calibrate_mmc(host);
++
+ 	for_each_child_of_node(node, child_node) {
+ 		/*
+ 		 * mmc_of_parse and devm* require one device per slot.
+diff --git a/drivers/mmc/host/cavium.h b/drivers/mmc/host/cavium.h
+index d9fe26e00375..e7d0aaea1cb6 100644
+--- a/drivers/mmc/host/cavium.h
++++ b/drivers/mmc/host/cavium.h
+@@ -45,6 +45,11 @@
+ #define	LOW_SLEW_RATE	(0x0)
+ #define	HIGH_SLEW_RATE	(0x1)
+ 
++/* octtx2: emmc interface calibration */
++#define START_CALIBRATION	(0x1)
++#define TOTAL_NO_OF_TAPS	(512)
++#define PS_10000		(10 * 1000)
++
+ /* DMA register addresses */
+ #define MIO_EMM_DMA_FIFO_CFG(x)	(0x00 + x->reg_off_dma)
+ #define MIO_EMM_DMA_FIFO_ADR(x)	(0x10 + x->reg_off_dma)
+@@ -56,6 +61,11 @@
+ #define MIO_EMM_DMA_INT_ENA_W1S(x) (0x40 + x->reg_off_dma)
+ #define MIO_EMM_DMA_INT_ENA_W1C(x) (0x48 + x->reg_off_dma)
+ 
++/* octtx2 specific registers */
++#define MIO_EMM_CALB(x)		(0xC0 + x->reg_off)
++#define MIO_EMM_TAP(x)		(0xC8 + x->reg_off)
++#define MIO_EMM_TIMING(x)	(0xD0 + x->reg_off)
++
+ /* register addresses */
+ #define MIO_EMM_CFG(x)		(0x00 + x->reg_off)
+ /* octtx2 specific register */
+@@ -107,6 +117,8 @@ struct cvm_mmc_host {
+ 
+ 	struct cvm_mmc_slot *slot[CAVIUM_MAX_MMC];
+ 	struct platform_device *slot_pdev[CAVIUM_MAX_MMC];
++	/* octtx2 specific */
++	unsigned int per_tap_delay; /* per tap delay in pico second */
+ 
+ 	void (*set_shared_power)(struct cvm_mmc_host *, int);
+ 	void (*acquire_bus)(struct cvm_mmc_host *);
+@@ -191,9 +203,14 @@ struct cvm_mmc_cr_mods {
+ #define MIO_EMM_DMA_CFG_SIZE		GENMASK_ULL(55, 36)
+ #define MIO_EMM_DMA_CFG_ADR		GENMASK_ULL(35, 0)
+ 
++#define MIO_EMM_CFG_BUS_ENA		GENMASK_ULL(3, 0)
++
+ #define MIO_EMM_IO_CTL_DRIVE		GENMASK_ULL(3, 2)
+ #define MIO_EMM_IO_CTL_SLEW		BIT_ULL(0)
+ 
++#define MIO_EMM_CALB_START		BIT_ULL(0)
++#define MIO_EMM_TAP_DELAY		GENMASK_ULL(7, 0)
++
+ #define MIO_EMM_INT_NCB_FLT		BIT_ULL(7)
+ #define MIO_EMM_INT_SWITCH_ERR		BIT_ULL(6)
+ #define MIO_EMM_INT_SWITCH_DONE		BIT_ULL(5)
+@@ -244,6 +261,8 @@ struct cvm_mmc_cr_mods {
+ irqreturn_t cvm_mmc_interrupt(int irq, void *dev_id);
+ int cvm_mmc_of_slot_probe(struct device *dev, struct cvm_mmc_host *host);
+ int cvm_mmc_of_slot_remove(struct cvm_mmc_slot *slot);
++void calibrate_mmc(struct cvm_mmc_host *host);
++
+ extern const char *cvm_mmc_irq_names[];
+ 
+ static inline bool is_mmc_8xxx(struct cvm_mmc_host *host)
+-- 
+2.17.1
+

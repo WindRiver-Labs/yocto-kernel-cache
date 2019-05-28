@@ -1,0 +1,174 @@
+From 29905016c18a9ef2d76472b4cf4e4c33868cff29 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 7 Aug 2018 18:54:06 +0530
+Subject: [PATCH 0102/1051] net: octeontx2: Attach RVU NIX and NPA block LFs
+
+For a RVU PF to function as a NIC, NPA (for receive buffers)
+and NIX (for rcv, send and completion queues) are the
+minimum resources needed. So request admin function (AF)
+to attach one each of NIX and NPA LFs (local functions).
+Also get the msix vector offsets for these LFs.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/otx2_common.c  | 61 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/otx2_common.h  | 10 +++
+ .../net/ethernet/marvell/octeontx2/otx2_pf.c  | 17 +++++-
+ 3 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+index 0ec1e453bf85..54061f22e068 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+@@ -14,6 +14,67 @@
+ #include "otx2_reg.h"
+ #include "otx2_common.h"
+ 
++int otx2_detach_resources(struct mbox *mbox)
++{
++	struct rsrc_detach *detach;
++
++	detach = otx2_mbox_alloc_msg_DETACH_RESOURCES(mbox);
++	if (!detach)
++		return -ENOMEM;
++
++	/* detach all */
++	detach->partial = false;
++
++	/* Send detach request to AF */
++	otx2_mbox_msg_send(&mbox->mbox, 0);
++	return 0;
++}
++
++int otx2_attach_npa_nix(struct otx2_nic *pfvf)
++{
++	struct rsrc_attach *attach;
++	struct msg_req *msix;
++	int err;
++
++	/* Get memory to put this msg */
++	attach = otx2_mbox_alloc_msg_ATTACH_RESOURCES(&pfvf->mbox);
++	if (!attach)
++		return -ENOMEM;
++
++	attach->npalf = true;
++	attach->nixlf = true;
++
++	/* Send attach request to AF */
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	if (err)
++		return err;
++
++	/* Get NPA and NIX MSIX vector offsets */
++	msix = otx2_mbox_alloc_msg_MSIX_OFFSET(&pfvf->mbox);
++	if (!msix)
++		return -ENOMEM;
++
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	if (err)
++		return err;
++
++	if (pfvf->hw.npa_msixoff == MSIX_VECTOR_INVALID ||
++	    pfvf->hw.nix_msixoff == MSIX_VECTOR_INVALID) {
++		dev_err(pfvf->dev,
++			"RVUPF: Invalid MSIX vector offset for NPA/NIX\n");
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/* Mbox message handlers */
++void mbox_handler_MSIX_OFFSET(struct otx2_nic *pfvf,
++			      struct msix_offset_rsp *rsp)
++{
++	pfvf->hw.npa_msixoff = rsp->npa_msixoff;
++	pfvf->hw.nix_msixoff = rsp->nix_msixoff;
++}
++
+ void otx2_disable_msix(struct otx2_nic *pfvf)
+ {
+ 	struct otx2_hw *hw = &pfvf->hw;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+index 936415108003..c6461d5734e5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.h
+@@ -40,6 +40,8 @@ struct otx2_hw {
+ 
+ 	/* MSI-X*/
+ 	u16			num_vec;
++	u16			npa_msixoff; /* Offset of NPA vectors */
++	u16			nix_msixoff; /* Offset of NIX vectors */
+ 	bool			*irq_allocated;
+ 	char			*irq_name;
+ };
+@@ -97,4 +99,12 @@ MBOX_MESSAGES
+ 
+ int otx2_enable_msix(struct otx2_hw *hw);
+ void otx2_disable_msix(struct otx2_nic *pfvf);
++
++/* RVU block related APIs */
++int otx2_attach_npa_nix(struct otx2_nic *pfvf);
++int otx2_detach_resources(struct mbox *mbox);
++
++/* Mbox handlers */
++void mbox_handler_MSIX_OFFSET(struct otx2_nic *pf, struct msix_offset_rsp *rsp);
++
+ #endif /* OTX2_COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+index 36be5d31a1a3..30bf5c0b996c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+@@ -55,6 +55,9 @@ static void otx2_process_pfaf_mbox_msg(struct otx2_nic *pf,
+ 	case MBOX_MSG_READY:
+ 		pf->pcifunc = msg->pcifunc;
+ 		break;
++	case MBOX_MSG_MSIX_OFFSET:
++		mbox_handler_MSIX_OFFSET(pf, (struct msix_offset_rsp *)msg);
++		break;
+ 	default:
+ 		if (msg->rc)
+ 			dev_err(pf->dev,
+@@ -344,19 +347,28 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_irq;
+ 
+-	err = otx2_set_real_num_queues(netdev, hw->tx_queues, hw->rx_queues);
++	/* Request AF to attach NPA and NIX LFs to this PF.
++	 * NIX and NPA LFs are needed for this PF to function as a NIC.
++	 */
++	err = otx2_attach_npa_nix(pf);
+ 	if (err)
+ 		goto err_irq;
+ 
++	err = otx2_set_real_num_queues(netdev, hw->tx_queues, hw->rx_queues);
++	if (err)
++		goto err_detach_rsrc;
++
+ 	netdev->netdev_ops = &otx2_netdev_ops;
+ 	err = register_netdev(netdev);
+ 	if (err) {
+ 		dev_err(dev, "Failed to register netdevice\n");
+-		goto err_irq;
++		goto err_detach_rsrc;
+ 	}
+ 
+ 	return 0;
+ 
++err_detach_rsrc:
++	otx2_detach_resources(&pf->mbox);
+ err_irq:
+ 	otx2_disable_msix(pf);
+ 	otx2_pfaf_mbox_destroy(pf);
+@@ -383,6 +395,7 @@ static void otx2_remove(struct pci_dev *pdev)
+ 
+ 	otx2_disable_mbox_intr(pf);
+ 	otx2_disable_msix(pf);
++	otx2_detach_resources(&pf->mbox);
+ 	otx2_pfaf_mbox_destroy(pf);
+ 
+ 	pci_set_drvdata(pdev, NULL);
+-- 
+2.17.1
+

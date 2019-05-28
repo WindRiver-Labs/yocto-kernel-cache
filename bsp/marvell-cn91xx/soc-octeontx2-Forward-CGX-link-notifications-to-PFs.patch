@@ -1,0 +1,651 @@
+From 0fe12be76c9c5e7c34c094a0fcaacbfdea870433 Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Thu, 16 Aug 2018 14:19:47 +0530
+Subject: [PATCH 0043/1051] soc: octeontx2: Forward CGX link notifications to
+ PFs
+
+Upon receiving notification from firmware the CGX event handler
+in the AF driver gets the current link info such as status, speed,
+duplex etc from CGX driver and sends it across to PFs who have
+registered to receive such notifications.
+
+To support above
+ - Mbox messaging support for sending msgs from AF to PF has been added.
+ - Added mbox msgs so that PFs can register/unregister for link events.
+ - Link notifications are sent to PF under two scenarioss.
+  1. When a asynchronous link change notification is received from
+     firmware with notification flag turned on for that PF.
+  2. Upon notification turn on request, the current link status is
+     send to the PF.
+
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/cgx.c       |  92 ++++++++++++++-
+ drivers/soc/marvell/octeontx2/cgx.h       |  21 +++-
+ drivers/soc/marvell/octeontx2/cgx_fw_if.h |   9 +-
+ drivers/soc/marvell/octeontx2/mbox.h      |  21 ++++
+ drivers/soc/marvell/octeontx2/rvu.c       |  82 ++++++++++++++
+ drivers/soc/marvell/octeontx2/rvu.h       |   7 ++
+ drivers/soc/marvell/octeontx2/rvu_cgx.c   | 129 +++++++++++++++++++++-
+ 7 files changed, 354 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/cgx.c b/drivers/soc/marvell/octeontx2/cgx.c
+index a7f393d02358..85f4938e869a 100644
+--- a/drivers/soc/marvell/octeontx2/cgx.c
++++ b/drivers/soc/marvell/octeontx2/cgx.c
+@@ -29,6 +29,7 @@
+  * @wq_cmd_cmplt:	waitq to keep the process blocked until cmd completion
+  * @cmd_lock:		Lock to serialize the command interface
+  * @resp:		command response
++ * @link_info:		link related information
+  * @event_cb:		callback for linkchange events
+  * @cmd_pend:		flag set before new command is started
+  *			flag cleared after command response is received
+@@ -40,6 +41,7 @@ struct lmac {
+ 	wait_queue_head_t wq_cmd_cmplt;
+ 	struct mutex cmd_lock;
+ 	struct cgx_evt_sts resp;
++	struct cgx_link_user_info link_info;
+ 	struct cgx_event_cb event_cb;
+ 	bool cmd_pend;
+ 	struct cgx *cgx;
+@@ -58,6 +60,12 @@ struct cgx {
+ 
+ static LIST_HEAD(cgx_list);
+ 
++/* Convert firmware speed encoding to user format(Mbps) */
++static u32 cgx_speed_mbps[CGX_LINK_SPEED_MAX];
++
++/* Convert firmware lmac type encoding to string */
++static char *cgx_lmactype_string[LMAC_MODE_MAX];
++
+ /* CGX PHY management internal APIs */
+ static int cgx_fwi_link_change(struct cgx *cgx, int lmac_id, bool en);
+ 
+@@ -126,6 +134,24 @@ void *cgx_get_pdata(int cgx_id)
+ }
+ EXPORT_SYMBOL(cgx_get_pdata);
+ 
++/* Ensure the required lock for event queue(where asynchronous events are
++ * posted) is acquired before calling this API. Else an asynchronous event(with
++ * latest link status) can reach the destination before this function returns
++ * and could make the link status appear wrong.
++ */
++int cgx_get_link_info(void *cgxd, int lmac_id,
++		      struct cgx_link_user_info *linfo)
++{
++	struct lmac *lmac = lmac_pdata(lmac_id, cgxd);
++
++	if (!lmac)
++		return -ENODEV;
++
++	*linfo = lmac->link_info;
++	return 0;
++}
++EXPORT_SYMBOL(cgx_get_link_info);
++
+ static u64 mac2u64 (u8 *mac_addr)
+ {
+ 	u64 mac = 0;
+@@ -167,6 +193,14 @@ u64 cgx_lmac_addr_get(u8 cgx_id, u8 lmac_id)
+ }
+ EXPORT_SYMBOL(cgx_lmac_addr_get);
+ 
++static inline u8 cgx_get_lmac_type(struct cgx *cgx, int lmac_id)
++{
++	u64 cfg;
++
++	cfg = cgx_read(cgx, lmac_id, CGXX_CMRX_CFG);
++	return (cfg >> CGX_LMAC_TYPE_SHIFT) & CGX_LMAC_TYPE_MASK;
++}
++
+ void cgx_lmac_promisc_config(int cgx_id, int lmac_id, bool enable)
+ {
+ 	struct cgx *cgx = cgx_get_pdata(cgx_id);
+@@ -326,18 +360,66 @@ static inline int cgx_fwi_cmd_generic(struct cgx_cmd *req,
+ 	return err;
+ }
+ 
++static inline void cgx_link_usertable_init(void)
++{
++	cgx_speed_mbps[CGX_LINK_NONE] = 0;
++	cgx_speed_mbps[CGX_LINK_10M] = 10;
++	cgx_speed_mbps[CGX_LINK_100M] = 100;
++	cgx_speed_mbps[CGX_LINK_1G] = 1000;
++	cgx_speed_mbps[CGX_LINK_2HG] = 2500;
++	cgx_speed_mbps[CGX_LINK_5G] = 5000;
++	cgx_speed_mbps[CGX_LINK_10G] = 10000;
++	cgx_speed_mbps[CGX_LINK_20G] = 20000;
++	cgx_speed_mbps[CGX_LINK_25G] = 25000;
++	cgx_speed_mbps[CGX_LINK_40G] = 40000;
++	cgx_speed_mbps[CGX_LINK_50G] = 50000;
++	cgx_speed_mbps[CGX_LINK_100G] = 100000;
++
++	cgx_lmactype_string[LMAC_MODE_SGMII] = "SGMII";
++	cgx_lmactype_string[LMAC_MODE_XAUI] = "XAUI";
++	cgx_lmactype_string[LMAC_MODE_RXAUI] = "RXAUI";
++	cgx_lmactype_string[LMAC_MODE_10G_R] = "10G_R";
++	cgx_lmactype_string[LMAC_MODE_40G_R] = "40G_R";
++	cgx_lmactype_string[LMAC_MODE_QSGMII] = "QSGMII";
++	cgx_lmactype_string[LMAC_MODE_25G_R] = "25G_R";
++	cgx_lmactype_string[LMAC_MODE_50G_R] = "50G_R";
++	cgx_lmactype_string[LMAC_MODE_100G_R] = "100G_R";
++	cgx_lmactype_string[LMAC_MODE_USXGMII] = "USXGMII";
++}
++
++static inline void link_status_user_format(struct cgx_lnk_sts *lstat,
++					   struct cgx_link_user_info *linfo,
++					   struct cgx *cgx, u8 lmac_id)
++{
++	char *lmac_string;
++
++	linfo->link_up = lstat->link_up;
++	linfo->full_duplex = lstat->full_duplex;
++	linfo->lmac_type_id = cgx_get_lmac_type(cgx, lmac_id);
++	linfo->speed = cgx_speed_mbps[lstat->speed];
++	lmac_string = cgx_lmactype_string[linfo->lmac_type_id];
++	strncpy(linfo->lmac_type, lmac_string, LMACTYPE_STR_LEN - 1);
++}
++
+ /* Hardware event handlers */
+ static inline void cgx_link_change_handler(struct cgx_lnk_sts *lstat,
+ 					   struct lmac *lmac)
+ {
++	struct cgx_link_user_info *linfo;
+ 	struct cgx *cgx = lmac->cgx;
+ 	struct cgx_link_event event;
+-	struct device *dev = &cgx->pdev->dev;
++	struct device *dev;
+ 
+-	event.lstat = *lstat;
++	dev = &cgx->pdev->dev;
++
++	link_status_user_format(lstat, &event.link_uinfo, cgx, lmac->lmac_id);
+ 	event.cgx_id = cgx->cgx_id;
+ 	event.lmac_id = lmac->lmac_id;
+ 
++	/* update the local copy of link status */
++	lmac->link_info = event.link_uinfo;
++	linfo = &lmac->link_info;
++
+ 	if (!lmac->event_cb.notify_link_chg) {
+ 		dev_dbg(dev, "cgx port %d:%d Link change handler null",
+ 			cgx->cgx_id, lmac->lmac_id);
+@@ -345,9 +427,9 @@ static inline void cgx_link_change_handler(struct cgx_lnk_sts *lstat,
+ 			dev_err(dev, "cgx port %d:%d Link error %x\n",
+ 				cgx->cgx_id, lmac->lmac_id, lstat->err_type);
+ 		}
+-		dev_info(dev, "cgx port %d:%d Link status %s, speed %x\n",
++		dev_info(dev, "cgx port %d:%d Link is %s %d Mbps\n",
+ 			 cgx->cgx_id, lmac->lmac_id,
+-			lstat->link_up ? "UP" : "DOWN", lstat->speed);
++			 linfo->link_up ? "UP" : "DOWN", linfo->speed);
+ 		return;
+ 	}
+ 
+@@ -583,6 +665,8 @@ static int cgx_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	list_add(&cgx->cgx_list, &cgx_list);
+ 	cgx->cgx_id = cgx_get_cgx_cnt() - 1;
+ 
++	cgx_link_usertable_init();
++
+ 	err = cgx_lmac_init(cgx);
+ 	if (err)
+ 		goto err_release_lmac;
+diff --git a/drivers/soc/marvell/octeontx2/cgx.h b/drivers/soc/marvell/octeontx2/cgx.h
+index 92934f343667..d8d95e958673 100644
+--- a/drivers/soc/marvell/octeontx2/cgx.h
++++ b/drivers/soc/marvell/octeontx2/cgx.h
+@@ -11,6 +11,7 @@
+ #ifndef CGX_H
+ #define CGX_H
+ 
++#include "mbox.h"
+ #include "cgx_fw_if.h"
+ 
+  /* PCI device IDs */
+@@ -28,6 +29,8 @@
+ #define  CMR_EN					BIT_ULL(55)
+ #define  DATA_PKT_TX_EN				BIT_ULL(53)
+ #define  DATA_PKT_RX_EN				BIT_ULL(54)
++#define  CGX_LMAC_TYPE_SHIFT			40
++#define  CGX_LMAC_TYPE_MASK			0xF
+ #define CGXX_CMRX_RX_ID_MAP		0x060
+ #define CGXX_CMRX_RX_STAT0		0x070
+ #define CGXX_CMRX_RX_LMACS		0x128
+@@ -52,8 +55,22 @@
+ #define CGX_NVEC			37
+ #define CGX_LMAC_FWI			0
+ 
++enum LMAC_TYPE {
++	LMAC_MODE_SGMII		= 0,
++	LMAC_MODE_XAUI		= 1,
++	LMAC_MODE_RXAUI		= 2,
++	LMAC_MODE_10G_R		= 3,
++	LMAC_MODE_40G_R		= 4,
++	LMAC_MODE_QSGMII	= 6,
++	LMAC_MODE_25G_R		= 7,
++	LMAC_MODE_50G_R		= 8,
++	LMAC_MODE_100G_R	= 9,
++	LMAC_MODE_USXGMII	= 10,
++	LMAC_MODE_MAX,
++};
++
+ struct cgx_link_event {
+-	struct cgx_lnk_sts lstat;
++	struct cgx_link_user_info link_uinfo;
+ 	u8 cgx_id;
+ 	u8 lmac_id;
+ };
+@@ -78,4 +95,6 @@ int cgx_lmac_rx_tx_enable(void *cgxd, int lmac_id, bool enable);
+ int cgx_lmac_addr_set(u8 cgx_id, u8 lmac_id, u8 *mac_addr);
+ u64 cgx_lmac_addr_get(u8 cgx_id, u8 lmac_id);
+ void cgx_lmac_promisc_config(int cgx_id, int lmac_id, bool enable);
++int cgx_get_link_info(void *cgxd, int lmac_id, struct cgx_link_user_info
++			*linfo);
+ #endif /* CGX_H */
+diff --git a/drivers/soc/marvell/octeontx2/cgx_fw_if.h b/drivers/soc/marvell/octeontx2/cgx_fw_if.h
+index 8eb887176175..0c130e72b2af 100644
+--- a/drivers/soc/marvell/octeontx2/cgx_fw_if.h
++++ b/drivers/soc/marvell/octeontx2/cgx_fw_if.h
+@@ -33,10 +33,14 @@ enum cgx_error_type {
+ 	CGX_ERR_SPUX_TX_FAULT,
+ 	CGX_ERR_SPUX_RX_FAULT,
+ 	CGX_ERR_SPUX_RESET_FAIL,
++	CGX_ERR_SPUX_AN_RESET_FAIL,
++	CGX_ERR_SPUX_USX_AN_RESET_FAIL,
+ 	CGX_ERR_SMUX_RX_LINK_NOT_OK,
+ 	CGX_ERR_PCS_RECV_LINK_FAIL,
+ 	CGX_ERR_TRAINING_FAIL,
+-	CGX_ERR_RX_EQU_FAIL,		/* = 18 */
++	CGX_ERR_RX_EQU_FAIL,
++	CGX_ERR_SPUX_BER_FAIL,
++	CGX_ERR_SPUX_RSFEC_ALGN_FAIL,   /* = 22 */
+ 	/* FIXME : add more error types when adding support for new modes */
+ };
+ 
+@@ -46,7 +50,10 @@ enum cgx_link_speed {
+ 	CGX_LINK_10M,
+ 	CGX_LINK_100M,
+ 	CGX_LINK_1G,
++	CGX_LINK_2HG,
++	CGX_LINK_5G,
+ 	CGX_LINK_10G,
++	CGX_LINK_20G,
+ 	CGX_LINK_25G,
+ 	CGX_LINK_40G,
+ 	CGX_LINK_50G,
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 321b74a65e02..9aaffa2f093a 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -132,6 +132,8 @@ M(CGX_MAC_ADDR_GET,	0x204, cgx_mac_addr_set_or_get,			\
+ 				cgx_mac_addr_set_or_get)		\
+ M(CGX_PROMISC_ENABLE,	0x205, msg_req, msg_rsp)			\
+ M(CGX_PROMISC_DISABLE,	0x206, msg_req, msg_rsp)			\
++M(CGX_START_LINKEVENTS, 0x207, msg_req, msg_rsp)			\
++M(CGX_STOP_LINKEVENTS,	0x208, msg_req, msg_rsp)			\
+ /* NPA mbox IDs (range 0x400 - 0x5FF) */				\
+ /* SSO/SSOW mbox IDs (range 0x600 - 0x7FF) */				\
+ /* TIM mbox IDs (range 0x800 - 0x9FF) */				\
+@@ -139,9 +141,14 @@ M(CGX_PROMISC_DISABLE,	0x206, msg_req, msg_rsp)			\
+ /* NPC mbox IDs (range 0x6000 - 0x7FFF) */				\
+ /* NIX mbox IDs (range 0x8000 - 0xFFFF) */				\
+ 
++/* Messages initiated by AF (range 0xC00 - 0xDFF) */
++#define MBOX_UP_CGX_MESSAGES						\
++M(CGX_LINK_EVENT,		0xC00, cgx_link_info_msg, msg_rsp)
++
+ enum {
+ #define M(_name, _id, _1, _2) MBOX_MSG_ ## _name = _id,
+ MBOX_MESSAGES
++MBOX_UP_CGX_MESSAGES
+ #undef M
+ };
+ 
+@@ -234,4 +241,18 @@ struct cgx_mac_addr_set_or_get {
+ 	u8 mac_addr[ETH_ALEN];
+ };
+ 
++struct cgx_link_user_info {
++	uint64_t link_up:1;
++	uint64_t full_duplex:1;
++	uint64_t lmac_type_id:4;
++	uint64_t speed:20; /* speed in Mbps */
++#define LMACTYPE_STR_LEN 16
++	char lmac_type[LMACTYPE_STR_LEN];
++};
++
++struct cgx_link_info_msg {
++	struct mbox_msghdr hdr;
++	struct cgx_link_user_info link_info;
++};
++
+ #endif /* MBOX_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index 38095172f4c7..24d4d04b6882 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -1315,6 +1315,63 @@ static void rvu_mbox_handler(struct work_struct *work)
+ 	otx2_mbox_msg_send(mbox, pf);
+ }
+ 
++static void rvu_mbox_up_handler(struct work_struct *work)
++{
++	struct rvu_work *mwork = container_of(work, struct rvu_work, work);
++	struct rvu *rvu = mwork->rvu;
++	struct otx2_mbox_dev *mdev;
++	struct mbox_hdr *rsp_hdr;
++	struct mbox_msghdr *msg;
++	struct otx2_mbox *mbox;
++	int offset, id;
++	u16 pf;
++
++	mbox = &rvu->mbox_up;
++	pf = mwork - rvu->mbox_wrk_up;
++	mdev = &mbox->dev[pf];
++
++	rsp_hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
++	if (rsp_hdr->num_msgs == 0) {
++		dev_warn(rvu->dev, "mbox up handler: num_msgs = 0\n");
++		return;
++	}
++
++	offset = mbox->rx_start + ALIGN(sizeof(*rsp_hdr), MBOX_MSG_ALIGN);
++
++	for (id = 0; id < rsp_hdr->num_msgs; id++) {
++		msg = (struct mbox_msghdr *)(mdev->mbase + offset);
++
++		if (msg->id >= MBOX_MSG_MAX) {
++			dev_err(rvu->dev,
++				"Mbox msg with unknown ID 0x%x\n", msg->id);
++			goto end;
++		}
++
++		if (msg->sig != OTX2_MBOX_RSP_SIG) {
++			dev_err(rvu->dev,
++				"Mbox msg with wrong signature %x, ID 0x%x\n",
++				msg->sig, msg->id);
++			goto end;
++		}
++
++		switch (msg->id) {
++		case MBOX_MSG_CGX_LINK_EVENT:
++			break;
++		default:
++			if (msg->rc)
++				dev_err(rvu->dev,
++					"Mbox msg response has err %d, ID 0x%x\n",
++					msg->rc, msg->id);
++			break;
++		}
++end:
++		offset = mbox->rx_start + msg->next_msgoff;
++		mdev->msgs_acked++;
++	}
++
++	otx2_mbox_reset(mbox, 0);
++}
++
+ static int rvu_mbox_init(struct rvu *rvu)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
+@@ -1336,6 +1393,13 @@ static int rvu_mbox_init(struct rvu *rvu)
+ 		goto exit;
+ 	}
+ 
++	rvu->mbox_wrk_up = devm_kcalloc(rvu->dev, hw->total_pfs,
++					sizeof(struct rvu_work), GFP_KERNEL);
++	if (!rvu->mbox_wrk_up) {
++		err = -ENOMEM;
++		goto exit;
++	}
++
+ 	/* Map mbox region shared with PFs */
+ 	bar4_addr = rvu_read64(rvu, BLKADDR_RVUM, RVU_AF_PF_BAR4_ADDR);
+ 	/* Mailbox is a reserved memory (in RAM) region shared between
+@@ -1354,12 +1418,23 @@ static int rvu_mbox_init(struct rvu *rvu)
+ 	if (err)
+ 		goto exit;
+ 
++	err = otx2_mbox_init(&rvu->mbox_up, hwbase, rvu->pdev, rvu->afreg_base,
++			     MBOX_DIR_AFPF_UP, hw->total_pfs);
++	if (err)
++		goto exit;
++
+ 	for (pf = 0; pf < hw->total_pfs; pf++) {
+ 		mwork = &rvu->mbox_wrk[pf];
+ 		mwork->rvu = rvu;
+ 		INIT_WORK(&mwork->work, rvu_mbox_handler);
+ 	}
+ 
++	for (pf = 0; pf < hw->total_pfs; pf++) {
++		mwork = &rvu->mbox_wrk_up[pf];
++		mwork->rvu = rvu;
++		INIT_WORK(&mwork->work, rvu_mbox_up_handler);
++	}
++
+ 	return 0;
+ exit:
+ 	if (hwbase)
+@@ -1380,6 +1455,7 @@ static void rvu_mbox_destroy(struct rvu *rvu)
+ 		iounmap((void __iomem *)rvu->mbox.hwbase);
+ 
+ 	otx2_mbox_destroy(&rvu->mbox);
++	otx2_mbox_destroy(&rvu->mbox_up);
+ }
+ 
+ static irqreturn_t rvu_mbox_intr_handler(int irq, void *rvu_irq)
+@@ -1406,6 +1482,12 @@ static irqreturn_t rvu_mbox_intr_handler(int irq, void *rvu_irq)
+ 			if (hdr->num_msgs)
+ 				queue_work(rvu->mbox_wq,
+ 					   &rvu->mbox_wrk[pf].work);
++			mbox = &rvu->mbox_up;
++			mdev = &mbox->dev[pf];
++			hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
++			if (hdr->num_msgs)
++				queue_work(rvu->mbox_wq,
++					   &rvu->mbox_wrk_up[pf].work);
+ 		}
+ 	}
+ 
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index 43905eed357a..476b38567aca 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -93,6 +93,8 @@ struct rvu {
+ 	/* Mbox */
+ 	struct otx2_mbox	mbox;
+ 	struct rvu_work		*mbox_wrk;
++	struct otx2_mbox        mbox_up;
++	struct rvu_work		*mbox_wrk_up;
+ 	struct workqueue_struct *mbox_wq;
+ 
+ 	/* MSI-X */
+@@ -109,6 +111,7 @@ struct rvu {
+ 	u16			*cgxlmac2pf_map; /* bitmap of mapped pfs for
+ 						  * every cgx lmac port
+ 						  */
++	unsigned long		pf_notify_bmap; /* Flags for PF notification */
+ 	void			**cgx_idmap; /* cgx id to cgx data map table */
+ 	struct			work_struct cgx_evh_work;
+ 	struct			workqueue_struct *cgx_evh_wq;
+@@ -183,4 +186,8 @@ int rvu_mbox_handler_CGX_PROMISC_ENABLE(struct rvu *rvu, struct msg_req *req,
+ 					struct msg_rsp *rsp);
+ int rvu_mbox_handler_CGX_PROMISC_DISABLE(struct rvu *rvu, struct msg_req *req,
+ 					 struct msg_rsp *rsp);
++int rvu_mbox_handler_CGX_START_LINKEVENTS(struct rvu *rvu, struct msg_req *req,
++					  struct msg_rsp *rsp);
++int rvu_mbox_handler_CGX_STOP_LINKEVENTS(struct rvu *rvu, struct msg_req *req,
++					 struct msg_rsp *rsp);
+ #endif /* RVU_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu_cgx.c b/drivers/soc/marvell/octeontx2/rvu_cgx.c
+index f06bd74c7e66..ef0f9eee9151 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_cgx.c
++++ b/drivers/soc/marvell/octeontx2/rvu_cgx.c
+@@ -20,6 +20,31 @@ struct cgx_evq_entry {
+ 	struct cgx_link_event link_event;
+ };
+ 
++#define M(_name, _id, _req_type, _rsp_type)				\
++static struct _req_type __maybe_unused					\
++*otx2_mbox_alloc_msg_ ## _name(struct rvu *rvu, int devid)		\
++{									\
++	struct _req_type *req;						\
++									\
++	req = (struct _req_type *)otx2_mbox_alloc_msg_rsp(		\
++		&rvu->mbox_up, devid, sizeof(struct _req_type),		\
++		sizeof(struct _rsp_type));				\
++	if (!req)							\
++		return NULL;						\
++	req->hdr.sig = OTX2_MBOX_REQ_SIG;				\
++	req->hdr.id = _id;						\
++	return req;							\
++}
++
++MBOX_UP_CGX_MESSAGES
++#undef M
++
++/* Returns bitmap of mapped PFs */
++static inline u16 cgxlmac_to_pfmap(struct rvu *rvu, u8 cgx_id, u8 lmac_id)
++{
++	return rvu->cgxlmac2pf_map[CGX_OFFSET(cgx_id) + lmac_id];
++}
++
+ static inline u8 cgxlmac_id_to_bmap(u8 cgx_id, u8 lmac_id)
+ {
+ 	return ((cgx_id & 0xF) << 4) | (lmac_id & 0xF);
+@@ -77,6 +102,34 @@ static int rvu_map_cgx_lmac_pf(struct rvu *rvu)
+ 	return 0;
+ }
+ 
++static int rvu_cgx_send_link_info(int cgx_id, int lmac_id, struct rvu *rvu)
++{
++	struct cgx_evq_entry *qentry;
++	unsigned long flags;
++	int err;
++
++	qentry = kmalloc(sizeof(*qentry), GFP_KERNEL);
++	if (!qentry)
++		return -ENOMEM;
++
++	/* Lock the event queue before we read the local link status */
++	spin_lock_irqsave(&rvu->cgx_evq_lock, flags);
++	err = cgx_get_link_info(rvu_cgx_pdata(cgx_id, rvu), lmac_id,
++				&qentry->link_event.link_uinfo);
++	qentry->link_event.cgx_id = cgx_id;
++	qentry->link_event.lmac_id = lmac_id;
++	if (err)
++		goto skip_add;
++	list_add_tail(&qentry->evq_node, &rvu->cgx_evq_head);
++skip_add:
++	spin_unlock_irqrestore(&rvu->cgx_evq_lock, flags);
++
++	/* start worker to process the events */
++	queue_work(rvu->cgx_evh_wq, &rvu->cgx_evh_work);
++
++	return 0;
++}
++
+ /* This is called from interrupt context and is expected to be atomic */
+ static int cgx_lmac_postevent(struct cgx_link_event *event, void *data)
+ {
+@@ -98,6 +151,41 @@ static int cgx_lmac_postevent(struct cgx_link_event *event, void *data)
+ 	return 0;
+ }
+ 
++static void cgx_notify_pfs(struct cgx_link_event *event, struct rvu *rvu)
++{
++	struct cgx_link_user_info *linfo;
++	struct cgx_link_info_msg *msg;
++	unsigned long pfmap;
++	int err, pfid;
++
++	linfo = &event->link_uinfo;
++	pfmap = cgxlmac_to_pfmap(rvu, event->cgx_id, event->lmac_id);
++
++	do {
++		pfid = find_first_bit(&pfmap, 16);
++		clear_bit(pfid, &pfmap);
++
++		/* check if notification is enabled */
++		if (!test_bit(pfid, &rvu->pf_notify_bmap)) {
++			dev_info(rvu->dev, "cgx %d: lmac %d Link status %s\n",
++				 event->cgx_id, event->lmac_id,
++				 linfo->link_up ? "UP" : "DOWN");
++			continue;
++		}
++
++		/* Send mbox message to PF */
++		msg = otx2_mbox_alloc_msg_CGX_LINK_EVENT(rvu, pfid);
++		if (!msg)
++			continue;
++		msg->link_info = *linfo;
++		otx2_mbox_msg_send(&rvu->mbox_up, pfid);
++		err = otx2_mbox_wait_for_rsp(&rvu->mbox_up, pfid);
++		if (err)
++			dev_warn(rvu->dev, "notification to pf %d failed\n",
++				 pfid);
++	} while (pfmap);
++}
++
+ static void cgx_evhandler_task(struct work_struct *work)
+ {
+ 	struct rvu *rvu = container_of(work, struct rvu, cgx_evh_work);
+@@ -119,7 +207,8 @@ static void cgx_evhandler_task(struct work_struct *work)
+ 
+ 		event = &qentry->link_event;
+ 
+-		/* Do nothing for now */
++		/* process event */
++		cgx_notify_pfs(event, rvu);
+ 		kfree(qentry);
+ 	} while (1);
+ }
+@@ -334,3 +423,41 @@ int rvu_mbox_handler_CGX_PROMISC_DISABLE(struct rvu *rvu, struct msg_req *req,
+ 	cgx_lmac_promisc_config(cgx_id, lmac_id, false);
+ 	return 0;
+ }
++
++static int rvu_cgx_config_linkevents(struct rvu *rvu, u16 pcifunc, bool en)
++{
++	int pf = rvu_get_pf(pcifunc);
++	u8 cgx_id, lmac_id;
++
++	/* This msg is expected only from PFs that are mapped to CGX LMACs,
++	 * if received from other PF/VF simply ACK, nothing to do.
++	 */
++	if ((pcifunc & RVU_PFVF_FUNC_MASK) || !is_pf_cgxmapped(rvu, pf))
++		return -ENODEV;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++
++	if (en) {
++		set_bit(pf, &rvu->pf_notify_bmap);
++		/* Send the current link status to PF */
++		rvu_cgx_send_link_info(cgx_id, lmac_id, rvu);
++	} else {
++		clear_bit(pf, &rvu->pf_notify_bmap);
++	}
++
++	return 0;
++}
++
++int rvu_mbox_handler_CGX_START_LINKEVENTS(struct rvu *rvu, struct msg_req *req,
++					  struct msg_rsp *rsp)
++{
++	rvu_cgx_config_linkevents(rvu, req->hdr.pcifunc, true);
++	return 0;
++}
++
++int rvu_mbox_handler_CGX_STOP_LINKEVENTS(struct rvu *rvu, struct msg_req *req,
++					 struct msg_rsp *rsp)
++{
++	rvu_cgx_config_linkevents(rvu, req->hdr.pcifunc, false);
++	return 0;
++}
+-- 
+2.17.1
+

@@ -1,0 +1,137 @@
+From 4d605412d2f2010b9224a24b354ab685b9135aef Mon Sep 17 00:00:00 2001
+From: Yan Markman <ymarkman@marvell.com>
+Date: Tue, 16 Oct 2018 18:55:35 +0300
+Subject: [PATCH 0730/1051] net: mvpp2: fix recycle-get failure handling
+
+Fix "frag-allocation or dma-mapping failure" handling in the
+recycle-get procedure and in appropriated callers - build_skb()
+and rx().
+
+The fixed problem is in the next scenario:
+- N>1 packets are under handling of rx() loop
+- Packet n (1<=n<N) is OK with frag-buffer allocation
+  and sets *refill_needed=0
+- Packet n+1 failed to allocate new frag and succeed with SKB-alloc
+  the retun code *refill_needed stays 0
+- rx() continue with no-error but BM-buffer is not refilled!
+
+Change-Id: I9f0baf8028f603df3d765f22bbca38701de09ef2
+Signed-off-by: Yan Markman <ymarkman@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/60522
+Reviewed-by: Igal Liberman <igall@marvell.com>
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 41 ++++++++-----------
+ 1 file changed, 18 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 56a2e9bd6cac..a5100b3c9e2e 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -3105,8 +3105,8 @@ static void mvpp2_rx_csum(struct mvpp2_port *port, u32 status,
+ }
+ 
+ /* Allocate a new skb and add it to BM pool */
+-static int mvpp2_rx_refill(struct mvpp2_port *port,
+-			   struct mvpp2_bm_pool *bm_pool, int pool)
++static inline int mvpp2_rx_refill(struct mvpp2_port *port,
++				  struct mvpp2_bm_pool *bm_pool, int pool)
+ {
+ 	dma_addr_t dma_addr = mvpp2_buf_alloc(port, bm_pool, GFP_ATOMIC);
+ 
+@@ -3300,7 +3300,6 @@ static inline void mvpp2_recycle_put(struct mvpp2_txq_pcpu *txq_pcpu,
+ }
+ 
+ static struct sk_buff *mvpp2_recycle_get(struct mvpp2_port *port,
+-					 int *refill_needed,
+ 					 struct mvpp2_bm_pool *bm_pool)
+ {
+ 	int cpu;
+@@ -3338,9 +3337,7 @@ static struct sk_buff *mvpp2_recycle_get(struct mvpp2_port *port,
+ 		pcpu->idx[bm_pool->id]++; /* Return back to recycle */
+ 		netdev_err(port->dev, "failed to refill BM pool-%d (%d:%p)\n",
+ 			   bm_pool->id, pcpu->idx[bm_pool->id], frag);
+-	} else {
+-		mvpp2_bm_pool_put(port, bm_pool->id, dma_addr);
+-		*refill_needed = 0;
++		return NULL;
+ 	}
+ 
+ 	/* GET skb buffer */
+@@ -3349,10 +3346,19 @@ static struct sk_buff *mvpp2_recycle_get(struct mvpp2_port *port,
+ 		pool = &pcpu->pool[MVPP2_BM_POOLS_NUM];
+ 		skb = pool->pbuf[idx];
+ 		pcpu->idx[MVPP2_BM_POOLS_NUM]--;
+-		return skb;
++	} else {
++		skb = kmem_cache_alloc(skbuff_head_cache, GFP_ATOMIC);
+ 	}
+ 
+-	return kmem_cache_alloc(skbuff_head_cache, GFP_ATOMIC);
++	if (!skb) {
++		dma_unmap_single(port->dev->dev.parent, dma_addr,
++				 MVPP2_RX_BUF_SIZE(bm_pool->pkt_size),
++				 DMA_FROM_DEVICE);
++		mvpp2_frag_free(bm_pool, frag);
++		return NULL;
++	}
++	mvpp2_bm_pool_put(port, bm_pool->id, dma_addr);
++	return skb;
+ }
+ 
+ static inline void mvpp2_skb_set_extra(struct sk_buff *skb,
+@@ -3382,14 +3388,13 @@ struct sk_buff *mvpp2_build_skb(void *data, unsigned int frag_size,
+ 				struct mvpp2_port *port,
+ 				u32 rx_status,
+ 				u8 rxq_id,
+-				struct mvpp2_bm_pool *bm_pool,
+-				int *refill_needed)
++				struct mvpp2_bm_pool *bm_pool)
+ {
+ 	struct skb_shared_info *shinfo;
+ 	struct sk_buff *skb;
+ 	unsigned int size = frag_size ? : ksize(data);
+ 
+-	skb = mvpp2_recycle_get(port, refill_needed, bm_pool);
++	skb = mvpp2_recycle_get(port, bm_pool);
+ 	if (!skb)
+ 		return NULL;
+ 
+@@ -3455,7 +3460,7 @@ static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+ 		dma_addr_t dma_addr;
+ 		phys_addr_t phys_addr;
+ 		u32 rx_status;
+-		int pool, rx_bytes, err;
++		int pool, rx_bytes;
+ 		void *data;
+ 
+ 		rx_done++;
+@@ -3501,22 +3506,12 @@ static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+ 				 bm_pool->buf_size, DMA_FROM_DEVICE);
+ 
+ 		skb = mvpp2_build_skb(data, frag_size,
+-				      napi, port, rx_status, rxq->id,
+-				      bm_pool, &rx_received);
++				      napi, port, rx_status, rxq->id, bm_pool);
+ 		if (!skb) {
+ 			netdev_warn(port->dev, "skb build failed\n");
+ 			goto err_drop_frame;
+ 		}
+ 
+-		if (!rx_received)
+-			goto refill_done; /* done by build-skb */
+-
+-		err = mvpp2_rx_refill(port, bm_pool, pool);
+-		if (err) {
+-			netdev_err(port->dev, "failed to refill BM pools\n");
+-			goto err_drop_frame;
+-		}
+-refill_done:
+ 		skb_reserve(skb, MVPP2_MH_SIZE + NET_SKB_PAD);
+ 		skb_put(skb, rx_bytes);
+ 		skb->protocol = eth_type_trans(skb, dev);
+-- 
+2.17.1
+

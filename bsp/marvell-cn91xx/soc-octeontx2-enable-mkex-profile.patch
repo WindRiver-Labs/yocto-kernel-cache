@@ -1,0 +1,400 @@
+From 05fb818bd137b4ba43ea037006f757b188fb7c5a Mon Sep 17 00:00:00 2001
+From: "Attunuru, Vamsi" <Vamsi.Attunuru@cavium.com>
+Date: Wed, 28 Nov 2018 12:20:29 +0530
+Subject: [PATCH 0776/1051] soc: octeontx2: enable mkex profile
+
+The following set of NPC registers allow driver to configure NPC
+to generate different key value schemes to compare against
+packet payload in MCAM search.
+
+NPC_AF_INTF(0..1)_KEX_CFG
+NPC_AF_KEX_LDATA(0..1)_FLAGS_CFG
+NPC_AF_INTF(0..1)_LID(0..7)_LT(0..15)_LD(0..1)_CFG
+NPC_AF_INTF(0..1)_LDATA(0..1)_FLAGS(0..15)_CFG
+
+Currently, the AF driver populates these registers to
+configure the default values to address the most common
+use cases such as key generation for channel number + DMAC.
+
+The secure firmware stores different configuration
+value of these registers to enable different NPC use case
+along with the name for the lookup.
+
+Patch loads profile binary from secure firmware over
+the exiting CGX mailbox interface and select the given
+profile based on the octeontx2_af.mkex_profile
+module parameter.
+
+Patch does name search for the module parameter specified
+profile in the profile binary and configures matched profile.
+
+AF driver can fall back to default configuration in the
+following cases.
+* If mkex_profile module parameter is not specified
+* If CGX mailbox scheme detects an issue
+* If mkex_profile module parameter is specified and
+  it fails to find the associated profile
+
+The AF consumer driver can know the selected profile
+on response to NPC_GET_KEX_CFG mailbox by introducing
+mkex_pfl_name in the struct npc_get_kex_cfg_rsp.
+
+Signed-off-by: Vamsi Attunuru <vamsi.attunuru@marvell.com>
+Signed-off-by: Jerin Jacob <jerinj@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/cgx.c       |  54 +++++++++++
+ drivers/soc/marvell/octeontx2/cgx.h       |   1 +
+ drivers/soc/marvell/octeontx2/cgx_fw_if.h |  12 +++
+ drivers/soc/marvell/octeontx2/mbox.h      |   2 +
+ drivers/soc/marvell/octeontx2/npc.h       |  18 ++++
+ drivers/soc/marvell/octeontx2/rvu.c       |  15 +++
+ drivers/soc/marvell/octeontx2/rvu.h       |   2 +
+ drivers/soc/marvell/octeontx2/rvu_npc.c   | 111 +++++++++++++++++++++-
+ 8 files changed, 213 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/cgx.c b/drivers/soc/marvell/octeontx2/cgx.c
+index cdf3b07e3a24..ef0766ab4463 100644
+--- a/drivers/soc/marvell/octeontx2/cgx.c
++++ b/drivers/soc/marvell/octeontx2/cgx.c
+@@ -533,6 +533,60 @@ static inline bool cgx_event_is_linkevent(u64 event)
+ 		return false;
+ }
+ 
++static inline int cgx_fwi_get_mkex_prfl_sz(u64 *prfl_sz,
++					struct cgx *cgx)
++{
++	u64 req = 0;
++	u64 resp;
++	int err;
++
++	req = FIELD_SET(CMDREG_ID, CGX_CMD_GET_MKEX_PRFL_SIZE, req);
++	err = cgx_fwi_cmd_generic(req, &resp, cgx, 0);
++	if (!err)
++		*prfl_sz = FIELD_GET(RESP_MKEX_PRFL_SIZE, resp);
++
++	return err;
++}
++
++static inline int cgx_fwi_get_mkex_prfl_addr(u64 *prfl_addr,
++					struct cgx *cgx)
++{
++	u64 req = 0;
++	u64 resp;
++	int err;
++
++	req = FIELD_SET(CMDREG_ID, CGX_CMD_GET_MKEX_PRFL_ADDR, req);
++	err = cgx_fwi_cmd_generic(req, &resp, cgx, 0);
++	if (!err)
++		*prfl_addr = FIELD_GET(RESP_MKEX_PRFL_ADDR, resp);
++
++	return err;
++}
++
++int cgx_get_mkex_prfl_info(u64 *addr, u64 *size)
++{
++	struct cgx *cgx_dev;
++	int err;
++
++	if (!addr || !size)
++		return -EINVAL;
++
++	cgx_dev = list_first_entry(&cgx_list, struct cgx, cgx_list);
++	if (!cgx_dev)
++		return -ENXIO;
++
++	err = cgx_fwi_get_mkex_prfl_sz(size, cgx_dev);
++	if (err)
++		return -EIO;
++
++	err = cgx_fwi_get_mkex_prfl_addr(addr, cgx_dev);
++	if (err)
++		return -EIO;
++
++	return 0;
++}
++EXPORT_SYMBOL(cgx_get_mkex_prfl_info);
++
+ static irqreturn_t cgx_fwi_event_handler(int irq, void *data)
+ {
+ 	struct lmac *lmac = data;
+diff --git a/drivers/soc/marvell/octeontx2/cgx.h b/drivers/soc/marvell/octeontx2/cgx.h
+index fe209d412d3f..72e0aea0114f 100644
+--- a/drivers/soc/marvell/octeontx2/cgx.h
++++ b/drivers/soc/marvell/octeontx2/cgx.h
+@@ -114,4 +114,5 @@ int cgx_lmac_internal_loopback(void *cgxd, int lmac_id, bool enable);
+ int cgx_get_link_info(void *cgxd, int lmac_id, struct cgx_link_user_info
+ 			*linfo);
+ int cgx_lmac_linkup_start(void *cgxd);
++int cgx_get_mkex_prfl_info(u64 *addr, u64 *size);
+ #endif /* CGX_H */
+diff --git a/drivers/soc/marvell/octeontx2/cgx_fw_if.h b/drivers/soc/marvell/octeontx2/cgx_fw_if.h
+index 071c8137f87a..033a2138fb92 100644
+--- a/drivers/soc/marvell/octeontx2/cgx_fw_if.h
++++ b/drivers/soc/marvell/octeontx2/cgx_fw_if.h
+@@ -79,6 +79,8 @@ enum cgx_cmd_id {
+ 	CGX_CMD_LINK_STATE_CHANGE,
+ 	CGX_CMD_MODE_CHANGE,		/* hot plug support */
+ 	CGX_CMD_INTF_SHUTDOWN,
++	CGX_CMD_GET_MKEX_PRFL_SIZE,
++	CGX_CMD_GET_MKEX_PRFL_ADDR
+ };
+ 
+ /* async event ids */
+@@ -138,6 +140,16 @@ enum cgx_cmd_own {
+  */
+ #define RESP_MAC_ADDR		GENMASK_ULL(56, 9)
+ 
++/* Response to cmd ID as CGX_CMD_GET_MKEX_PRFL_SIZE with cmd status as
++ * CGX_STAT_SUCCESS
++ */
++#define RESP_MKEX_PRFL_SIZE		GENMASK_ULL(63, 9)
++
++/* Response to cmd ID as CGX_CMD_GET_MKEX_PRFL_ADDR with cmd status as
++ * CGX_STAT_SUCCESS
++ */
++#define RESP_MKEX_PRFL_ADDR		GENMASK_ULL(63, 9)
++
+ /* Response to cmd ID - CGX_CMD_LINK_BRING_UP/DOWN, event ID CGX_EVT_LINK_CHANGE
+  * status can be either CGX_STAT_FAIL or CGX_STAT_SUCCESS
+  *
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 80364cde0fdb..2f787364bdd8 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -913,6 +913,8 @@ struct npc_get_kex_cfg_rsp {
+ 	u64 intf_lid_lt_ld[NPC_MAX_INTF][NPC_MAX_LID][NPC_MAX_LT][NPC_MAX_LD];
+ 	/* NPC_AF_INTF(0..1)_LDATA(0..1)_FLAGS(0..15)_CFG */
+ 	u64 intf_ld_flags[NPC_MAX_INTF][NPC_MAX_LD][NPC_MAX_LFL];
++#define MKEX_NAME_LEN 128
++	u8 mkex_pfl_name[MKEX_NAME_LEN];
+ };
+ 
+ /* TIM mailbox error codes
+diff --git a/drivers/soc/marvell/octeontx2/npc.h b/drivers/soc/marvell/octeontx2/npc.h
+index ce59b266a60a..b85c3f5f6374 100644
+--- a/drivers/soc/marvell/octeontx2/npc.h
++++ b/drivers/soc/marvell/octeontx2/npc.h
+@@ -297,4 +297,22 @@ struct nix_rx_vtag_action {
+ #endif
+ };
+ 
++struct npc_mcam_kex {
++	/* MKEX Profle Header */
++	u64 mkex_sign; /* "mcam-kex-profile" (8 bytes/ASCII characters) */
++	u8 name[MKEX_NAME_LEN];   /* MKEX Profile name */
++	u64 cpu_model;   /* Format as profiled by CPU hardware */
++	u64 kpu_version; /* KPU firmware/profile version */
++	u64 reserved; /* Reserved for extension */
++
++	/* MKEX Profle Data */
++	u64 keyx_cfg[NPC_MAX_INTF]; /* NPC_AF_INTF(0..1)_KEX_CFG */
++	/* NPC_AF_KEX_LDATA(0..1)_FLAGS_CFG */
++	u64 kex_ld_flags[NPC_MAX_LD];
++	/* NPC_AF_INTF(0..1)_LID(0..7)_LT(0..15)_LD(0..1)_CFG */
++	u64 intf_lid_lt_ld[NPC_MAX_INTF][NPC_MAX_LID][NPC_MAX_LT][NPC_MAX_LD];
++	/* NPC_AF_INTF(0..1)_LDATA(0..1)_FLAGS(0..15)_CFG */
++	u64 intf_ld_flags[NPC_MAX_INTF][NPC_MAX_LD][NPC_MAX_LFL];
++} __packed;
++
+ #endif /* NPC_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index fce7376624af..c1f95965ad88 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -52,6 +52,10 @@ MODULE_LICENSE("GPL v2");
+ MODULE_VERSION(DRV_VERSION);
+ MODULE_DEVICE_TABLE(pci, rvu_id_table);
+ 
++static char *mkex_profile; /* MKEX profile name */
++module_param(mkex_profile, charp, 0000);
++MODULE_PARM_DESC(mkex_profile, "MKEX profile name string");
++
+ /* Poll a RVU block's register 'offset', for a 'zero'
+  * or 'nonzero' at bits specified by 'mask'
+  */
+@@ -2444,6 +2448,14 @@ static void rvu_disable_sriov(struct rvu *rvu)
+ 	pci_disable_sriov(rvu->pdev);
+ }
+ 
++static void rvu_update_module_params(struct rvu *rvu)
++{
++	const char *default_pfl_name = "default";
++
++	strscpy(rvu->mkex_pfl_name,
++		mkex_profile ? mkex_profile : default_pfl_name, MKEX_NAME_LEN);
++}
++
+ static int rvu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -2509,6 +2521,9 @@ static int rvu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_put_ptp;
+ 	}
+ 
++	/* Store module params in rvu structure */
++	rvu_update_module_params(rvu);
++
+ 	/* Check which blocks the HW supports */
+ 	rvu_check_block_implemented(rvu);
+ 
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index a9b63e4b4d22..8fd887ad5400 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -308,6 +308,8 @@ struct rvu {
+ #ifdef CONFIG_DEBUG_FS
+ 	struct rvu_debugfs	rvu_dbg;
+ #endif /* CONFIG_DEBUG_FS */
++
++	char mkex_pfl_name[MKEX_NAME_LEN]; /* Configured MKEX profile name */
+ };
+ 
+ static inline void rvu_write64(struct rvu *rvu, u64 block, u64 offset, u64 val)
+diff --git a/drivers/soc/marvell/octeontx2/rvu_npc.c b/drivers/soc/marvell/octeontx2/rvu_npc.c
+index 082e1b38b15d..0b1976ac252b 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_npc.c
++++ b/drivers/soc/marvell/octeontx2/rvu_npc.c
+@@ -15,6 +15,7 @@
+ #include "rvu_reg.h"
+ #include "rvu.h"
+ #include "npc.h"
++#include "cgx.h"
+ #include "npc_profile.h"
+ 
+ #define RSVD_MCAM_ENTRIES_PER_PF	2 /* Bcast & Promisc */
+@@ -762,6 +763,111 @@ static void npc_config_ldata_extract(struct rvu *rvu, int blkaddr)
+ 	SET_KEX_LD(NIX_INTF_RX, NPC_LID_LD, NPC_LT_LD_TCP, 1, cfg);
+ }
+ 
++static void npc_program_mkex_profile(struct rvu *rvu, int blkaddr,
++						struct npc_mcam_kex *mkex)
++{
++	int lid, lt, ld, fl;
++
++	rvu_write64(rvu, blkaddr,
++		NPC_AF_INTFX_KEX_CFG(NIX_INTF_RX), mkex->keyx_cfg[NIX_INTF_RX]);
++	rvu_write64(rvu, blkaddr,
++		NPC_AF_INTFX_KEX_CFG(NIX_INTF_TX), mkex->keyx_cfg[NIX_INTF_TX]);
++
++	for (ld = 0; ld < NPC_MAX_LD; ld++)
++		rvu_write64(rvu, blkaddr, NPC_AF_KEX_LDATAX_FLAGS_CFG(ld),
++				mkex->kex_ld_flags[ld]);
++
++	for (lid = 0; lid < NPC_MAX_LID; lid++) {
++		for (lt = 0; lt < NPC_MAX_LT; lt++) {
++			for (ld = 0; ld < NPC_MAX_LD; ld++) {
++
++				SET_KEX_LD(NIX_INTF_RX, lid, lt, ld,
++					mkex->intf_lid_lt_ld
++					[NIX_INTF_RX][lid][lt][ld]);
++
++				SET_KEX_LD(NIX_INTF_TX, lid, lt, ld,
++					mkex->intf_lid_lt_ld
++					[NIX_INTF_TX][lid][lt][ld]);
++			}
++		}
++	}
++
++	for (ld = 0; ld < NPC_MAX_LD; ld++) {
++		for (fl = 0; fl < NPC_MAX_LFL; fl++) {
++
++			SET_KEX_LDFLAGS(NIX_INTF_RX, ld, fl,
++				mkex->intf_ld_flags[NIX_INTF_RX][ld][fl]);
++
++			SET_KEX_LDFLAGS(NIX_INTF_TX, ld, fl,
++				mkex->intf_ld_flags[NIX_INTF_TX][ld][fl]);
++		}
++	}
++}
++
++/* strtoull of "mkexprof" with base:36 */
++#define MKEX_SIGN      0x19bbfdbd15f
++#define MKEX_END_SIGN  0xdeadbeef
++
++void npc_load_mkex_profile(struct rvu *rvu, int blkaddr)
++{
++	const char *mkex_profile = rvu->mkex_pfl_name;
++	struct device *dev = &rvu->pdev->dev;
++	void __iomem *mkex_prfl_addr = NULL;
++	struct npc_mcam_kex *mcam_kex;
++	u64 prfl_addr;
++	u64 prfl_sz;
++
++	/* If user not selected mkex profile */
++	if (!strncmp(mkex_profile, "default", MKEX_NAME_LEN))
++		goto load_default;
++
++	if (cgx_get_mkex_prfl_info(&prfl_addr, &prfl_sz))
++		goto load_default;
++
++	if (!prfl_addr || !prfl_sz)
++		goto load_default;
++
++	mkex_prfl_addr = ioremap_wc(prfl_addr, prfl_sz);
++	if (!mkex_prfl_addr)
++		goto load_default;
++
++	mcam_kex = (struct npc_mcam_kex *)mkex_prfl_addr;
++
++	while (((s64)prfl_sz > 0) && (mcam_kex->mkex_sign != MKEX_END_SIGN)) {
++		/* Compare with mkex mod_param name string */
++		if ((mcam_kex->mkex_sign == MKEX_SIGN) &&
++			!strncmp(mcam_kex->name, mkex_profile, MKEX_NAME_LEN)) {
++			/* Due to an errata (35786) in A0 pass silicon,
++			 * parse nibble enable configuration has to be
++			 * identical for both Rx and Tx interfaces.
++			 */
++			if (is_rvu_9xxx_A0(rvu) &&
++				(mcam_kex->keyx_cfg[NIX_INTF_RX] !=
++					mcam_kex->keyx_cfg[NIX_INTF_TX]))
++				goto load_default;
++
++			/* Program selected mkex profile */
++			npc_program_mkex_profile(rvu, blkaddr, mcam_kex);
++
++			goto unmap;
++		}
++
++		mcam_kex++;
++		prfl_sz -= sizeof(struct npc_mcam_kex);
++	}
++	dev_warn(dev, "Failed to load requested profile: %s\n",
++			 rvu->mkex_pfl_name);
++
++load_default:
++	dev_info(rvu->dev, "Using default mkex profile\n");
++	/* Config packet data and flags extraction into PARSE result */
++	npc_config_ldata_extract(rvu, blkaddr);
++
++unmap:
++	if (mkex_prfl_addr)
++		iounmap(mkex_prfl_addr);
++}
++
+ static void npc_config_kpuaction(struct rvu *rvu, int blkaddr,
+ 				 struct npc_kpu_profile_action *kpuaction,
+ 				 int kpu, int entry, bool pkind)
+@@ -1107,8 +1213,8 @@ int rvu_npc_init(struct rvu *rvu)
+ 	if (err)
+ 		return err;
+ 
+-	/* Config packet data and flags extraction into PARSE result */
+-	npc_config_ldata_extract(rvu, blkaddr);
++	/* Configure MKEX profile */
++	npc_load_mkex_profile(rvu, blkaddr);
+ 
+ 	/* Set TX miss action to UCAST_DEFAULT i.e
+ 	 * transmit the packet on NIX LF SQ's default channel.
+@@ -2157,6 +2263,7 @@ int rvu_mbox_handler_npc_get_kex_cfg(struct rvu *rvu, struct msg_req *req,
+ 					GET_KEX_LDFLAGS(NIX_INTF_TX, ld, fl);
+ 		}
+ 	}
++	memcpy(rsp->mkex_pfl_name, rvu->mkex_pfl_name, MKEX_NAME_LEN);
+ 	return 0;
+ }
+ 
+-- 
+2.17.1
+

@@ -1,0 +1,148 @@
+From da7912450454503ea72b368b367ec32a6da28d61 Mon Sep 17 00:00:00 2001
+From: Marcin Wojtas <mw@semihalf.com>
+Date: Mon, 24 Dec 2018 02:55:35 +0100
+Subject: [PATCH 0836/1051] net: mvpp2: add PP2.2 GMAC TX FIFO configuration
+
+TX FIFO can be additionally configured in MAC registers,
+which is valid when the interface speed is max. 2500Mbps.
+Until now, however this setting was done only for PP2.1,
+leaving the defaults for the latest NIC revision.
+
+This patch change the TX FIFO minimal threshold as specified
+in erratum RM-9725147 (50 for 1G and 136 for 2.5G). Because
+the link speed can be changed dynamically move the TX FIFO
+to a separate subroutine, which is executed during init and
+also in a phylink callback.
+
+Moreover, fix the MVPP2_GMAC_TX_FIFO_MIN_TH_ALL_MASK value and
+add updating assertion/deassertion levels of the p2mem_ready_signal,
+which indicates readiness for fetching the data from DRAM to the
+TX FIFO. Those levels must be set according to the conditions:
+TxFifoHiWM > TxFifoLowWM > TxFifoMinTh.
+
+Change-Id: I74be927c7fe66c801b316e6d94b27a2146424a66
+Signed-off-by: Marcin Wojtas <mw@semihalf.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/62044
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/1703
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Stefan Chulski <Stefan.Chulski@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h    | 15 +++++-
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 49 +++++++++++++++----
+ 2 files changed, 54 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+index 84d7bb0ae047..5dde83ddf002 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -420,9 +420,12 @@
+ #define     MVPP2_GMAC_STATUS0_RX_PAUSE		BIT(6)
+ #define     MVPP2_GMAC_STATUS0_TX_PAUSE		BIT(7)
+ #define     MVPP2_GMAC_STATUS0_AN_COMPLETE	BIT(11)
++#define MVPP2_GMAC_PORT_FIFO_CFG_0_REG		0x18
++#define     MVPP2_GMAC_TX_FIFO_WM_MASK		0xffff
++#define     MVPP2_GMAC_TX_FIFO_WM_LOW_OFFSET	8
+ #define MVPP2_GMAC_PORT_FIFO_CFG_1_REG		0x1c
+ #define     MVPP2_GMAC_TX_FIFO_MIN_TH_OFFS	6
+-#define     MVPP2_GMAC_TX_FIFO_MIN_TH_ALL_MASK	0x1fc0
++#define     MVPP2_GMAC_TX_FIFO_MIN_TH_ALL_MASK	0x3fc0
+ #define     MVPP2_GMAC_TX_FIFO_MIN_TH_MASK(v)	(((v) << 6) & \
+ 					MVPP2_GMAC_TX_FIFO_MIN_TH_ALL_MASK)
+ #define MVPP22_GMAC_INT_STAT			0x20
+@@ -619,6 +622,16 @@
+ #define MVPP2_TX_FIFO_THRESHOLD_3KB	\
+ 	(MVPP22_TX_FIFO_DATA_SIZE_3KB * 1024 - MVPP2_TX_FIFO_THRESHOLD_MIN)
+ 
++/* GMAC TX FIFO configuration */
++#define MVPP2_GMAC_TX_FIFO_MIN_TH_1000	\
++	MVPP2_GMAC_TX_FIFO_MIN_TH_MASK(50)
++#define MVPP2_GMAC_TX_FIFO_MIN_TH_2500	\
++	MVPP2_GMAC_TX_FIFO_MIN_TH_MASK(136)
++#define MVPP2_GMAC_TX_FIFO_LOW_WM_1000		75
++#define MVPP2_GMAC_TX_FIFO_HI_WM_1000		77
++#define MVPP2_GMAC_TX_FIFO_LOW_WM_2500		180
++#define MVPP2_GMAC_TX_FIFO_HI_WM_2500		185
++
+ /* RX buffer constants */
+ #define MVPP2_SKB_SHINFO_SIZE \
+ 	SKB_DATA_ALIGN(sizeof(struct skb_shared_info))
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 5e680675ef5e..0c7d353d867d 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -1464,19 +1464,48 @@ static inline void mvpp2_xlg_max_rx_size_set(struct mvpp2_port *port)
+ 	writel(val, port->base + MVPP22_XLG_CTRL1_REG);
+ }
+ 
++static void mvpp2_gmac_tx_fifo_configure(struct mvpp2_port *port,
++					 phy_interface_t phy_interface)
++{
++	u32 val, tx_fifo_min_th;
++	u8 low_wm, hi_wm;
++
++	if (phy_interface == PHY_INTERFACE_MODE_2500BASEX) {
++		tx_fifo_min_th = MVPP2_GMAC_TX_FIFO_MIN_TH_2500;
++		low_wm = MVPP2_GMAC_TX_FIFO_LOW_WM_2500;
++		hi_wm = MVPP2_GMAC_TX_FIFO_HI_WM_2500;
++	} else {
++		tx_fifo_min_th = MVPP2_GMAC_TX_FIFO_MIN_TH_1000;
++		low_wm = MVPP2_GMAC_TX_FIFO_LOW_WM_1000;
++		hi_wm = MVPP2_GMAC_TX_FIFO_HI_WM_1000;
++	}
++
++	/* Update TX FIFO MIN Threshold */
++	val = readl(port->base + MVPP2_GMAC_PORT_FIFO_CFG_1_REG);
++	val &= ~MVPP2_GMAC_TX_FIFO_MIN_TH_ALL_MASK;
++	val |= tx_fifo_min_th;
++	writel(val, port->base + MVPP2_GMAC_PORT_FIFO_CFG_1_REG);
++
++	/* Update TX FIFO levels of assertion/deassertion
++	 * of p2mem_ready_signal, which indicates readiness
++	 * for fetching the data from DRAM.
++	 */
++	val = readl(port->base + MVPP2_GMAC_PORT_FIFO_CFG_0_REG);
++	val &= ~MVPP2_GMAC_TX_FIFO_WM_MASK;
++	val |= (low_wm << MVPP2_GMAC_TX_FIFO_WM_LOW_OFFSET) | hi_wm;
++	writel(val, port->base + MVPP2_GMAC_PORT_FIFO_CFG_0_REG);
++}
++
+ /* Set defaults to the MVPP2 port */
+ static void mvpp2_defaults_set(struct mvpp2_port *port)
+ {
+ 	int tx_port_num, val, queue, ptxq, lrxq;
+ 
+-	if (port->priv->hw_version == MVPP21) {
+-		/* Update TX FIFO MIN Threshold */
+-		val = readl(port->base + MVPP2_GMAC_PORT_FIFO_CFG_1_REG);
+-		val &= ~MVPP2_GMAC_TX_FIFO_MIN_TH_ALL_MASK;
+-		/* Min. TX threshold must be less than minimal packet length */
+-		val |= MVPP2_GMAC_TX_FIFO_MIN_TH_MASK(64 - 4 - 2);
+-		writel(val, port->base + MVPP2_GMAC_PORT_FIFO_CFG_1_REG);
+-	}
++	if (phy_interface_mode_is_rgmii(port->phy_interface) ||
++	    port->phy_interface == PHY_INTERFACE_MODE_SGMII ||
++	    port->phy_interface == PHY_INTERFACE_MODE_1000BASEX ||
++	    port->phy_interface == PHY_INTERFACE_MODE_2500BASEX)
++		mvpp2_gmac_tx_fifo_configure(port, port->phy_interface);
+ 
+ 	/* Disable Legacy WRR, Disable EJP, Release from reset */
+ 	tx_port_num = mvpp2_egress_port(port);
+@@ -5612,8 +5641,10 @@ static void mvpp2_mac_config(struct net_device *dev, unsigned int mode,
+ 	else if (phy_interface_mode_is_rgmii(state->interface) ||
+ 		 state->interface == PHY_INTERFACE_MODE_SGMII ||
+ 		 state->interface == PHY_INTERFACE_MODE_1000BASEX ||
+-		 state->interface == PHY_INTERFACE_MODE_2500BASEX)
++		 state->interface == PHY_INTERFACE_MODE_2500BASEX) {
+ 		mvpp2_gmac_config(port, mode, state);
++		mvpp2_gmac_tx_fifo_configure(port, state->interface);
++	}
+ 
+ 	if (port->priv->hw_version == MVPP21 && port->flags & MVPP2_F_LOOPBACK)
+ 		mvpp2_port_loopback_set(port, state);
+-- 
+2.17.1
+

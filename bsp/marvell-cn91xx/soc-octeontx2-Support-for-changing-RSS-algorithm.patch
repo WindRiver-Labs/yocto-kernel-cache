@@ -1,0 +1,190 @@
+From bae6ae97d28e6ea723d489066f01752b654554c3 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 16 Aug 2018 18:23:59 +0530
+Subject: [PATCH 0074/1051] soc: octeontx2: Support for changing RSS algorithm
+
+This patch adds support for a RVU PF/VF to change
+NIX Rx flowkey algorithm index in NPC RX RSS_ACTION.
+eg: a ethtool command changing RSS algorithm for a netdev
+interface would trigger this change in NPC.
+
+If PF/VF doesn't specify any MCAM entry index then default
+UCAST entry of the NIXLF attached to PF/VF will be updated
+with RSS_ACTION and flowkey index.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/mbox.h    | 10 ++++-
+ drivers/soc/marvell/octeontx2/rvu.h     |  5 +++
+ drivers/soc/marvell/octeontx2/rvu_nix.c | 51 +++++++++++++++++++++++++
+ drivers/soc/marvell/octeontx2/rvu_npc.c | 43 +++++++++++++++++++++
+ 4 files changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 846052188c21..d6a848d50ccd 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -156,7 +156,8 @@ M(NIX_TXSCH_ALLOC,	0x8004, nix_txsch_alloc_req, nix_txsch_alloc_rsp) \
+ M(NIX_TXSCH_FREE,	0x8005, msg_req, msg_rsp)			\
+ M(NIX_TXSCHQ_CFG,	0x8006, nix_txschq_config, msg_rsp)		\
+ M(NIX_STATS_RST,	0x8007, msg_req, msg_rsp)			\
+-M(NIX_VTAG_CFG,		0x8008, nix_vtag_config, msg_rsp)
++M(NIX_VTAG_CFG,		0x8008, nix_vtag_config, msg_rsp)		\
++M(NIX_RSS_FLOWKEY_CFG,  0x8009, nix_rss_flowkey_cfg, msg_rsp)
+ 
+ /* Messages initiated by AF (range 0xC00 - 0xDFF) */
+ #define MBOX_UP_CGX_MESSAGES						\
+@@ -488,4 +489,11 @@ struct nix_vtag_config {
+ 	};
+ };
+ 
++struct nix_rss_flowkey_cfg {
++	struct mbox_msghdr hdr;
++	int	mcam_index;  /* MCAM entry index to modify */
++	u32	flowkey_cfg; /* Flowkey types selected */
++	u8	group;       /* RSS context or group */
++};
++
+ #endif /* MBOX_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index c86a2c518ccb..097540a5f7c6 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -338,6 +338,9 @@ int rvu_mbox_handler_NIX_STATS_RST(struct rvu *rvu, struct msg_req *req,
+ int rvu_mbox_handler_NIX_VTAG_CFG(struct rvu *rvu,
+ 				  struct nix_vtag_config *req,
+ 				  struct msg_rsp *rsp);
++int rvu_mbox_handler_NIX_RSS_FLOWKEY_CFG(struct rvu *rvu,
++					 struct nix_rss_flowkey_cfg *req,
++					 struct msg_rsp *rsp);
+ 
+ /* NPC APIs */
+ int rvu_npc_init(struct rvu *rvu);
+@@ -349,4 +352,6 @@ void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
+ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+ 				       int nixlf, u64 chan);
+ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
++void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
++				    int group, int alg_idx, int mcam_index);
+ #endif /* RVU_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+index 459ca1d12051..fd0fdf4e1913 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_nix.c
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -1534,6 +1534,57 @@ int rvu_mbox_handler_NIX_STATS_RST(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
++/* Returns the ALG index to be set into NPC_RX_ACTION */
++static int get_flowkey_alg_idx(u32 flow_cfg)
++{
++	u32 ip_cfg;
++
++	flow_cfg &= ~FLOW_KEY_TYPE_PORT;
++	ip_cfg = FLOW_KEY_TYPE_IPV4 | FLOW_KEY_TYPE_IPV6;
++	if (flow_cfg == ip_cfg)
++		return FLOW_KEY_ALG_IP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_TCP))
++		return FLOW_KEY_ALG_TCP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_UDP))
++		return FLOW_KEY_ALG_UDP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_SCTP))
++		return FLOW_KEY_ALG_SCTP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_TCP | FLOW_KEY_TYPE_UDP))
++		return FLOW_KEY_ALG_TCP_UDP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_TCP | FLOW_KEY_TYPE_SCTP))
++		return FLOW_KEY_ALG_TCP_SCTP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_UDP | FLOW_KEY_TYPE_SCTP))
++		return FLOW_KEY_ALG_UDP_SCTP;
++	else if (flow_cfg == (ip_cfg | FLOW_KEY_TYPE_TCP |
++			      FLOW_KEY_TYPE_UDP | FLOW_KEY_TYPE_SCTP))
++		return FLOW_KEY_ALG_TCP_UDP_SCTP;
++
++	return FLOW_KEY_ALG_PORT;
++}
++
++int rvu_mbox_handler_NIX_RSS_FLOWKEY_CFG(struct rvu *rvu,
++					 struct nix_rss_flowkey_cfg *req,
++					 struct msg_rsp *rsp)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	int alg_idx, nixlf, blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
++	if (blkaddr < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	nixlf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, 0);
++	if (nixlf < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	alg_idx = get_flowkey_alg_idx(req->flowkey_cfg);
++
++	rvu_npc_update_flowkey_alg_idx(rvu, pcifunc, nixlf, req->group,
++				       alg_idx, req->mcam_index);
++	return 0;
++}
++
+ static void set_flowkey_fields(struct nix_rx_flowkey_alg *alg, u32 flow_cfg)
+ {
+ 	struct nix_rx_flowkey_alg *field = NULL;
+diff --git a/drivers/soc/marvell/octeontx2/rvu_npc.c b/drivers/soc/marvell/octeontx2/rvu_npc.c
+index 115ae6372751..0d2b28d6d5f9 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_npc.c
++++ b/drivers/soc/marvell/octeontx2/rvu_npc.c
+@@ -354,6 +354,49 @@ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+ 			      NIX_INTF_RX, &entry, true);
+ }
+ 
++void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
++				    int group, int alg_idx, int mcam_index)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	struct nix_rx_action action;
++	int blkaddr, index, bank;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return;
++
++	/* Check if this is for reserved default entry */
++	if (mcam_index < 0) {
++		if (group != DEFAULT_RSS_CONTEXT_GROUP)
++			return;
++		index = npc_get_nixlf_mcam_index(mcam, pcifunc,
++						 nixlf, NIXLF_UCAST_ENTRY);
++	} else {
++		/* TODO: validate this mcam index */
++		index = mcam_index;
++	}
++
++	if (index >= mcam->total_entries)
++		return;
++
++	bank = npc_get_bank(mcam, index);
++	index &= (mcam->banksize - 1);
++
++	*(u64 *)&action = rvu_read64(rvu, blkaddr,
++				     NPC_AF_MCAMEX_BANKX_ACTION(index, bank));
++	/* Ignore if no action was set earlier */
++	if (!*(u64 *)&action)
++		return;
++
++	action.op = NIX_RX_ACTIONOP_RSS;
++	action.pf_func = pcifunc;
++	action.index = group;
++	action.flow_key_alg = alg_idx;
++
++	rvu_write64(rvu, blkaddr,
++		    NPC_AF_MCAMEX_BANKX_ACTION(index, bank), *(u64 *)&action);
++}
++
+ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ {
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+-- 
+2.17.1
+

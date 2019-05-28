@@ -1,0 +1,305 @@
+From a77f9592f9e1006922be1e2118d0c94505671115 Mon Sep 17 00:00:00 2001
+From: Aleksey Makarov <amakarov@marvell.com>
+Date: Fri, 12 Oct 2018 08:00:55 +0300
+Subject: [PATCH 0238/1051] net: octeontx2: Support queue interrupts
+
+Queue interrupts communicate errors from completion, receive and send
+queues to the driver.  This patch supports them.  In the case of error
+it just reinitializes the driver.
+
+There exist 64 queue interrupts.
+All errors from completion, send and receive queues are reported to
+the queue interrupt 0;
+
+Signed-off-by: Aleksey Makarov <amakarov@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/otx2_common.c  |  24 +++-
+ .../net/ethernet/marvell/octeontx2/otx2_pf.c  | 122 +++++++++++++++++-
+ .../ethernet/marvell/octeontx2/otx2_struct.h  |  29 +++++
+ 3 files changed, 168 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+index cccabb370948..17b24790623d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+@@ -16,6 +16,7 @@
+ #include "otx2_reg.h"
+ #include "otx2_common.h"
+ #include "otx2_struct.h"
++#include "otx2_struct.h"
+ 
+ static inline void otx2_nix_rq_op_stats(struct queue_stats *stats,
+ 					struct otx2_nic *pfvf, int qidx);
+@@ -483,6 +484,8 @@ static int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx)
+ 	aq->rq.lpb_sizem1 = (DMA_BUFFER_LEN / 8) - 1;
+ 	aq->rq.xqe_imm_size = 0; /* Copying of packet to CQE not needed */
+ 	aq->rq.flow_tagw = 32; /* Copy full 32bit flow_tag to CQE header */
++	aq->rq.rq_int_ena = NIX_RQINT_BITS;
++	aq->rq.qint_idx = 0;
+ 
+ 	/* Fill AQ info */
+ 	aq->qidx = qidx;
+@@ -548,6 +551,8 @@ static int otx2_sq_init(struct otx2_nic *pfvf, u16 qidx)
+ 	aq->sq.default_chan = pfvf->tx_chan_base;
+ 	aq->sq.sqe_stype = NIX_STYPE_STF; /* Cache SQB */
+ 	aq->sq.sqb_aura = pfvf->hw.rx_queues + qidx;
++	aq->sq.sq_int_ena = NIX_SQINT_BITS;
++	aq->sq.qint_idx = 0;
+ 
+ 	/* Fill AQ info */
+ 	aq->qidx = qidx;
+@@ -597,6 +602,9 @@ static int otx2_cq_init(struct otx2_nic *pfvf, u16 qidx)
+ 				: (qidx - pfvf->hw.rx_queues);
+ 	cq->cint_idx = aq->cq.cint_idx;
+ 
++	aq->cq.cq_err_int_ena = NIX_CQERRINT_BITS;
++	aq->cq.qint_idx = 0;
++
+ 	/* Fill AQ info */
+ 	aq->qidx = qidx;
+ 	aq->ctype = NIX_AQ_CTYPE_CQ;
+@@ -635,8 +643,8 @@ int otx2_config_nix_queues(struct otx2_nic *pfvf)
+ 
+ int otx2_config_nix(struct otx2_nic *pfvf)
+ {
+-	struct nix_lf_alloc_req  *nixlf;
+-	struct mbox_msghdr *rsp_hdr;
++	struct nix_lf_alloc_req *nixlf;
++	struct nix_lf_alloc_rsp *rsp;
+ 	int err;
+ 
+ 	pfvf->qset.xqe_size = NIX_XQESZ_W16 ? 128 : 512;
+@@ -667,11 +675,15 @@ int otx2_config_nix(struct otx2_nic *pfvf)
+ 	if (err)
+ 		return err;
+ 
+-	rsp_hdr = otx2_mbox_get_rsp(&pfvf->mbox.mbox, 0, &nixlf->hdr);
+-	if (IS_ERR(rsp_hdr))
+-		return PTR_ERR(rsp_hdr);
++	rsp = (struct nix_lf_alloc_rsp *)otx2_mbox_get_rsp(&pfvf->mbox.mbox, 0,
++							   &nixlf->hdr);
++	if (IS_ERR(rsp))
++		return PTR_ERR(rsp);
+ 
+-	return rsp_hdr->rc;
++	if (rsp->qints < 1)
++		return -ENXIO;
++
++	return rsp->hdr.rc;
+ }
+ 
+ void otx2_free_aura_ptr(struct otx2_nic *pfvf, int type)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+index 147fb3a79771..b6d84453582f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+@@ -20,6 +20,7 @@
+ #include "otx2_reg.h"
+ #include "otx2_common.h"
+ #include "otx2_txrx.h"
++#include "otx2_struct.h"
+ 
+ #define DRV_NAME	"octeontx2-nicpf"
+ #define DRV_STRING	"Marvell OcteonTX2 NIC Physical Function Driver"
+@@ -397,6 +398,94 @@ int otx2_set_real_num_queues(struct net_device *netdev,
+ }
+ EXPORT_SYMBOL(otx2_set_real_num_queues);
+ 
++static irqreturn_t otx2_q_intr_handler(int irq, void *data)
++{
++	struct otx2_nic *pf = data;
++	atomic64_t *ptr;
++	u64 qidx = 0;
++	u64 val;
++
++	/* CQ */
++	for (qidx = 0; qidx < pf->qset.cq_cnt; qidx++) {
++		ptr = pf->reg_base + NIX_LF_CQ_OP_INT;
++		val = atomic64_fetch_add_relaxed((qidx << 32) |
++						 NIX_CQERRINT_BITS, ptr);
++
++		if (!(val & (NIX_CQERRINT_BITS | BIT_ULL(42))))
++			continue;
++
++		if (val & BIT_ULL(42)) {
++			dev_err(pf->dev, "CQ%lld: error reading NIX_LF_CQ_OP_INT\n",
++				qidx);
++		} else {
++			if (val & BIT_ULL(NIX_CQERRINT_DOOR_ERR))
++				dev_err(pf->dev, "CQ%lld: Doorbell error",
++					qidx);
++			if (val & BIT_ULL(NIX_CQERRINT_WR_FULL))
++				dev_err(pf->dev, "CQ%lld: Write full. A CQE to be added has been dropped because the CQ is full",
++					qidx);
++			if (val & BIT_ULL(NIX_CQERRINT_CQE_FAULT))
++				dev_err(pf->dev, "CQ%lld: Memory fault on CQE write to LLC/DRAM",
++					qidx);
++		}
++
++		schedule_work(&pf->reset_task);
++	}
++
++	/* RQ */
++	for (qidx = 0; qidx < pf->hw.rx_queues; qidx++) {
++		ptr = pf->reg_base + NIX_LF_RQ_OP_INT;
++		val = atomic64_fetch_add_relaxed((qidx << 32) | NIX_RQINT_BITS,
++						 ptr);
++		if (!(val & (NIX_RQINT_BITS | BIT_ULL(42))))
++			continue;
++
++		if (val & BIT_ULL(42)) {
++			dev_err(pf->dev, "RQ%lld: error reading NIX_LF_RQ_OP_INT\n",
++				qidx);
++		} else {
++			if (val & BIT_ULL(NIX_RQINT_DROP))
++				dev_err(pf->dev, "RQ%lld: RX packet was dropped",
++					qidx);
++			if (val & BIT_ULL(NIX_RQINT_RED))
++				dev_err(pf->dev, "RQ%lld: RX packet was RED dropped",
++					qidx);
++		}
++
++		schedule_work(&pf->reset_task);
++	}
++
++	/* SQ */
++	for (qidx = 0; qidx < pf->hw.tx_queues; qidx++) {
++		ptr = pf->reg_base + NIX_LF_SQ_OP_INT;
++		val = atomic64_fetch_add_relaxed((qidx << 32) | NIX_SQINT_BITS,
++						 ptr);
++		if (!(val & (NIX_SQINT_BITS | BIT_ULL(42))))
++			continue;
++
++		if (val & BIT_ULL(42)) {
++			dev_err(pf->dev, "SQ%lld: error reading NIX_LF_SQ_OP_INT\n",
++				qidx);
++		} else {
++			if (val & BIT_ULL(NIX_SQINT_LMT_ERR))
++				dev_err(pf->dev, "SQ%lld: LMT store error",
++					qidx);
++			if (val & BIT_ULL(NIX_SQINT_MNQ_ERR))
++				dev_err(pf->dev, "SQ%lld: Meta-descriptor enqueue error",
++					qidx);
++			if (val & BIT_ULL(NIX_SQINT_SEND_ERR))
++				dev_err(pf->dev, "SQ%lld: Send error", qidx);
++			if (val & BIT_ULL(NIX_SQINT_SQB_ALLOC_FAIL))
++				dev_err(pf->dev, "SQ%lld: SQB allocation failed",
++					qidx);
++		}
++
++		schedule_work(&pf->reset_task);
++	}
++
++	return IRQ_HANDLED;
++}
++
+ static irqreturn_t otx2_cq_intr_handler(int irq, void *cq_irq)
+ {
+ 	struct otx2_cq_poll *cq_poll = (struct otx2_cq_poll *)cq_irq;
+@@ -576,6 +665,7 @@ int otx2_open(struct net_device *netdev)
+ 	struct otx2_cq_poll *cq_poll = NULL;
+ 	struct otx2_qset *qset = &pf->qset;
+ 	int err = 0, qidx, vec;
++	char *irq_name;
+ 
+ 	netif_carrier_off(netdev);
+ 
+@@ -647,10 +737,28 @@ int otx2_open(struct net_device *netdev)
+ 	if (err)
+ 		goto err_disable_napi;
+ 
++	/* Register Queue IRQ handlers */
++	vec = pf->hw.nix_msixoff + NIX_LF_QINT_VEC_START;
++	irq_name = &pf->hw.irq_name[vec * NAME_SIZE];
++
++	snprintf(irq_name, NAME_SIZE, "%s-qerr", pf->netdev->name);
++
++	err = request_irq(pci_irq_vector(pf->pdev, vec),
++			  otx2_q_intr_handler, 0, irq_name, pf);
++	if (err) {
++		dev_err(pf->dev,
++			"RVUPF%d: IRQ registration failed for QERR\n",
++			rvu_get_pf(pf->pcifunc));
++		goto err_disable_napi;
++	}
++
++	/* Enable QINT IRQ */
++	otx2_write64(pf, NIX_LF_QINTX_ENA_W1S(0), BIT_ULL(0));
++
+ 	/* Register CQ IRQ handlers */
+ 	vec = pf->hw.nix_msixoff + NIX_LF_CINT_VEC_START;
+ 	for (qidx = 0; qidx < pf->hw.cint_cnt; qidx++) {
+-		char *irq_name = &pf->hw.irq_name[vec * NAME_SIZE];
++		irq_name = &pf->hw.irq_name[vec * NAME_SIZE];
+ 
+ 		snprintf(irq_name, NAME_SIZE, "%s-rxtx-%d", pf->netdev->name,
+ 			 qidx);
+@@ -690,6 +798,11 @@ int otx2_open(struct net_device *netdev)
+ 
+ err_free_cints:
+ 	otx2_free_cints(pf, qidx);
++	vec = pci_irq_vector(pf->pdev,
++			     pf->hw.nix_msixoff + NIX_LF_QINT_VEC_START);
++	otx2_write64(pf, NIX_LF_QINTX_ENA_W1C(0), BIT_ULL(0));
++	synchronize_irq(vec);
++	free_irq(vec, pf);
+ err_disable_napi:
+ 	otx2_disable_napi(pf);
+ 	otx2_free_hw_resources(pf);
+@@ -721,6 +834,13 @@ int otx2_stop(struct net_device *netdev)
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
+ 
++	/* Cleanup Queue IRQ */
++	vec = pci_irq_vector(pf->pdev,
++			     pf->hw.nix_msixoff + NIX_LF_QINT_VEC_START);
++	otx2_write64(pf, NIX_LF_QINTX_ENA_W1C(0), BIT_ULL(0));
++	synchronize_irq(vec);
++	free_irq(vec, pf);
++
+ 	/* Cleanup CQ NAPI and IRQ */
+ 	vec = pf->hw.nix_msixoff + NIX_LF_CINT_VEC_START;
+ 	for (qidx = 0; qidx < pf->hw.cint_cnt; qidx++) {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_struct.h b/drivers/net/ethernet/marvell/octeontx2/otx2_struct.h
+index 4a12e359d795..6dd4db07c4a8 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_struct.h
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_struct.h
+@@ -360,4 +360,33 @@ struct nix_sqe_sg_s {
+ #endif
+ };
+ 
++enum nix_cqerrint_e {
++	NIX_CQERRINT_DOOR_ERR = 0,
++	NIX_CQERRINT_WR_FULL = 1,
++	NIX_CQERRINT_CQE_FAULT = 2,
++};
++
++#define NIX_CQERRINT_BITS (BIT_ULL(NIX_CQERRINT_DOOR_ERR) | \
++			   BIT_ULL(NIX_CQERRINT_WR_FULL) | \
++			   BIT_ULL(NIX_CQERRINT_CQE_FAULT))
++
++enum nix_rqint_e {
++	NIX_RQINT_DROP = 0,
++	NIX_RQINT_RED = 1,
++};
++
++#define NIX_RQINT_BITS (BIT_ULL(NIX_RQINT_DROP) | BIT_ULL(NIX_RQINT_RED))
++
++enum nix_sqint_e {
++	NIX_SQINT_LMT_ERR = 0,
++	NIX_SQINT_MNQ_ERR = 1,
++	NIX_SQINT_SEND_ERR = 2,
++	NIX_SQINT_SQB_ALLOC_FAIL = 3,
++};
++
++#define NIX_SQINT_BITS (BIT_ULL(NIX_SQINT_LMT_ERR) | \
++			BIT_ULL(NIX_SQINT_MNQ_ERR) | \
++			BIT_ULL(NIX_SQINT_SEND_ERR) | \
++			BIT_ULL(NIX_SQINT_SQB_ALLOC_FAIL))
++
+ #endif /* OTX2_STRUCT_H */
+-- 
+2.17.1
+

@@ -1,0 +1,204 @@
+From 627622f499974876c3ea3ff7ed7608a36e349913 Mon Sep 17 00:00:00 2001
+From: Sujeet Baranwal <sujeet.baranwal@cavium.com>
+Date: Tue, 27 Nov 2018 04:01:11 +0300
+Subject: [PATCH 0781/1051] mmc: octeontx2: emmc tuning for delay
+
+The eMMC/SD interface supports a variety of devices with
+board configurations and different timing requirements.
+The interface supports independent programmable setup/hold
+times on outgoing EMMC_CMD and EMMC_DAT signals as well as
+separate programmable sample clocks for the inbound EMMC_CMD,
+EMMC_DAT,and EMMC_DS signals. Timing is specified via the
+MIO_EMM_TIMING register which controls the programmable
+delay lines.
+
+Signed-off-by: Sujeet Baranwal <sujeet.baranwal@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/mmc/host/cavium.c | 101 ++++++++++++++++++++++++++++++++++++--
+ drivers/mmc/host/cavium.h |  18 ++++++-
+ 2 files changed, 114 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/mmc/host/cavium.c b/drivers/mmc/host/cavium.c
+index a7fa197264a7..5a1b6dcbb9ac 100644
+--- a/drivers/mmc/host/cavium.c
++++ b/drivers/mmc/host/cavium.c
+@@ -118,6 +118,101 @@ static struct cvm_mmc_cr_type cvm_mmc_cr_types[] = {
+ 	{0, 0}		/* CMD63 */
+ };
+ 
++/* Given a delay in ps, return the tap delay count */
++static u32 cvm_mmc_calc_delay(struct cvm_mmc_slot *slot, int delay)
++{
++	u32 no_of_taps;
++
++	if (!slot->host->per_tap_delay) {
++		pr_err("Error: tap timing not calibrated\n");
++		return -EINVAL;
++	}
++
++	no_of_taps = delay / slot->host->per_tap_delay;
++	if (no_of_taps > MAX_NO_OF_TAPS)
++		no_of_taps = MAX_NO_OF_TAPS;
++
++	return no_of_taps;
++}
++
++bool cvm_is_mmc_timing_ddr(struct cvm_mmc_slot *slot)
++{
++	if ((slot->mmc->ios.timing == MMC_TIMING_UHS_DDR50) ||
++	   (slot->mmc->ios.timing == MMC_TIMING_MMC_DDR52) ||
++	   (slot->mmc->ios.timing == MMC_TIMING_MMC_HS400))
++		return true;
++	else
++		return false;
++}
++
++static int cvm_mmc_configure_delay(struct cvm_mmc_slot *slot)
++{
++	u32 delay;
++	u64 timing = 0, emm_sample;
++	struct cvm_mmc_host *host = slot->host;
++
++	if (is_mmc_otx2(host)) {
++		/* SDR, data out delay is zero */
++		slot->data_out_tap = 0;
++
++		/*
++		 * EMM_CMD hold time from rising edge of EMMC_CLK.
++		 * Typically 5.0 ns at frequencies < 26 MHz.
++		 * Typically 2.5 ns at frequencies <= 52 MHz.
++		 * Typically 0.4 ns at frequencies > 52 MHz.
++		 */
++		if (slot->mmc->ios.clock < MHZ_26)
++			delay = cvm_mmc_calc_delay(slot, PS_5000);
++		else if (slot->mmc->ios.clock <= MHZ_52)
++			delay = cvm_mmc_calc_delay(slot, PS_2500);
++		else
++			delay  = cvm_mmc_calc_delay(slot, PS_400);
++		if (slot->cmd_out_tap < 0) {
++			pr_err("Error: could not calculate command out clock skew\n");
++			return -EINVAL;
++		}
++		slot->cmd_out_tap = delay;
++
++		/*
++		 * EMM_DAT hold time from either edge of EMMC_CLK.
++		 * Typically set to 0 for single data rate since data is
++		 * output on falling edge of EMMC_CLK. For DDR:
++		 * Typically 5.0 ns at frequencies < 26 MHz.
++		 * Typically 2.5 ns at frequencies <= 52 MHz.
++		 * Typically 0.4 ns at frequencies > 52 MHz.
++		 */
++		if (cvm_is_mmc_timing_ddr(slot))
++			slot->data_out_tap = delay;
++
++		/*
++		 * Pack all the four respective delays for data/cmd - in/out
++		 * to be written to MIO_EMM_TIMING register.
++		 */
++		timing = FIELD_PREP(MIO_EMM_MIO_TIMING_DATA_IN,
++							slot->data_cnt) |
++			FIELD_PREP(MIO_EMM_MIO_TIMING_DATA_OUT,
++							slot->data_out_tap) |
++			FIELD_PREP(MIO_EMM_MIO_TIMING_CMD_IN,
++							slot->cmd_cnt) |
++			FIELD_PREP(MIO_EMM_MIO_TIMING_CMD_OUT,
++						slot->cmd_out_tap);
++
++		pr_debug("data in: %u, data out: %u, cmd in: %u, cmd out: %u\n",
++				slot->data_cnt, slot->data_out_tap,
++				slot->cmd_cnt, slot->cmd_out_tap);
++
++		/* Commit the delay values ot register */
++		writeq(timing, host->base + MIO_EMM_TIMING(host));
++	} else {
++		/* MIO_EMM_SAMPLE is till T83XX */
++		emm_sample = FIELD_PREP(MIO_EMM_SAMPLE_CMD_CNT, slot->cmd_cnt) |
++			     FIELD_PREP(MIO_EMM_SAMPLE_DAT_CNT, slot->data_cnt);
++		writeq(emm_sample, host->base + MIO_EMM_SAMPLE(host));
++	}
++
++	return 0;
++}
++
+ static struct cvm_mmc_cr_mods cvm_mmc_get_cr_mods(struct mmc_command *cmd)
+ {
+ 	struct cvm_mmc_cr_type *cr;
+@@ -316,11 +411,11 @@ static void cvm_mmc_switch_to(struct cvm_mmc_slot *slot)
+ 	host->powered = true;
+ 
+ 	emm_sample = FIELD_PREP(MIO_EMM_SAMPLE_CMD_CNT, slot->cmd_cnt) |
+-		     FIELD_PREP(MIO_EMM_SAMPLE_DAT_CNT, slot->dat_cnt);
++		     FIELD_PREP(MIO_EMM_SAMPLE_DAT_CNT, slot->data_cnt);
+ 	writeq(emm_sample, host->base + MIO_EMM_SAMPLE(host));
+ 
+ 	emmc_io_drive_setup(slot);
+-
++	cvm_mmc_configure_delay(slot);
+ 	host->last_slot = slot->bus_id;
+ }
+ 
+@@ -1086,7 +1181,7 @@ static int cvm_mmc_of_parse(struct device *dev, struct cvm_mmc_slot *slot)
+ 	of_property_read_u32(node, "cavium,cmd-clk-skew", &cmd_skew);
+ 	of_property_read_u32(node, "cavium,dat-clk-skew", &dat_skew);
+ 	slot->cmd_cnt = cmd_skew;
+-	slot->dat_cnt = dat_skew;
++	slot->data_cnt = dat_skew;
+ 
+ 	/* Get current drive and clk skew */
+ 	ret = of_property_read_u32(node, "cavium,drv-strength", &current_drive);
+diff --git a/drivers/mmc/host/cavium.h b/drivers/mmc/host/cavium.h
+index e7d0aaea1cb6..47f39e876ada 100644
+--- a/drivers/mmc/host/cavium.h
++++ b/drivers/mmc/host/cavium.h
+@@ -31,6 +31,7 @@
+ #define PCI_SUBSYS_DEVID_95XX   0xB300
+ 
+ #define KHZ_400 (400000)
++#define MHZ_26  (26000000)
+ #define MHZ_52  (52000000)
+ #define MHZ_100 (100000000)
+ #define MHZ_200 (200000000)
+@@ -49,6 +50,11 @@
+ #define START_CALIBRATION	(0x1)
+ #define TOTAL_NO_OF_TAPS	(512)
+ #define PS_10000		(10 * 1000)
++#define PS_5000			(5000)
++#define PS_2500			(2500)
++#define PS_400			(400)
++#define MAX_NO_OF_TAPS		(63)
++
+ 
+ /* DMA register addresses */
+ #define MIO_EMM_DMA_FIFO_CFG(x)	(0x00 + x->reg_off_dma)
+@@ -139,8 +145,11 @@ struct cvm_mmc_slot {
+ 	u64 cached_switch;
+ 	u64 cached_rca;
+ 
+-	unsigned int cmd_cnt;		/* sample delay */
+-	unsigned int dat_cnt;		/* sample delay */
++	unsigned int cmd_cnt;		/* sample cmd in delay */
++	unsigned int data_cnt;		/* sample data in delay */
++
++	unsigned int cmd_out_tap;	/* sample cmd out delay */
++	unsigned int data_out_tap;	/* sample data out delay */
+ 
+ 	unsigned int drive;		/* Current drive */
+ 	unsigned int slew;		/* clock skew */
+@@ -211,6 +220,11 @@ struct cvm_mmc_cr_mods {
+ #define MIO_EMM_CALB_START		BIT_ULL(0)
+ #define MIO_EMM_TAP_DELAY		GENMASK_ULL(7, 0)
+ 
++#define MIO_EMM_MIO_TIMING_CMD_IN      GENMASK_ULL(53, 48)
++#define MIO_EMM_MIO_TIMING_CMD_OUT     GENMASK_ULL(37, 32)
++#define MIO_EMM_MIO_TIMING_DATA_IN     GENMASK_ULL(21, 16)
++#define MIO_EMM_MIO_TIMING_DATA_OUT    GENMASK_ULL(5, 0)
++
+ #define MIO_EMM_INT_NCB_FLT		BIT_ULL(7)
+ #define MIO_EMM_INT_SWITCH_ERR		BIT_ULL(6)
+ #define MIO_EMM_INT_SWITCH_DONE		BIT_ULL(5)
+-- 
+2.17.1
+

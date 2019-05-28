@@ -1,0 +1,299 @@
+From 385c32e7058a21de6d1fe1b09d57d6c06652dbb8 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 16 Aug 2018 18:23:55 +0530
+Subject: [PATCH 0070/1051] soc: octeontx2: NPC MCAM and LDATA extract minimal
+ configuration
+
+This patch adds some minimal configuration for NPC MCAM and
+LDATA extraction which is sufficient enough to install
+ucast/bcast/promiscuous forwarding rules. Below is the
+config done
+- LDATA extraction config to extract DMAC from pkt
+  to offset 64bit in MCAM search key.
+- Set MCAM lookup keysize to 224bits
+- Set MCAM TX miss action to UCAST_DEFAULT
+- Set MCAM RX miss action to DROP
+
+Also inorder to have guaranteed space in MCAM to install
+ucast forwarding rule for each of RVU PF/VF, reserved
+one MCAM entry for each of NIXLF for ucast rule. And two
+entries for each of RVU PF. One for bcast pkt replication
+and other for promiscuous mode which allows all pkts
+received on a HW CGX/LBK channel.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/common.h  |  21 ++++
+ drivers/soc/marvell/octeontx2/rvu.h     |  14 +++
+ drivers/soc/marvell/octeontx2/rvu_nix.c |  12 +++
+ drivers/soc/marvell/octeontx2/rvu_npc.c | 134 ++++++++++++++++++++++++
+ 4 files changed, 181 insertions(+)
+
+diff --git a/drivers/soc/marvell/octeontx2/common.h b/drivers/soc/marvell/octeontx2/common.h
+index 6291256c78a9..08fe89327487 100644
+--- a/drivers/soc/marvell/octeontx2/common.h
++++ b/drivers/soc/marvell/octeontx2/common.h
+@@ -104,6 +104,27 @@ enum nix_scheduler {
+ 	NIX_TXSCH_LVL_CNT = 0x5,
+ };
+ 
++/* NIX RX action operation*/
++#define NIX_RX_ACTIONOP_DROP		(0x0ull)
++#define NIX_RX_ACTIONOP_UCAST		(0x1ull)
++#define NIX_RX_ACTIONOP_UCAST_IPSEC	(0x2ull)
++#define NIX_RX_ACTIONOP_MCAST		(0x3ull)
++#define NIX_RX_ACTIONOP_RSS		(0x4ull)
++
++/* NIX TX action operation*/
++#define NIX_TX_ACTIONOP_DROP		(0x0ull)
++#define NIX_TX_ACTIONOP_UCAST_DEFAULT	(0x1ull)
++#define NIX_TX_ACTIONOP_UCAST_CHAN	(0x2ull)
++#define NIX_TX_ACTIONOP_MCAST		(0x3ull)
++#define NIX_TX_ACTIONOP_DROP_VIOL	(0x5ull)
++
++#define NPC_MCAM_KEY_X1			0
++#define NPC_MCAM_KEY_X2			1
++#define NPC_MCAM_KEY_X4			2
++
++#define NIX_INTF_RX			0
++#define NIX_INTF_TX			1
++
+ #define NIX_INTF_TYPE_CGX		0
+ #define NIX_INTF_TYPE_LBK		1
+ 
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index a730263faf5c..89a7046f55c9 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -73,6 +73,18 @@ struct nix_mce_list {
+ 	int			max;
+ };
+ 
++struct npc_mcam {
++	spinlock_t	lock;	/* MCAM entries and counters update lock */
++	u8	keysize;	/* MCAM keysize 112/224/448 bits */
++	u8	banks;		/* Number of MCAM banks */
++	u8	banks_per_entry;/* Number of keywords in key */
++	u16	banksize;	/* Number of MCAM entries in each bank */
++	u16	total_entries;	/* Total number of MCAM entries */
++	u16     entries;	/* Total minus reserved for NIX LFs */
++	u16	nixlf_offset;	/* Offset of nixlf rsvd uncast entries */
++	u16	pf_offset;	/* Offset of PF's rsvd bcast, promisc entries */
++};
++
+ /* Structure for per RVU func info ie PF/VF */
+ struct rvu_pfvf {
+ 	bool		npalf; /* Only one NPALF per RVU_FUNC */
+@@ -144,6 +156,7 @@ struct rvu_hwinfo {
+ 	struct rvu_block block[BLK_COUNT]; /* Block info */
+ 	struct nix_hw    *nix0;
+ 	struct npc_pkind pkind;
++	struct npc_mcam  mcam;
+ };
+ 
+ struct rvu {
+@@ -296,6 +309,7 @@ int rvu_npa_init(struct rvu *rvu);
+ /* NIX APIs */
+ int rvu_nix_init(struct rvu *rvu);
+ void rvu_nix_freemem(struct rvu *rvu);
++int rvu_get_nixlf_count(struct rvu *rvu);
+ int rvu_mbox_handler_NIX_LF_ALLOC(struct rvu *rvu,
+ 				  struct nix_lf_alloc_req *req,
+ 				  struct nix_lf_alloc_rsp *rsp);
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+index 80ca2f435133..ab5bd546c647 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_nix.c
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -55,6 +55,18 @@ struct mce {
+ 	u16			pcifunc;
+ };
+ 
++int rvu_get_nixlf_count(struct rvu *rvu)
++{
++	struct rvu_block *block;
++	int blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, 0);
++	if (blkaddr < 0)
++		return 0;
++	block = &rvu->hw->block[blkaddr];
++	return block->lf.max;
++}
++
+ static void nix_mce_list_init(struct nix_mce_list *list, int max)
+ {
+ 	INIT_HLIST_HEAD(&list->head);
+diff --git a/drivers/soc/marvell/octeontx2/rvu_npc.c b/drivers/soc/marvell/octeontx2/rvu_npc.c
+index 599b2498f6ca..f03df8bf9923 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_npc.c
++++ b/drivers/soc/marvell/octeontx2/rvu_npc.c
+@@ -17,6 +17,15 @@
+ #include "npc.h"
+ #include "npc_profile.h"
+ 
++#define RSVD_MCAM_ENTRIES_PER_PF	2 /* Bcast & Promisc */
++#define RSVD_MCAM_ENTRIES_PER_NIXLF	1 /* Ucast for LFs */
++
++#define NIXLF_UCAST_ENTRY	0
++#define NIXLF_BCAST_ENTRY	1
++#define NIXLF_PROMISC_ENTRY	2
++
++#define NPC_PARSE_RESULT_DMAC_OFFSET	8
++
+ void rvu_npc_set_pkind(struct rvu *rvu, int pkind, struct rvu_pfvf *pfvf)
+ {
+ 	int blkaddr;
+@@ -45,6 +54,53 @@ int rvu_npc_get_pkind(struct rvu *rvu, u16 pf)
+ 	return -1;
+ }
+ 
++#define LDATA_EXTRACT_CONFIG(intf, lid, ltype, ld, cfg) \
++	rvu_write64(rvu, blkaddr,			\
++		NPC_AF_INTFX_LIDX_LTX_LDX_CFG(intf, lid, ltype, ld), cfg)
++
++#define LDATA_FLAGS_CONFIG(intf, ld, flags, cfg)	\
++	rvu_write64(rvu, blkaddr,			\
++		NPC_AF_INTFX_LDATAX_FLAGSX_CFG(intf, ld, flags), cfg)
++
++static void npc_config_ldata_extract(struct rvu *rvu, int blkaddr)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int lid, ltype;
++	int lid_count;
++	u64 cfg;
++
++	cfg = rvu_read64(rvu, blkaddr, NPC_AF_CONST);
++	lid_count = (cfg >> 4) & 0xF;
++
++	/* First clear any existing config i.e
++	 * disable LDATA and FLAGS extraction.
++	 */
++	for (lid = 0; lid < lid_count; lid++) {
++		for (ltype = 0; ltype < 16; ltype++) {
++			LDATA_EXTRACT_CONFIG(NIX_INTF_RX, lid, ltype, 0, 0ULL);
++			LDATA_EXTRACT_CONFIG(NIX_INTF_RX, lid, ltype, 1, 0ULL);
++			LDATA_EXTRACT_CONFIG(NIX_INTF_TX, lid, ltype, 0, 0ULL);
++			LDATA_EXTRACT_CONFIG(NIX_INTF_TX, lid, ltype, 1, 0ULL);
++
++			LDATA_FLAGS_CONFIG(NIX_INTF_RX, 0, ltype, 0ULL);
++			LDATA_FLAGS_CONFIG(NIX_INTF_RX, 1, ltype, 0ULL);
++			LDATA_FLAGS_CONFIG(NIX_INTF_TX, 0, ltype, 0ULL);
++			LDATA_FLAGS_CONFIG(NIX_INTF_TX, 1, ltype, 0ULL);
++		}
++	}
++
++	/* If we plan to extract Outer IPv4 tuple for TCP/UDP pkts
++	 * then 112bit key is not sufficient
++	 */
++	if (mcam->keysize != NPC_MCAM_KEY_X2)
++		return;
++
++	/* Start placing extracted data/flags from 64bit onwards, for now */
++	/* Extract DMAC from the packet */
++	cfg = (0x05 << 16) | BIT_ULL(7) | NPC_PARSE_RESULT_DMAC_OFFSET;
++	LDATA_EXTRACT_CONFIG(NIX_INTF_RX, NPC_LID_LA, NPC_LT_LA_ETHER, 0, cfg);
++}
++
+ static void npc_config_kpuaction(struct rvu *rvu, int blkaddr,
+ 				 struct npc_kpu_profile_action *kpuaction,
+ 				 int kpu, int entry, bool pkind)
+@@ -193,9 +249,61 @@ static void npc_parser_profile_init(struct rvu *rvu, int blkaddr)
+ 					idx, &npc_kpu_profiles[idx]);
+ }
+ 
++static int npc_mcam_rsrcs_init(struct rvu *rvu, int blkaddr)
++{
++	int nixlf_count = rvu_get_nixlf_count(rvu);
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int rsvd;
++	u64 cfg;
++
++	/* Get HW limits */
++	cfg = rvu_read64(rvu, blkaddr, NPC_AF_CONST);
++	mcam->banks = (cfg >> 44) & 0xF;
++	mcam->banksize = (cfg >> 28) & 0xFFFF;
++
++	/* Actual number of MCAM entries vary by entry size */
++	cfg = (rvu_read64(rvu, blkaddr,
++			  NPC_AF_INTFX_KEX_CFG(0)) >> 32) & 0x07;
++	mcam->total_entries = (mcam->banks / BIT_ULL(cfg)) * mcam->banksize;
++	mcam->keysize = cfg;
++
++	/* Number of banks combined per MCAM entry */
++	if (cfg == NPC_MCAM_KEY_X4)
++		mcam->banks_per_entry = 4;
++	else if (cfg == NPC_MCAM_KEY_X2)
++		mcam->banks_per_entry = 2;
++	else
++		mcam->banks_per_entry = 1;
++
++	/* Reserve one MCAM entry for each of the NIX LF to
++	 * guarantee space to install default matching DMAC rule.
++	 * Also reserve 2 MCAM entries for each PF for default
++	 * channel based matching or 'bcast & promisc' matching to
++	 * support BCAST and PROMISC modes of operation for PFs.
++	 * PF0 is excluded.
++	 */
++	rsvd = (nixlf_count * RSVD_MCAM_ENTRIES_PER_NIXLF) +
++		((rvu->hw->total_pfs - 1) * RSVD_MCAM_ENTRIES_PER_PF);
++	if (mcam->total_entries <= rsvd) {
++		dev_warn(rvu->dev,
++			 "Insufficient NPC MCAM size %d for pkt I/O, exiting\n",
++			 mcam->total_entries);
++		return -ENOMEM;
++	}
++
++	mcam->entries = mcam->total_entries - rsvd;
++	mcam->nixlf_offset = mcam->entries;
++	mcam->pf_offset = mcam->nixlf_offset + nixlf_count;
++
++	spin_lock_init(&mcam->lock);
++
++	return 0;
++}
++
+ int rvu_npc_init(struct rvu *rvu)
+ {
+ 	struct npc_pkind *pkind = &rvu->hw->pkind;
++	u64 keyz = NPC_MCAM_KEY_X2;
+ 	int blkaddr, err;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+@@ -234,6 +342,32 @@ int rvu_npc_init(struct rvu *rvu)
+ 		    rvu_read64(rvu, blkaddr, NPC_AF_PCK_CFG) |
+ 		    BIT_ULL(6) | BIT_ULL(2));
+ 
++	/* Set RX and TX side MCAM search key size.
++	 * Also enable parse key extract nibbles suchthat except
++	 * layer E to H, rest of the key is included for MCAM search.
++	 */
++	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_KEX_CFG(NIX_INTF_RX),
++		    ((keyz & 0x3) << 32) | ((1ULL << 20) - 1));
++	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_KEX_CFG(NIX_INTF_TX),
++		    ((keyz & 0x3) << 32) | ((1ULL << 20) - 1));
++
++	err = npc_mcam_rsrcs_init(rvu, blkaddr);
++	if (err)
++		return err;
++
++	/* Config packet data and flags extraction into PARSE result */
++	npc_config_ldata_extract(rvu, blkaddr);
++
++	/* Set TX miss action to UCAST_DEFAULT i.e
++	 * transmit the packet on NIX LF SQ's default channel.
++	 */
++	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_MISS_ACT(NIX_INTF_TX),
++		    NIX_TX_ACTIONOP_UCAST_DEFAULT);
++
++	/* If MCAM lookup doesn't result in a match, drop the received packet */
++	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_MISS_ACT(NIX_INTF_RX),
++		    NIX_RX_ACTIONOP_DROP);
++
+ 	return 0;
+ }
+ 
+-- 
+2.17.1
+

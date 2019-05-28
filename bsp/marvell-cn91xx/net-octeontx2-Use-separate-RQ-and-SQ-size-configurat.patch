@@ -1,0 +1,178 @@
+From 46ba626bfede529c2b03200cde5406342f81476f Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Fri, 9 Nov 2018 15:49:36 +0530
+Subject: [PATCH 0751/1051] net: octeontx2: Use separate RQ and SQ size
+ configuration parameters.
+
+Since RQ and SQ, CQ size can be different have separate parameters
+to configure CQ size of RQ and SQ.
+
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/otx2_common.c  |  6 ++++--
+ .../ethernet/marvell/octeontx2/otx2_ethtool.c | 19 +++++++++++++------
+ .../net/ethernet/marvell/octeontx2/otx2_pf.c  |  6 ++++--
+ .../ethernet/marvell/octeontx2/otx2_txrx.c    |  2 +-
+ .../ethernet/marvell/octeontx2/otx2_txrx.h    |  9 ++++-----
+ 5 files changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+index 82f3c32f23e2..cd453f4a89a0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_common.c
+@@ -499,6 +499,7 @@ static int otx2_sq_init(struct otx2_nic *pfvf, u16 qidx, u16 sqb_aura)
+ 	pool = &pfvf->qset.pool[sqb_aura];
+ 	sq = &qset->sq[qidx];
+ 	sq->sqe_size = NIX_SQESZ_W16 ? 64 : 128;
++	sq->sqe_cnt = qset->sqe_cnt;
+ 
+ 	err = qmem_alloc(pfvf->dev, &sq->sqe, 1, sq->sqe_size);
+ 	if (err)
+@@ -562,8 +563,9 @@ static int otx2_cq_init(struct otx2_nic *pfvf, u16 qidx)
+ 	int err, pool_id;
+ 
+ 	cq = &qset->cq[qidx];
+-	cq->cqe_cnt = qset->cqe_cnt;
+ 	cq->cqe_size = pfvf->qset.xqe_size;
++	cq->cqe_cnt = (qidx < pfvf->hw.rx_queues) ? qset->rqe_cnt
++				: qset->sqe_cnt;
+ 
+ 	/* Allocate memory for CQEs */
+ 	err = qmem_alloc(pfvf->dev, &cq->cqe, cq->cqe_cnt, cq->cqe_size);
+@@ -898,7 +900,7 @@ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf)
+ 	int err, ptr, num_ptrs;
+ 	s64 bufptr;
+ 
+-	num_ptrs = RQ_QLEN;
++	num_ptrs = pfvf->qset.rqe_cnt;
+ 
+ 	stack_pages =
+ 		(num_ptrs + hw->stack_pg_ptrs - 1) / hw->stack_pg_ptrs;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c
+index abe3d99b10a8..b490c6d09985 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_ethtool.c
+@@ -260,7 +260,7 @@ static void otx2_get_ringparam(struct net_device *netdev,
+ 	struct otx2_qset *qs = &pfvf->qset;
+ 
+ 	ring->rx_max_pending = Q_COUNT(Q_SIZE_MAX);
+-	ring->rx_pending = qs->cqe_cnt;
++	ring->rx_pending = qs->rqe_cnt;
+ 	ring->tx_max_pending = Q_COUNT(Q_SIZE_MAX);
+ 	ring->tx_pending = qs->sqe_cnt;
+ }
+@@ -277,24 +277,31 @@ static int otx2_set_ringparam(struct net_device *netdev,
+ 	if (ring->rx_mini_pending || ring->rx_jumbo_pending)
+ 		return -EINVAL;
+ 
+-	if (if_up)
+-		otx2_stop(netdev);
+-
+ 	rx_count = clamp_t(u32, ring->rx_pending,
+ 			   Q_COUNT(Q_SIZE_MIN), Q_COUNT(Q_SIZE_MAX));
+ 	tx_count = clamp_t(u32, ring->tx_pending,
+ 			   Q_COUNT(Q_SIZE_MIN), Q_COUNT(Q_SIZE_MAX));
+ 
+-	if (tx_count == qs->sqe_cnt && rx_count == qs->cqe_cnt)
++	if (tx_count == qs->sqe_cnt && rx_count == qs->rqe_cnt)
+ 		return 0;
+ 
+ 	/* Permitted lengths are 16 64 256 1K 4K 16K 64K 256K 1M  */
+ 	tx_size = Q_SIZE(tx_count, 3);
+ 	rx_size = Q_SIZE(rx_count, 3);
+ 
++	/* Due to HW errata #34934 & #34873 RQ.CQ.size >= 1K
++	 * and SQ.CQ.size >= 4K to avoid CQ overflow.
++	 */
++	if ((is_9xxx_pass1_silicon(pfvf->pdev)) &&
++	    (tx_size < 0x4 || rx_size < 0x3))
++		return 0;
++
++	if (if_up)
++		otx2_stop(netdev);
++
+ 	/* Assigned to the nearest possible exponent. */
+ 	qs->sqe_cnt = Q_COUNT(tx_size);
+-	qs->cqe_cnt = Q_COUNT(rx_size);
++	qs->rqe_cnt = Q_COUNT(rx_size);
+ 
+ 	if (if_up)
+ 		otx2_open(netdev);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+index 124c360966f1..c7a65185bdf3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_pf.c
+@@ -759,8 +759,10 @@ int otx2_open(struct net_device *netdev)
+ 	if (!qset->napi)
+ 		return -ENOMEM;
+ 
+-	qset->cqe_cnt = qset->cqe_cnt ? qset->cqe_cnt : Q_COUNT(Q_SIZE_4K);
+-	qset->sqe_cnt = qset->sqe_cnt ? qset->sqe_cnt : Q_COUNT(Q_SIZE_1K);
++	/* CQ size of RQ */
++	qset->rqe_cnt = qset->rqe_cnt ? qset->rqe_cnt : Q_COUNT(Q_SIZE_1K);
++	/* CQ size of SQ */
++	qset->sqe_cnt = qset->sqe_cnt ? qset->sqe_cnt : Q_COUNT(Q_SIZE_4K);
+ 
+ 	err = -ENOMEM;
+ 	qset->cq = kcalloc(pf->qset.cq_cnt,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.c
+index fe3208dfc25a..8cca5ca47533 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.c
+@@ -407,7 +407,7 @@ static inline void otx2_sqe_flush(struct otx2_snd_queue *sq, int size)
+ 	} while (status == 0);
+ 
+ 	sq->head++;
+-	sq->head &= (SQ_QLEN - 1);
++	sq->head &= (sq->sqe_cnt - 1);
+ }
+ 
+ #define MAX_SEGS_PER_SG	3
+diff --git a/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.h
+index 3fda9af8ca0f..41fad18b740e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/otx2_txrx.h
+@@ -19,8 +19,6 @@
+ #define SDP_CHAN_BASE	0x700
+ #define CGX_CHAN_BASE	0x800
+ 
+-#define RQ_QLEN		1024
+-#define SQ_QLEN		1024
+ #define DMA_BUFFER_LEN	1536 /* In multiples of 128bytes */
+ #define RCV_FRAG_LEN	(SKB_DATA_ALIGN(DMA_BUFFER_LEN + NET_SKB_PAD) + \
+ 			 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+@@ -59,6 +57,7 @@ struct otx2_snd_queue {
+ 	u8			aura_id;
+ 	u16			head;
+ 	u16			sqe_size;
++	u32			sqe_cnt;
+ 	u16			num_sqbs;
+ 	u8			sqe_per_sqb;
+ 	u64			 io_addr;
+@@ -92,8 +91,8 @@ struct otx2_pool {
+ struct otx2_cq_queue {
+ 	u8			cq_idx;
+ 	u8			cint_idx; /* CQ interrupt id */
+-	u16			cqe_cnt;
+ 	u16			cqe_size;
++	u32			cqe_cnt;
+ 	void			*cqe_base;
+ 	struct qmem		*cqe;
+ 	struct otx2_pool	*rbpool;
+@@ -102,9 +101,9 @@ struct otx2_cq_queue {
+ struct otx2_qset {
+ #define OTX2_MAX_CQ_CNT		64
+ 	u16			cq_cnt;
+-	u16			cqe_cnt;
+-	u16			sqe_cnt;
+ 	u16			xqe_size;
++	u32			rqe_cnt;
++	u32			sqe_cnt;
+ 	struct otx2_pool	*pool;
+ 	struct otx2_cq_poll	*napi;
+ 	struct otx2_cq_queue	*cq;
+-- 
+2.17.1
+

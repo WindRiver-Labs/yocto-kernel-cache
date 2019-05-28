@@ -1,0 +1,186 @@
+From 9e12c00ab84d49b33e79d46cb2fbc9438c7bd8ad Mon Sep 17 00:00:00 2001
+From: Slawomir Rosek <slawomir.rosek@cavium.com>
+Date: Thu, 22 Nov 2018 10:08:05 +0100
+Subject: [PATCH 0786/1051] octeontx-fpa: Fix IOMMU context of XAQ/DPFI bufs
+
+Change IOMMU translation context of XAQ/DPFI buffers from FPA VF domains
+to SSO/PKO PF domains respectively.
+
+Signed-off-by: Slawomir Rosek <slawomir.rosek@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/cavium/octeontx-83xx/fpa.h   |  3 +-
+ .../cavium/octeontx-83xx/fpavf_main.c         | 32 +++++++++++++++----
+ .../cavium/octeontx-83xx/pkopf_main.c         |  6 +++-
+ .../cavium/octeontx-83xx/ssopf_main.c         |  7 +++-
+ 4 files changed, 39 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h b/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h
+index 93b68a18767b..e0cd6e0ce0b2 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h
+@@ -218,6 +218,7 @@ struct fpavf {
+ 	/* VA of pool memory */
+ 	u64                     vhpool_memvec_size;
+ 	struct memvec           *vhpool_memvec;
++	struct device           *vhpool_owner;
+ 	atomic_t		alloc_count;
+ 	u32			stack_ln_ptrs;
+ 	void			*pool_addr;
+@@ -232,7 +233,7 @@ struct fpavf {
+ 
+ struct fpavf_com_s {
+ 	struct fpavf* (*get)(u16, u16, struct octeontx_master_com_t *, void *);
+-	int (*setup)(struct fpavf *, u64, u32);
++	int (*setup)(struct fpavf *, u64, u32, struct device *);
+ 	void (*free)(struct fpavf*, u32, u64, u32);
+ 	u64 (*alloc)(struct fpavf*, u32);
+ 	void (*add_alloc)(struct fpavf *fpa, int count);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c
+index e958d05622a3..6aa86b6ab5fe 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c
+@@ -105,7 +105,8 @@ static int fpa_vf_do_test(struct fpavf *fpa, u64 num_buffers)
+ 	return 0;
+ }
+ 
+-static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
++static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len,
++			    struct device *owner)
+ {
+ 	dma_addr_t iova,  first_addr = -1, last_addr = 0;
+ 	u32 buffs_per_chunk, chunk_size;
+@@ -132,10 +133,17 @@ static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
+ 	}
+ 	memset(fpa->vhpool_memvec, 0, PAGE_SIZE);
+ 
++	/* Use given memory owner to setup IOMMU translation context.
++	 * If memory owner is not specified then use FPA VF.
++	 */
++	if (!owner)
++		owner = &fpa->pdev->dev;
++
++	fpa->vhpool_owner = owner;
+ 	for (i = 0; i < fpa->vhpool_memvec_size; i++) {
+ 		fpa->vhpool_memvec[i].size = chunk_size;
+ 		fpa->vhpool_memvec[i].addr =
+-			dma_zalloc_coherent(&fpa->pdev->dev,
++			dma_zalloc_coherent(fpa->vhpool_owner,
+ 					    fpa->vhpool_memvec[i].size,
+ 					    &fpa->vhpool_memvec[i].iova,
+ 					    GFP_KERNEL);
+@@ -146,6 +154,10 @@ static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
+ 			goto err_unlock;
+ 		}
+ 
++		dev_notice(fpa->vhpool_owner, "Alloc IO memory: iova [%llx-%llx]\n",
++			   fpa->vhpool_memvec[i].iova,
++			   fpa->vhpool_memvec[i].iova + chunk_size - 1);
++
+ 		fpa->vhpool_memvec[i].in_use = true;
+ 		if (fpa->vhpool_memvec[i].iova > last_addr)
+ 			last_addr = fpa->vhpool_memvec[i].iova;
+@@ -157,6 +169,9 @@ static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
+ 	fpavf_reg_write(fpa, FPA_VF_VHPOOL_END_ADDR(0),
+ 			last_addr + chunk_size - 1);
+ 
++	dev_notice(&fpa->pdev->dev, "Setup IO memory: iova [%llx-%llx]\n",
++		   first_addr, last_addr + chunk_size - 1);
++
+ 	for (i = 0; i < fpa->vhpool_memvec_size && num_buffers > 0; i++) {
+ 		iova = fpa->vhpool_memvec[i].iova;
+ 		for (j = 0; j < buffs_per_chunk; j++) {
+@@ -174,7 +189,7 @@ static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
+ 
+ 	for (i = 0; i < fpa->vhpool_memvec_size; i++)
+ 		if (fpa->vhpool_memvec[i].in_use) {
+-			dma_free_coherent(&fpa->pdev->dev,
++			dma_free_coherent(fpa->vhpool_owner,
+ 					  fpa->vhpool_memvec[i].size,
+ 					  fpa->vhpool_memvec[i].addr,
+ 					  fpa->vhpool_memvec[i].iova);
+@@ -185,7 +200,8 @@ static int fpa_vf_addmemory(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
+ 	return ret;
+ }
+ 
+-static int fpa_vf_setup(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
++static int fpa_vf_setup(struct fpavf *fpa, u64 num_buffers, u32 buf_len,
++			struct device *owner)
+ {
+ 	struct mbox_fpa_cfg cfg;
+ 	struct mbox_hdr hdr;
+@@ -234,7 +250,7 @@ static int fpa_vf_setup(struct fpavf *fpa, u64 num_buffers, u32 buf_len)
+ 	if (ret || hdr.res_code)
+ 		return -EINVAL;
+ 
+-	fpa_vf_addmemory(fpa, num_buffers, buf_len);
++	fpa_vf_addmemory(fpa, num_buffers, buf_len, owner);
+ 
+ 	req.data = 0;
+ 	hdr.coproc = FPA_COPROC;
+@@ -281,7 +297,11 @@ static int fpa_vf_teardown(struct fpavf *fpa)
+ 	/* Free buffers memory */
+ 	for (i = 0; i < fpa->vhpool_memvec_size; i++) {
+ 		if (fpa->vhpool_memvec[i].in_use) {
+-			dma_free_coherent(&fpa->pdev->dev,
++			dev_notice(fpa->vhpool_owner, "Free IO memory: iova [%llx-%llx]\n",
++				   fpa->vhpool_memvec[i].iova,
++				   fpa->vhpool_memvec[i].iova +
++				   fpa->vhpool_memvec[i].size - 1);
++			dma_free_coherent(fpa->vhpool_owner,
+ 					  fpa->vhpool_memvec[i].size,
+ 					  fpa->vhpool_memvec[i].addr,
+ 					  fpa->vhpool_memvec[i].iova);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+index 7f071b15257f..158a12231b0e 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+@@ -1252,7 +1252,10 @@ static int setup_dpfi(struct pkopf *pko)
+ 		symbol_put(fpavf_com);
+ 		return -ENODEV;
+ 	}
+-	err = fpavf->setup(fpa, PKO_BUFFERS, pko->pdm_buf_size);
++	dev_notice(&pko->pdev->dev, "Setup PKO_DPFI_DOMAIN: pdm_buffers %d, pdm_buf_size %d\n",
++		   PKO_BUFFERS, pko->pdm_buf_size);
++	err = fpavf->setup(fpa, PKO_BUFFERS, pko->pdm_buf_size,
++			   &pko->pdev->dev);
+ 	if (err) {
+ 		dev_err(&pko->pdev->dev, "failed to setup fpavf\n");
+ 		symbol_put(fpapf_com);
+@@ -1302,6 +1305,7 @@ static int teardown_dpfi(struct pkopf *pko)
+ 	pko_reg_write(pko, PKO_PF_DPFI_GMCTL, 0);
+ 	pko_reg_write(pko, PKO_PF_DPFI_ENA, 0);
+ 
++	dev_notice(&pko->pdev->dev, "Destroy PKO_DPFI_DOMAIN\n");
+ 	fpavf->teardown(fpa);
+ 	fpavf->put(fpa);
+ 	fpapf->destroy_domain(pko->id, FPA_PKO_DPFI_GMID, NULL);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c
+index 477e99643a62..74832c46ca02 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c
+@@ -1203,7 +1203,10 @@ static int sso_init(struct ssopf *sso)
+ 	xaq_buffers = (max_events + xae_waes - 1) / xae_waes;
+ 	xaq_buffers = (nr_grps * 2) + 48 + xaq_buffers;
+ 
+-	err = fpavf->setup(fpa, xaq_buffers, xaq_buf_size);
++	dev_notice(&sso->pdev->dev, "Setup SSO_XAQ_DOMAIN: xaq_buffers %d, xaq_buf_size %d\n",
++		   xaq_buffers, xaq_buf_size);
++	err = fpavf->setup(fpa, xaq_buffers, xaq_buf_size,
++			   &sso->pdev->dev);
+ 	if (err) {
+ 		dev_err(&sso->pdev->dev, "failed to setup fpavf\n");
+ 		symbol_put(fpapf_com);
+@@ -1388,6 +1391,8 @@ static void sso_remove(struct pci_dev *pdev)
+ 		if (addr)
+ 			fpavf->free(fpa, FPA_SSO_XAQ_AURA, addr, 0);
+ 	}
++
++	dev_notice(&sso->pdev->dev, "Destroy SSO_XAQ_DOMAIN\n");
+ 	fpavf->teardown(fpa);
+ 	fpavf->put(fpa);
+ 	fpapf->destroy_domain(sso->id, FPA_SSO_XAQ_GMID, NULL);
+-- 
+2.17.1
+

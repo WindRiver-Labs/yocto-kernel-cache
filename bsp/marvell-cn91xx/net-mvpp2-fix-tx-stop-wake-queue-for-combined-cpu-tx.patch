@@ -1,0 +1,105 @@
+From 031e7d5df08090a441c8172d1b451188c591b6b1 Mon Sep 17 00:00:00 2001
+From: Yan Markman <ymarkman@marvell.com>
+Date: Thu, 15 Nov 2018 18:56:29 +0200
+Subject: [PATCH 0794/1051] net: mvpp2: fix tx stop-wake queue for combined
+ cpu-txq map
+
+The tx-stop/wake has constrain - working properly only if
+netdev-queue-id (TXQ) selected by core-xmit is absolutely conforms
+to the cpu/TXQ mapping.
+
+This is not always correct!
+For example, for UDP-Application (APP) the core-xmit always keeps the
+same TXQ chosen on APP's start according to a socket-hash.
+Even the APP migrates to another CPU the TXQ stays the same.
+
+If TXQ doesn't match to CPU the stop/wake would work incorrectly -
+a lot of drops or even could cause stop-without-wakeup.
+
+This patch fixes the constrain
+ and handles all CPU<->TXQ combinations.
+It saves the TXQ in new per-cpu field "stopped_on_txq_id" and
+uses it to wake the correct queue.
+
+NOTE:
+The stop/wake/stopped field sizes and if conditions in the patch
+Are strictly optimized to keep the same TX performance as before.
+
+Change-Id: I33be0f4c045ff18bdbbdfc0df769efedfb158dd2
+Signed-off-by: Yan Markman <ymarkman@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/60974
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h    |  6 ++++--
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 21 +++++++++++++++----
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+index aa791efd9554..da37189fa8bb 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -1052,8 +1052,10 @@ struct mvpp2_txq_pcpu {
+ 	 */
+ 	int count;
+ 
+-	int wake_threshold;
+-	int stop_threshold;
++	u16 wake_threshold;
++	u16 stop_threshold;
++	/* TXQ-number above stop_threshold to be wake-up */
++	u16 stopped_on_txq_id;
+ 
+ 	/* Number of Tx DMA descriptors reserved for each CPU */
+ 	int reserved_num;
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index e47619a22f12..e7289fc3f8aa 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -2192,9 +2192,15 @@ static void mvpp2_txq_done(struct mvpp2_port *port, struct mvpp2_tx_queue *txq,
+ 
+ 	txq_pcpu->count -= tx_done;
+ 
+-	if (netif_tx_queue_stopped(nq) && !mvpp2_tx_stopped(port) &&
+-	    txq_pcpu->count <= txq_pcpu->wake_threshold)
+-		netif_tx_wake_queue(nq);
++	if (netif_tx_queue_stopped(nq) && !mvpp2_tx_stopped(port)) {
++		/* Wake if netif_tx_queue_stopped on same txq->log_id */
++		if (txq_pcpu->stopped_on_txq_id == txq->log_id &&
++		    txq_pcpu->count <= txq_pcpu->wake_threshold) {
++			txq_pcpu->stopped_on_txq_id = MVPP2_MAX_TXQ;
++			nq = netdev_get_tx_queue(port->dev, txq->log_id);
++			netif_tx_wake_queue(nq);
++		}
++	}
+ }
+ 
+ static unsigned int mvpp2_tx_done(struct mvpp2_port *port, u32 cause,
+@@ -2459,6 +2465,7 @@ static int mvpp2_txq_init(struct mvpp2_port *port,
+ 				MVPP2_MAX_SKB_DESCS(num_present_cpus());
+ 		txq_pcpu->wake_threshold = txq_pcpu->stop_threshold -
+ 						MVPP2_TX_PAUSE_HYSTERESIS;
++		txq_pcpu->stopped_on_txq_id = MVPP2_MAX_TXQ;
+ 
+ 		txq_pcpu->tso_headers =
+ 			dma_alloc_coherent(port->dev->dev.parent,
+@@ -3823,7 +3830,13 @@ static netdev_tx_t mvpp2_tx(struct sk_buff *skb, struct net_device *dev)
+ 
+ 		if (unlikely(txq_pcpu->count >= txq_pcpu->stop_threshold)) {
+ 			nq = netdev_get_tx_queue(dev, txq_id);
+-			netif_tx_stop_queue(nq);
++			/* txq_id may differ from thread/cpu and come from more
++			 * than one txq_pcpu. Save only the first for wakeup.
++			 */
++			if (unlikely(!netif_tx_queue_stopped(nq))) {
++				txq_pcpu->stopped_on_txq_id = txq_id;
++				netif_tx_stop_queue(nq);
++			}
+ 		}
+ 		u64_stats_update_begin(&stats->syncp);
+ 		stats->tx_packets++;
+-- 
+2.17.1
+

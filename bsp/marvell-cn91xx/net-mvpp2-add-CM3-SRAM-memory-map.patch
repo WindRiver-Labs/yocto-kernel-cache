@@ -1,0 +1,148 @@
+From b9925d4230300e18d1b33d4b173a80c46823a24b Mon Sep 17 00:00:00 2001
+From: Stefan Chulski <stefanc@marvell.com>
+Date: Sun, 3 Feb 2019 14:06:27 +0200
+Subject: [PATCH 0979/1051] net: mvpp2: add CM3 SRAM memory map
+
+This patch add CM3 memory map and CM3 read/write callbacks.
+No functionality changes.
+
+Change-Id: If334cbe818f86b66610786a319791cf3abd7af0b
+Signed-off-by: Stefan Chulski <stefanc@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/3420
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Marcin Wojtas <Marcin.Wojtas@cavium.com>
+Reviewed-by: Stefan Chulski <Stefan.Chulski@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h    | 19 +++++++++
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 41 +++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+index ad8304937dcb..a4d8c2bc65db 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -765,6 +765,9 @@ enum mvpp2_prs_l3_cast {
+ 
+ #define MVPP2_DESC_DMA_MASK	DMA_BIT_MASK(40)
+ 
++/* MSS Flow control */
++#define MSS_SRAM_SIZE	0x800
++
+ /* Definitions */
+ 
+ /* Shared Packet Processor resources */
+@@ -772,6 +775,7 @@ struct mvpp2 {
+ 	/* Shared registers' base addresses */
+ 	void __iomem *lms_base;
+ 	void __iomem *iface_base;
++	void __iomem *cm3_base;
+ 
+ 	/* On PPv2.2, each "software thread" can access the base
+ 	 * register through a separate address space, each 64 KB apart
+@@ -830,6 +834,9 @@ struct mvpp2 {
+ 	/* Debugfs root entry */
+ 	struct dentry *dbgfs_dir;
+ 
++	/* CM3 SRAM pool */
++	struct gen_pool *sram_pool;
++
+ 	bool custom_dma_mask;
+ };
+ 
+@@ -1221,6 +1228,18 @@ u32 mvpp2_cpu_to_thread(struct mvpp2 *priv, int cpu)
+ 	return cpu % priv->nthreads;
+ }
+ 
++static inline
++void mvpp2_cm3_write(struct mvpp2 *priv, u32 offset, u32 data)
++{
++	writel(data, priv->cm3_base + offset);
++}
++
++static inline
++u32 mvpp2_cm3_read(struct mvpp2 *priv, u32 offset)
++{
++	return readl(priv->cm3_base + offset);
++}
++
+ /* These accessors should be used to access:
+  *
+  * - per-thread registers, where each thread has its own copy of the
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 37591e3d2985..04a7abbdb83b 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -26,6 +26,7 @@
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/genalloc.h>
+ #include <linux/phy.h>
+ #include <linux/phylink.h>
+ #include <linux/phy/phy.h>
+@@ -6348,6 +6349,35 @@ static int mvpp2_init(struct platform_device *pdev, struct mvpp2 *priv)
+ 	return 0;
+ }
+ 
++static int mvpp2_get_sram(struct platform_device *pdev,
++			  struct mvpp2 *priv)
++{
++	struct device_node *dn = pdev->dev.of_node;
++	struct resource *res;
++
++	if (has_acpi_companion(&pdev->dev)) {
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
++		if (!res) {
++			dev_warn(&pdev->dev, "ACPI is too old, TX FC disabled\n");
++			return 0;
++		}
++		priv->cm3_base = devm_ioremap_resource(&pdev->dev, res);
++		if (IS_ERR(priv->cm3_base))
++			return PTR_ERR(priv->cm3_base);
++	} else {
++		priv->sram_pool = of_gen_pool_get(dn, "cm3-mem", 0);
++		if (!priv->sram_pool) {
++			dev_warn(&pdev->dev, "DT is too old, TX FC disabled\n");
++			return 0;
++		}
++		priv->cm3_base = (void __iomem *)gen_pool_alloc(priv->sram_pool,
++								MSS_SRAM_SIZE);
++		if (!priv->cm3_base)
++			return -ENOMEM;
++	}
++	return 0;
++}
++
+ static int mvpp2_probe(struct platform_device *pdev)
+ {
+ 	const struct acpi_device_id *acpi_id;
+@@ -6404,6 +6434,11 @@ static int mvpp2_probe(struct platform_device *pdev)
+ 		priv->iface_base = devm_ioremap_resource(&pdev->dev, res);
+ 		if (IS_ERR(priv->iface_base))
+ 			return PTR_ERR(priv->iface_base);
++
++		/* Map CM3 SRAM */
++		err = mvpp2_get_sram(pdev, priv);
++		if (err)
++			dev_warn(&pdev->dev, "Fail to alloc CM3 SRAM\n");
+ 	}
+ 
+ 	if (priv->hw_version != MVPP21 && dev_of_node(&pdev->dev)) {
+@@ -6655,6 +6690,12 @@ static int mvpp2_remove(struct platform_device *pdev)
+ 		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+ 	}
+ 
++	if (!has_acpi_companion(&pdev->dev)) {
++		gen_pool_free(priv->sram_pool, (unsigned long)priv->cm3_base,
++			      MSS_SRAM_SIZE);
++		gen_pool_destroy(priv->sram_pool);
++	}
++
+ 	if (is_acpi_node(port_fwnode))
+ 		return 0;
+ 
+-- 
+2.17.1
+

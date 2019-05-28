@@ -1,0 +1,96 @@
+From cb9f43f0789236955a08f5019027376acda6c2b3 Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <marc.zyngier@arm.com>
+Date: Tue, 30 Oct 2018 15:41:00 +0000
+Subject: [PATCH 0796/1051] net: mvpp2: Fix affinity hint allocation
+
+commit a6b3a3fa042343e29ffaf9169f5ba3c819d4f9a2 upstream
+
+The mvpp2 driver has the curious behaviour of passing a stack variable
+to irq_set_affinity_hint(), which results in the kernel exploding
+the first time anyone accesses this information. News flash: userspace
+does, and irqbalance will happily take the machine down. Great stuff.
+
+An easy fix is to track the mask within the queue_vector structure,
+and to make sure it has the same lifetime as the interrupt itself.
+
+Fixes: e531f76757eb ("net: mvpp2: handle cases where more CPUs are available than s/w threads")
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h     |  1 +
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c    | 18 ++++++++++++++----
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+index da37189fa8bb..5b6c87698b8a 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -849,6 +849,7 @@ struct mvpp2_queue_vector {
+ 	int nrxqs;
+ 	u32 pending_cause_rx;
+ 	struct mvpp2_port *port;
++	struct cpumask *mask;
+ };
+ 
+ struct mvpp2_port {
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index ebdcc95e8ad7..c2a6dc899df0 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -4121,24 +4121,30 @@ static int mvpp2_irqs_init(struct mvpp2_port *port)
+ 	for (i = 0; i < port->nqvecs; i++) {
+ 		struct mvpp2_queue_vector *qv = port->qvecs + i;
+ 
+-		if (qv->type == MVPP2_QUEUE_VECTOR_PRIVATE)
++		if (qv->type == MVPP2_QUEUE_VECTOR_PRIVATE) {
++			qv->mask = kzalloc(cpumask_size(), GFP_KERNEL);
++			if (!qv->mask) {
++				err = -ENOMEM;
++				goto err;
++			}
++
+ 			irq_set_status_flags(qv->irq, IRQ_NO_BALANCING);
++		}
+ 
+ 		err = request_irq(qv->irq, mvpp2_isr, 0, port->dev->name, qv);
+ 		if (err)
+ 			goto err;
+ 
+ 		if (qv->type == MVPP2_QUEUE_VECTOR_PRIVATE) {
+-			unsigned long mask = 0;
+ 			unsigned int cpu;
+ 
+ 			for_each_present_cpu(cpu) {
+ 				if (mvpp2_cpu_to_thread(port->priv, cpu) ==
+ 				    qv->sw_thread_id)
+-					mask |= BIT(cpu);
++					cpumask_set_cpu(cpu, qv->mask);
+ 			}
+ 
+-			irq_set_affinity_hint(qv->irq, to_cpumask(&mask));
++			irq_set_affinity_hint(qv->irq, qv->mask);
+ 		}
+ 	}
+ 
+@@ -4148,6 +4154,8 @@ static int mvpp2_irqs_init(struct mvpp2_port *port)
+ 		struct mvpp2_queue_vector *qv = port->qvecs + i;
+ 
+ 		irq_set_affinity_hint(qv->irq, NULL);
++		kfree(qv->mask);
++		qv->mask = NULL;
+ 		free_irq(qv->irq, qv);
+ 	}
+ 
+@@ -4162,6 +4170,8 @@ static void mvpp2_irqs_deinit(struct mvpp2_port *port)
+ 		struct mvpp2_queue_vector *qv = port->qvecs + i;
+ 
+ 		irq_set_affinity_hint(qv->irq, NULL);
++		kfree(qv->mask);
++		qv->mask = NULL;
+ 		irq_clear_status_flags(qv->irq, IRQ_NO_BALANCING);
+ 		free_irq(qv->irq, qv);
+ 	}
+-- 
+2.17.1
+

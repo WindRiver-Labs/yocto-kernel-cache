@@ -1,0 +1,259 @@
+From aa523791acfdfca45f6781dc2cad607412ab3a5e Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Fri, 7 Sep 2018 11:34:12 +0530
+Subject: [PATCH 0182/1051] soc: octeontx2: Support to enable/disable default
+ MCAM entries
+
+For a PF/VF with a NIXLF attached has default/reserved MCAM entries
+for receiving Ucast/Bcast/Promisc traffic. Ideally traffic should be
+forwarded to NIXLF only after it's contexts are initialized. This
+patch keeps these default entries disabled and adds mbox messages
+for a PF/VF to enable these once NPA/NIXLF initialization is done.
+Likewise while PF/VF is being teared down, it can send the disable
+mailbox message to stop receiving traffic.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/mbox.h    |  4 +-
+ drivers/soc/marvell/octeontx2/rvu.h     |  7 ++
+ drivers/soc/marvell/octeontx2/rvu_nix.c | 48 +++++++++++++
+ drivers/soc/marvell/octeontx2/rvu_npc.c | 91 +++++++++++++++++--------
+ 4 files changed, 122 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 2ab76b726841..4341bfc027a8 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -189,7 +189,9 @@ M(NIX_VTAG_CFG,		0x8008, nix_vtag_config, msg_rsp)		\
+ M(NIX_RSS_FLOWKEY_CFG,  0x8009, nix_rss_flowkey_cfg, nix_rss_flowkey_cfg_rsp)\
+ M(NIX_SET_MAC_ADDR,	0x800a, nix_set_mac_addr, msg_rsp)		\
+ M(NIX_SET_RX_MODE,	0x800b, nix_rx_mode, msg_rsp)			\
+-M(NIX_SET_HW_FRS,	0x800c, nix_frs_cfg, msg_rsp)
++M(NIX_SET_HW_FRS,	0x800c, nix_frs_cfg, msg_rsp)			\
++M(NIX_LF_START_RX,	0x800d, msg_req, msg_rsp)			\
++M(NIX_LF_STOP_RX,	0x800e, msg_req, msg_rsp)
+ 
+ /* Messages initiated by AF (range 0xC00 - 0xDFF) */
+ #define MBOX_UP_CGX_MESSAGES						\
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index 5fdbd7624404..cb7f2edbcf87 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -465,6 +465,10 @@ int rvu_mbox_handler_NIX_SET_RX_MODE(struct rvu *rvu, struct nix_rx_mode *req,
+ 				     struct msg_rsp *rsp);
+ int rvu_mbox_handler_NIX_SET_HW_FRS(struct rvu *rvu, struct nix_frs_cfg *req,
+ 				    struct msg_rsp *rsp);
++int rvu_mbox_handler_NIX_LF_START_RX(struct rvu *rvu, struct msg_req *req,
++				      struct msg_rsp *rsp);
++int rvu_mbox_handler_NIX_LF_STOP_RX(struct rvu *rvu, struct msg_req *req,
++				     struct msg_rsp *rsp);
+ 
+ /* NPC APIs */
+ int rvu_npc_init(struct rvu *rvu);
+@@ -476,9 +480,12 @@ void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
+ void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
+ 				   int nixlf, u64 chan, bool allmulti);
+ void rvu_npc_disable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf);
++void rvu_npc_enable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+ 				       int nixlf, u64 chan);
+ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
++void rvu_npc_disable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
++void rvu_npc_enable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 				    int group, int alg_idx, int mcam_index);
+ void rvu_npc_get_mcam_entry_alloc_info(struct rvu *rvu, u16 pcifunc,
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+index 558b891021a9..822360803a84 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_nix.c
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -851,6 +851,9 @@ int rvu_mbox_handler_NIX_LF_ALLOC(struct rvu *rvu,
+ 	if (err)
+ 		goto free_mem;
+ 
++	/* Disable NPC entries as NIXLF's contexts are not initialized yet */
++	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
++
+ 	goto exit;
+ 
+ free_mem:
+@@ -2609,3 +2612,48 @@ void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int nixlf)
+ 
+ 	nix_ctx_free(rvu, pfvf);
+ }
++
++static int nix_get_nixlf(struct rvu *rvu, u16 pcifunc, int *nixlf)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	struct rvu_hwinfo *hw = rvu->hw;
++	int blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
++	if (!pfvf->nixlf || (blkaddr < 0))
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	*nixlf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, 0);
++	if (*nixlf < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	return 0;
++}
++
++int rvu_mbox_handler_NIX_LF_START_RX(struct rvu *rvu, struct msg_req *req,
++				      struct msg_rsp *rsp)
++{
++	u16 pcifunc = req->hdr.pcifunc;
++	int nixlf, err;
++
++	err = nix_get_nixlf(rvu, pcifunc, &nixlf);
++	if (err)
++		return err;
++
++	rvu_npc_enable_default_entries(rvu, pcifunc, nixlf);
++	return 0;
++}
++
++int rvu_mbox_handler_NIX_LF_STOP_RX(struct rvu *rvu, struct msg_req *req,
++				     struct msg_rsp *rsp)
++{
++	u16 pcifunc = req->hdr.pcifunc;
++	int nixlf, err;
++
++	err = nix_get_nixlf(rvu, pcifunc, &nixlf);
++	if (err)
++		return err;
++
++	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
++	return 0;
++}
+diff --git a/drivers/soc/marvell/octeontx2/rvu_npc.c b/drivers/soc/marvell/octeontx2/rvu_npc.c
+index 97155e10a8bd..dee6d2f09753 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_npc.c
++++ b/drivers/soc/marvell/octeontx2/rvu_npc.c
+@@ -388,7 +388,8 @@ void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
+ 			      NIX_INTF_RX, &entry, true);
+ }
+ 
+-void rvu_npc_disable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf)
++static void npc_enadis_promisc_entry(struct rvu *rvu, u16 pcifunc,
++				     int nixlf, bool enable)
+ {
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	int blkaddr, index;
+@@ -403,7 +404,17 @@ void rvu_npc_disable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf)
+ 
+ 	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+ 					 nixlf, NIXLF_PROMISC_ENTRY);
+-	npc_enable_mcam_entry(rvu, mcam, blkaddr, index, false);
++	npc_enable_mcam_entry(rvu, mcam, blkaddr, index, enable);
++}
++
++void rvu_npc_disable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	npc_enadis_promisc_entry(rvu, pcifunc, nixlf, false);
++}
++
++void rvu_npc_enable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	npc_enadis_promisc_entry(rvu, pcifunc, nixlf, true);
+ }
+ 
+ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+@@ -512,11 +523,59 @@ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 		    NPC_AF_MCAMEX_BANKX_ACTION(index, bank), *(u64 *)&action);
+ }
+ 
+-void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
++static void npc_enadis_default_entries(struct rvu *rvu, u16 pcifunc,
++				       int nixlf, bool enable)
+ {
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct nix_rx_action action;
+-	int blkaddr, index, bank;
++	int index, bank, blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return;
++
++	/* Ucast MCAM match entry of this PF/VF */
++	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
++					 nixlf, NIXLF_UCAST_ENTRY);
++	npc_enable_mcam_entry(rvu, mcam, blkaddr, index, enable);
++
++	/* For PF, ena/dis promisc and bcast MCAM match entries */
++	if (pcifunc & RVU_PFVF_FUNC_MASK)
++		return;
++
++	/* For bcast, enable/disable only if it's action is not
++	 * packet replication, incase if action is replication
++	 * then this PF's nixlf is removed from bcast replication
++	 * list.
++	 */
++	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
++					 nixlf, NIXLF_BCAST_ENTRY);
++	bank = npc_get_bank(mcam, index);
++	*(u64 *)&action = rvu_read64(rvu, blkaddr,
++	     NPC_AF_MCAMEX_BANKX_ACTION(index & (mcam->banksize - 1), bank));
++	if (action.op != NIX_RX_ACTIONOP_MCAST)
++		npc_enable_mcam_entry(rvu, mcam,
++				      blkaddr, index, enable);
++	if (enable)
++		rvu_npc_enable_promisc_entry(rvu, pcifunc, nixlf);
++	else
++		rvu_npc_disable_promisc_entry(rvu, pcifunc, nixlf);
++}
++
++void rvu_npc_disable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	npc_enadis_default_entries(rvu, pcifunc, nixlf, false);
++}
++
++void rvu_npc_enable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	npc_enadis_default_entries(rvu, pcifunc, nixlf, true);
++}
++
++void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int blkaddr;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+ 	if (blkaddr < 0)
+@@ -532,29 +591,7 @@ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ 
+ 	mutex_unlock(&mcam->lock);
+ 
+-	/* Disable ucast MCAM match entry of this PF/VF */
+-	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+-					 nixlf, NIXLF_UCAST_ENTRY);
+-	npc_enable_mcam_entry(rvu, mcam, blkaddr, index, false);
+-
+-	/* For PF, disable promisc and bcast MCAM match entries */
+-	if (!(pcifunc & RVU_PFVF_FUNC_MASK)) {
+-		index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+-						 nixlf, NIXLF_BCAST_ENTRY);
+-		/* For bcast, disable only if it's action is not
+-		 * packet replication, incase if action is replication
+-		 * then this PF's nixlf is removed from bcast replication
+-		 * list.
+-		 */
+-		bank = npc_get_bank(mcam, index);
+-		index &= (mcam->banksize - 1);
+-		*(u64 *)&action = rvu_read64(rvu, blkaddr,
+-				     NPC_AF_MCAMEX_BANKX_ACTION(index, bank));
+-		if (action.op != NIX_RX_ACTIONOP_MCAST)
+-			npc_enable_mcam_entry(rvu, mcam, blkaddr, index, false);
+-
+-		rvu_npc_disable_promisc_entry(rvu, pcifunc, nixlf);
+-	}
++	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ }
+ 
+ #define SET_KEX_LD(intf, lid, ltype, ld, cfg)	\
+-- 
+2.17.1
+

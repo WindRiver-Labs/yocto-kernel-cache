@@ -1,0 +1,173 @@
+From 4179338292064012fb41e1807c205f0f5efb05fa Mon Sep 17 00:00:00 2001
+From: Slawomir Rosek <slawomir.rosek@cavium.com>
+Date: Tue, 27 Nov 2018 17:30:58 +0300
+Subject: [PATCH 0765/1051] octeontx-fpa: Fix XAQ/DPFI VFs identification
+
+Put back XAQ/DPFI VFs on SSO/PKO modules exit. Otherwise subsequent
+insertion of SSO/PKO modules may fail due to invalid cache of previous
+FPA VF identification result.
+
+Signed-off-by: Slawomir Rosek <slawomir.rosek@cavium.com>
+Reviewed-by: Stanislaw Kardach <stanislaw.kardach@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/cavium/octeontx-83xx/fpa.h   |  2 ++
+ .../cavium/octeontx-83xx/fpapf_main.c         | 12 +++++--
+ .../cavium/octeontx-83xx/fpavf_main.c         | 35 +++++++++++++------
+ .../cavium/octeontx-83xx/pkopf_main.c         |  1 +
+ .../cavium/octeontx-83xx/ssopf_main.c         |  1 +
+ 5 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h b/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h
+index 16ee0d40fc89..5fe3d26bbab3 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/fpa.h
+@@ -207,6 +207,7 @@ struct fpavf {
+ 	void __iomem		*reg_base;
+ 	struct msix_entry	*msix_entries;
+ 	struct list_head	list;
++	u32			ref_count;
+ 
+ 	bool			setup_done;
+ 	u16			domain_id;
+@@ -240,6 +241,7 @@ struct fpavf_com_s {
+ 	int (*refill)(struct fpavf *fpa);
+ 	void (*add_alloc)(struct fpavf *fpa, int count);
+ 	int (*teardown)(struct fpavf *fpa);
++	void (*put)(struct fpavf *);
+ };
+ 
+ extern struct fpavf_com_s fpavf_com;
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/fpapf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/fpapf_main.c
+index 7dbdcef3ecd3..73757bf21e34 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/fpapf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/fpapf_main.c
+@@ -408,9 +408,9 @@ static int fpa_pf_destroy_domain(u32 id, u16 domain_id, struct kobject *kobj)
+ 						  &pool_redcnt_attr.attr);
+ 				sysfs_remove_link(kobj, virtfn->dev.kobj.name);
+ 			}
+-			dev_info(&fpa->pdev->dev,
+-				 "Free vf[%d] from domain:%d subdomain_id:%d\n",
+-				 i, fpa->vf[i].domain.domain_id, vf_idx);
++			dev_dbg(&fpa->pdev->dev,
++				"Free vf[%d] from domain:%d subdomain_id:%d\n",
++				i, fpa->vf[i].domain.domain_id, vf_idx);
+ 			memset(&fpa->vf[i], 0, sizeof(struct octeontx_pf_vf));
+ 			reg = FPA_MAP_VALID(0) | FPA_MAP_VHAURASET(i)
+ 				| FPA_MAP_GAURASET(0)
+@@ -531,6 +531,9 @@ static u64 fpa_pf_create_domain(u32 id, u16 domain_id,
+ 
+ 			fpa_reg_write(fpa, FPA_PF_VFX_GMCTL(i), reg);
+ 
++			dev_dbg(&fpa->pdev->dev, "Alloc vf[%u] domain:%u subdomain_id:%u\n",
++				i, domain_id, vf_idx);
++
+ 			fpa->vf[i].domain.in_use = true;
+ 			set_bit(i, &aura_set);
+ 			identify(&fpa->vf[i], domain_id, vf_idx,
+@@ -627,6 +630,9 @@ int fpa_reset_domain(u32 id, u16 domain_id)
+ 			}
+ 
+ empty:
++			dev_dbg(&fpa->pdev->dev, "Reset vf[%u] domain:%u subdomain_id:%u\n",
++				i, domain_id, fpa->vf[i].domain.subdomain_id);
++
+ 			if (domain_id != FPA_SSO_XAQ_AURA &&
+ 			    domain_id != FPA_PKO_DPFI_AURA)
+ 				reg = (0xff & (i + 1)) << 24 |
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c
+index d09222c442ec..0bcc267de3fd 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/fpavf_main.c
+@@ -380,6 +380,17 @@ static int fpa_vf_teardown(struct fpavf *fpa)
+ 	return 0;
+ }
+ 
++static void fpa_vf_put(struct fpavf *fpa)
++{
++	mutex_lock(&octeontx_fpavf_devices_lock);
++	fpa->ref_count -= 1;
++	if (!fpa->ref_count) {
++		fpa->domain_id = 0;
++		fpa->subdomain_id = 0;
++	}
++	mutex_unlock(&octeontx_fpavf_devices_lock);
++}
++
+ static struct fpavf *fpa_vf_get(u16 domain_id, u16 subdomain_id,
+ 				struct octeontx_master_com_t *master,
+ 				void *master_data)
+@@ -398,6 +409,7 @@ static struct fpavf *fpa_vf_get(u16 domain_id, u16 subdomain_id,
+ 		if (curr->domain_id == domain_id &&
+ 		    curr->subdomain_id == subdomain_id) {
+ 			fpa = curr;
++			fpa->ref_count += 1;
+ 			break;
+ 		}
+ 	}
+@@ -433,17 +445,19 @@ static struct fpavf *fpa_vf_get(u16 domain_id, u16 subdomain_id,
+ 				break;
+ 			}
+ 		}
+-		mutex_unlock(&octeontx_fpavf_devices_lock);
+-	}
+ 
+-	if (fpa) {
+-		reg = fpavf_reg_read(fpa,
+-				     FPA_VF_VHPOOL_THRESHOLD(0));
+-		fpa->domain_id = domain_id;
+-		fpa->subdomain_id = subdomain_id;
+-		fpa->master = master;
+-		fpa->master_data = master_data;
+-		fpa->stack_ln_ptrs = reg;
++		if (fpa) {
++			reg = fpavf_reg_read(fpa,
++					     FPA_VF_VHPOOL_THRESHOLD(0));
++			fpa->domain_id = domain_id;
++			fpa->subdomain_id = subdomain_id;
++			fpa->master = master;
++			fpa->master_data = master_data;
++			fpa->stack_ln_ptrs = reg;
++			fpa->ref_count = 1;
++		}
++
++		mutex_unlock(&octeontx_fpavf_devices_lock);
+ 	}
+ 
+ 	return fpa;
+@@ -476,6 +490,7 @@ struct fpavf_com_s fpavf_com = {
+ 	.refill = fpa_vf_refill,
+ 	.add_alloc = fpa_vf_add_alloc,
+ 	.teardown = fpa_vf_teardown,
++	.put = fpa_vf_put,
+ };
+ EXPORT_SYMBOL(fpavf_com);
+ 
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+index 3b089e3aa310..ebbf6c3551a9 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+@@ -1304,6 +1304,7 @@ static int teardown_dpfi(struct pkopf *pko)
+ 	pko_reg_write(pko, PKO_PF_DPFI_ENA, 0);
+ 
+ 	fpavf->teardown(fpa);
++	fpavf->put(fpa);
+ 	fpapf->destroy_domain(pko->id, FPA_PKO_DPFI_GMID, NULL);
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c
+index e2537e458261..9ff2b3d4e1c7 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/ssopf_main.c
+@@ -1390,6 +1390,7 @@ static void sso_remove(struct pci_dev *pdev)
+ 			fpavf->free(fpa, FPA_SSO_XAQ_AURA, addr, 0);
+ 	}
+ 	fpavf->teardown(fpa);
++	fpavf->put(fpa);
+ 	fpapf->destroy_domain(sso->id, FPA_SSO_XAQ_GMID, NULL);
+ 	sso_irq_free(sso);
+ 	sso_sriov_configure(pdev, 0);
+-- 
+2.17.1
+

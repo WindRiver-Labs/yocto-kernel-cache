@@ -1,0 +1,271 @@
+From 87a1cbcafb83e03cd5d78d2af255fb5293b5abb7 Mon Sep 17 00:00:00 2001
+From: Prakash Brahmajyosyula <bprakash@marvell.com>
+Date: Thu, 16 Aug 2018 21:50:54 +0530
+Subject: [PATCH 0094/1051] soc: octeontx2: Add NDC statistics to debugfs
+
+Added NPA/NIX-Rx/NIX-Tx's NDC cache stats like
+to debugfs.
+
+This will help in checking if NPA/NIX context updates
+are having NDC cache misses which inturn will effect
+performance.
+
+Signed-off-by: Prakash Brahmajyosyula <bprakash@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/common.h      |  16 +++
+ drivers/soc/marvell/octeontx2/rvu_debugfs.c | 138 ++++++++++++++++++++
+ drivers/soc/marvell/octeontx2/rvu_reg.h     |  29 +++-
+ 3 files changed, 180 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/common.h b/drivers/soc/marvell/octeontx2/common.h
+index f27987cbe69e..456f53a77862 100644
+--- a/drivers/soc/marvell/octeontx2/common.h
++++ b/drivers/soc/marvell/octeontx2/common.h
+@@ -176,4 +176,20 @@ enum {
+ 	FLOW_KEY_ALG_MAX,
+ };
+ 
++/* NDC info */
++enum ndc_idx_e {
++	NIX0_RX = 0x0,
++	NIX0_TX = 0x1,
++	NPA0_U  = 0x2,
++};
++
++enum ndc_ctype_e {
++	CACHING = 0x0,
++	BYPASS = 0x1,
++};
++
++#define NDC_MAX_PORT 6
++#define NDC_READ_TRANS 0
++#define NDC_WRITE_TRANS 1
++
+ #endif /* COMMON_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu_debugfs.c b/drivers/soc/marvell/octeontx2/rvu_debugfs.c
+index c3d8df632440..2c8b5cb8e7d6 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_debugfs.c
++++ b/drivers/soc/marvell/octeontx2/rvu_debugfs.c
+@@ -79,6 +79,9 @@ static char *cgx_tx_stats_fields[] = {
+ 	[CGX_STAT17]    = "Control/PAUSE packets sent",
+ };
+ 
++#define NDC_MAX_BANK(rvu, blk_addr) (rvu_read64(rvu, \
++		blk_addr, NDC_AF_CONST) & 0xFF)
++
+ #define rvu_dbg_NULL NULL
+ #define RVU_DEBUG_FOPS(name, read_op, write_op) \
+ static const struct file_operations rvu_dbg_##name##_fops = { \
+@@ -500,6 +503,77 @@ static ssize_t rvu_dbg_npa_pool_ctx_display(struct file *filp,
+ }
+ RVU_DEBUG_FOPS(npa_pool_ctx, NULL, npa_pool_ctx_display);
+ 
++static void ndc_cache_stats(struct rvu *rvu, int blk_addr,
++			    int ctype, int transaction)
++{
++	u64 req, out_req, lat, cant_alloc;
++	int port;
++
++	for (port = 0; port < NDC_MAX_PORT; port++) {
++		req = rvu_read64(rvu, blk_addr, NDC_AF_PORTX_RTX_RWX_REQ_PC
++						(port, ctype, transaction));
++		lat = rvu_read64(rvu, blk_addr, NDC_AF_PORTX_RTX_RWX_LAT_PC
++						(port, ctype, transaction));
++		out_req = rvu_read64(rvu, blk_addr,
++				     NDC_AF_PORTX_RTX_RWX_OSTDN_PC(port, ctype,
++								  transaction));
++		cant_alloc = rvu_read64(rvu, blk_addr,
++					NDC_AF_PORTX_RTX_CANT_ALLOC_PC(port,
++							       transaction));
++		pr_info("\nPort:%d\n", port);
++		pr_info("\tTotal Requests:\t\t%lld\n", req);
++		pr_info("\tTotal Time Taken:\t%lld cycles\n", lat);
++		pr_info("\tAvg Latency:\t\t%lld cycles\n", lat / req);
++		pr_info("\tOutstanding Requests:\t%lld\n", out_req);
++		pr_info("\tCant Alloc Requests:\t%lld\n", cant_alloc);
++	}
++}
++
++static int ndc_blk_cache_stats(struct rvu *rvu, int idx, int blk_addr)
++{
++	pr_info("\n***** CACHE mode read stats *****\n\n");
++	ndc_cache_stats(rvu, blk_addr, CACHING, NDC_READ_TRANS);
++	pr_info("\n***** CACHE mode write stats *****\n\n");
++	ndc_cache_stats(rvu, blk_addr, CACHING, NDC_WRITE_TRANS);
++	pr_info("\n***** BY-PASS mode read stats *****\n\n");
++	ndc_cache_stats(rvu, blk_addr, BYPASS, NDC_READ_TRANS);
++	pr_info("\n***** BY-PASS mode write stats *****\n\n");
++	ndc_cache_stats(rvu, blk_addr, BYPASS, NDC_WRITE_TRANS);
++	return 0;
++}
++
++static ssize_t rvu_dbg_npa_ndc_cache_display(struct file *filp,
++					     char __user *buffer,
++					     size_t count, loff_t *ppos)
++{
++	return ndc_blk_cache_stats(filp->private_data, NPA0_U, BLKADDR_NDC2);
++}
++RVU_DEBUG_FOPS(npa_ndc_cache, npa_ndc_cache_display, NULL);
++
++static int ndc_blk_hits_miss_stats(struct rvu *rvu, int idx, int blk_addr)
++{
++	int bank, max_bank;
++
++	max_bank = NDC_MAX_BANK(rvu, blk_addr);
++	for (bank = 0; bank < max_bank; bank++) {
++		pr_info("BANK:%d\n", bank);
++		pr_info("\tHits:\t%lld\n", (u64)rvu_read64(rvu, blk_addr,
++						NDC_AF_BANKX_HIT_PC(bank)));
++		pr_info("\tMiss:\t%lld\n", (u64)rvu_read64(rvu, blk_addr,
++						NDC_AF_BANKX_MISS_PC(bank)));
++	}
++	return 0;
++}
++
++static ssize_t rvu_dbg_npa_ndc_hits_miss_display(struct file *filp,
++						 char __user *buffer,
++						 size_t count, loff_t *ppos)
++{
++	return ndc_blk_hits_miss_stats(filp->private_data,
++				      NPA0_U, BLKADDR_NDC2);
++}
++RVU_DEBUG_FOPS(npa_ndc_hits_miss, npa_ndc_hits_miss_display, NULL);
++
+ static void rvu_dbg_npa_init(struct rvu *rvu)
+ {
+ 	const struct device *dev = &rvu->pdev->dev;
+@@ -524,6 +598,16 @@ static void rvu_dbg_npa_init(struct rvu *rvu)
+ 	if (!pfile)
+ 		goto create_failed;
+ 
++	pfile = debugfs_create_file("ndc_cache", 0600, rvu->rvu_dbg.npa, rvu,
++				    &rvu_dbg_npa_ndc_cache_fops);
++	if (!pfile)
++		goto create_failed;
++
++	pfile = debugfs_create_file("ndc_hits_miss", 0600, rvu->rvu_dbg.npa,
++				    rvu, &rvu_dbg_npa_ndc_hits_miss_fops);
++	if (!pfile)
++		goto create_failed;
++
+ 	return;
+ create_failed:
+ 	dev_err(dev, "Failed to create debugfs dir/file for NPA\n");
+@@ -922,6 +1006,40 @@ static ssize_t rvu_dbg_nix_cq_ctx_display(struct file *filp,
+ }
+ RVU_DEBUG_FOPS(nix_cq_ctx, NULL, nix_cq_ctx_display);
+ 
++static ssize_t rvu_dbg_nix_ndc_rx_cache_display(struct file *filp,
++						char __user *buffer,
++						size_t count, loff_t *ppos)
++{
++	return ndc_blk_cache_stats(filp->private_data, NIX0_RX, BLKADDR_NDC0);
++}
++RVU_DEBUG_FOPS(nix_ndc_rx_cache, nix_ndc_rx_cache_display, NULL);
++
++static ssize_t rvu_dbg_nix_ndc_tx_cache_display(struct file *filp,
++						char __user *buffer,
++						size_t count, loff_t *ppos)
++{
++	return ndc_blk_cache_stats(filp->private_data, NIX0_TX, BLKADDR_NDC1);
++}
++RVU_DEBUG_FOPS(nix_ndc_tx_cache, nix_ndc_tx_cache_display, NULL);
++
++static ssize_t rvu_dbg_nix_ndc_rx_hits_miss_display(struct file *filp,
++						    char __user *buffer,
++						    size_t count, loff_t *ppos)
++{
++	return ndc_blk_hits_miss_stats(filp->private_data,
++				      NPA0_U, BLKADDR_NDC0);
++}
++RVU_DEBUG_FOPS(nix_ndc_rx_hits_miss, nix_ndc_rx_hits_miss_display, NULL);
++
++static ssize_t rvu_dbg_nix_ndc_tx_hits_miss_display(struct file *filp,
++						    char __user *buffer,
++						    size_t count, loff_t *ppos)
++{
++	return ndc_blk_hits_miss_stats(filp->private_data,
++				      NPA0_U, BLKADDR_NDC1);
++}
++RVU_DEBUG_FOPS(nix_ndc_tx_hits_miss, nix_ndc_tx_hits_miss_display, NULL);
++
+ static void rvu_dbg_nix_init(struct rvu *rvu)
+ {
+ 	const struct device *dev = &rvu->pdev->dev;
+@@ -948,6 +1066,26 @@ static void rvu_dbg_nix_init(struct rvu *rvu)
+ 	if (!pfile)
+ 		goto create_failed;
+ 
++	pfile = debugfs_create_file("ndc_tx_cache", 0600, rvu->rvu_dbg.nix, rvu,
++				    &rvu_dbg_nix_ndc_tx_cache_fops);
++	if (!pfile)
++		goto create_failed;
++
++	pfile = debugfs_create_file("ndc_rx_cache", 0600, rvu->rvu_dbg.nix, rvu,
++				    &rvu_dbg_nix_ndc_rx_cache_fops);
++	if (!pfile)
++		goto create_failed;
++
++	pfile = debugfs_create_file("ndc_tx_hits_miss", 0600, rvu->rvu_dbg.nix,
++				    rvu, &rvu_dbg_nix_ndc_tx_hits_miss_fops);
++	if (!pfile)
++		goto create_failed;
++
++	pfile = debugfs_create_file("ndc_rx_hits_miss", 0600, rvu->rvu_dbg.nix,
++				    rvu, &rvu_dbg_nix_ndc_rx_hits_miss_fops);
++	if (!pfile)
++		goto create_failed;
++
+ 	return;
+ create_failed:
+ 	dev_err(dev, "Failed to create debugfs dir/file for NIX\n");
+diff --git a/drivers/soc/marvell/octeontx2/rvu_reg.h b/drivers/soc/marvell/octeontx2/rvu_reg.h
+index c9bd16885768..af0f57eb37a7 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_reg.h
++++ b/drivers/soc/marvell/octeontx2/rvu_reg.h
+@@ -436,9 +436,6 @@
+ #define CPT_AF_LF_RST			(0x44000)
+ #define CPT_AF_BLK_RST			(0x46000)
+ 
+-#define NDC_AF_BLK_RST                  (0x002F0)
+-#define NPC_AF_BLK_RST                  (0x00040)
+-
+ /* NPC */
+ #define NPC_AF_CFG			(0x00000)
+ #define NPC_AF_ACTIVE_PC		(0x00010)
+@@ -500,4 +497,30 @@
+ #define NPC_AF_DBG_DATAX(a)		(0x3001400 | (a) << 4)
+ #define NPC_AF_DBG_RESULTX(a)		(0x3001800 | (a) << 4)
+ 
++/* NDC */
++#define NDC_AF_CONST			(0x00000)
++#define NDC_AF_CLK_EN			(0x00020)
++#define NDC_AF_CTL			(0x00030)
++#define NDC_AF_BANK_CTL			(0x00040)
++#define NDC_AF_BANK_CTL_DONE		(0x00048)
++#define NDC_AF_INTR			(0x00058)
++#define NDC_AF_INTR_W1S			(0x00060)
++#define NDC_AF_INTR_ENA_W1S		(0x00068)
++#define NDC_AF_INTR_ENA_W1C		(0x00070)
++#define NDC_AF_ACTIVE_PC		(0x00078)
++#define NDC_AF_BP_TEST_ENABLE		(0x001F8)
++#define NDC_AF_BLK_RST			(0x002F0)
++#define NDC_PRIV_AF_INT_CFG		(0x002F8)
++#define NDC_AF_HASHX(a)			(0x00300 | (a) << 3)
++#define NDC_AF_PORTX_RTX_RWX_REQ_PC(a, b, c) \
++		(0x00C00 | (a) << 5 | (b) << 4 | (c) << 3)
++#define NDC_AF_PORTX_RTX_RWX_OSTDN_PC(a, b, c) \
++		(0x00D00 | (a) << 5 | (b) << 4 | (c) << 3)
++#define NDC_AF_PORTX_RTX_RWX_LAT_PC(a, b, c) \
++		(0x00E00 | (a) << 5 | (b) << 4 | (c) << 3)
++#define NDC_AF_PORTX_RTX_CANT_ALLOC_PC(a, b) \
++		(0x00F00 | (a) << 5 | (b) << 4)
++#define NDC_AF_BANKX_HIT_PC(a)		(0x01000 | (a) << 3)
++#define NDC_AF_BANKX_MISS_PC(a)		(0x01100 | (a) << 3)
++
+ #endif /* RVU_REG_H */
+-- 
+2.17.1
+

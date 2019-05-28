@@ -1,0 +1,295 @@
+From 28f0470337fa018551d7ed210b31da8f5198c1a8 Mon Sep 17 00:00:00 2001
+From: Peter Swain <pswain@cavium.com>
+Date: Mon, 4 Jun 2018 17:48:07 -0700
+Subject: [PATCH 0345/1051] (SDK only) spi-cavium: spi-mux gpio pin extends to
+ 8 chip-selects
+
+This should go in Cavium SDK, but not to kernel.org.
+
+For SLIC+Framer support on sff8104 board
+An optional gpio pin (spi-mux-gpios) adds another bit of SPI
+addressing, by multiplexing CS0..CS3 lines to CS4..CS7.
+
+Since SPI transactions are already serialized per-adapter
+by the linux spi subsystem no further locking is required
+to avoid conflict.
+
+The current state of the spi-mux GPIO is cached, and the
+bit is toggled only as needed.
+
+Signed-off-by: Peter Swain <pswain@cavium.com>
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/spi/spi-cavium-octeon.c   |  1 +
+ drivers/spi/spi-cavium-thunderx.c | 68 +++++++++++++++++++++++--------
+ drivers/spi/spi-cavium.c          | 30 ++++++++++----
+ drivers/spi/spi-cavium.h          | 14 +++++++
+ 4 files changed, 88 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/spi/spi-cavium-octeon.c b/drivers/spi/spi-cavium-octeon.c
+index ee4703e84622..495c3ac9c7bd 100644
+--- a/drivers/spi/spi-cavium-octeon.c
++++ b/drivers/spi/spi-cavium-octeon.c
+@@ -44,6 +44,7 @@ static int octeon_spi_probe(struct platform_device *pdev)
+ 	p->regs.status = 0x08;
+ 	p->regs.tx = 0x10;
+ 	p->regs.data = 0x80;
++	p->regs.cs_mux = -1;
+ 
+ 	master->num_chipselect = 4;
+ 	master->mode_bits = SPI_CPHA |
+diff --git a/drivers/spi/spi-cavium-thunderx.c b/drivers/spi/spi-cavium-thunderx.c
+index 877937706240..41573cd7ea46 100644
+--- a/drivers/spi/spi-cavium-thunderx.c
++++ b/drivers/spi/spi-cavium-thunderx.c
+@@ -21,7 +21,36 @@ static int thunderx_spi_probe(struct pci_dev *pdev,
+ 	struct device *dev = &pdev->dev;
+ 	struct spi_master *master;
+ 	struct octeon_spi *p;
+-	int ret;
++	s32 pin = -EINVAL;
++	int ret = -ENOENT;
++
++	/* may need to hunt for devtree entry */
++	if (!pdev->dev.of_node) {
++		struct device_node *np = of_find_node_by_name(NULL, "spi");
++
++		if (IS_ERR(np)) {
++			ret = PTR_ERR(np);
++			goto error;
++		}
++		pdev->dev.of_node = np;
++		of_node_put(np);
++	}
++
++	/* some boards use a GPIO pin to enable CS4-CS7 */
++	if (of_find_property(pdev->dev.of_node, "spi-mux-gpios", NULL))
++		pin = of_get_named_gpio(pdev->dev.of_node, "spi-mux-gpios", 0);
++	if (pin < 0 && pin != -EINVAL)
++		ret = pin;
++	if (pin == -EPROBE_DEFER)
++		goto error;
++	if (pin >= 0) {
++		ret = devm_gpio_request(dev, pin, "spi-mux");
++		if (ret) {
++			dev_err(dev, "Cannot get spi-mux (gpio%d): %d\n",
++				pin, ret);
++			goto error;
++		}
++	}
+ 
+ 	master = spi_alloc_master(dev, sizeof(struct octeon_spi));
+ 	if (!master)
+@@ -31,39 +60,40 @@ static int thunderx_spi_probe(struct pci_dev *pdev,
+ 
+ 	ret = pcim_enable_device(pdev);
+ 	if (ret)
+-		goto error;
++		goto error_put;
+ 
+ 	ret = pci_request_regions(pdev, DRV_NAME);
+ 	if (ret)
+-		goto error;
++		goto error_disable;
+ 
+ 	p->register_base = pcim_iomap(pdev, 0, pci_resource_len(pdev, 0));
+ 	if (!p->register_base) {
+ 		ret = -EINVAL;
+-		goto error;
++		goto error_disable;
+ 	}
+ 
+ 	p->regs.config = 0x1000;
+ 	p->regs.status = 0x1008;
+ 	p->regs.tx = 0x1010;
+ 	p->regs.data = 0x1080;
++	p->regs.cs_mux = pin;
+ 
++	/* FIXME: need a proper clocksource object for SCLK */
+ 	p->clk = devm_clk_get(dev, NULL);
+ 	if (IS_ERR(p->clk)) {
+-		ret = PTR_ERR(p->clk);
+-		goto error;
++		p->clk = devm_clk_get(dev, "sclk");
++		p->sys_freq = 0;
++	} else {
++		ret = clk_prepare_enable(p->clk);
++		if (!ret)
++			p->sys_freq = clk_get_rate(p->clk);
+ 	}
+ 
+-	ret = clk_prepare_enable(p->clk);
+-	if (ret)
+-		goto error;
+-
+-	p->sys_freq = clk_get_rate(p->clk);
+ 	if (!p->sys_freq)
+ 		p->sys_freq = SYS_FREQ_DEFAULT;
+ 	dev_info(dev, "Set system clock to %u\n", p->sys_freq);
+ 
+-	master->num_chipselect = 4;
++	master->num_chipselect = (p->regs.cs_mux >= 0) ? 8 : 4;
+ 	master->mode_bits = SPI_CPHA | SPI_CPOL | SPI_CS_HIGH |
+ 			    SPI_LSB_FIRST | SPI_3WIRE;
+ 	master->transfer_one_message = octeon_spi_transfer_one_message;
+@@ -75,13 +105,15 @@ static int thunderx_spi_probe(struct pci_dev *pdev,
+ 
+ 	ret = devm_spi_register_master(dev, master);
+ 	if (ret)
+-		goto error;
++		goto error_disable;
+ 
+ 	return 0;
+ 
+-error:
++error_disable:
+ 	clk_disable_unprepare(p->clk);
++error_put:
+ 	spi_master_put(master);
++error:
+ 	return ret;
+ }
+ 
+@@ -91,12 +123,14 @@ static void thunderx_spi_remove(struct pci_dev *pdev)
+ 	struct octeon_spi *p;
+ 
+ 	p = spi_master_get_devdata(master);
+-	if (!p)
+-		return;
+ 
+ 	clk_disable_unprepare(p->clk);
+ 	/* Put everything in a known state. */
+-	writeq(0, p->register_base + OCTEON_SPI_CFG(p));
++	if (p)
++		writeq(0, p->register_base + OCTEON_SPI_CFG(p));
++
++	pci_disable_device(pdev);
++	spi_master_put(master);
+ }
+ 
+ static const struct pci_device_id thunderx_spi_pci_id_table[] = {
+diff --git a/drivers/spi/spi-cavium.c b/drivers/spi/spi-cavium.c
+index 19a9a2e6c60f..e05a7fb70cd6 100644
+--- a/drivers/spi/spi-cavium.c
++++ b/drivers/spi/spi-cavium.c
+@@ -25,10 +25,26 @@ static void octeon_spi_wait_ready(struct octeon_spi *p)
+ 	} while (mpi_sts.s.busy);
+ }
+ 
++static int octeon_spi_mux(struct spi_master *master, struct spi_message *msg)
++{
++#ifdef CONFIG_CAVIUM_SPI_MUX
++	struct octeon_spi *p = spi_master_get_devdata(master);
++	int cs = msg->spi->chip_select;
++	int half = (cs >= 4);
++	static int was = -1;
++
++	if (was != half && p->regs.cs_mux >= 0)
++		gpio_direction_output(p->regs.cs_mux, half);
++	was = half;
++#endif
++	return cs % 4;
++}
++
+ static int octeon_spi_do_transfer(struct octeon_spi *p,
+ 				  struct spi_message *msg,
+ 				  struct spi_transfer *xfer,
+-				  bool last_xfer)
++				  bool last_xfer,
++				  int cs)
+ {
+ 	struct spi_device *spi = msg->spi;
+ 	union cvmx_mpi_cfg mpi_cfg;
+@@ -38,7 +54,6 @@ static int octeon_spi_do_transfer(struct octeon_spi *p,
+ 	bool cpha, cpol;
+ 	const u8 *tx_buf;
+ 	u8 *rx_buf;
+-	int cs = msg->spi->chip_select;
+ 	u64 enax = 1ull << (12 + cs);
+ 	int len;
+ 	int i;
+@@ -59,9 +74,7 @@ static int octeon_spi_do_transfer(struct octeon_spi *p,
+ 	mpi_cfg.s.cslate = cpha ? 1 : 0;
+ 	mpi_cfg.s.enable = 1;
+ 
+-	if (spi->chip_select < 4 && enax != p->cs_enax)
+-		p->cs_enax = enax;
+-
++	p->cs_enax |= 1ull << (12 + cs);
+ 	mpi_cfg.u64 |= p->cs_enax;
+ 
+ 	if (mpi_cfg.u64 != p->last_cfg) {
+@@ -82,7 +95,7 @@ static int octeon_spi_do_transfer(struct octeon_spi *p,
+ 			writeq(d, p->register_base + OCTEON_SPI_DAT0(p) + (8 * i));
+ 		}
+ 		mpi_tx.u64 = 0;
+-		mpi_tx.s.csid = spi->chip_select;
++		mpi_tx.s.csid = cs;
+ 		mpi_tx.s.leavecs = 1;
+ 		mpi_tx.s.txnum = tx_buf ? OCTEON_SPI_MAX_BYTES : 0;
+ 		mpi_tx.s.totnum = OCTEON_SPI_MAX_BYTES;
+@@ -107,7 +120,7 @@ static int octeon_spi_do_transfer(struct octeon_spi *p,
+ 	}
+ 
+ 	mpi_tx.u64 = 0;
+-	mpi_tx.s.csid = spi->chip_select;
++	mpi_tx.s.csid = cs;
+ 	if (last_xfer)
+ 		mpi_tx.s.leavecs = xfer->cs_change;
+ 	else
+@@ -136,11 +149,12 @@ int octeon_spi_transfer_one_message(struct spi_master *master,
+ 	unsigned int total_len = 0;
+ 	int status = 0;
+ 	struct spi_transfer *xfer;
++	int cs = octeon_spi_mux(master, msg);
+ 
+ 	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+ 		bool last_xfer = list_is_last(&xfer->transfer_list,
+ 					      &msg->transfers);
+-		int r = octeon_spi_do_transfer(p, msg, xfer, last_xfer);
++		int r = octeon_spi_do_transfer(p, msg, xfer, last_xfer, cs);
+ 		if (r < 0) {
+ 			status = r;
+ 			goto err;
+diff --git a/drivers/spi/spi-cavium.h b/drivers/spi/spi-cavium.h
+index 1f3ac463a20b..8f58e3c2d642 100644
+--- a/drivers/spi/spi-cavium.h
++++ b/drivers/spi/spi-cavium.h
+@@ -12,6 +12,7 @@ struct octeon_spi_regs {
+ 	int status;
+ 	int tx;
+ 	int data;
++	int cs_mux; /* gpio to select CS4-7, not 0-3 */
+ };
+ 
+ struct octeon_spi {
+@@ -31,6 +32,7 @@ struct octeon_spi {
+ int octeon_spi_transfer_one_message(struct spi_master *master,
+ 				    struct spi_message *msg);
+ 
++
+ /* MPI register descriptions */
+ 
+ #define CVMX_MPI_CFG (CVMX_ADD_IO_SEG(0x0001070000001000ull))
+@@ -330,4 +332,16 @@ union cvmx_mpi_tx {
+ 	struct cvmx_mpi_tx_cn61xx cnf71xx;
+ };
+ 
++
++/*
++ * when (regs->cs_mux >= 0) it names a gpio pin which expands chip-select,
++ * when asserted the cavium-spi's CS0-3 address devices 4-7.
++ * May be useful when board design faces gpio-pin shortage.
++ */
++#define CONFIG_CAVIUM_SPI_MUX /* move to Kconfig? */
++#ifdef CONFIG_CAVIUM_SPI_MUX
++# include <linux/gpio.h>
++# include <linux/of_gpio.h>
++#endif
++
+ #endif /* __SPI_CAVIUM_H */
+-- 
+2.17.1
+

@@ -1,0 +1,173 @@
+From 43bc532bfd24a2cdce46179162279744eac94c94 Mon Sep 17 00:00:00 2001
+From: Alan Winkowski <walan@marvell.com>
+Date: Thu, 22 Nov 2018 15:23:18 +0200
+Subject: [PATCH 0803/1051] net: mvpp2: use dynamic search for HASH lookup
+ entries
+
+Modify the way classifier HASH lookups are accessed.
+Before this patch, the lookups were expected to be in
+a predefined place in the flow sequence.
+This patch allows to search for the HASH lookups, providing
+more flexibility to re-arrange the HASH lookups.
+This is useful i.e. when adding further lookups into a
+sequence, usually the lookups are grouped per engine
+(all C3 together, all C2 together).
+
+Change-Id: Ibf106df8cbfce9f7748b70149b342b6c9a8dedab
+Reviewed-on: http://vgitil04.il.marvell.com:8080/61211
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+Tested-by: Igal Liberman <igall@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/mvpp2/mvpp2_cls.c    | 48 +++++++++++++++++--
+ .../net/ethernet/marvell/mvpp2/mvpp2_cls.h    |  9 +++-
+ .../ethernet/marvell/mvpp2/mvpp2_debugfs.c    |  6 ++-
+ 3 files changed, 54 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.c
+index b337724e715a..8c7806229d92 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.c
+@@ -436,6 +436,11 @@ static void mvpp2_cls_flow_last_set(struct mvpp2_cls_flow_entry *fe,
+ 	fe->data[0] |= !!is_last;
+ }
+ 
++static bool mvpp2_cls_flow_last_get(struct mvpp2_cls_flow_entry *fe)
++{
++	return (fe->data[0] & MVPP2_CLS_FLOW_TBL0_LAST);
++}
++
+ static void mvpp2_cls_flow_lkp_type_set(struct mvpp2_cls_flow_entry *fe,
+ 					int lkp_type)
+ {
+@@ -456,6 +461,11 @@ static void mvpp2_cls_flow_port_add(struct mvpp2_cls_flow_entry *fe,
+ 	fe->data[0] |= MVPP2_CLS_FLOW_TBL0_PORT_ID(port);
+ }
+ 
++static int mvpp2_cls_flow_port_get(struct mvpp2_cls_flow_entry *fe)
++{
++	return ((fe->data[0] >> 4) & MVPP2_CLS_FLOW_TBL0_PORT_ID_MASK);
++}
++
+ /* Initialize the parser entry for the given flow */
+ static void mvpp2_cls_flow_prs_init(struct mvpp2 *priv,
+ 				    struct mvpp2_cls_flow *flow)
+@@ -512,7 +522,7 @@ static void mvpp2_cls_flow_init(struct mvpp2 *priv, struct mvpp2_cls_flow *flow)
+ 	/* C3Hx lookups */
+ 	for (i = 0; i < MVPP2_MAX_PORTS; i++) {
+ 		memset(&fe, 0, sizeof(fe));
+-		fe.index = MVPP2_PORT_FLOW_HASH_ENTRY(i, flow->flow_id);
++		fe.index = MVPP2_PORT_FLOW_INDEX(i, flow->flow_id);
+ 
+ 		mvpp2_cls_flow_eng_set(&fe, MVPP22_CLS_ENGINE_C3HA);
+ 		mvpp2_cls_flow_port_id_sel(&fe, true);
+@@ -596,6 +606,34 @@ struct mvpp2_cls_flow *mvpp2_cls_flow_get(int flow)
+ 	return &cls_flows[flow];
+ }
+ 
++int mvpp2_cls_flow_hash_find(struct mvpp2_port *port,
++			     struct mvpp2_cls_flow *flow,
++			     struct mvpp2_cls_flow_entry *fe,
++			     int *flow_index)
++{
++	int engine, is_last, flow_offset, port_bm, idx = 0;
++
++	flow_offset = 0;
++	while (!is_last) {
++		idx = MVPP2_PORT_FLOW_INDEX(flow_offset, flow->flow_id);
++		mvpp2_cls_flow_read(port->priv, idx, fe);
++		engine = mvpp2_cls_flow_eng_get(fe);
++		port_bm = mvpp2_cls_flow_port_get(fe);
++		is_last = mvpp2_cls_flow_last_get(fe);
++		if ((engine == MVPP22_CLS_ENGINE_C3HA ||
++		     engine == MVPP22_CLS_ENGINE_C3HB) &&
++		    (port_bm & BIT(port->id)))
++			break;
++		flow_offset++;
++	}
++
++	*flow_index = idx;
++	if (is_last)
++		return -EINVAL;
++
++	return 0;
++}
++
+ /* Set the hash generation options for the given traffic flow.
+  * One traffic flow (in the ethtool sense) has multiple classification flows,
+  * to handle specific cases such as fragmentation, or the presence of a
+@@ -623,8 +661,8 @@ static int mvpp2_port_rss_hash_opts_set(struct mvpp2_port *port, int flow_type,
+ 		if (flow->flow_type != flow_type)
+ 			continue;
+ 
+-		flow_index = MVPP2_PORT_FLOW_HASH_ENTRY(port->id,
+-							flow->flow_id);
++		if (mvpp2_cls_flow_hash_find(port, flow, &fe, &flow_index))
++			return -EINVAL;
+ 
+ 		mvpp2_cls_flow_read(port->priv, flow_index, &fe);
+ 
+@@ -712,8 +750,8 @@ static u16 mvpp2_port_rss_hash_opts_get(struct mvpp2_port *port, int flow_type)
+ 		if (flow->flow_type != flow_type)
+ 			continue;
+ 
+-		flow_index = MVPP2_PORT_FLOW_HASH_ENTRY(port->id,
+-							flow->flow_id);
++		if (mvpp2_cls_flow_hash_find(port, flow, &fe, &flow_index))
++			return 0;
+ 
+ 		mvpp2_cls_flow_read(port->priv, flow_index, &fe);
+ 
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.h
+index a6f35d649f44..0f04fab7bd75 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_cls.h
+@@ -186,8 +186,8 @@ struct mvpp2_cls_flow {
+ #define MVPP2_ENTRIES_PER_FLOW			(MVPP2_MAX_PORTS + 1)
+ #define MVPP2_FLOW_C2_ENTRY(id)			((((id) - MVPP2_FL_START) * \
+ 						 MVPP2_ENTRIES_PER_FLOW) + 1)
+-#define MVPP2_PORT_FLOW_HASH_ENTRY(port, id)	(MVPP2_FLOW_C2_ENTRY(id) + \
+-						 1 + (port))
++#define MVPP2_PORT_FLOW_INDEX(offset, id)	(MVPP2_FLOW_C2_ENTRY(id) + \
++						 1 + (offset))
+ 
+ struct mvpp2_cls_flow_entry {
+ 	u32 index;
+@@ -237,4 +237,9 @@ u32 mvpp2_cls_c2_hit_count(struct mvpp2 *priv, int c2_index);
+ void mvpp2_cls_c2_read(struct mvpp2 *priv, int index,
+ 		       struct mvpp2_cls_c2_entry *c2);
+ 
++int mvpp2_cls_flow_hash_find(struct mvpp2_port *port,
++			     struct mvpp2_cls_flow *flow,
++			     struct mvpp2_cls_flow_entry *fe,
++			     int *flow_index);
++
+ #endif
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_debugfs.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_debugfs.c
+index f9744a61e5dd..d9beb9ee2bca 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_debugfs.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_debugfs.c
+@@ -142,7 +142,8 @@ static int mvpp2_dbgfs_port_flow_hash_opt_show(struct seq_file *s, void *unused)
+ 	if (!f)
+ 		return -EINVAL;
+ 
+-	flow_index = MVPP2_PORT_FLOW_HASH_ENTRY(entry->port->id, f->flow_id);
++	if (mvpp2_cls_flow_hash_find(port, f, &fe, &flow_index))
++		return -EINVAL;
+ 
+ 	mvpp2_cls_flow_read(port->priv, flow_index, &fe);
+ 
+@@ -188,7 +189,8 @@ static int mvpp2_dbgfs_port_flow_engine_show(struct seq_file *s, void *unused)
+ 	if (!f)
+ 		return -EINVAL;
+ 
+-	flow_index = MVPP2_PORT_FLOW_HASH_ENTRY(entry->port->id, f->flow_id);
++	if (mvpp2_cls_flow_hash_find(port, f, &fe, &flow_index))
++		return -EINVAL;
+ 
+ 	mvpp2_cls_flow_read(port->priv, flow_index, &fe);
+ 
+-- 
+2.17.1
+

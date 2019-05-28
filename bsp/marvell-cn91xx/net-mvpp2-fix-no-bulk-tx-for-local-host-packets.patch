@@ -1,0 +1,74 @@
+From 2f5c529405d82a57f92a59c4806135b7f5f87fca Mon Sep 17 00:00:00 2001
+From: Yan Markman <ymarkman@marvell.com>
+Date: Thu, 18 Oct 2018 14:34:28 +0300
+Subject: [PATCH 0733/1051] net: mvpp2: fix: no bulk tx for local-host packets
+
+Problem appearance:
+iperf-UDP reports Out-Of-Ordering on the server side.
+
+INFO:
+For performance improving (up to 20%) the TX sends a bulk of packets
+with defer/bulk timer.
+Round-robin on hw packet sending from TX-queue + CPU-affinity-switch
+(on iperf TX) could cause Out-Of-Ordering.
+The RX-to-TX packets are not in this case since both RX and TX are
+always done on same softirq context / same CPU.
+
+FIX:
+Check the RXTX hash (placed by RX) for the defer decision.
+Do not bulk/defer the packet without this hash and flush the bulk at
+once.
+
+Change-Id: I22e889651cc3b03a126f6582035a3d682158e9f3
+Signed-off-by: Yan Markman <ymarkman@marvell.com>
+Reviewed-on: http://vgitil04.il.marvell.com:8080/60525
+Tested-by: iSoC Platform CI <ykjenk@marvell.com>
+Reviewed-by: Igal Liberman <igall@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index a0a05ec77428..8642e713117c 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -60,15 +60,21 @@ static struct {
+ #define MVPP2_RXTX_HASH			0xbac0
+ #define MVPP2_RXTX_HASH_CONST_MASK	0xfff0
+ #define MVPP2_RXTX_HASH_BMID_MASK	0xf
+-/* HashBits[31..16] contain skb->head[22..7], the head is aligned and [6..0]=0
++/* HashBits[31..16] contain skb->head[22..7], the head is aligned and [6..0]=0,
++ * so skb->head is shifted left for (16-7) bits.
+  * This hash permits to detect 2 non-recyclable cases:
+  * - new skb with old hash inside
+  * - same skb but NET-stack has replaced the data-buffer with another one
+  */
++#define MVPP2_HEAD_HASH_SHIFT	(16 - 7)
+ #define MVPP2_RXTX_HASH_GENER(skb, bm_pool_id) \
+-	(((u32)(phys_addr_t)skb->head << 9) | MVPP2_RXTX_HASH | bm_pool_id)
++	(((u32)(phys_addr_t)skb->head << MVPP2_HEAD_HASH_SHIFT) | \
++					MVPP2_RXTX_HASH | bm_pool_id)
+ #define MVPP2_RXTX_HASH_IS_OK(skb, hash) \
+ 	(MVPP2_RXTX_HASH_GENER(skb, 0) == (hash & ~MVPP2_RXTX_HASH_BMID_MASK))
++#define MVPP2_RXTX_HASH_IS_OK_TX(skb, hash) \
++	(((((u32)(phys_addr_t)skb->head << MVPP2_HEAD_HASH_SHIFT) | \
++			MVPP2_RXTX_HASH) ^ hash) <= MVPP2_RXTX_HASH_BMID_MASK)
+ 
+ /* The recycle pool size should be "effectively big" but limited (to eliminate
+  * memory-wasting on TX-pick). It should be >8 (Net-stack-forwarding-buffer)
+@@ -3802,8 +3808,9 @@ static netdev_tx_t mvpp2_tx(struct sk_buff *skb, struct net_device *dev)
+ 		txq_pcpu->count += frags;
+ 		aggr_txq->count += frags;
+ 
+-		/* Enable transmit; may be deferred with Bulk-timer */
++		/* Enable transmit; RX-to-TX may be deferred with Bulk-timer */
+ 		deferred_tx = (frags == 1) &&
++			MVPP2_RXTX_HASH_IS_OK_TX(skb, skb_get_hash_raw(skb)) &&
+ 			(aggr_txq->pending < (txq->done_pkts_coal / 2));
+ 
+ 		if (deferred_tx) {
+-- 
+2.17.1
+

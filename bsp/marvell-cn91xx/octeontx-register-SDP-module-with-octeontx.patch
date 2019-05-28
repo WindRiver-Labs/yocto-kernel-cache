@@ -1,0 +1,484 @@
+From d8d6fc42f50437bc528a17b2dc56d070a8f574f4 Mon Sep 17 00:00:00 2001
+From: Aakash Sasidharan <Aakash.Sasidharan@cavium.com>
+Date: Fri, 11 May 2018 19:13:00 +0530
+Subject: [PATCH 0344/1051] octeontx: register SDP module with octeontx
+
+Register SDP module with octeontx driver. pkopf_create_domain()
+prototype has been updated. Disable interrupts in octeontx-dpi driver
+as some issues were observed with interrupts enabled.
+
+Signed-off-by: Aakash Sasidharan <Aakash.Sasidharan@cavium.com>
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/cavium/Kconfig           |  10 ++
+ .../ethernet/cavium/octeontx-83xx/Makefile    |   2 +
+ .../cavium/octeontx-83xx/dpipf_main.c         |  20 ++--
+ .../cavium/octeontx-83xx/octeontx_main.c      | 110 ++++++++++++++++--
+ .../net/ethernet/cavium/octeontx-83xx/pko.h   |   1 +
+ .../cavium/octeontx-83xx/pkopf_main.c         |  33 +++++-
+ 6 files changed, 157 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/cavium/Kconfig b/drivers/net/ethernet/cavium/Kconfig
+index bbbf056688b4..60bda2988037 100644
+--- a/drivers/net/ethernet/cavium/Kconfig
++++ b/drivers/net/ethernet/cavium/Kconfig
+@@ -189,6 +189,15 @@ config OCTEONTX_ZIP_PF
+ 	  Select this option to enable ZIP Physical function.
+ 	  ZIP provides hardware compression/decompression support.
+ 
++config OCTEONTX_SLI_PF
++	tristate "OcteonTX SLI physical function driver(SLI_PF)"
++	depends on 64BIT && OCTEONTX_DPI
++	default y
++	help
++	  Select this option to enable SLI.
++          SLI interfaces PEM(PCIe) blocks to the cores and memory.
++          SLI needs to be configured when OcteonTX is connected
++          in EP mode to a host.
+ 
+ config OCTEONTX
+ 	tristate "OcteonTX coprocessor maintanier"
+@@ -196,6 +205,7 @@ config OCTEONTX
+ 	depends on OCTEONTX_PKO_PF
+ 	depends on OCTEONTX_DPI
+ 	depends on OCTEONTX_ZIP_PF
++	depends on OCTEONTX_SLI_PF
+ 	default y
+ 	help
+ 	  Select this option to enable Octeon coprocessor management.
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/Makefile b/drivers/net/ethernet/cavium/octeontx-83xx/Makefile
+index 46162caeb206..7bbbb9dedd0a 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/Makefile
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/Makefile
+@@ -13,6 +13,7 @@ obj-$(CONFIG_OCTEONTX_TIM_PF) += timpf.o
+ obj-$(CONFIG_OCTEONTX_PKI) += pki.o
+ obj-$(CONFIG_OCTEONTX_DPI) += dpi.o
+ obj-$(CONFIG_OCTEONTX_ZIP_PF) += zippf.o
++obj-$(CONFIG_OCTEONTX_SLI_PF) += slipf.o
+ obj-$(CONFIG_OCTEONTX) += octeontx.o
+ 
+ fpapf-objs := fpapf_main.o
+@@ -27,3 +28,4 @@ timpf-objs := timpf_main.o
+ pki-objs := pki_main.o pki_ucode.o pki_config.o
+ dpi-objs := dpipf_main.o
+ zippf-objs := zippf_main.o
++slipf-objs := slipf_main.o
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c
+index bd7e02069f03..4c7bfe7539f4 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c
+@@ -379,6 +379,14 @@ static void dpi_irq_free(struct dpipf *dpi)
+ 	dpi_reg_write(dpi, DPI_SBE_INT_ENA_W1C, DPI_SBE_INT_RDB_SBE);
+ 	dpi_reg_write(dpi, DPI_DBE_INT_ENA_W1C, DPI_DBE_INT_RDB_DBE);
+ 
++	for (i = 0; i < DPI_PF_MSIX_COUNT; i++) {
++		if (dpi->msix_entries[i].vector)
++			free_irq(dpi->msix_entries[i].vector, dpi);
++	}
++
++	pci_disable_msix(dpi->pdev);
++	devm_kfree(&dpi->pdev->dev, dpi->msix_entries);
++
+ 	for (i = 0; i < DPI_MAX_CC_INT; i++) {
+ 		dpi_reg_write(dpi, DPI_REQQX_INT(i), DPI_REQQ_INT);
+ 		dpi_reg_write(dpi, DPI_REQQX_INT_ENA_W1C(i), DPI_REQQ_INT);
+@@ -389,13 +397,6 @@ static void dpi_irq_free(struct dpipf *dpi)
+ 		dpi_reg_write(dpi, DPI_DMA_CCX_INT_ENA_W1C(i), DPI_DMA_CC_INT);
+ 	}
+ 
+-	for (i = 0; i < DPI_PF_MSIX_COUNT; i++) {
+-		if (dpi->msix_entries[i].vector)
+-			free_irq(dpi->msix_entries[i].vector, dpi);
+-	}
+-
+-	pci_disable_msix(dpi->pdev);
+-	devm_kfree(&dpi->pdev->dev, dpi->msix_entries);
+ }
+ 
+ static irqreturn_t dpi_pf_intr_handler (int irq, void *dpi_irq)
+@@ -495,7 +496,8 @@ static int dpi_irq_init(struct dpipf *dpi)
+ 		if (ret)
+ 			goto free_irq;
+ 	}
+-
++#define ENABLE_DPI_INTERRUPTS 0
++#if ENABLE_DPI_INTERRUPTS
+ 	/*Enable All Interrupts */
+ 	dpi_reg_write(dpi, DPI_INT_ENA_W1S, DPI_INT_REG_NFOVR |
+ 		      DPI_INT_REG_NDERR);
+@@ -504,7 +506,7 @@ static int dpi_irq_init(struct dpipf *dpi)
+ 
+ 	for (i = 0; i < 8; i++)
+ 		dpi_reg_write(dpi, DPI_REQQX_INT_ENA_W1S(i), DPI_REQQ_INT);
+-
++#endif
+ 	return 0;
+ free_irq:
+ 	for (; i >= 0; i--)
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c
+index 659c3f3527b4..76b206e56ea4 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c
+@@ -24,6 +24,7 @@
+ #include "fpa.h"
+ #include "sso.h"
+ #include "bgx.h"
++#include "sli.h"
+ #include "pko.h"
+ #include "lbk.h"
+ #include "tim.h"
+@@ -51,6 +52,7 @@ static dev_t octtx_dev;
+ static atomic_t gbl_domain_id = ATOMIC_INIT(MIN_DOMAIN_ID);
+ 
+ static struct bgx_com_s *bgx;
++static struct slipf_com_s *slipf;
+ static struct lbk_com_s *lbk;
+ static struct fpapf_com_s *fpapf;
+ static struct ssopf_com_s *ssopf;
+@@ -91,8 +93,10 @@ struct octtx_domain {
+ 
+ 	int bgx_count;
+ 	int lbk_count;
++	int sdp_count;
+ 	struct octtx_bgx_port bgx_port[OCTTX_MAX_BGX_PORTS];
+ 	struct octtx_lbk_port lbk_port[OCTTX_MAX_LBK_PORTS];
++	struct octtx_sdp_port sdp_port[OCTTX_MAX_SDP_PORTS];
+ 
+ 	struct kobject *kobj;
+ 	struct kobject *ports_kobj;
+@@ -111,6 +115,7 @@ struct octtx_domain {
+ 	bool tim_domain_created;
+ 	bool dpi_domain_created;
+ 	bool zip_domain_created;
++	bool sdp_domain_created;
+ };
+ 
+ static int gpio_in_use;
+@@ -130,8 +135,10 @@ static int octeontx_create_domain(const char *name, int type, int sso_count,
+ 				  int fpa_count, int ssow_count, int pko_count,
+ 				  int pki_count, int tim_count, int bgx_count,
+ 				  int lbk_count, int dpi_count, int zip_count,
++				  int sdp_count,
+ 				  const long int *bgx_port,
+-				  const long int *lbk_port);
++				  const long int *lbk_port,
++				  const long int *sdp_port);
+ 
+ static void octeontx_destroy_domain(const char *domain_name);
+ 
+@@ -176,8 +183,10 @@ static ssize_t octtx_create_domain_store(struct device *dev,
+ 	long int dpi_count = 0;
+ 	long int zip_count = 0;
+ 	long int pki_count = 0;
++	long int sdp_count = 0;
+ 	long int lbk_port[OCTTX_MAX_LBK_PORTS];
+ 	long int bgx_port[OCTTX_MAX_BGX_PORTS];
++	long int sdp_port[OCTTX_MAX_SDP_PORTS];
+ 	char *errmsg = "Wrong domain specification format.";
+ 
+ 	end = kzalloc(PAGE_SIZE, GFP_KERNEL);
+@@ -260,6 +269,13 @@ static ssize_t octtx_create_domain_store(struct device *dev,
+ 				goto error;
+ 			if (kstrtol(start, 10, &dpi_count))
+ 				goto error;
++		} else if (!strncmp(strim(start), "sdp", sizeof("sdp") - 1)) {
++			temp = strsep(&start, ":");
++			if (!start)
++				goto error;
++			if (kstrtol(strim(start), 10, &sdp_port[sdp_count]))
++				goto error;
++			sdp_count++;
+ 		} else if (!strncmp(start, "zip", sizeof("zip") - 1)) {
+ 			temp = strsep(&start, ":");
+ 			if (!start)
+@@ -275,8 +291,9 @@ static ssize_t octtx_create_domain_store(struct device *dev,
+ 				     ssow_count, pko_count, pki_count,
+ 				     tim_count, bgx_count, lbk_count,
+ 				     dpi_count, zip_count,
+-				     (const long int *)bgx_port,
+-				     (const long int *)lbk_port);
++				     sdp_count, (const long int *)bgx_port,
++				     (const long int *)lbk_port,
++				     (const long int *)sdp_port);
+ 	if (ret) {
+ 		errmsg = "Failed to create application domain.";
+ 		goto error;
+@@ -413,6 +430,7 @@ static int octtx_master_receive_message(struct mbox_hdr *hdr,
+ 			dcfg->tim_count = domain->tim_vf_count;
+ 			dcfg->net_port_count = domain->bgx_count;
+ 			dcfg->virt_port_count = domain->lbk_count;
++			dcfg->host_port_count = domain->sdp_count;
+ 			resp->data = sizeof(struct dcfg_resp);
+ 			hdr->res_code = MBOX_RET_SUCCESS;
+ 			break;
+@@ -421,6 +439,10 @@ static int octtx_master_receive_message(struct mbox_hdr *hdr,
+ 		dpipf->receive_message(0, domain->domain_id, hdr,
+ 				       req, resp, add_data);
+ 		break;
++	case SDP_COPROC:
++		slipf->receive_message(0, domain->domain_id, hdr,
++				req, resp, add_data);
++		break;
+ 	case ZIP_COPROC:
+ 		zippf->receive_message(0, domain->domain_id, hdr,
+ 				req, resp, add_data);
+@@ -582,6 +604,15 @@ static void do_destroy_domain(struct octtx_domain *domain)
+ 		}
+ 	}
+ 
++	if (domain->sdp_domain_created) {
++		ret = slipf->destroy_domain(node, domain_id, domain->kobj);
++		if (ret) {
++			dev_err(octtx_device,
++				"Failed to remove sdp of domain %d on node %d.\n",
++				domain->domain_id, node);
++		}
++	}
++
+ 	if (domain->sysfs_domain_in_use_created)
+ 		sysfs_remove_file(domain->kobj,
+ 				  &domain->sysfs_domain_in_use.attr);
+@@ -655,8 +686,10 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 			   int fpa_count, int ssow_count, int pko_count,
+ 			   int pki_count, int tim_count, int bgx_count,
+ 			   int lbk_count, int dpi_count, int zip_count,
++			   int sdp_count,
+ 			   const long int *bgx_port,
+-			   const long int *lbk_port)
++			   const long int *lbk_port,
++			   const long int *sdp_port)
+ {
+ 	void *ssow_ram_mbox_addr = NULL;
+ 	struct octtx_domain *domain;
+@@ -665,7 +698,7 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 	int ret = -EINVAL;
+ 	int node = 0;
+ 	bool found = false;
+-	int i, port_count = bgx_count + lbk_count;
++	int i, port_count = bgx_count + lbk_count + sdp_count;
+ 
+ 	list_for_each_entry(domain, &octeontx_domains, list) {
+ 		if (!strcmp(name, domain->name)) {
+@@ -687,12 +720,12 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 	}
+ 
+ 	if (port_count != 0 && pki_count != 1) {
+-		dev_err(octtx_device, "Domain has to include exactly 1 PKI if there are BGX or LBK ports\n");
++		dev_err(octtx_device, "Domain has to include exactly 1 PKI if there are BGX or LBK or SDP ports\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (pko_count != port_count) {
+-		dev_err(octtx_device, "Domain has to include as many PKOs as there are BGX and LBK ports\n");
++		dev_err(octtx_device, "Domain has to include as many PKOs as there are BGX and LBK and SDP ports\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -891,6 +924,52 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 		if (ret < 0)
+ 			goto error;
+ 	}
++
++	domain->sdp_count = sdp_count;
++	if (domain->sdp_count) {
++		for (i = 0; i < domain->sdp_count; i++) {
++			domain->sdp_port[i].domain_id = domain_id;
++			domain->sdp_port[i].dom_port_idx = i;
++			domain->sdp_port[i].glb_port_idx = sdp_port[i];
++		}
++		ret = slipf->create_domain(node, domain_id, domain->sdp_port, i,
++				&octtx_master_com, domain, domain->ports_kobj);
++		if (ret) {
++			dev_err(octtx_device, "Failed to create SDP domain\n");
++			goto error;
++		}
++		domain->sdp_domain_created = true;
++	}
++
++	/* Now that we know which exact ports we have, set pkinds for them. */
++	for (i = 0; i < domain->sdp_count; i++) {
++		ret = pki->add_sdp_port(node, domain_id, &domain->sdp_port[i]);
++		if (ret < 0) {
++			dev_err(octtx_device,
++				"SDP::Failed to allocate PKIND for port l%d(g%d)\n",
++				domain->sdp_port[i].dom_port_idx,
++				domain->sdp_port[i].glb_port_idx);
++			goto error;
++		}
++
++		domain->sdp_port[i].pkind = ret;
++		ret = slipf->set_pkind(node, domain_id,
++				     domain->sdp_port[i].dom_port_idx,
++				     domain->sdp_port[i].pkind);
++		if (ret < 0) {
++			dev_err(octtx_device,
++				"SDP::Failed to set PKIND for port l%d(g%d)\n",
++				domain->sdp_port[i].dom_port_idx,
++				domain->sdp_port[i].glb_port_idx);
++			goto error;
++		}
++		/* TODO: setup sysfs entry for sdp port*/
++	}
++	if (ret) {
++		dev_err(octtx_device, "Failed to create SDP domain\n");
++		goto error;
++	}
++
+ 	/* remove this once PKO init extends for LBK. */
+ 	domain->pko_vf_count = port_count;
+ 	if (domain->pko_vf_count) {
+@@ -898,6 +977,7 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 					domain->pko_vf_count,
+ 					domain->bgx_port, domain->bgx_count,
+ 					domain->lbk_port, domain->lbk_count,
++					domain->sdp_port, domain->sdp_count,
+ 					&octtx_master_com, domain,
+ 					domain->kobj);
+ 		if (ret) {
+@@ -996,6 +1076,15 @@ static int octeontx_reset_domain(void *master_data)
+ 		}
+ 	}
+ 
++	if (domain->sdp_domain_created) {
++		ret = slipf->reset_domain(node, domain->domain_id);
++		if (ret) {
++			dev_err(octtx_device,
++				"Failed to reset SDP of domain %d on node %d.\n",
++				domain->domain_id, node);
++		}
++	}
++
+ 	if (domain->lbk_domain_created) {
+ 		ret = lbk->reset_domain(node, domain->domain_id);
+ 		if (ret) {
+@@ -1334,6 +1423,9 @@ static int __init octeontx_init_module(void)
+ 	bgx = bgx_octeontx_init();
+ 	if (!bgx)
+ 		return -ENODEV;
++	slipf = try_then_request_module(symbol_get(slipf_com), "slipf");
++	if (!slipf)
++		return -ENODEV;
+ 	lbk = try_then_request_module(symbol_get(lbk_com), "lbk");
+ 	if (!lbk)
+ 		return -ENODEV;
+@@ -1363,7 +1455,7 @@ static int __init octeontx_init_module(void)
+ 		goto pkopf_err;
+ 	}
+ 
+-	dpipf = try_then_request_module(symbol_get(dpipf_com), "dpipf");
++	dpipf = try_then_request_module(symbol_get(dpipf_com), "dpi");
+ 	if (!dpipf) {
+ 		ret = -ENODEV;
+ 		goto dpipf_err;
+@@ -1495,6 +1587,7 @@ static int __init octeontx_init_module(void)
+ 
+ fpapf_err:
+ 	symbol_put(lbk_com);
++	symbol_put(slipf_com);
+ 
+ 	return ret;
+ }
+@@ -1523,6 +1616,7 @@ static void __exit octeontx_cleanup_module(void)
+ 	symbol_put(timpf_com);
+ 	symbol_put(zippf_com);
+ 	symbol_put(lbk_com);
++	symbol_put(slipf_com);
+ 	symbol_put(thunder_bgx_com);
+ 	task_cleanup_handler_remove(cleanup_el3_irqs);
+ }
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pko.h b/drivers/net/ethernet/cavium/octeontx-83xx/pko.h
+index eedf342677a2..08266d1c8495 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pko.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pko.h
+@@ -323,6 +323,7 @@ struct pkopf_com_s {
+ 	int (*create_domain)(u32 id, u16 domain_id, u32 pko_vf_count,
+ 			     struct octtx_bgx_port *bgx_port, int bgx_count,
+ 			     struct octtx_lbk_port *lbk_port, int lbk_count,
++			     struct octtx_sdp_port *sdp_port, int sdp_count,
+ 			     void *master, void *master_data,
+ 			     struct kobject *kobj);
+ 	int (*destroy_domain)(u32, u16, struct kobject *kobj);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+index 83ce10183d8b..57bd5d374270 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+@@ -145,6 +145,9 @@ static irqreturn_t pko_peb_err_intr_handler(int irq, void *pko_irq)
+ 	struct pkopf *pko = (struct pkopf *)pko_irq;
+ 	u64 reg;
+ 
++	reg = pko_reg_read(pko, PKO_PF_PEB_ERR_INT_W1C);
++	dev_err(&pko->pdev->dev, "val @PKO_PEB_ERR_INT_W1C: %llx\n", reg);
++
+ 	dev_err(&pko->pdev->dev, "peb err received\n");
+ 	reg = pko_reg_read(pko, PKO_PF_PEB_PAD_ERR_INFO);
+ 	dev_err(&pko->pdev->dev, "peb pad err info:%llx\n", reg);
+@@ -350,6 +353,7 @@ static void pko_pf_gmctl_init(struct pkopf *pf, int vf, u16 gmid)
+ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 				struct octtx_bgx_port *bgx_port, int bgx_count,
+ 				struct octtx_lbk_port *lbk_port, int lbk_count,
++				struct octtx_sdp_port *sdp_port, int sdp_count,
+ 				void *master, void *master_data,
+ 				struct kobject *kobj)
+ {
+@@ -357,7 +361,7 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 	struct pkopf *curr;
+ 	struct pci_dev *virtfn;
+ 	resource_size_t vf_start;
+-	int i, pko_mac = PKO_MAC_BGX;
++	int i, pko_mac = sdp_count ? PKO_MAC_HOST : PKO_MAC_BGX;
+ 	int vf_idx = 0, port_idx = 0;
+ 	int mac_num, mac_mode, chan, ret = 0;
+ 	const u32 max_frame = 0xffff;
+@@ -378,6 +382,13 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 		goto err_unlock;
+ 	}
+ 
++	/**
++	 * pko_vfs are partitioned among SDP, BGX and LBK as:
++	 *   SDP <= PKO_VF[(0) .. (sdp_count-1)]
++	 *   BGX <= PKO_VF[(sdp_count) .. (sdp_count + bgx_count - 1)]
++	 *   LBK <= PKO_VF[(sdp_count + bgx_count) .. (sdp_count + bgx_count +
++	 *                                             lbk_count- 1)]
++	 */
+ 	for (i = 0; i < pko->total_vfs; i++) {
+ 		if (pko->vf[i].domain.in_use) {
+ 			continue;
+@@ -417,7 +428,21 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 
+ 			/* Setup the PKO Scheduling tree: PQ/SQ/DQ.
+ 			 */
+-			if (pko_mac == PKO_MAC_BGX) {
++			if (pko_mac == PKO_MAC_HOST) {
++				mac_num = pko_get_sdp_mac(
++						sdp_port[port_idx].sdp,
++						sdp_port[port_idx].lmac);
++				chan = pko_get_sdp_chan(
++						sdp_port[port_idx].sdp,
++						sdp_port[port_idx].lmac, 0);
++				mac_mode = sdp_port[port_idx].lmac_type;
++				port_idx++;
++				if (port_idx >= sdp_count) {
++					pko_mac = bgx_count ? PKO_MAC_BGX :
++						  PKO_MAC_LBK;
++					port_idx = 0;
++				}
++			} else if (pko_mac == PKO_MAC_BGX) {
+ 				mac_num = pko_get_bgx_mac(
+ 						bgx_port[port_idx].bgx,
+ 						bgx_port[port_idx].lmac);
+@@ -443,6 +468,10 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 			pko->vf[i].mac_num = mac_num;
+ 			pko->vf[i].chan = chan;
+ 
++			dev_dbg(&pko->pdev->dev,
++				"i: %d, max_frame: %d, mac_num: %d, mac_mode: %d, chan: %d\n",
++				i, max_frame, mac_num, mac_mode, chan);
++
+ 			pko_pstree_setup(pko, i, max_frame,
+ 					 mac_num, mac_mode, chan);
+ 			vf_idx++;
+-- 
+2.17.1
+

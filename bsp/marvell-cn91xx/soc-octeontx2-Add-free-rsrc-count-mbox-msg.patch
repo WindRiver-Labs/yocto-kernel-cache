@@ -1,0 +1,124 @@
+From da1b9e804d54f1538d9d5621efd352896b09db4e Mon Sep 17 00:00:00 2001
+From: Stanislaw Kardach <skardach@marvell.com>
+Date: Thu, 16 Aug 2018 21:50:57 +0530
+Subject: [PATCH 0097/1051] soc: octeontx2: Add free rsrc count mbox msg
+
+Upon receiving the MBOX_MSG_FREE_RSRC_CNT, the AF will find out the
+current number of free resources and reply it back to the requester. No
+guarantee is given on the future state of the free resources yet.
+If another requester sends MBOX_MSG_ATTACH_RESOURCES after this call,
+the number of available resources will change.
+
+Signed-off-by: Stanislaw Kardach <skardach@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/mbox.h          | 18 +++++++-
+ .../soc/marvell/octeontx2/rvu_validation.c    | 43 +++++++++++++++++++
+ .../soc/marvell/octeontx2/rvu_validation.h    |  2 +
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 60f535847683..ad3a96d40024 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -122,7 +122,8 @@ static inline struct mbox_msghdr *otx2_mbox_alloc_msg(struct otx2_mbox *mbox,
+ M(READY,		0x001, msg_req, ready_msg_rsp)			\
+ M(ATTACH_RESOURCES,	0x002, rsrc_attach, msg_rsp)			\
+ M(DETACH_RESOURCES,	0x003, rsrc_detach, msg_rsp)			\
+-M(MSIX_OFFSET,		0x004, msg_req, msix_offset_rsp)		\
++M(FREE_RSRC_CNT,	0x004, msg_req, free_rsrcs_rsp)			\
++M(MSIX_OFFSET,		0x005, msg_req, msix_offset_rsp)		\
+ M(VF_FLR,		0x006, msg_req, msg_rsp)			\
+ /* CGX mbox IDs (range 0x200 - 0x3FF) */				\
+ M(CGX_START_RXTX,	0x200, msg_req, msg_rsp)			\
+@@ -255,6 +256,21 @@ struct rsrc_detach {
+ 	u8 cptlfs:1;
+ };
+ 
++/*
++ * Number of resources available to the caller.
++ * In reply to MBOX_MSG_FREE_RSRC_CNT.
++ */
++struct free_rsrcs_rsp {
++	struct mbox_msghdr hdr;
++	u16 schq[NIX_TXSCH_LVL_CNT];
++	u16  sso;
++	u16  tim;
++	u16  ssow;
++	u16  cpt;
++	u8   npa;
++	u8   nix;
++};
++
+ #define MSIX_VECTOR_INVALID	0xFFFF
+ #define MAX_RVU_BLKLF_CNT	256
+ 
+diff --git a/drivers/soc/marvell/octeontx2/rvu_validation.c b/drivers/soc/marvell/octeontx2/rvu_validation.c
+index fa9c7a8c045f..c32718e51bf2 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_validation.c
++++ b/drivers/soc/marvell/octeontx2/rvu_validation.c
+@@ -205,6 +205,49 @@ static int rvu_blk_count_rsrc(struct rvu_block *block, u16 pcifunc, u8 rshift)
+ 	return count;
+ }
+ 
++int rvu_mbox_handler_FREE_RSRC_CNT(struct rvu *rvu, struct msg_req *req,
++				   struct free_rsrcs_rsp *rsp)
++{
++	struct nix_hw *nix_hw = rvu->hw->nix0;
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	struct rvu_block *block;
++	int lvl, pf, curlfs;
++
++	mutex_lock(&rvu->rsrc_lock);
++	pf = rvu_get_pf(pcifunc);
++
++	block = &hw->block[BLKADDR_NPA];
++	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
++	rsp->npa = rvu->pf_limits.npa->a[pf].val - curlfs;
++
++	block = &hw->block[BLKADDR_NIX0];
++	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
++	rsp->nix = rvu->pf_limits.nix->a[pf].val - curlfs;
++
++	block = &hw->block[BLKADDR_SSO];
++	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
++	rsp->sso = rvu->pf_limits.sso->a[pf].val - curlfs;
++
++	block = &hw->block[BLKADDR_SSOW];
++	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
++	rsp->ssow = rvu->pf_limits.ssow->a[pf].val - curlfs;
++
++	block = &hw->block[BLKADDR_TIM];
++	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
++	rsp->tim = rvu->pf_limits.tim->a[pf].val - curlfs;
++
++	block = &hw->block[BLKADDR_CPT0];
++	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
++	rsp->cpt = rvu->pf_limits.cpt->a[pf].val - curlfs;
++
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++)
++		rsp->schq[lvl] = rvu_rsrc_free_count(&nix_hw->txsch[lvl].schq);
++	mutex_unlock(&rvu->rsrc_lock);
++
++	return 0;
++}
++
+ int rvu_check_rsrc_policy(struct rvu *rvu, struct rsrc_attach *req,
+ 			  u16 pcifunc)
+ {
+diff --git a/drivers/soc/marvell/octeontx2/rvu_validation.h b/drivers/soc/marvell/octeontx2/rvu_validation.h
+index 3d3888fadadd..d0ddf11668d0 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_validation.h
++++ b/drivers/soc/marvell/octeontx2/rvu_validation.h
+@@ -61,4 +61,6 @@ void rvu_policy_destroy(struct rvu *rvu);
+ int rvu_check_rsrc_policy(struct rvu *rvu,
+ 			  struct rsrc_attach *req, u16 pcifunc);
+ 
++int rvu_mbox_handler_FREE_RSRC_CNT(struct rvu *rvu, struct msg_req *req,
++				   struct free_rsrcs_rsp *rsp);
+ #endif /* RVU_VALIDATION_H */
+-- 
+2.17.1
+

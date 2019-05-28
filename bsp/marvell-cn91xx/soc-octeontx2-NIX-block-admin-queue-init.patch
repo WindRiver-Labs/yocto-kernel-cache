@@ -1,0 +1,224 @@
+From 3d5e0095a0e4587444a1ea7b79f798d5f0583990 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 16 Aug 2018 18:23:37 +0530
+Subject: [PATCH 0052/1051] soc: octeontx2: NIX block admin queue init
+
+Initialize NIX admin queue (AQ) i.e alloc memory for
+AQ instructions and for the results. All NIX LFs will submit
+instructions to AQ to init/write/read RQ/SQ/CQ/RSS contexts
+and in case of read, get context from result memory.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/Makefile     |  2 +-
+ drivers/soc/marvell/octeontx2/rvu.c        |  4 ++
+ drivers/soc/marvell/octeontx2/rvu.h        |  3 +
+ drivers/soc/marvell/octeontx2/rvu_nix.c    | 75 ++++++++++++++++++++++
+ drivers/soc/marvell/octeontx2/rvu_struct.h | 72 +++++++++++++++++++++
+ 5 files changed, 155 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/soc/marvell/octeontx2/rvu_nix.c
+
+diff --git a/drivers/soc/marvell/octeontx2/Makefile b/drivers/soc/marvell/octeontx2/Makefile
+index fd57eaf2484d..a268fa916605 100644
+--- a/drivers/soc/marvell/octeontx2/Makefile
++++ b/drivers/soc/marvell/octeontx2/Makefile
+@@ -7,4 +7,4 @@ obj-$(CONFIG_OCTEONTX2_CGX) += octeontx2_cgx.o
+ obj-$(CONFIG_OCTEONTX2_AF) += octeontx2_af.o
+ 
+ octeontx2_cgx-y := cgx.o
+-octeontx2_af-y := rvu.o mbox.o rvu_cgx.o rvu_npa.o
++octeontx2_af-y := rvu.o mbox.o rvu_cgx.o rvu_npa.o rvu_nix.o
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index 9a4e2b15b97e..1ab3cbb4c758 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -771,6 +771,10 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	if (err)
+ 		return err;
+ 
++	err = rvu_nix_init(rvu);
++	if (err)
++		return err;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index d4d8ab492f52..ebeed74436fa 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -225,4 +225,7 @@ int rvu_mbox_handler_NPA_LF_ALLOC(struct rvu *rvu,
+ int rvu_mbox_handler_NPA_LF_FREE(struct rvu *rvu, struct msg_req *req,
+ 				 struct msg_rsp *rsp);
+ int rvu_npa_init(struct rvu *rvu);
++
++/* NIX APIs */
++int rvu_nix_init(struct rvu *rvu);
+ #endif /* RVU_H */
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+new file mode 100644
+index 000000000000..b61f931bd269
+--- /dev/null
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 RVU Admin Function driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include "rvu_struct.h"
++#include "rvu_reg.h"
++#include "rvu.h"
++#include "cgx.h"
++
++static int nix_aq_init(struct rvu *rvu, struct rvu_block *block)
++{
++	u64 cfg;
++	int err;
++
++	/* Set admin queue endianness */
++	cfg = rvu_read64(rvu, block->addr, NIX_AF_CFG);
++#ifdef __BIG_ENDIAN
++	cfg |= BIT_ULL(1);
++	rvu_write64(rvu, block->addr, NIX_AF_CFG, cfg);
++#else
++	cfg &= ~BIT_ULL(1);
++	rvu_write64(rvu, block->addr, NIX_AF_CFG, cfg);
++#endif
++
++	/* Do not bypass NDC cache */
++	cfg = rvu_read64(rvu, block->addr, NIX_AF_NDC_CFG);
++	cfg &= ~0x3FFEULL;
++	rvu_write64(rvu, block->addr, NIX_AF_NDC_CFG, cfg);
++
++	/* Result structure can be followed by RQ/SQ/CQ context at
++	 * RES + 128bytes and a write mask at RES + 256 bytes, depending on
++	 * operation type. Alloc sufficient result memory for all operations.
++	 */
++	err = rvu_aq_alloc(rvu, &block->aq,
++			   Q_COUNT(AQ_SIZE), sizeof(struct nix_aq_inst_s),
++			   ALIGN(sizeof(struct nix_aq_res_s), 128) + 256);
++	if (err)
++		return err;
++
++	rvu_write64(rvu, block->addr, NIX_AF_AQ_CFG, AQ_SIZE);
++	rvu_write64(rvu, block->addr,
++		    NIX_AF_AQ_BASE, (u64)block->aq->inst->iova);
++	return 0;
++}
++
++int rvu_nix_init(struct rvu *rvu)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	int blkaddr, err;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, 0);
++	if (blkaddr < 0)
++		return 0;
++	block = &hw->block[blkaddr];
++
++	/* Initialize admin queue */
++	err = nix_aq_init(rvu, block);
++	if (err)
++		return err;
++
++	/* Restore CINT timer delay to HW reset values */
++	rvu_write64(rvu, blkaddr, NIX_AF_CINT_DELAY, 0x0ULL);
++
++	return 0;
++}
+diff --git a/drivers/soc/marvell/octeontx2/rvu_struct.h b/drivers/soc/marvell/octeontx2/rvu_struct.h
+index af3fe066406c..6dcca17f2652 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_struct.h
++++ b/drivers/soc/marvell/octeontx2/rvu_struct.h
+@@ -358,4 +358,76 @@ struct npa_pool_s {
+ 	u64 reserved_896_959;		/* W14 */
+ 	u64 reserved_960_1023;		/* W15 */
+ };
++
++/* NIX admin queue completion status */
++enum nix_aq_comp {
++	NIX_AQ_COMP_NOTDONE        = 0x0,
++	NIX_AQ_COMP_GOOD           = 0x1,
++	NIX_AQ_COMP_SWERR          = 0x2,
++	NIX_AQ_COMP_CTX_POISON     = 0x3,
++	NIX_AQ_COMP_CTX_FAULT      = 0x4,
++	NIX_AQ_COMP_LOCKERR        = 0x5,
++	NIX_AQ_COMP_SQB_ALLOC_FAIL = 0x6,
++};
++
++/* NIX admin queue context types */
++enum nix_aq_ctype {
++	NIX_AQ_CTYPE_RQ   = 0x0,
++	NIX_AQ_CTYPE_SQ   = 0x1,
++	NIX_AQ_CTYPE_CQ   = 0x2,
++	NIX_AQ_CTYPE_MCE  = 0x3,
++	NIX_AQ_CTYPE_RSS  = 0x4,
++	NIX_AQ_CTYPE_DYNO = 0x5,
++};
++
++/* NIX admin queue instruction opcodes */
++enum nix_aq_instop {
++	NIX_AQ_INSTOP_NOP    = 0x0,
++	NIX_AQ_INSTOP_INIT   = 0x1,
++	NIX_AQ_INSTOP_WRITE  = 0x2,
++	NIX_AQ_INSTOP_READ   = 0x3,
++	NIX_AQ_INSTOP_LOCK   = 0x4,
++	NIX_AQ_INSTOP_UNLOCK = 0x5,
++};
++
++/* NIX admin queue instruction structure */
++struct nix_aq_inst_s {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 doneint		: 1;	/* W0 */
++	u64 reserved_44_62	: 19;
++	u64 cindex		: 20;
++	u64 reserved_15_23	: 9;
++	u64 lf			: 7;
++	u64 ctype		: 4;
++	u64 op			: 4;
++#else
++	u64 op			: 4;
++	u64 ctype		: 4;
++	u64 lf			: 7;
++	u64 reserved_15_23	: 9;
++	u64 cindex		: 20;
++	u64 reserved_44_62	: 19;
++	u64 doneint		: 1;
++#endif
++	u64 res_addr;			/* W1 */
++};
++
++/* NIX admin queue result structure */
++struct nix_aq_res_s {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 reserved_17_63	: 47;	/* W0 */
++	u64 doneint		: 1;
++	u64 compcode		: 8;
++	u64 ctype		: 4;
++	u64 op			: 4;
++#else
++	u64 op			: 4;
++	u64 ctype		: 4;
++	u64 compcode		: 8;
++	u64 doneint		: 1;
++	u64 reserved_17_63	: 47;
++#endif
++	u64 reserved_64_127;		/* W1 */
++};
++
+ #endif /* RVU_STRUCT_H */
+-- 
+2.17.1
+

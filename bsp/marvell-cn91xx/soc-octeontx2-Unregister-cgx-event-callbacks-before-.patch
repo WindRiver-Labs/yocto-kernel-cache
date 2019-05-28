@@ -1,0 +1,204 @@
+From 02a2d32c2bfa3ff6d50f4c06004fdeef19016a1e Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Tue, 16 Oct 2018 17:29:39 +0300
+Subject: [PATCH 0285/1051] soc: octeontx2: Unregister cgx event callbacks
+ before wq destroy
+
+Ensure cgx event callbacks are unregistered before workqueues
+get destroyed.
+
+For this,
+- rvu_cgx_exit has been introduced to take care of the exit path
+- cgx_lmac_eh_callback_unregister introduced
+
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/cgx.c     | 29 ++++++++++++++++++++++++-
+ drivers/soc/marvell/octeontx2/cgx.h     |  1 +
+ drivers/soc/marvell/octeontx2/rvu.c     |  6 ++---
+ drivers/soc/marvell/octeontx2/rvu.h     |  2 +-
+ drivers/soc/marvell/octeontx2/rvu_cgx.c | 23 +++++++++++++++++++-
+ 5 files changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/cgx.c b/drivers/soc/marvell/octeontx2/cgx.c
+index ff2c2d5c7c73..944d66fa1715 100644
+--- a/drivers/soc/marvell/octeontx2/cgx.c
++++ b/drivers/soc/marvell/octeontx2/cgx.c
+@@ -33,6 +33,7 @@
+  * @resp:		command response
+  * @link_info:		link related information
+  * @event_cb:		callback for linkchange events
++ * @event_cb_lock:	lock for serializing callback with unregister
+  * @cmd_pend:		flag set before new command is started
+  *			flag cleared after command response is received
+  * @cgx:		parent cgx port
+@@ -45,6 +46,7 @@ struct lmac {
+ 	struct cgx_evt_sts resp;
+ 	struct cgx_link_user_info link_info;
+ 	struct cgx_event_cb event_cb;
++	spinlock_t event_cb_lock;
+ 	bool cmd_pend;
+ 	struct cgx *cgx;
+ 	u8 lmac_id;
+@@ -470,6 +472,9 @@ static inline void cgx_link_change_handler(struct cgx_lnk_sts *lstat,
+ 	lmac->link_info = event.link_uinfo;
+ 	linfo = &lmac->link_info;
+ 
++	/* Ensure callback doesn't get unregistered until we finish it */
++	spin_lock(&lmac->event_cb_lock);
++
+ 	if (!lmac->event_cb.notify_link_chg) {
+ 		dev_dbg(dev, "cgx port %d:%d Link change handler null",
+ 			cgx->cgx_id, lmac->lmac_id);
+@@ -480,11 +485,13 @@ static inline void cgx_link_change_handler(struct cgx_lnk_sts *lstat,
+ 		dev_info(dev, "cgx port %d:%d Link is %s %d Mbps\n",
+ 			 cgx->cgx_id, lmac->lmac_id,
+ 			 linfo->link_up ? "UP" : "DOWN", linfo->speed);
+-		return;
++		goto err;
+ 	}
+ 
+ 	if (lmac->event_cb.notify_link_chg(&event, lmac->event_cb.data))
+ 		dev_err(dev, "event notification failure\n");
++err:
++	spin_unlock(&lmac->event_cb_lock);
+ }
+ 
+ static inline bool cgx_cmdresp_is_linkevent(struct cgx_evt_sts *rsp)
+@@ -576,6 +583,25 @@ int cgx_lmac_evh_register(struct cgx_event_cb *cb, void *cgxd, int lmac_id)
+ }
+ EXPORT_SYMBOL(cgx_lmac_evh_register);
+ 
++int cgx_lmac_evh_unregister(void *cgxd, int lmac_id)
++{
++	struct lmac *lmac;
++	unsigned long flags;
++	struct cgx *cgx = cgxd;
++
++	lmac = lmac_pdata(lmac_id, cgx);
++	if (!lmac)
++		return -ENODEV;
++
++	spin_lock_irqsave(&lmac->event_cb_lock, flags);
++	lmac->event_cb.notify_link_chg = NULL;
++	lmac->event_cb.data = NULL;
++	spin_unlock_irqrestore(&lmac->event_cb_lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL(cgx_lmac_evh_unregister);
++
+ static int cgx_fwi_link_change(struct cgx *cgx, int lmac_id, bool enable)
+ {
+ 	struct cgx_cmd req = { 0 };
+@@ -672,6 +698,7 @@ static int cgx_lmac_init(struct cgx *cgx)
+ 		lmac->cgx = cgx;
+ 		init_waitqueue_head(&lmac->wq_cmd_cmplt);
+ 		mutex_init(&lmac->cmd_lock);
++		spin_lock_init(&lmac->event_cb_lock);
+ 		err = request_irq(pci_irq_vector(cgx->pdev,
+ 						 CGX_LMAC_FWI + i * 9),
+ 				   cgx_fwi_event_handler, 0, lmac->name, lmac);
+diff --git a/drivers/soc/marvell/octeontx2/cgx.h b/drivers/soc/marvell/octeontx2/cgx.h
+index b73c540cd4f7..9e7915a6bfd1 100644
+--- a/drivers/soc/marvell/octeontx2/cgx.h
++++ b/drivers/soc/marvell/octeontx2/cgx.h
+@@ -99,6 +99,7 @@ int cgx_get_lmac_cnt(void *cgxd);
+ void *cgx_get_pdata(int cgx_id);
+ int cgx_set_pkind(void *cgxd, u8 lmac_id, int pkind);
+ int cgx_lmac_evh_register(struct cgx_event_cb *cb, void *cgxd, int lmac_id);
++int cgx_lmac_evh_unregister(void *cgxd, int lmac_id);
+ int cgx_get_tx_stats(void *cgxd, int lmac_id, int idx, u64 *tx_stat);
+ int cgx_get_rx_stats(void *cgxd, int lmac_id, int idx, u64 *rx_stat);
+ int cgx_lmac_rx_tx_enable(void *cgxd, int lmac_id, bool enable);
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index 81f352c6ba96..c8ed6e5b5766 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -828,7 +828,7 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	return 0;
+ 
+ cgx_err:
+-	rvu_cgx_wq_destroy(rvu);
++	rvu_cgx_exit(rvu);
+ msix_err:
+ 	rvu_reset_msix(rvu);
+ 	return err;
+@@ -2523,7 +2523,7 @@ static int rvu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ err_mbox:
+ 	rvu_mbox_destroy(&rvu->afpf_wq_info);
+ err_hwsetup:
+-	rvu_cgx_wq_destroy(rvu);
++	rvu_cgx_exit(rvu);
+ 	rvu_reset_all_blocks(rvu);
+ 	rvu_free_hw_resources(rvu);
+ err_release_regions:
+@@ -2545,7 +2545,7 @@ static void rvu_remove(struct pci_dev *pdev)
+ 	rvu_policy_destroy(rvu);
+ 	rvu_unregister_interrupts(rvu);
+ 	rvu_flr_wq_destroy(rvu);
+-	rvu_cgx_wq_destroy(rvu);
++	rvu_cgx_exit(rvu);
+ 	rvu_mbox_destroy(&rvu->afpf_wq_info);
+ 	rvu_disable_sriov(rvu);
+ 	rvu_reset_all_blocks(rvu);
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index f7c5960929db..a8636c30257d 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -375,8 +375,8 @@ static inline void rvu_get_cgx_lmac_id(u8 map, u8 *cgx_id, u8 *lmac_id)
+ }
+ 
+ int rvu_cgx_init(struct rvu *rvu);
++int rvu_cgx_exit(struct rvu *rvu);
+ int rvu_check_cgx_driver(struct rvu *rvu);
+-void rvu_cgx_wq_destroy(struct rvu *rvu);
+ void *rvu_cgx_pdata(u8 cgx_id, struct rvu *rvu);
+ int rvu_cgx_config_rxtx(struct rvu *rvu, u16 pcifunc, bool start);
+ int rvu_mbox_handler_CGX_START_RXTX(struct rvu *rvu, struct msg_req *req,
+diff --git a/drivers/soc/marvell/octeontx2/rvu_cgx.c b/drivers/soc/marvell/octeontx2/rvu_cgx.c
+index d14d6868bcfa..98a56bc09daa 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_cgx.c
++++ b/drivers/soc/marvell/octeontx2/rvu_cgx.c
+@@ -249,7 +249,7 @@ static int cgx_lmac_event_handler_init(struct rvu *rvu)
+ 	return 0;
+ }
+ 
+-void rvu_cgx_wq_destroy(struct rvu *rvu)
++static void rvu_cgx_wq_destroy(struct rvu *rvu)
+ {
+ 	if (rvu->cgx_evh_wq) {
+ 		flush_workqueue(rvu->cgx_evh_wq);
+@@ -313,6 +313,27 @@ int rvu_cgx_init(struct rvu *rvu)
+ 	return 0;
+ }
+ 
++int rvu_cgx_exit(struct rvu *rvu)
++{
++	int cgx, lmac;
++	void *cgxd;
++
++	for (cgx = 0; cgx <= rvu->cgx_cnt_max; cgx++) {
++		cgxd = rvu_cgx_pdata(cgx, rvu);
++		if (!cgxd)
++			continue;
++		for (lmac = 0; lmac < cgx_get_lmac_cnt(cgxd); lmac++)
++			cgx_lmac_evh_unregister(cgxd, lmac);
++	}
++
++	/* Ensure event handler unregister is completed */
++	mb();
++
++	rvu_cgx_wq_destroy(rvu);
++
++	return 0;
++}
++
+ int rvu_check_cgx_driver(struct rvu *rvu)
+ {
+ 	struct pci_dev *pdev;
+-- 
+2.17.1
+

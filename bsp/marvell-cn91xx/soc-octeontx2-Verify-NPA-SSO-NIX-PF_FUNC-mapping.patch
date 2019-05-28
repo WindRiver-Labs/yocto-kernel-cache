@@ -1,0 +1,251 @@
+From 893d2565ebf1a8ac49f674b8e30baec44a3bfda5 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 6 Nov 2018 12:02:00 +0530
+Subject: [PATCH 0749/1051] soc: octeontx2: Verify NPA/SSO/NIX PF_FUNC mapping
+
+While mapping a NIX LF to a NPA LF attached PF_FUNC or
+other NPA/SSO/TIM LF's PF_FUNC config, verify if PF_FUNC
+is valid and if that PF_FUNC has a LF of that block
+attached to it.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/soc/marvell/octeontx2/mbox.h    |  7 +++--
+ drivers/soc/marvell/octeontx2/rvu.c     | 38 +++++++++++++++++++++++++
+ drivers/soc/marvell/octeontx2/rvu.h     |  1 +
+ drivers/soc/marvell/octeontx2/rvu_nix.c | 32 ++++++++++++++-------
+ drivers/soc/marvell/octeontx2/rvu_sso.c | 21 +++++++++-----
+ drivers/soc/marvell/octeontx2/rvu_tim.c | 18 ++++++++++++
+ 6 files changed, 97 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2/mbox.h b/drivers/soc/marvell/octeontx2/mbox.h
+index 793a8f03aa7d..9bbbe636cc48 100644
+--- a/drivers/soc/marvell/octeontx2/mbox.h
++++ b/drivers/soc/marvell/octeontx2/mbox.h
+@@ -435,6 +435,8 @@ enum nix_af_status {
+ 	NIX_AF_ERR_RSS_NOSPC_ALGO   = -416,
+ 	NIX_AF_ERR_MARK_CFG_FAIL    = -417,
+ 	NIX_AF_ERR_LSO_CFG_FAIL     = -418,
++	NIX_AF_INVAL_NPA_PF_FUNC    = -419,
++	NIX_AF_INVAL_SSO_PF_FUNC    = -420,
+ };
+ 
+ /* For NIX LF context alloc and init */
+@@ -661,6 +663,7 @@ enum sso_af_status {
+ 	SSO_AF_ERR_LF_INVALID	= -502,
+ 	SSO_AF_ERR_AF_LF_ALLOC	= -503,
+ 	SSO_AF_ERR_GRP_EBUSY	= -504,
++	SSO_AF_INVAL_NPA_PF_FUNC = -505,
+ };
+ 
+ struct sso_lf_alloc_req {
+@@ -878,8 +881,8 @@ struct npc_get_kex_cfg_rsp {
+  */
+ enum tim_af_status {
+ 	TIM_AF_NO_RINGS_LEFT			= -801,
+-	TIM_AF_INVALID_NPA_PF_FUNC		= -802,
+-	TIM_AF_INVALID_SSO_PF_FUNC		= -803,
++	TIM_AF_INVAL_NPA_PF_FUNC		= -802,
++	TIM_AF_INVAL_SSO_PF_FUNC		= -803,
+ 	TIM_AF_RING_STILL_RUNNING		= -804,
+ 	TIM_AF_LF_INVALID			= -805,
+ 	TIM_AF_CSIZE_NOT_ALIGNED		= -806,
+diff --git a/drivers/soc/marvell/octeontx2/rvu.c b/drivers/soc/marvell/octeontx2/rvu.c
+index 25d807faf698..1f98ca55cf80 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.c
++++ b/drivers/soc/marvell/octeontx2/rvu.c
+@@ -346,6 +346,28 @@ struct rvu_pfvf *rvu_get_pfvf(struct rvu *rvu, int pcifunc)
+ 		return &rvu->pf[rvu_get_pf(pcifunc)];
+ }
+ 
++static bool is_pf_func_valid(struct rvu *rvu, u16 pcifunc)
++{
++	int pf, vf, nvfs;
++	u64 cfg;
++
++	pf = rvu_get_pf(pcifunc);
++	if (pf >= rvu->hw->total_pfs)
++		return false;
++
++	if (!(pcifunc & RVU_PFVF_FUNC_MASK))
++		return true;
++
++	/* Check if VF is within number of VFs attached to this PF */
++	vf = (pcifunc & RVU_PFVF_FUNC_MASK) - 1;
++	cfg = rvu_read64(rvu, BLKADDR_RVUM, RVU_PRIV_PFX_CFG(pf));
++	nvfs = (cfg >> 12) & 0xFF;
++	if (vf >= nvfs)
++		return false;
++
++	return true;
++}
++
+ bool is_block_implemented(struct rvu_hwinfo *hw, int blkaddr)
+ {
+ 	struct rvu_block *block;
+@@ -946,6 +968,22 @@ u16 rvu_get_rsrc_mapcount(struct rvu_pfvf *pfvf, int blktype)
+ 	return 0;
+ }
+ 
++bool is_pffunc_map_valid(struct rvu *rvu, u16 pcifunc, int blktype)
++{
++	struct rvu_pfvf *pfvf;
++
++	if (!is_pf_func_valid(rvu, pcifunc))
++		return false;
++
++	pfvf = rvu_get_pfvf(rvu, pcifunc);
++
++	/* Check if this PFFUNC has a LF of type blktype attached */
++	if (!rvu_get_rsrc_mapcount(pfvf, blktype))
++		return false;
++
++	return true;
++}
++
+ static int rvu_lookup_rsrc(struct rvu *rvu, struct rvu_block *block,
+ 			   int pcifunc, int slot)
+ {
+diff --git a/drivers/soc/marvell/octeontx2/rvu.h b/drivers/soc/marvell/octeontx2/rvu.h
+index d7bdb32d17c1..761fa8e0b899 100644
+--- a/drivers/soc/marvell/octeontx2/rvu.h
++++ b/drivers/soc/marvell/octeontx2/rvu.h
+@@ -353,6 +353,7 @@ int rvu_get_pf(u16 pcifunc);
+ struct rvu_pfvf *rvu_get_pfvf(struct rvu *rvu, int pcifunc);
+ void rvu_get_pf_numvfs(struct rvu *rvu, int pf, int *numvfs, int *hwvf);
+ bool is_block_implemented(struct rvu_hwinfo *hw, int blkaddr);
++bool is_pffunc_map_valid(struct rvu *rvu, u16 pcifunc, int blktype);
+ int rvu_get_lf(struct rvu *rvu, struct rvu_block *block, u16 pcifunc, u16 slot);
+ int rvu_lf_reset(struct rvu *rvu, struct rvu_block *block, int lf);
+ int rvu_lf_reset_ndc_errata_workaround(struct rvu *rvu, struct rvu_block *block,
+diff --git a/drivers/soc/marvell/octeontx2/rvu_nix.c b/drivers/soc/marvell/octeontx2/rvu_nix.c
+index c358eb274967..bfff6291627d 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_nix.c
++++ b/drivers/soc/marvell/octeontx2/rvu_nix.c
+@@ -755,6 +755,24 @@ int rvu_mbox_handler_NIX_LF_ALLOC(struct rvu *rvu,
+ 	if (nixlf < 0)
+ 		return NIX_AF_ERR_AF_LF_INVALID;
+ 
++	/* Check if requested 'NIXLF <=> NPALF' mapping is valid */
++	if (req->npa_func) {
++		/* If default, use 'this' NIXLF's PFFUNC */
++		if (req->npa_func == RVU_DEFAULT_PF_FUNC)
++			req->npa_func = pcifunc;
++		if (!is_pffunc_map_valid(rvu, req->npa_func, BLKTYPE_NPA))
++			return NIX_AF_INVAL_NPA_PF_FUNC;
++	}
++
++	/* Check if requested 'NIXLF <=> SSOLF' mapping is valid */
++	if (req->sso_func) {
++		/* If default, use 'this' NIXLF's PFFUNC */
++		if (req->sso_func == RVU_DEFAULT_PF_FUNC)
++			req->sso_func = pcifunc;
++		if (!is_pffunc_map_valid(rvu, req->sso_func, BLKTYPE_SSO))
++			return NIX_AF_INVAL_SSO_PF_FUNC;
++	}
++
+ 	/* If RSS is being enabled, check if requested config is valid.
+ 	 * RSS table size should be power of two, otherwise
+ 	 * RSS_GRP::OFFSET + adder might go beyond that group or
+@@ -866,18 +884,10 @@ int rvu_mbox_handler_NIX_LF_ALLOC(struct rvu *rvu,
+ 	/* Enable LMTST for this NIX LF */
+ 	rvu_write64(rvu, blkaddr, NIX_AF_LFX_TX_CFG2(nixlf), BIT_ULL(0));
+ 
+-	/* Set CQE/WQE size, NPA_PF_FUNC for SQBs and also SSO_PF_FUNC
+-	 * If requester has sent a 'RVU_DEFAULT_PF_FUNC' use this NIX LF's
+-	 * PCIFUNC itself.
+-	 */
+-	if (req->npa_func == RVU_DEFAULT_PF_FUNC)
+-		cfg = pcifunc;
+-	else
++	/* Set CQE/WQE size, NPA_PF_FUNC for SQBs and also SSO_PF_FUNC */
++	if (req->npa_func)
+ 		cfg = req->npa_func;
+-
+-	if (req->sso_func == RVU_DEFAULT_PF_FUNC)
+-		cfg |= (u64)pcifunc << 16;
+-	else
++	if (req->sso_func)
+ 		cfg |= (u64)req->sso_func << 16;
+ 
+ 	cfg |= (u64)req->xqe_sz << 33;
+diff --git a/drivers/soc/marvell/octeontx2/rvu_sso.c b/drivers/soc/marvell/octeontx2/rvu_sso.c
+index b9bc6e611fa4..6eb207227aa2 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_sso.c
++++ b/drivers/soc/marvell/octeontx2/rvu_sso.c
+@@ -170,19 +170,26 @@ int rvu_mbox_handler_SSO_HW_SETCONFIG(struct rvu *rvu,
+ 				      struct msg_rsp *rsp)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
+-	u32 npa_aura_id, npa_pf_func;
++	u16 pcifunc = req->hdr.pcifunc;
+ 	int hwgrp, lf, err, blkaddr;
+-	u16 pcifunc;
++	u32 npa_aura_id;
+ 	u64 reg;
+ 
+-	npa_aura_id = req->npa_aura_id;
+-	npa_pf_func = req->npa_pf_func;
+-	pcifunc = req->hdr.pcifunc;
+-
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_SSO, pcifunc);
+ 	if (blkaddr < 0)
+ 		return SSO_AF_ERR_LF_INVALID;
+ 
++	npa_aura_id = req->npa_aura_id;
++
++	/* Check if requested 'SSOLF <=> NPALF' mapping is valid */
++	if (req->npa_pf_func) {
++		/* If default, use 'this' SSOLF's PFFUNC */
++		if (req->npa_pf_func == RVU_DEFAULT_PF_FUNC)
++			req->npa_pf_func = pcifunc;
++		if (!is_pffunc_map_valid(rvu, req->npa_pf_func, BLKTYPE_NPA))
++			return SSO_AF_INVAL_NPA_PF_FUNC;
++	}
++
+ 	/* Initialize XAQ ring */
+ 	for (hwgrp = 0; hwgrp < req->hwgrps; hwgrp++) {
+ 		lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, hwgrp);
+@@ -204,7 +211,7 @@ int rvu_mbox_handler_SSO_HW_SETCONFIG(struct rvu *rvu,
+ 		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf),
+ 			    npa_aura_id);
+ 		rvu_write64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf),
+-			    npa_pf_func);
++			    req->npa_pf_func);
+ 
+ 		/* enable XAQ */
+ 		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf), 0xF);
+diff --git a/drivers/soc/marvell/octeontx2/rvu_tim.c b/drivers/soc/marvell/octeontx2/rvu_tim.c
+index 82933ed3517f..86e48f5f24af 100644
+--- a/drivers/soc/marvell/octeontx2/rvu_tim.c
++++ b/drivers/soc/marvell/octeontx2/rvu_tim.c
+@@ -89,6 +89,24 @@ int rvu_mbox_handler_TIM_LF_ALLOC(struct rvu *rvu,
+ 	if (lf < 0)
+ 		return TIM_AF_LF_INVALID;
+ 
++	/* Check if requested 'TIMLF <=> NPALF' mapping is valid */
++	if (req->npa_pf_func) {
++		/* If default, use 'this' TIMLF's PFFUNC */
++		if (req->npa_pf_func == RVU_DEFAULT_PF_FUNC)
++			req->npa_pf_func = pcifunc;
++		if (!is_pffunc_map_valid(rvu, req->npa_pf_func, BLKTYPE_NPA))
++			return TIM_AF_INVAL_NPA_PF_FUNC;
++	}
++
++	/* Check if requested 'TIMLF <=> SSOLF' mapping is valid */
++	if (req->sso_pf_func) {
++		/* If default, use 'this' SSOLF's PFFUNC */
++		if (req->sso_pf_func == RVU_DEFAULT_PF_FUNC)
++			req->sso_pf_func = pcifunc;
++		if (!is_pffunc_map_valid(rvu, req->sso_pf_func, BLKTYPE_SSO))
++			return TIM_AF_INVAL_SSO_PF_FUNC;
++	}
++
+ 	regval = (((u64)req->npa_pf_func) << 16) |
+ 		 ((u64)req->sso_pf_func);
+ 	rvu_write64(rvu, blkaddr, TIM_AF_RINGX_GMCTL(lf), regval);
+-- 
+2.17.1
+

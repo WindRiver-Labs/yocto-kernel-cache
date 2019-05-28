@@ -1,0 +1,117 @@
+From 3941d8396cfb74b9b72438a3b1ba41aa43bc8201 Mon Sep 17 00:00:00 2001
+From: Jan Glauber <jglauber@cavium.com>
+Date: Thu, 27 Sep 2018 10:41:50 +0300
+Subject: [PATCH 0226/1051] mmc: octeon: Work-around hardware bug on cn6xxx and
+ cnf7xxx
+
+Prevent data corruption on cn6xxx and cnf7xxx.
+Due to an imperfection in the design of the MMC bus hardware,
+the 2nd to last cache block of a DMA read must be locked into the L2
+cache.
+
+Signed-off-by: Jan Glauber <jglauber@cavium.com>
+Signed-off-by: Yury Norov <ynorov@caviumnetworks.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06.
+Drop the parts for the arch/mips.]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/mmc/host/cavium.c             |  3 +++
+ drivers/mmc/host/cavium_mmc.h         |  5 +++++
+ drivers/mmc/host/octeon_platdrv_mmc.c | 30 +++++++++++++++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/drivers/mmc/host/cavium.c b/drivers/mmc/host/cavium.c
+index 9baa4208dead..938f2d799300 100644
+--- a/drivers/mmc/host/cavium.c
++++ b/drivers/mmc/host/cavium.c
+@@ -712,6 +712,9 @@ static void cvm_mmc_dma_request(struct mmc_host *mmc,
+ 	if (host->dmar_fixup)
+ 		host->dmar_fixup(host, mrq->cmd, data, addr);
+ 
++	if (host->dmar_fixup)
++		host->dmar_fixup(host, mrq->cmd, data, addr);
++
+ 	/*
+ 	 * If we have a valid SD card in the slot, we set the response
+ 	 * bit mask to check for CRC errors and timeouts only.
+diff --git a/drivers/mmc/host/cavium_mmc.h b/drivers/mmc/host/cavium_mmc.h
+index e900dd1d0316..f350212db9a6 100644
+--- a/drivers/mmc/host/cavium_mmc.h
++++ b/drivers/mmc/host/cavium_mmc.h
+@@ -40,6 +40,7 @@ struct cvm_mmc_host {
+ 	void __iomem *base;
+ 	void __iomem *dma_base;
+ 	u64 emm_cfg;
++	u64 n_minus_one;	/* OCTEON II workaround location */
+ 	int last_slot;
+ 	struct clk *clk;
+ 	int sys_freq;
+@@ -55,6 +56,10 @@ struct cvm_mmc_host {
+ 	void (*acquire_bus)(struct cvm_mmc_host *);
+ 	void (*release_bus)(struct cvm_mmc_host *);
+ 	void (*int_enable)(struct cvm_mmc_host *, u64);
++	/* required on some MIPS models */
++	void (*dmar_fixup)(struct cvm_mmc_host *, struct mmc_command *,
++			   struct mmc_data *, u64);
++	void (*dmar_fixup_done)(struct cvm_mmc_host *);
+ };
+ 
+ struct cvm_mmc_slot {
+diff --git a/drivers/mmc/host/octeon_platdrv_mmc.c b/drivers/mmc/host/octeon_platdrv_mmc.c
+index f3f65811c731..59b73fb930a8 100644
+--- a/drivers/mmc/host/octeon_platdrv_mmc.c
++++ b/drivers/mmc/host/octeon_platdrv_mmc.c
+@@ -20,6 +20,9 @@
+ 
+ #define CVMX_MIO_BOOT_CTL CVMX_ADD_IO_SEG(0x00011800000000D0ull)
+ 
++extern void l2c_lock_mem_region(u64 start, u64 len);
++extern void l2c_unlock_mem_region(u64 start, u64 len);
++
+ static void octeon_mmc_acquire_bus(struct cvm_mmc_host *host)
+ {
+ 	/* Switch the MMC controller onto the bus. */
+@@ -38,6 +41,28 @@ static void octeon_mmc_int_enable(struct cvm_mmc_host *host, u64 val)
+ 	writeq(val, host->base + MIO_EMM_INT_EN);
+ }
+ 
++static void octeon_mmc_dmar_fixup(struct cvm_mmc_host *host,
++				  struct mmc_command *cmd,
++				  struct mmc_data *data,
++				  u64 addr)
++{
++	if (cmd->opcode != MMC_WRITE_MULTIPLE_BLOCK)
++		return;
++	if (data->blksz * data->blocks <= 1024)
++		return;
++
++	host->n_minus_one = addr + (data->blksz * data->blocks) - 1024;
++	l2c_lock_mem_region(host->n_minus_one, 512);
++}
++
++static void octeon_mmc_dmar_fixup_done(struct cvm_mmc_host *host)
++{
++	if (!host->n_minus_one)
++		return;
++	l2c_unlock_mem_region(host->n_minus_one, 512);
++	host->n_minus_one = 0;
++}
++
+ static int octeon_mmc_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *cn, *node = pdev->dev.of_node;
+@@ -56,6 +81,11 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 	host->acquire_bus = octeon_mmc_acquire_bus;
+ 	host->release_bus = octeon_mmc_release_bus;
+ 	host->int_enable = octeon_mmc_int_enable;
++	if (OCTEON_IS_MODEL(OCTEON_CN6XXX) ||
++	    OCTEON_IS_MODEL(OCTEON_CNF7XXX)) {
++		host->dmar_fixup = octeon_mmc_dmar_fixup;
++		host->dmar_fixup_done = octeon_mmc_dmar_fixup_done;
++	}
+ 
+ 	host->sys_freq = octeon_get_io_clock_rate();
+ 
+-- 
+2.17.1
+

@@ -1,0 +1,279 @@
+From 9cb830322b6edf77e6a6f6f7f7e5f79e9500b0ab Mon Sep 17 00:00:00 2001
+From: Lukasz Bartosik <lbartosik@marvell.com>
+Date: Fri, 28 Dec 2018 15:22:21 +0300
+Subject: [PATCH 0871/1051] crypto: cpt - share CPT queues between cpu cores
+
+Previosly one CPT queue was logically bound to only one cpu core.
+If there were more cpu cores than CPT queues then requests on
+cores which didn't have CPT queue bound were dropped. This change
+introduces sharing of CPT queues between cpu cores therefore now
+CPT queue might be logically bound to more than one core.
+
+Change-Id: I8c8fe75ed5d2c1ea5215ab3d77e2ffef51f1a7ef
+Signed-off-by: Lukasz Bartosik <lbartosik@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/1778
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[Kevin: The original patch got from Marvell sdk10.0_19.06]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../crypto/cavium/cpt/9x/cpt9x_passthrough.c  |  2 +-
+ drivers/crypto/cavium/cpt/common/cpt_algs.c   | 45 +++++++++----------
+ drivers/crypto/cavium/cpt/common/cpt_common.h |  4 +-
+ drivers/crypto/cavium/cpt/common/cpt_reqmgr.h | 29 ++++++------
+ 4 files changed, 39 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/crypto/cavium/cpt/9x/cpt9x_passthrough.c b/drivers/crypto/cavium/cpt/9x/cpt9x_passthrough.c
+index 1b258ee35969..8ed97195bcbf 100644
+--- a/drivers/crypto/cavium/cpt/9x/cpt9x_passthrough.c
++++ b/drivers/crypto/cavium/cpt/9x/cpt9x_passthrough.c
+@@ -59,7 +59,7 @@ static int cvm_passthrough(struct pci_dev *pdev, struct ablkcipher_request *req)
+ 	req_info->req.param2 = 0x0;
+ 
+ 	req_info->callback = (void *) cvm_callback;
+-	req_info->callback_arg = &req->base;
++	req_info->areq = &req->base;
+ 	req_info->req_type = PASSTHROUGH_REQ;
+ 
+ 	req_info->in[0].vptr = sg_virt(req->src);
+diff --git a/drivers/crypto/cavium/cpt/common/cpt_algs.c b/drivers/crypto/cavium/cpt/common/cpt_algs.c
+index 403897c9cd8e..fedda40226f4 100644
+--- a/drivers/crypto/cavium/cpt/common/cpt_algs.c
++++ b/drivers/crypto/cavium/cpt/common/cpt_algs.c
+@@ -49,7 +49,7 @@ static struct cpt_device_table ae_devices = {
+ 
+ static inline int get_se_device(struct pci_dev **pdev, int *cpu_num)
+ {
+-	int count, ret = 0;
++	int count;
+ 
+ 	count = atomic_read(&se_devices.count);
+ 	if (count < 1)
+@@ -60,39 +60,35 @@ static inline int get_se_device(struct pci_dev **pdev, int *cpu_num)
+ 	switch (se_devices.desc[0].pf_type) {
+ 	case CPT_81XX:
+ 	case CPT_SE_83XX:
+-		/* On 8X platform there is one CPT instruction queues
+-		 * bound to one VF therefore we need to check if number
+-		 * of CPT VF devices is greater than the cpu number from
+-		 * which we received a request
++		/* On 8X platform there is one CPT instruction queue bound
++		 * to each VF. We get maximum performance if one CPT queue
++		 * is available for each cpu otherwise CPT queues need to be
++		 * shared between cpus.
+ 		 */
+-		if (*cpu_num >= count) {
+-			ret = -ENODEV;
+-			goto err;
+-		}
++		if (*cpu_num >= count)
++			*cpu_num %= count;
+ 		*pdev = se_devices.desc[*cpu_num].dev;
+ 	break;
+ 
+ 	case CPT_96XX:
+-		/* On 9X platform CPT instruction queue is bound to local
+-		 * function LF, in turn LFs can be attached to PF or VF
+-		 * therefore we always use first device but we need to check
+-		 * if number of LFs attached to that device is greater than
+-		 * cpu number from which we received a request
++		/* On 9X platform CPT instruction queue is bound to each
++		 * local function LF, in turn LFs can be attached to PF
++		 * or VF therefore we always use first device. We get maximum
++		 * performance if one CPT queue is available for each cpu
++		 * otherwise CPT queues need to be shared between cpus.
+ 		 */
+-		if (*cpu_num >= se_devices.desc[0].num_queues) {
+-			ret = -ENODEV;
+-			goto err;
+-		}
++		if (*cpu_num >= se_devices.desc[0].num_queues)
++			*cpu_num %= se_devices.desc[0].num_queues;
+ 		*pdev = se_devices.desc[0].dev;
+ 	break;
+ 
+ 	default:
+ 		pr_err("Unknown PF type %d\n", se_devices.desc[0].pf_type);
+-		ret =  -EINVAL;
++		return -EINVAL;
+ 	}
+-err:
++
+ 	put_cpu();
+-	return ret;
++	return 0;
+ }
+ 
+ static inline int validate_hmac_cipher_null(struct cpt_request_info *cpt_req)
+@@ -101,8 +97,7 @@ static inline int validate_hmac_cipher_null(struct cpt_request_info *cpt_req)
+ 	struct cvm_req_ctx *rctx;
+ 	struct crypto_aead *tfm;
+ 
+-	req = container_of(cpt_req->callback_arg,
+-			   struct aead_request, base);
++	req = container_of(cpt_req->areq, struct aead_request, base);
+ 	tfm = crypto_aead_reqtfm(req);
+ 	rctx = aead_request_ctx(req);
+ 	if (memcmp(rctx->fctx.hmac.s.hmac_calc,
+@@ -273,7 +268,7 @@ static inline int cvm_enc_dec(struct ablkcipher_request *req, u32 enc)
+ 		return status;
+ 
+ 	req_info->callback = (void *)cvm_callback;
+-	req_info->callback_arg = (void *)&req->base;
++	req_info->areq = &req->base;
+ 	req_info->req_type = ENC_DEC_REQ;
+ 	req_info->ctrl.s.grp = cpt_get_kcrypto_eng_grp_num(pdev);
+ 
+@@ -1132,7 +1127,7 @@ u32 cvm_aead_enc_dec(struct aead_request *req, u8 reg_type, u8 enc)
+ 		return status;
+ 
+ 	req_info->callback = cvm_callback;
+-	req_info->callback_arg = &req->base;
++	req_info->areq = &req->base;
+ 	req_info->req_type = reg_type;
+ 	req_info->is_enc = enc;
+ 	req_info->ctrl.s.grp = cpt_get_kcrypto_eng_grp_num(pdev);
+diff --git a/drivers/crypto/cavium/cpt/common/cpt_common.h b/drivers/crypto/cavium/cpt/common/cpt_common.h
+index 2f061f96cff9..b87188c3c8d7 100644
+--- a/drivers/crypto/cavium/cpt/common/cpt_common.h
++++ b/drivers/crypto/cavium/cpt/common/cpt_common.h
+@@ -175,7 +175,7 @@ struct pending_entry {
+ 	void *post_arg;
+ 	/* Kernel async request callback */
+ 	void (*callback)(int, void *, void *);
+-	void *callback_arg;	/* Kernel async request callback arg */
++	struct crypto_async_request *areq; /* Async request callback arg */
+ 	u8 resume_sender;	/* Notify sender to resume sending requests */
+ 	u8 busy;		/* Entry status (free/busy) */
+ };
+@@ -192,7 +192,7 @@ struct pending_queue {
+ struct cpt_request_info {
+ 	/* Kernel async request callback */
+ 	void (*callback)(int, void *, void *);
+-	void *callback_arg; /* Kernel async request callback arg */
++	struct crypto_async_request *areq; /* Async request callback arg */
+ 	struct cptvf_request req; /* Request information (core specific) */
+ 	union ctrl_info ctrl; /* User control information */
+ 	struct buf_ptr in[MAX_BUF_CNT];
+diff --git a/drivers/crypto/cavium/cpt/common/cpt_reqmgr.h b/drivers/crypto/cavium/cpt/common/cpt_reqmgr.h
+index 33c054b8635d..a948d39ee7a0 100644
+--- a/drivers/crypto/cavium/cpt/common/cpt_reqmgr.h
++++ b/drivers/crypto/cavium/cpt/common/cpt_reqmgr.h
+@@ -12,6 +12,7 @@
+ #define __CPT_REQUEST_MANAGER_H
+ 
+ #include <linux/delay.h>
++#include <linux/crypto.h>
+ #include "cpt_hw_types.h"
+ 
+ void send_cpt_cmd(union cpt_inst_s *cptinst, u32 val, void *obj);
+@@ -60,7 +61,7 @@ static inline void free_pentry(struct pending_entry *pentry)
+ 	pentry->completion_addr = NULL;
+ 	pentry->post_arg = NULL;
+ 	pentry->callback = NULL;
+-	pentry->callback_arg = NULL;
++	pentry->areq = NULL;
+ 	pentry->resume_sender = false;
+ 	pentry->busy = false;
+ }
+@@ -306,7 +307,7 @@ static inline void process_pending_queue(struct pci_dev *pdev,
+ 	struct pending_entry *pentry = NULL;
+ 	struct cpt_request_info *req = NULL;
+ 	union cpt_res_s *cpt_status = NULL;
+-	void *callback_arg;
++	struct crypto_async_request *areq;
+ 	u32 res_code, resume_index;
+ 
+ 	while (1) {
+@@ -325,7 +326,7 @@ static inline void process_pending_queue(struct pci_dev *pdev,
+ 		}
+ 
+ 		if (unlikely(!pentry->callback) ||
+-			unlikely(!pentry->callback_arg)) {
++		    unlikely(!pentry->areq)) {
+ 			dev_err(&pdev->dev, "Callback or callback arg NULL\n");
+ 			goto process_pentry;
+ 		}
+@@ -368,21 +369,22 @@ static inline void process_pending_queue(struct pci_dev *pdev,
+ 		    resume_pentry->resume_sender) {
+ 			resume_pentry->resume_sender = false;
+ 			callback = resume_pentry->callback;
+-			callback_arg = resume_pentry->callback_arg;
++			areq = resume_pentry->areq;
+ 
+-			if (callback && callback_arg) {
++			if (callback && areq) {
+ 				spin_unlock_bh(&pqueue->lock);
++
+ 				/*
+ 				 * EINPROGRESS is an indication for sending
+ 				 * side that it can resume sending requests
+ 				 */
+-				callback(-EINPROGRESS, callback_arg, req);
++				callback(-EINPROGRESS, areq, req);
+ 				spin_lock_bh(&pqueue->lock);
+ 			}
+ 		}
+ 
+ 		callback = pentry->callback;
+-		callback_arg = pentry->callback_arg;
++		areq = pentry->areq;
+ 		free_pentry(pentry);
+ 
+ 		pqueue->pending_count--;
+@@ -394,8 +396,8 @@ static inline void process_pending_queue(struct pci_dev *pdev,
+ 		 * processed we don't do it if the callback pointer or
+ 		 * argument pointer is invalid
+ 		 */
+-		if (callback && callback_arg)
+-			callback(res_code, callback_arg, req);
++		if (callback && areq)
++			callback(res_code, areq, req);
+ 
+ 		if (cpt_info)
+ 			do_request_cleanup(pdev, cpt_info);
+@@ -458,7 +460,6 @@ static inline int process_request(struct pci_dev *pdev,
+ 	while (unlikely(!pentry) && retry--) {
+ 		spin_unlock_bh(&pqueue->lock);
+ 		udelay(CPT_PENTRY_STEP);
+-
+ 		spin_lock_bh(&pqueue->lock);
+ 		pentry = get_free_pending_entry(pqueue, pqueue->qlen);
+ 	}
+@@ -473,8 +474,10 @@ static inline int process_request(struct pci_dev *pdev,
+ 	 * Check if we are close to filling in entire pending queue,
+ 	 * if so then tell the sender to stop by returning -EBUSY
+ 	 */
+-	if (pqueue->pending_count > (pqueue->qlen - CPT_IQ_STOP_MARGIN))
++	if ((req->areq->flags & CRYPTO_TFM_REQ_MAY_SLEEP) &&
++	    pqueue->pending_count > (pqueue->qlen - CPT_IQ_STOP_MARGIN)) {
+ 		pentry->resume_sender = true;
++	}
+ 	else
+ 		pentry->resume_sender = false;
+ 	resume_sender = pentry->resume_sender;
+@@ -483,11 +486,12 @@ static inline int process_request(struct pci_dev *pdev,
+ 	pentry->completion_addr = info->completion_addr;
+ 	pentry->post_arg = (void *) info;
+ 	pentry->callback = req->callback;
+-	pentry->callback_arg = req->callback_arg;
++	pentry->areq = req->areq;
+ 	pentry->busy = true;
+ 	info->pentry = pentry;
+ 	info->time_in = jiffies;
+ 	info->req = req;
++	spin_unlock_bh(&pqueue->lock);
+ 
+ 	/* Fill in the command */
+ 	iq_cmd.cmd.u64 = 0;
+@@ -521,7 +525,6 @@ static inline int process_request(struct pci_dev *pdev,
+ 
+ 	/* Send CPT command */
+ 	send_cpt_cmd(&cptinst, 1, obj);
+-	spin_unlock_bh(&pqueue->lock);
+ 
+ 	ret = resume_sender ? -EBUSY : -EINPROGRESS;
+ 	return ret;
+-- 
+2.17.1
+
