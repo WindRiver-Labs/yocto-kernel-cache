@@ -1,0 +1,514 @@
+From c2e266f415d03ed9a6de07861a9c7b96c03d4a99 Mon Sep 17 00:00:00 2001
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date: Wed, 10 Apr 2019 17:23:26 +0200
+Subject: [PATCH 03/25] x86: load FPU registers on return to userland (Update
+ to v9)
+
+This is an incremental change to update the patch series from v7 to v9
+as posted on Date: Wed,  3 Apr 2019 18:41:29 +0200.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Bruce Ashfield <bruce.ashfield@gmail.com>
+---
+ arch/x86/include/asm/fpu/internal.h  | 99 +++++++++++++++++++++++++---
+ arch/x86/include/asm/pgtable.h       |  8 ++-
+ arch/x86/include/asm/special_insns.h | 24 ++++---
+ arch/x86/kernel/cpu/common.c         |  5 ++
+ arch/x86/kernel/fpu/signal.c         | 95 +++++++++++++++++++++-----
+ arch/x86/kvm/vmx/vmx.c               |  2 +-
+ arch/x86/mm/pkeys.c                  |  7 +-
+ 7 files changed, 202 insertions(+), 38 deletions(-)
+
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 749ee389a117..33e2294b5a67 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -14,6 +14,7 @@
+ #include <linux/compat.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/mm.h>
+ 
+ #include <asm/user.h>
+ #include <asm/fpu/api.h>
+@@ -120,7 +121,7 @@ extern void fpstate_sanitize_xstate(struct fpu *fpu);
+ 	err;								\
+ })
+ 
+-#define kernel_insn_norestore(insn, output, input...)			\
++#define kernel_insn_err(insn, output, input...)				\
+ ({									\
+ 	int err;							\
+ 	asm volatile("1:" #insn "\n\t"					\
+@@ -141,6 +142,22 @@ extern void fpstate_sanitize_xstate(struct fpu *fpu);
+ 		     _ASM_EXTABLE_HANDLE(1b, 2b, ex_handler_fprestore)	\
+ 		     : output : input)
+ 
++static inline int copy_fregs_to_user(struct fregs_state __user *fx)
++{
++	return user_insn(fnsave %[fx]; fwait,  [fx] "=m" (*fx), "m" (*fx));
++}
++
++static inline int copy_fxregs_to_user(struct fxregs_state __user *fx)
++{
++	if (IS_ENABLED(CONFIG_X86_32))
++		return user_insn(fxsave %[fx], [fx] "=m" (*fx), "m" (*fx));
++	else if (IS_ENABLED(CONFIG_AS_FXSAVEQ))
++		return user_insn(fxsaveq %[fx], [fx] "=m" (*fx), "m" (*fx));
++
++	/* See comment in copy_fxregs_to_kernel() below. */
++	return user_insn(rex64/fxsave (%[fx]), "=m" (*fx), [fx] "R" (fx));
++}
++
+ static inline void copy_kernel_to_fxregs(struct fxregs_state *fx)
+ {
+ 	if (IS_ENABLED(CONFIG_X86_32)) {
+@@ -155,15 +172,23 @@ static inline void copy_kernel_to_fxregs(struct fxregs_state *fx)
+ 	}
+ }
+ 
+-static inline int copy_users_to_fxregs(struct fxregs_state *fx)
++static inline int copy_kernel_to_fxregs_err(struct fxregs_state *fx)
+ {
+ 	if (IS_ENABLED(CONFIG_X86_32))
+-		return kernel_insn_norestore(fxrstor %[fx], "=m" (*fx), [fx] "m" (*fx));
++		return kernel_insn_err(fxrstor %[fx], "=m" (*fx), [fx] "m" (*fx));
++	else
++		return kernel_insn_err(fxrstorq %[fx], "=m" (*fx), [fx] "m" (*fx));
++}
++
++static inline int copy_user_to_fxregs(struct fxregs_state __user *fx)
++{
++	if (IS_ENABLED(CONFIG_X86_32))
++		return user_insn(fxrstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+ 	else if (IS_ENABLED(CONFIG_AS_FXSAVEQ))
+-		return kernel_insn_norestore(fxrstorq %[fx], "=m" (*fx), [fx] "m" (*fx));
++		return user_insn(fxrstorq %[fx], "=m" (*fx), [fx] "m" (*fx));
+ 
+ 	/* See comment in copy_fxregs_to_kernel() below. */
+-	return kernel_insn_norestore(rex64/fxrstor (%[fx]), "=m" (*fx), [fx] "R" (fx),
++	return user_insn(rex64/fxrstor (%[fx]), "=m" (*fx), [fx] "R" (fx),
+ 			  "m" (*fx));
+ }
+ 
+@@ -172,9 +197,14 @@ static inline void copy_kernel_to_fregs(struct fregs_state *fx)
+ 	kernel_insn(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+ }
+ 
+-static inline int copy_users_to_fregs(struct fregs_state *fx)
++static inline int copy_kernel_to_fregs_err(struct fregs_state *fx)
++{
++	return kernel_insn_err(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
++}
++
++static inline int copy_user_to_fregs(struct fregs_state __user *fx)
+ {
+-	return kernel_insn_norestore(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
++	return user_insn(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+ }
+ 
+ static inline void copy_fxregs_to_kernel(struct fpu *fpu)
+@@ -351,11 +381,57 @@ static inline void copy_kernel_to_xregs(struct xregs_state *xstate, u64 mask)
+ 	XSTATE_XRESTORE(xstate, lmask, hmask);
+ }
+ 
++/*
++ * Save xstate to user space xsave area.
++ *
++ * We don't use modified optimization because xrstor/xrstors might track
++ * a different application.
++ *
++ * We don't use compacted format xsave area for
++ * backward compatibility for old applications which don't understand
++ * compacted format of xsave area.
++ */
++static inline int copy_xregs_to_user(struct xregs_state __user *buf)
++{
++	int err;
++
++	/*
++	 * Clear the xsave header first, so that reserved fields are
++	 * initialized to zero.
++	 */
++	err = __clear_user(&buf->header, sizeof(buf->header));
++	if (unlikely(err))
++		return -EFAULT;
++
++	stac();
++	XSTATE_OP(XSAVE, buf, -1, -1, err);
++	clac();
++
++	return err;
++}
++
++/*
++ * Restore xstate from user space xsave area.
++ */
++static inline int copy_user_to_xregs(struct xregs_state __user *buf, u64 mask)
++{
++	struct xregs_state *xstate = ((__force struct xregs_state *)buf);
++	u32 lmask = mask;
++	u32 hmask = mask >> 32;
++	int err;
++
++	stac();
++	XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++	clac();
++
++	return err;
++}
++
+ /*
+  * Restore xstate from kernel space xsave area, return an error code instead an
+  * exception.
+  */
+-static inline int copy_users_to_xregs(struct xregs_state *xstate, u64 mask)
++static inline int copy_kernel_to_xregs_err(struct xregs_state *xstate, u64 mask)
+ {
+ 	u32 lmask = mask;
+ 	u32 hmask = mask >> 32;
+@@ -544,7 +620,7 @@ switch_fpu_prepare(struct fpu *old_fpu, int cpu)
+ static inline void switch_fpu_finish(struct fpu *new_fpu)
+ {
+ 	struct pkru_state *pk;
+-	u32 pkru_val = 0;
++	u32 pkru_val = init_pkru_value;
+ 
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+ 		return;
+@@ -554,9 +630,12 @@ static inline void switch_fpu_finish(struct fpu *new_fpu)
+ 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return;
+ 
++	/*
++	 * PKRU state is switched eagerly because it needs to be valid before we
++	 * return to userland e.g. for a copy_to_user() operation.
++	 */
+ 	if (current->mm) {
+ 		pk = get_xsave_addr(&new_fpu->state.xsave, XFEATURE_PKRU);
+-		WARN_ON_ONCE(!pk);
+ 		if (pk)
+ 			pkru_val = pk->pkru;
+ 	}
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 50a8399d223e..58a3a68e1f11 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -129,7 +129,7 @@ static inline int pte_dirty(pte_t pte)
+ static inline u32 read_pkru(void)
+ {
+ 	if (boot_cpu_has(X86_FEATURE_OSPKE))
+-		return __read_pkru();
++		return __read_pkru_ins();
+ 	return 0;
+ }
+ 
+@@ -1371,6 +1371,12 @@ static inline pmd_t pmd_swp_clear_soft_dirty(pmd_t pmd)
+ #define PKRU_WD_BIT 0x2
+ #define PKRU_BITS_PER_PKEY 2
+ 
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++extern u32 init_pkru_value;
++#else
++#define init_pkru_value	0
++#endif
++
+ static inline bool __pkru_allows_read(u32 pkru, u16 pkey)
+ {
+ 	int pkru_pkey_bits = pkey * PKRU_BITS_PER_PKEY;
+diff --git a/arch/x86/include/asm/special_insns.h b/arch/x86/include/asm/special_insns.h
+index 2d3adeb268e3..28ffdf0c1add 100644
+--- a/arch/x86/include/asm/special_insns.h
++++ b/arch/x86/include/asm/special_insns.h
+@@ -92,7 +92,7 @@ static inline void native_write_cr8(unsigned long val)
+ #endif
+ 
+ #ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+-static inline u32 __read_pkru(void)
++static inline u32 __read_pkru_ins(void)
+ {
+ 	u32 ecx = 0;
+ 	u32 edx, pkru;
+@@ -107,16 +107,10 @@ static inline u32 __read_pkru(void)
+ 	return pkru;
+ }
+ 
+-static inline void __write_pkru(u32 pkru)
++static inline void __write_pkru_ins(u32 pkru)
+ {
+ 	u32 ecx = 0, edx = 0;
+ 
+-	/*
+-	 * WRPKRU is relatively expensive compared to RDPKRU.
+-	 * Avoid WRPKRU when it would not change the value.
+-	 */
+-	if (pkru == __read_pkru())
+-		return;
+ 	/*
+ 	 * "wrpkru" instruction.  Loads contents in EAX to PKRU,
+ 	 * requires that ecx = edx = 0.
+@@ -124,8 +118,20 @@ static inline void __write_pkru(u32 pkru)
+ 	asm volatile(".byte 0x0f,0x01,0xef\n\t"
+ 		     : : "a" (pkru), "c"(ecx), "d"(edx));
+ }
++
++static inline void __write_pkru(u32 pkru)
++{
++	/*
++	 * WRPKRU is relatively expensive compared to RDPKRU.
++	 * Avoid WRPKRU when it would not change the value.
++	 */
++	if (pkru == __read_pkru_ins())
++		return;
++	__write_pkru_ins(pkru);
++}
++
+ #else
+-static inline u32 __read_pkru(void)
++static inline u32 __read_pkru_ins(void)
+ {
+ 	return 0;
+ }
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 132a63dc5a76..abb9b52b6602 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -372,6 +372,8 @@ static bool pku_disabled;
+ 
+ static __always_inline void setup_pku(struct cpuinfo_x86 *c)
+ {
++	struct pkru_state *pk;
++
+ 	/* check the boot processor, plus compile options for PKU: */
+ 	if (!cpu_feature_enabled(X86_FEATURE_PKU))
+ 		return;
+@@ -382,6 +384,9 @@ static __always_inline void setup_pku(struct cpuinfo_x86 *c)
+ 		return;
+ 
+ 	cr4_set_bits(X86_CR4_PKE);
++	pk = get_xsave_addr(&init_fpstate.xsave, XFEATURE_PKRU);
++	if (pk)
++		pk->pkru = init_pkru_value;
+ 	/*
+ 	 * Seting X86_CR4_PKE will cause the X86_FEATURE_OSPKE
+ 	 * cpuid bit to be set.  We need to ensure that we
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 589fb27515e0..16f700d5b3a4 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -118,6 +118,22 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ 	return err;
+ }
+ 
++static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
++{
++	int err;
++
++	if (use_xsave())
++		err = copy_xregs_to_user(buf);
++	else if (use_fxsr())
++		err = copy_fxregs_to_user((struct fxregs_state __user *) buf);
++	else
++		err = copy_fregs_to_user((struct fregs_state __user *) buf);
++
++	if (unlikely(err) && __clear_user(buf, fpu_user_xstate_size))
++		err = -EFAULT;
++	return err;
++}
++
+ /*
+  * Save the fpu, extended register state to the user signal frame.
+  *
+@@ -128,8 +144,10 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+  *	buf == buf_fx for 64-bit frames and 32-bit fsave frame.
+  *	buf != buf_fx for 32-bit frames with fxstate.
+  *
+- * Save the state to task's fpu->state and then copy it to the user frame
+- * pointed by the aligned pointer 'buf_fx'.
++ * Try to save it directly to the user frame with disabled page fault handler.
++ * If this fails then do the slow path where the FPU state is first saved to
++ * task's fpu->state and then copy it to the user frame pointed by the aligned
++ * pointer 'buf_fx'.
+  *
+  * If this is a 32-bit frame with fxstate, put a fsave header before
+  * the aligned state at 'buf_fx'.
+@@ -143,6 +161,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	struct xregs_state *xsave = &fpu->state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
++	int ret = -EFAULT;
+ 
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+@@ -157,21 +176,31 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 
+ 	fpregs_lock();
+ 	/*
+-	 * If we do not need to load the FPU registers at return to userspace
+-	 * then the CPU has the current state and we need to save it. Otherwise
+-	 * it is already done and we can skip it.
++	 * Load the FPU register if they are not valid for the current task.
++	 * With a valid FPU state we can attempt to save the state directly to
++	 * userland's stack frame which will likely succeed. If it does not, do
++	 * the slowpath.
+ 	 */
+-	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+-		copy_fpregs_to_fpstate(fpu);
++	if (test_thread_flag(TIF_NEED_FPU_LOAD))
++		__fpregs_load_activate();
+ 
++	pagefault_disable();
++	ret = copy_fpregs_to_sigframe(buf_fx);
++	pagefault_enable();
++	if (ret && !test_thread_flag(TIF_NEED_FPU_LOAD))
++		copy_fpregs_to_fpstate(fpu);
++	set_thread_flag(TIF_NEED_FPU_LOAD);
+ 	fpregs_unlock();
+ 
+-	if (using_compacted_format()) {
+-		copy_xstate_to_user(buf_fx, xsave, 0, size);
+-	} else {
+-		fpstate_sanitize_xstate(fpu);
+-		if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
+-			return -1;
++	if (ret) {
++		if (using_compacted_format()) {
++			if (copy_xstate_to_user(buf_fx, xsave, 0, size))
++				return -1;
++		} else {
++			fpstate_sanitize_xstate(fpu);
++			if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
++				return -1;
++		}
+ 	}
+ 
+ 	/* Save the fsave header for the 32-bit frames. */
+@@ -221,6 +250,28 @@ sanitize_restored_xstate(union fpregs_state *state,
+ 	}
+ }
+ 
++/*
++ * Restore the extended state if present. Otherwise, restore the FP/SSE state.
++ */
++static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
++{
++	if (use_xsave()) {
++		if (fx_only) {
++			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			return copy_user_to_fxregs(buf);
++		} else {
++			u64 init_bv = xfeatures_mask & ~xbv;
++			if (unlikely(init_bv))
++				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			return copy_user_to_xregs(buf, xbv);
++		}
++	} else if (use_fxsr()) {
++		return copy_user_to_fxregs(buf);
++	} else
++		return copy_user_to_fregs(buf);
++}
++
+ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ {
+ 	struct user_i387_ia32_struct *envp = NULL;
+@@ -287,7 +338,19 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (ret)
+ 			goto err_out;
+ 		envp = &env;
++	} else {
++		fpregs_lock();
++		pagefault_disable();
++		ret = copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only);
++		pagefault_enable();
++		if (!ret) {
++			fpregs_mark_activate();
++			fpregs_unlock();
++			return 0;
++		}
++		fpregs_unlock();
+ 	}
++
+ 	if (use_xsave() && !fx_only) {
+ 		u64 init_bv = xfeatures_mask & ~xfeatures;
+ 
+@@ -307,7 +370,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		fpregs_lock();
+ 		if (unlikely(init_bv))
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-		ret = copy_users_to_xregs(&fpu->state.xsave, xfeatures);
++		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, xfeatures);
+ 
+ 	} else if (use_fxsr()) {
+ 		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
+@@ -324,13 +387,13 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 		}
+ 
+-		ret = copy_users_to_fxregs(&fpu->state.fxsave);
++		ret = copy_kernel_to_fxregs_err(&fpu->state.fxsave);
+ 	} else {
+ 		ret = __copy_from_user(&fpu->state.fsave, buf_fx, state_size);
+ 		if (ret)
+ 			goto err_out;
+ 		fpregs_lock();
+-		ret = copy_users_to_fregs(buf_fx);
++		ret = copy_kernel_to_fregs_err(&fpu->state.fsave);
+ 	}
+ 	if (!ret)
+ 		fpregs_mark_activate();
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index df6e325b288b..32fe924346df 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6635,7 +6635,7 @@ static void vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	 */
+ 	if (static_cpu_has(X86_FEATURE_PKU) &&
+ 	    kvm_read_cr4_bits(vcpu, X86_CR4_PKE)) {
+-		vcpu->arch.pkru = __read_pkru();
++		vcpu->arch.pkru = __read_pkru_ins();
+ 		if (vcpu->arch.pkru != vmx->host_pkru)
+ 			__write_pkru(vmx->host_pkru);
+ 	}
+diff --git a/arch/x86/mm/pkeys.c b/arch/x86/mm/pkeys.c
+index 50f65fc1b9a3..1dcfc91c8f0c 100644
+--- a/arch/x86/mm/pkeys.c
++++ b/arch/x86/mm/pkeys.c
+@@ -18,6 +18,7 @@
+ 
+ #include <asm/cpufeature.h>             /* boot_cpu_has, ...            */
+ #include <asm/mmu_context.h>            /* vma_pkey()                   */
++#include <asm/fpu/internal.h>		/* init_fpstate			*/
+ 
+ int __execute_only_pkey(struct mm_struct *mm)
+ {
+@@ -126,7 +127,6 @@ int __arch_override_mprotect_pkey(struct vm_area_struct *vma, int prot, int pkey
+  * in the process's lifetime will not accidentally get access
+  * to data which is pkey-protected later on.
+  */
+-static
+ u32 init_pkru_value = PKRU_AD_KEY( 1) | PKRU_AD_KEY( 2) | PKRU_AD_KEY( 3) |
+ 		      PKRU_AD_KEY( 4) | PKRU_AD_KEY( 5) | PKRU_AD_KEY( 6) |
+ 		      PKRU_AD_KEY( 7) | PKRU_AD_KEY( 8) | PKRU_AD_KEY( 9) |
+@@ -162,6 +162,7 @@ static ssize_t init_pkru_read_file(struct file *file, char __user *user_buf,
+ static ssize_t init_pkru_write_file(struct file *file,
+ 		 const char __user *user_buf, size_t count, loff_t *ppos)
+ {
++	struct pkru_state *pk;
+ 	char buf[32];
+ 	ssize_t len;
+ 	u32 new_init_pkru;
+@@ -184,6 +185,10 @@ static ssize_t init_pkru_write_file(struct file *file,
+ 		return -EINVAL;
+ 
+ 	WRITE_ONCE(init_pkru_value, new_init_pkru);
++	pk = get_xsave_addr(&init_fpstate.xsave, XFEATURE_PKRU);
++	if (!pk)
++		return -EINVAL;
++	pk->pkru = new_init_pkru;
+ 	return count;
+ }
+ 
+-- 
+2.19.1
+
