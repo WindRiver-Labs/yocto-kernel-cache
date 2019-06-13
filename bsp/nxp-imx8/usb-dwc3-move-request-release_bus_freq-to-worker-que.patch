@@ -1,0 +1,92 @@
+From 358afe1044e22a02ba2c16fd5121f498654a5028 Mon Sep 17 00:00:00 2001
+From: Quanyang Wang <quanyang.wang@windriver.com>
+Date: Thu, 13 Jun 2019 14:23:43 +0800
+Subject: [PATCH] usb: dwc3: move request/release_bus_freq to worker queue
+
+Request/release_bus_freq call mutex_lock, so they should NOT be called in an
+irqs_disabled context. Unfortunately, the function dwc3_gadget_reset_interrupt
+is in an irqs_disabled context and will call them. So move request/release_bus_freq
+from dwc3_gadget_reset_interrupt to an worker queue to avoid the calltrace as below:
+
+BUG: sleeping function called from invalid context at kernel/locking/mutex.c:239
+in_atomic(): 1, irqs_disabled(): 128, pid: 561, name: irq/233-dwc3
+Preemption disabled at:
+[<ffff0000087cf264>] dwc3_thread_interrupt+0x44/0x14f8
+CPU: 0 PID: 561 Comm: irq/233-dwc3 Not tainted 4.18.39-yocto-standard #1
+Hardware name: Freescale i.MX8MQ EVK (DT)
+Call trace:
+ dump_backtrace+0x0/0x168
+ show_stack+0x24/0x30
+ dump_stack+0x80/0xa4
+ ___might_sleep+0x148/0x170
+ __might_sleep+0x58/0x90
+ mutex_lock+0x2c/0x60
+ request_bus_freq+0x2c/0x100
+ dwc3_gadget_reset_interrupt+0x164/0x440
+ dwc3_thread_interrupt+0xb60/0x14f8
+ irq_thread_fn+0x30/0x80
+ irq_thread+0x188/0x1e8
+ kthread+0x13c/0x140
+ ret_from_fork+0x10/0x1c
+
+Signed-off-by: Quanyang Wang <quanyang.wang@windriver.com>
+---
+ drivers/usb/dwc3/gadget.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 1a69632a0b45..a801041a8429 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -31,6 +31,8 @@
+ #define DWC3_ALIGN_FRAME(d)	(((d)->frame_number + (d)->interval) \
+ 					& ~((d)->interval - 1))
+ 
++static struct work_struct request_busfreq_worker;
++static struct work_struct release_busfreq_worker;
+ /**
+  * dwc3_gadget_set_test_mode - enables usb2 test modes
+  * @dwc: pointer to our context structure
+@@ -2616,17 +2618,27 @@ static void dwc3_gadget_disconnect_interrupt(struct dwc3 *dwc)
+ 	usb_gadget_set_state(&dwc->gadget, USB_STATE_NOTATTACHED);
+ 
+ 	if (dwc->connected) {
+-		release_bus_freq(BUS_FREQ_HIGH);
++		schedule_work(&release_busfreq_worker);
+ 		dwc->connected = false;
+ 	}
+ }
+ 
++static void request_busfreq_worker_handler(struct work_struct *work)
++{
++		request_bus_freq(BUS_FREQ_HIGH);
++}
++
++static void release_busfreq_worker_handler(struct work_struct *work)
++{
++		release_bus_freq(BUS_FREQ_HIGH);
++}
++
+ static void dwc3_gadget_reset_interrupt(struct dwc3 *dwc)
+ {
+ 	u32			reg;
+ 
+ 	if (!dwc->connected) {
+-		request_bus_freq(BUS_FREQ_HIGH);
++		schedule_work(&request_busfreq_worker);
+ 		dwc->connected = true;
+ 	}
+ 
+@@ -3248,6 +3260,9 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 
+ 	dwc3_gadget_set_speed(&dwc->gadget, dwc->maximum_speed);
+ 
++	INIT_WORK(&request_busfreq_worker, request_busfreq_worker_handler);
++	INIT_WORK(&release_busfreq_worker, release_busfreq_worker_handler);
++
+ 	return 0;
+ 
+ err4:
+-- 
+2.17.1
+
