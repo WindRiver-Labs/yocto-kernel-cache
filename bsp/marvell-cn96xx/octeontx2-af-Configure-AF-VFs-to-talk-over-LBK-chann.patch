@@ -1,0 +1,173 @@
+From ff6e570d07c78ce8d2da57f2b8e9a93ad82402a7 Mon Sep 17 00:00:00 2001
+From: Tomasz Duszynski <tduszynski@marvell.com>
+Date: Mon, 19 Nov 2018 16:17:40 +0530
+Subject: [PATCH 075/255] octeontx2-af: Configure AF VFs to talk over LBK
+ channels
+
+commit 8bb991c5e7c697b968abd9e8f6ad1c5fe8962536 upstream
+
+Configure AF VFs such that they are able to talk over consecutive
+loopback channels.
+
+If 8 VFs are attached to AF then communication will work as below:
+
+TX      RX
+lbk0 -> lbk1
+lbk1 -> lbk0
+
+lbk2 -> lbk3
+lbk3 -> lbk2
+
+lbk4 -> lbk5
+lbk5 -> lbk4
+
+lbk6 -> lbk7
+lbk7 -> lbk6
+
+Signed-off-by: Tomasz Duszynski <tduszynski@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/common.h    |  2 ++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  5 ++++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 25 ++++++++++++++++---
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 12 ++++++---
+ 4 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/common.h b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+index a8c89df07886..9bddb032dd7e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+@@ -174,7 +174,9 @@ enum nix_scheduler {
+ 
+ #define MAX_LMAC_PKIND			12
+ #define NIX_LINK_CGX_LMAC(a, b)		(0 + 4 * (a) + (b))
++#define NIX_LINK_LBK(a)			(12 + (a))
+ #define NIX_CHAN_CGX_LMAC_CHX(a, b, c)	(0x800 + 0x100 * (a) + 0x10 * (b) + (c))
++#define NIX_CHAN_LBK_CHX(a, b)		(0 + 0x100 * (a) + (b))
+ 
+ /* NIX LSO format indices.
+  * As of now TSO is the only one using, so statically assigning indices.
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index d5743e472fb8..8936cfbf10e0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -258,6 +258,11 @@ static inline u64 rvupf_read64(struct rvu *rvu, u64 offset)
+ /* Function Prototypes
+  * RVU
+  */
++static inline int is_afvf(u16 pcifunc)
++{
++	return !(pcifunc & ~RVU_PFVF_FUNC_MASK);
++}
++
+ int rvu_alloc_bitmap(struct rsrc_bmap *rsrc);
+ int rvu_alloc_rsrc(struct rsrc_bmap *rsrc);
+ void rvu_free_rsrc(struct rsrc_bmap *rsrc, int id);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 58c672014152..e46db89e91f9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -144,7 +144,7 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
+ 	u8 cgx_id, lmac_id;
+-	int pkind, pf;
++	int pkind, pf, vf;
+ 	int err;
+ 
+ 	pf = rvu_get_pf(pcifunc);
+@@ -170,6 +170,14 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf)
+ 		rvu_npc_set_pkind(rvu, pkind, pfvf);
+ 		break;
+ 	case NIX_INTF_TYPE_LBK:
++		vf = (pcifunc & RVU_PFVF_FUNC_MASK) - 1;
++		pfvf->rx_chan_base = NIX_CHAN_LBK_CHX(0, vf);
++		pfvf->tx_chan_base = vf & 0x1 ? NIX_CHAN_LBK_CHX(0, vf - 1) :
++						NIX_CHAN_LBK_CHX(0, vf + 1);
++		pfvf->rx_chan_cnt = 1;
++		pfvf->tx_chan_cnt = 1;
++		rvu_npc_install_promisc_entry(rvu, pcifunc, nixlf,
++					      pfvf->rx_chan_base, false);
+ 		break;
+ 	}
+ 
+@@ -684,7 +692,7 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 				  struct nix_lf_alloc_req *req,
+ 				  struct nix_lf_alloc_rsp *rsp)
+ {
+-	int nixlf, qints, hwctx_size, err, rc = 0;
++	int nixlf, qints, hwctx_size, intf, err, rc = 0;
+ 	struct rvu_hwinfo *hw = rvu->hw;
+ 	u16 pcifunc = req->hdr.pcifunc;
+ 	struct rvu_block *block;
+@@ -839,7 +847,8 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	/* Config Rx pkt length, csum checks and apad  enable / disable */
+ 	rvu_write64(rvu, blkaddr, NIX_AF_LFX_RX_CFG(nixlf), req->rx_cfg);
+ 
+-	err = nix_interface_init(rvu, pcifunc, NIX_INTF_TYPE_CGX, nixlf);
++	intf = is_afvf(pcifunc) ? NIX_INTF_TYPE_LBK : NIX_INTF_TYPE_CGX;
++	err = nix_interface_init(rvu, pcifunc, intf, nixlf);
+ 	if (err)
+ 		goto free_mem;
+ 
+@@ -1354,6 +1363,10 @@ static int nix_update_bcast_mce_list(struct rvu *rvu, u16 pcifunc, bool add)
+ 	struct rvu_pfvf *pfvf;
+ 	int blkaddr;
+ 
++	/* Broadcast pkt replication is not needed for AF's VFs, hence skip */
++	if (is_afvf(pcifunc))
++		return 0;
++
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
+ 	if (blkaddr < 0)
+ 		return 0;
+@@ -1966,6 +1979,12 @@ int rvu_mbox_handler_nix_rxvlan_alloc(struct rvu *rvu, struct msg_req *req,
+ 	int blkaddr, nixlf, err;
+ 	struct rvu_pfvf *pfvf;
+ 
++	/* LBK VFs do not have separate MCAM UCAST entry hence
++	 * skip allocating rxvlan for them
++	 */
++	if (is_afvf(pcifunc))
++		return 0;
++
+ 	pfvf = rvu_get_pfvf(rvu, pcifunc);
+ 	if (pfvf->rxvlan)
+ 		return 0;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 738314067a9e..d93397e27e05 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -314,6 +314,10 @@ void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
+ 	int blkaddr, index, kwi;
+ 	u64 mac = 0;
+ 
++	/* AF's VFs work in promiscuous mode */
++	if (is_afvf(pcifunc))
++		return;
++
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+ 	if (blkaddr < 0)
+ 		return;
+@@ -368,12 +372,12 @@ void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
+ 	struct nix_rx_action action = { };
+ 	int blkaddr, index, kwi;
+ 
+-	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+-	if (blkaddr < 0)
++	/* Only PF or AF VF can add a promiscuous entry */
++	if ((pcifunc & RVU_PFVF_FUNC_MASK) && !is_afvf(pcifunc))
+ 		return;
+ 
+-	/* Only PF or AF VF can add a promiscuous entry */
+-	if (pcifunc & RVU_PFVF_FUNC_MASK)
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
+ 		return;
+ 
+ 	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+-- 
+2.17.1
+

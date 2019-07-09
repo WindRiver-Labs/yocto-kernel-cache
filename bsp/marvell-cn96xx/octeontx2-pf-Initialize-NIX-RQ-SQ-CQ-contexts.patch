@@ -1,0 +1,176 @@
+From 6e989dbc847ce92c1ae897d33595166d4bcd665d Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Fri, 28 Dec 2018 15:07:16 +0530
+Subject: [PATCH 133/255] octeontx2-pf: Initialize NIX RQ/SQ/CQ contexts
+
+commit 5200bc4521e0eab4a76775c33680c6df25b32949 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Do the following mapping
+- RQ to a NPA aura for receive packet buffers
+- RQ to a CQ for receive packet notifications
+- SQ to a NPA aura for queueing SQEs in SQB
+- SQ to a CQ for transmit packet notifications
+
+And send NIX admin queue enqueue intructions to AF to
+initialize RQ/SQ/CQ's contexts.
+
+Change-Id: Ib7c49ecfd5fd9333c0d139fb608c9eb3881c9221
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 105 ++++++++++++++++++
+ .../marvell/octeontx2/nic/otx2_common.h       |   3 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |   4 +
+ 3 files changed, 111 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 26e801e8613c..96f862c17422 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -49,6 +49,111 @@ static dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 	return iova;
+ }
+ 
++static int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx, u16 lpb_aura)
++{
++	struct nix_aq_enq_req *aq;
++
++	/* Get memory to put this msg */
++	aq = otx2_mbox_alloc_msg_nix_aq_enq(&pfvf->mbox);
++	if (!aq)
++		return -ENOMEM;
++
++	aq->rq.cq = qidx;
++	aq->rq.ena = 1;
++	aq->rq.pb_caching = 1;
++	aq->rq.lpb_aura = lpb_aura; /* Use large packet buffer aura */
++	aq->rq.lpb_sizem1 = (DMA_BUFFER_LEN / 8) - 1;
++	aq->rq.xqe_imm_size = 0; /* Copying of packet to CQE not needed */
++
++	/* Fill AQ info */
++	aq->qidx = qidx;
++	aq->ctype = NIX_AQ_CTYPE_RQ;
++	aq->op = NIX_AQ_INSTOP_INIT;
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
++
++static int otx2_sq_init(struct otx2_nic *pfvf, u16 qidx, u16 sqb_aura)
++{
++	struct nix_aq_enq_req *aq;
++
++	/* Get memory to put this msg */
++	aq = otx2_mbox_alloc_msg_nix_aq_enq(&pfvf->mbox);
++	if (!aq)
++		return -ENOMEM;
++
++	aq->sq.cq = pfvf->hw.rx_queues + qidx;
++	aq->sq.max_sqe_size = NIX_MAXSQESZ_W16; /* 128 byte */
++	aq->sq.cq_ena = 1;
++	aq->sq.ena = 1;
++	aq->sq.smq = 0;
++	aq->sq.smq_rr_quantum = DMA_BUFFER_LEN / 4;
++	aq->sq.default_chan = pfvf->tx_chan_base;
++	aq->sq.sqe_stype = NIX_STYPE_STF; /* Cache SQB */
++	aq->sq.sqb_aura = sqb_aura;
++
++	/* Fill AQ info */
++	aq->qidx = qidx;
++	aq->ctype = NIX_AQ_CTYPE_SQ;
++	aq->op = NIX_AQ_INSTOP_INIT;
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
++
++static int otx2_cq_init(struct otx2_nic *pfvf, u16 qidx)
++{
++	struct nix_aq_enq_req *aq;
++
++	/* Get memory to put this msg */
++	aq = otx2_mbox_alloc_msg_nix_aq_enq(&pfvf->mbox);
++	if (!aq)
++		return -ENOMEM;
++
++	aq->cq.ena = 1;
++	aq->cq.qsize = Q_SIZE_4K;
++	aq->cq.caching = 1;
++	aq->cq.base = 1;
++
++	/* Fill AQ info */
++	aq->qidx = qidx;
++	aq->ctype = NIX_AQ_CTYPE_CQ;
++	aq->op = NIX_AQ_INSTOP_INIT;
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
++
++int otx2_config_nix_queues(struct otx2_nic *pfvf)
++{
++	int qidx, err;
++
++	/* Initialize RX queues */
++	for (qidx = 0; qidx < pfvf->hw.rx_queues; qidx++) {
++		u16 lpb_aura = otx2_get_pool_idx(pfvf, AURA_NIX_RQ, qidx);
++
++		err = otx2_rq_init(pfvf, qidx, lpb_aura);
++		if (err)
++			return err;
++	}
++
++	/* Initialize TX queues */
++	for (qidx = 0; qidx < pfvf->hw.tx_queues; qidx++) {
++		u16 sqb_aura = otx2_get_pool_idx(pfvf, AURA_NIX_SQ, qidx);
++
++		err = otx2_sq_init(pfvf, qidx, sqb_aura);
++		if (err)
++			return err;
++	}
++
++	/* Initialize completion queues */
++	for (qidx = 0; qidx < pfvf->qset.cq_cnt; qidx++) {
++		err = otx2_cq_init(pfvf, qidx);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
+ int otx2_config_nix(struct otx2_nic *pfvf)
+ {
+ 	struct nix_lf_alloc_req  *nixlf;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 4db8068c2398..2d8c8aab3172 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -282,9 +282,10 @@ MBOX_MESSAGES
+ int otx2_attach_npa_nix(struct otx2_nic *pfvf);
+ int otx2_detach_resources(struct mbox *mbox);
+ int otx2_config_npa(struct otx2_nic *pfvf);
+-int otx2_config_nix(struct otx2_nic *pfvf);
+ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf);
+ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf);
++int otx2_config_nix(struct otx2_nic *pfvf);
++int otx2_config_nix_queues(struct otx2_nic *pfvf);
+ 
+ /* Mbox handlers */
+ void mbox_handler_msix_offset(struct otx2_nic *pfvf,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 43ea87a8b9c5..ef6a2739ff1d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -289,6 +289,10 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	if (err)
+ 		return err;
+ 
++	err = otx2_config_nix_queues(pf);
++	if (err)
++		return err;
++
+ 	return 0;
+ }
+ 
+-- 
+2.17.1
+

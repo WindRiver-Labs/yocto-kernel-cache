@@ -1,0 +1,152 @@
+From ee0f9366f0d340d87ad078e874a6303438f623a2 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 19 Nov 2018 16:17:31 +0530
+Subject: [PATCH 066/255] octeontx2-af: Alloc and config NPC MCAM entry at a
+ time
+
+commit 63be91c89dd435fa5e88e7bae5390bfea5d54743 upstream
+
+A new mailbox message is added to support allocating a MCAM entry
+along with a counter and configuring it in one go. This reduces
+the amount of mailbox communication involved in installing a new
+MCAM rule.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  | 19 +++++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  3 +
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 72 +++++++++++++++++++
+ 3 files changed, 94 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 2caf43011d9b..bc1011059542 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -173,6 +173,9 @@ M(NPC_MCAM_CLEAR_COUNTER, 0x6009, npc_mcam_clear_counter,		\
+ M(NPC_MCAM_COUNTER_STATS, 0x600a, npc_mcam_counter_stats,		\
+ 				   npc_mcam_oper_counter_req,		\
+ 				   npc_mcam_oper_counter_rsp)		\
++M(NPC_MCAM_ALLOC_AND_WRITE_ENTRY, 0x600b, npc_mcam_alloc_and_write_entry,      \
++					  npc_mcam_alloc_and_write_entry_req,  \
++					  npc_mcam_alloc_and_write_entry_rsp)  \
+ /* NIX mbox IDs (range 0x8000 - 0xFFFF) */				\
+ M(NIX_LF_ALLOC,		0x8000, nix_lf_alloc,				\
+ 				 nix_lf_alloc_req, nix_lf_alloc_rsp)	\
+@@ -680,4 +683,20 @@ struct npc_mcam_unmap_counter_req {
+ 	u8  all;   /* Unmap all entries using this counter ? */
+ };
+ 
++struct npc_mcam_alloc_and_write_entry_req {
++	struct mbox_msghdr hdr;
++	struct mcam_entry entry_data;
++	u16 ref_entry;
++	u8  priority;    /* Lower or higher w.r.t ref_entry */
++	u8  intf;	 /* Rx or Tx interface */
++	u8  enable_entry;/* Enable this MCAM entry ? */
++	u8  alloc_cntr;  /* Allocate counter and map ? */
++};
++
++struct npc_mcam_alloc_and_write_entry_rsp {
++	struct mbox_msghdr hdr;
++	u16 entry;
++	u16 cntr;
++};
++
+ #endif /* MBOX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index e34f1bf451c7..ca13c1648ca1 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -412,4 +412,7 @@ int rvu_mbox_handler_npc_mcam_unmap_counter(struct rvu *rvu,
+ int rvu_mbox_handler_npc_mcam_counter_stats(struct rvu *rvu,
+ 			struct npc_mcam_oper_counter_req *req,
+ 			struct npc_mcam_oper_counter_rsp *rsp);
++int rvu_mbox_handler_npc_mcam_alloc_and_write_entry(struct rvu *rvu,
++			  struct npc_mcam_alloc_and_write_entry_req *req,
++			  struct npc_mcam_alloc_and_write_entry_rsp *rsp);
+ #endif /* RVU_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 6d03c72cae67..b74e5a691f9e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -1804,3 +1804,75 @@ int rvu_mbox_handler_npc_mcam_counter_stats(struct rvu *rvu,
+ 
+ 	return 0;
+ }
++
++int rvu_mbox_handler_npc_mcam_alloc_and_write_entry(struct rvu *rvu,
++			  struct npc_mcam_alloc_and_write_entry_req *req,
++			  struct npc_mcam_alloc_and_write_entry_rsp *rsp)
++{
++	struct npc_mcam_alloc_counter_req cntr_req;
++	struct npc_mcam_alloc_counter_rsp cntr_rsp;
++	struct npc_mcam_alloc_entry_req entry_req;
++	struct npc_mcam_alloc_entry_rsp entry_rsp;
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	u16 entry = NPC_MCAM_ENTRY_INVALID;
++	u16 cntr = NPC_MCAM_ENTRY_INVALID;
++	int blkaddr, rc;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return NPC_MCAM_INVALID_REQ;
++
++	if (req->intf != NIX_INTF_RX && req->intf != NIX_INTF_TX)
++		return NPC_MCAM_INVALID_REQ;
++
++	/* Try to allocate a MCAM entry */
++	entry_req.hdr.pcifunc = req->hdr.pcifunc;
++	entry_req.contig = true;
++	entry_req.priority = req->priority;
++	entry_req.ref_entry = req->ref_entry;
++	entry_req.count = 1;
++
++	rc = rvu_mbox_handler_npc_mcam_alloc_entry(rvu,
++						   &entry_req, &entry_rsp);
++	if (rc)
++		return rc;
++
++	if (!entry_rsp.count)
++		return NPC_MCAM_ALLOC_FAILED;
++
++	entry = entry_rsp.entry;
++
++	if (!req->alloc_cntr)
++		goto write_entry;
++
++	/* Now allocate counter */
++	cntr_req.hdr.pcifunc = req->hdr.pcifunc;
++	cntr_req.contig = true;
++	cntr_req.count = 1;
++
++	rc = rvu_mbox_handler_npc_mcam_alloc_counter(rvu, &cntr_req, &cntr_rsp);
++	if (rc) {
++		/* Free allocated MCAM entry */
++		mutex_lock(&mcam->lock);
++		mcam->entry2pfvf_map[entry] = 0;
++		npc_mcam_clear_bit(mcam, entry);
++		mutex_unlock(&mcam->lock);
++		return rc;
++	}
++
++	cntr = cntr_rsp.cntr;
++
++write_entry:
++	mutex_lock(&mcam->lock);
++	npc_config_mcam_entry(rvu, mcam, blkaddr, entry, req->intf,
++			      &req->entry_data, req->enable_entry);
++
++	if (req->alloc_cntr)
++		npc_map_mcam_entry_and_cntr(rvu, mcam, blkaddr, entry, cntr);
++	mutex_unlock(&mcam->lock);
++
++	rsp->entry = entry;
++	rsp->cntr = cntr;
++
++	return 0;
++}
+-- 
+2.17.1
+

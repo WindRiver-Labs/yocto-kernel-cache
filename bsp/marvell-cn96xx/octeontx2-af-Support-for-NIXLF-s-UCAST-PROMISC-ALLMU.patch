@@ -1,0 +1,200 @@
+From bb37fe745fb786f4c264f30d4343f4896838e553 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 22 Oct 2018 23:26:04 +0530
+Subject: [PATCH 055/255] octeontx2-af: Support for NIXLF's
+ UCAST/PROMISC/ALLMULTI modes
+
+commit d6f092ca928f4ed615c11b40f5856ebe1f3d4dd2 upstream
+
+By default NIXLF is set in UCAST mode. This patch adds a new
+mailbox message which when sent by a RVU PF changes this default
+mode. When promiscuous mode is needed, the reserved promisc entry
+for each of RVU PF is setup to match against ingress channel number
+only, so that all pkts on that channel are accepted and forwarded
+to the mode change requesting PF_FUNC's NIXLF.
+
+PROMISC and ALLMULTI modes are supported only for PFs, for VFs only
+UCAST mode is supported.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  | 11 +++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  5 ++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 33 +++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 57 +++++++++++++++++++
+ 4 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index afa2ead929a9..a15a59c9a239 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -159,7 +159,8 @@ M(NIX_TXSCHQ_CFG,	0x8006, nix_txschq_config, msg_rsp)		\
+ M(NIX_STATS_RST,	0x8007, msg_req, msg_rsp)			\
+ M(NIX_VTAG_CFG,	0x8008, nix_vtag_config, msg_rsp)		\
+ M(NIX_RSS_FLOWKEY_CFG,  0x8009, nix_rss_flowkey_cfg, msg_rsp)		\
+-M(NIX_SET_MAC_ADDR,	0x800a, nix_set_mac_addr, msg_rsp)
++M(NIX_SET_MAC_ADDR,	0x800a, nix_set_mac_addr, msg_rsp)		\
++M(NIX_SET_RX_MODE,	0x800b, nix_rx_mode, msg_rsp)
+ 
+ /* Messages initiated by AF (range 0xC00 - 0xDFF) */
+ #define MBOX_UP_CGX_MESSAGES						\
+@@ -513,4 +514,12 @@ struct nix_set_mac_addr {
+ 	u8 mac_addr[ETH_ALEN]; /* MAC address to be set for this pcifunc */
+ };
+ 
++struct nix_rx_mode {
++	struct mbox_msghdr hdr;
++#define NIX_RX_MODE_UCAST	BIT(0)
++#define NIX_RX_MODE_PROMISC	BIT(1)
++#define NIX_RX_MODE_ALLMULTI	BIT(2)
++	u16	mode;
++};
++
+ #endif /* MBOX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 93e68915a63c..2c0580cd2807 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -347,6 +347,8 @@ int rvu_mbox_handler_NIX_RSS_FLOWKEY_CFG(struct rvu *rvu,
+ int rvu_mbox_handler_NIX_SET_MAC_ADDR(struct rvu *rvu,
+ 				      struct nix_set_mac_addr *req,
+ 				      struct msg_rsp *rsp);
++int rvu_mbox_handler_NIX_SET_RX_MODE(struct rvu *rvu, struct nix_rx_mode *req,
++				     struct msg_rsp *rsp);
+ 
+ /* NPC APIs */
+ int rvu_npc_init(struct rvu *rvu);
+@@ -355,6 +357,9 @@ int rvu_npc_get_pkind(struct rvu *rvu, u16 pf);
+ void rvu_npc_set_pkind(struct rvu *rvu, int pkind, struct rvu_pfvf *pfvf);
+ void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
+ 				 int nixlf, u64 chan, u8 *mac_addr);
++void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
++				   int nixlf, u64 chan, bool allmulti);
++void rvu_npc_disable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+ 				       int nixlf, u64 chan);
+ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 3caf81bbf2f2..8890c95831ca 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -1745,6 +1745,39 @@ int rvu_mbox_handler_NIX_SET_MAC_ADDR(struct rvu *rvu,
+ 	return 0;
+ }
+ 
++int rvu_mbox_handler_NIX_SET_RX_MODE(struct rvu *rvu, struct nix_rx_mode *req,
++				     struct msg_rsp *rsp)
++{
++	bool allmulti = false, disable_promisc = false;
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	struct rvu_pfvf *pfvf;
++	int blkaddr, nixlf;
++
++	pfvf = rvu_get_pfvf(rvu, pcifunc);
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
++	if (!pfvf->nixlf || blkaddr < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	nixlf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, 0);
++	if (nixlf < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	if (req->mode & NIX_RX_MODE_PROMISC)
++		allmulti = false;
++	else if (req->mode & NIX_RX_MODE_ALLMULTI)
++		allmulti = true;
++	else
++		disable_promisc = true;
++
++	if (disable_promisc)
++		rvu_npc_disable_promisc_entry(rvu, pcifunc, nixlf);
++	else
++		rvu_npc_install_promisc_entry(rvu, pcifunc, nixlf,
++					      pfvf->rx_chan_base, allmulti);
++	return 0;
++}
++
+ static int nix_calibrate_x2p(struct rvu *rvu, int blkaddr)
+ {
+ 	int idx, err;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index a22eeb8af4ad..23ff47f7efc5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -310,6 +310,61 @@ void rvu_npc_install_ucast_entry(struct rvu *rvu, u16 pcifunc,
+ 			      NIX_INTF_RX, &entry, true);
+ }
+ 
++void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
++				   int nixlf, u64 chan, bool allmulti)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	struct mcam_entry entry = { {0} };
++	struct nix_rx_action action;
++	int blkaddr, index, kwi;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return;
++
++	/* Only PF or AF VF can add a promiscuous entry */
++	if (pcifunc & RVU_PFVF_FUNC_MASK)
++		return;
++
++	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
++					 nixlf, NIXLF_PROMISC_ENTRY);
++
++	entry.kw[0] = chan;
++	entry.kw_mask[0] = 0xFFFULL;
++
++	if (allmulti) {
++		kwi = NPC_PARSE_RESULT_DMAC_OFFSET / sizeof(u64);
++		entry.kw[kwi] = BIT_ULL(40); /* LSB bit of 1st byte in DMAC */
++		entry.kw_mask[kwi] = BIT_ULL(40);
++	}
++
++	*(u64 *)&action = 0x00;
++	action.op = NIX_RX_ACTIONOP_UCAST;
++	action.pf_func = pcifunc;
++
++	entry.action = *(u64 *)&action;
++	npc_config_mcam_entry(rvu, mcam, blkaddr, index,
++			      NIX_INTF_RX, &entry, true);
++}
++
++void rvu_npc_disable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int blkaddr, index;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return;
++
++	/* Only PF's have a promiscuous entry */
++	if (pcifunc & RVU_PFVF_FUNC_MASK)
++		return;
++
++	index = npc_get_nixlf_mcam_index(mcam, pcifunc,
++					 nixlf, NIXLF_PROMISC_ENTRY);
++	npc_enable_mcam_entry(rvu, mcam, blkaddr, index, false);
++}
++
+ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+ 				       int nixlf, u64 chan)
+ {
+@@ -431,6 +486,8 @@ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ 				     NPC_AF_MCAMEX_BANKX_ACTION(index, bank));
+ 		if (action.op != NIX_RX_ACTIONOP_MCAST)
+ 			npc_enable_mcam_entry(rvu, mcam, blkaddr, index, false);
++
++		rvu_npc_disable_promisc_entry(rvu, pcifunc, nixlf);
+ 	}
+ }
+ 
+-- 
+2.17.1
+

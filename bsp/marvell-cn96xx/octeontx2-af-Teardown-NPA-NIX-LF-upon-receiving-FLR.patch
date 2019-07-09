@@ -1,0 +1,285 @@
+From adb686228a00fb2f5d05f132aaf7cf8b51c46800 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Mon, 19 Nov 2018 16:17:37 +0530
+Subject: [PATCH 072/255] octeontx2-af: Teardown NPA, NIX LF upon receiving FLR
+
+commit c554f9c1574e022821260b24b043a4277e8ec5d8 upstream
+
+Upon receiving FLR IRQ for a RVU PF, teardown or cleanup
+resources held by that PF_FUNC. This patch cleans up,
+NIX LF
+ - Stop ingress/egress traffic
+ - Disable NPC MCAM entries being used.
+ - Free Tx scheduler queues
+ - Disable RQ/SQ/CQ HW contexts
+NPA LF
+ - Disable Pool/Aura HW contexts
+In future teardown of SSO/SSOW/TIM/CPT will be added.
+
+Also added a mailbox message for a RVU PF to request
+AF, to perform FLR for a RVU VF under it.
+
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Stanislaw Kardach <skardach@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  8 ++
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   | 82 ++++++++++++++++++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  2 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 48 +++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_npa.c   | 17 ++++
+ 5 files changed, 156 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index de31857bab9b..292c13a901df 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -124,6 +124,7 @@ M(READY,		0x001, ready, msg_req, ready_msg_rsp)		\
+ M(ATTACH_RESOURCES,	0x002, attach_resources, rsrc_attach, msg_rsp)	\
+ M(DETACH_RESOURCES,	0x003, detach_resources, rsrc_detach, msg_rsp)	\
+ M(MSIX_OFFSET,		0x004, msix_offset, msg_req, msix_offset_rsp)	\
++M(VF_FLR,		0x006, vf_flr, msg_req, msg_rsp)		\
+ /* CGX mbox IDs (range 0x200 - 0x3FF) */				\
+ M(CGX_START_RXTX,	0x200, cgx_start_rxtx, msg_req, msg_rsp)	\
+ M(CGX_STOP_RXTX,	0x201, cgx_stop_rxtx, msg_req, msg_rsp)		\
+@@ -229,6 +230,13 @@ struct msg_rsp {
+ 	struct mbox_msghdr hdr;
+ };
+ 
++/* RVU mailbox error codes
++ * Range 256 - 300.
++ */
++enum rvu_af_status {
++	RVU_INVALID_VF_ID           = -256,
++};
++
+ struct ready_msg_rsp {
+ 	struct mbox_msghdr hdr;
+ 	u16    sclk_feq;	/* SCLK frequency */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 73ed2654e413..eb1b69f27dd5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -29,6 +29,7 @@ static void rvu_set_msix_offset(struct rvu *rvu, struct rvu_pfvf *pfvf,
+ 				struct rvu_block *block, int lf);
+ static void rvu_clear_msix_offset(struct rvu *rvu, struct rvu_pfvf *pfvf,
+ 				  struct rvu_block *block, int lf);
++static void __rvu_flr_handler(struct rvu *rvu, u16 pcifunc);
+ 
+ /* Supported devices */
+ static const struct pci_device_id rvu_id_table[] = {
+@@ -1320,6 +1321,26 @@ static int rvu_mbox_handler_msix_offset(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
++static int rvu_mbox_handler_vf_flr(struct rvu *rvu, struct msg_req *req,
++				   struct msg_rsp *rsp)
++{
++	u16 pcifunc = req->hdr.pcifunc;
++	u16 vf, numvfs;
++	u64 cfg;
++
++	vf = pcifunc & RVU_PFVF_FUNC_MASK;
++	cfg = rvu_read64(rvu, BLKADDR_RVUM,
++			 RVU_PRIV_PFX_CFG(rvu_get_pf(pcifunc)));
++	numvfs = (cfg >> 12) & 0xFF;
++
++	if (vf && vf <= numvfs)
++		__rvu_flr_handler(rvu, pcifunc);
++	else
++		return RVU_INVALID_VF_ID;
++
++	return 0;
++}
++
+ static int rvu_process_mbox_msg(struct rvu *rvu, int devid,
+ 				struct mbox_msghdr *req)
+ {
+@@ -1601,14 +1622,73 @@ static void rvu_enable_mbox_intr(struct rvu *rvu)
+ 		    INTR_MASK(hw->total_pfs) & ~1ULL);
+ }
+ 
++static void rvu_blklf_teardown(struct rvu *rvu, u16 pcifunc, u8 blkaddr)
++{
++	struct rvu_block *block;
++	int slot, lf, num_lfs;
++	int err;
++
++	block = &rvu->hw->block[blkaddr];
++	num_lfs = rvu_get_rsrc_mapcount(rvu_get_pfvf(rvu, pcifunc),
++					block->type);
++	if (!num_lfs)
++		return;
++	for (slot = 0; slot < num_lfs; slot++) {
++		lf = rvu_get_lf(rvu, block, pcifunc, slot);
++		if (lf < 0)
++			continue;
++
++		/* Cleanup LF and reset it */
++		if (block->addr == BLKADDR_NIX0)
++			rvu_nix_lf_teardown(rvu, pcifunc, block->addr, lf);
++		else if (block->addr == BLKADDR_NPA)
++			rvu_npa_lf_teardown(rvu, pcifunc, lf);
++
++		err = rvu_lf_reset(rvu, block, lf);
++		if (err) {
++			dev_err(rvu->dev, "Failed to reset blkaddr %d LF%d\n",
++				block->addr, lf);
++		}
++	}
++}
++
++static void __rvu_flr_handler(struct rvu *rvu, u16 pcifunc)
++{
++	mutex_lock(&rvu->flr_lock);
++	/* Reset order should reflect inter-block dependencies:
++	 * 1. Reset any packet/work sources (NIX, CPT, TIM)
++	 * 2. Flush and reset SSO/SSOW
++	 * 3. Cleanup pools (NPA)
++	 */
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_NIX0);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_CPT0);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_TIM);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_SSOW);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_SSO);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_NPA);
++	rvu_detach_rsrcs(rvu, NULL, pcifunc);
++	mutex_unlock(&rvu->flr_lock);
++}
++
+ static void rvu_flr_handler(struct work_struct *work)
+ {
+ 	struct rvu_work *flrwork = container_of(work, struct rvu_work, work);
+ 	struct rvu *rvu = flrwork->rvu;
+-	u16 pf;
++	u16 pcifunc, numvfs, vf;
++	u64 cfg;
++	int pf;
+ 
+ 	pf = flrwork - rvu->flr_wrk;
+ 
++	cfg = rvu_read64(rvu, BLKADDR_RVUM, RVU_PRIV_PFX_CFG(pf));
++	numvfs = (cfg >> 12) & 0xFF;
++	pcifunc  = pf << RVU_PFVF_PF_SHIFT;
++
++	for (vf = 0; vf < numvfs; vf++)
++		__rvu_flr_handler(rvu, (pcifunc | (vf + 1)));
++
++	__rvu_flr_handler(rvu, pcifunc);
++
+ 	/* Signal FLR finish */
+ 	rvu_write64(rvu, BLKADDR_RVUM, RVU_AF_PFTRPEND, BIT_ULL(pf));
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 335ba1d83c50..5d986e1f6beb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -325,6 +325,7 @@ int rvu_mbox_handler_cgx_intlbk_disable(struct rvu *rvu, struct msg_req *req,
+ /* NPA APIs */
+ int rvu_npa_init(struct rvu *rvu);
+ void rvu_npa_freemem(struct rvu *rvu);
++void rvu_npa_lf_teardown(struct rvu *rvu, u16 pcifunc, int npalf);
+ int rvu_mbox_handler_npa_aq_enq(struct rvu *rvu,
+ 				struct npa_aq_enq_req *req,
+ 				struct npa_aq_enq_rsp *rsp);
+@@ -342,6 +343,7 @@ bool is_nixlf_attached(struct rvu *rvu, u16 pcifunc);
+ int rvu_nix_init(struct rvu *rvu);
+ void rvu_nix_freemem(struct rvu *rvu);
+ int rvu_get_nixlf_count(struct rvu *rvu);
++void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int npalf);
+ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 				  struct nix_lf_alloc_req *req,
+ 				  struct nix_lf_alloc_rsp *rsp);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 55fd2fd9918a..58c672014152 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -105,6 +105,17 @@ static inline struct nix_hw *get_nix_hw(struct rvu_hwinfo *hw, int blkaddr)
+ 	return NULL;
+ }
+ 
++static void nix_rx_sync(struct rvu *rvu, int blkaddr)
++{
++	int err;
++
++	/*Sync all in flight RX packets to LLC/DRAM */
++	rvu_write64(rvu, blkaddr, NIX_AF_RX_SW_SYNC, BIT_ULL(0));
++	err = rvu_poll_reg(rvu, blkaddr, NIX_AF_RX_SW_SYNC, BIT_ULL(0), true);
++	if (err)
++		dev_err(rvu->dev, "NIX RX software sync failed\n");
++}
++
+ static bool is_valid_txschq(struct rvu *rvu, int blkaddr,
+ 			    int lvl, u16 pcifunc, u16 schq)
+ {
+@@ -2281,3 +2292,40 @@ int rvu_mbox_handler_nix_lf_stop_rx(struct rvu *rvu, struct msg_req *req,
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ 	return 0;
+ }
++
++void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int nixlf)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	struct hwctx_disable_req ctx_req;
++	int err;
++
++	ctx_req.hdr.pcifunc = pcifunc;
++
++	/* Cleanup NPC MCAM entries, free Tx scheduler queues being used */
++	nix_interface_deinit(rvu, pcifunc, nixlf);
++	nix_rx_sync(rvu, blkaddr);
++	nix_txschq_free(rvu, pcifunc);
++
++	if (pfvf->sq_ctx) {
++		ctx_req.ctype = NIX_AQ_CTYPE_SQ;
++		err = nix_lf_hwctx_disable(rvu, &ctx_req);
++		if (err)
++			dev_err(rvu->dev, "SQ ctx disable failed\n");
++	}
++
++	if (pfvf->rq_ctx) {
++		ctx_req.ctype = NIX_AQ_CTYPE_RQ;
++		err = nix_lf_hwctx_disable(rvu, &ctx_req);
++		if (err)
++			dev_err(rvu->dev, "RQ ctx disable failed\n");
++	}
++
++	if (pfvf->cq_ctx) {
++		ctx_req.ctype = NIX_AQ_CTYPE_CQ;
++		err = nix_lf_hwctx_disable(rvu, &ctx_req);
++		if (err)
++			dev_err(rvu->dev, "CQ ctx disable failed\n");
++	}
++
++	nix_ctx_free(rvu, pfvf);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+index 77b8c2e00d86..c0e165dfc403 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+@@ -470,3 +470,20 @@ void rvu_npa_freemem(struct rvu *rvu)
+ 	block = &hw->block[blkaddr];
+ 	rvu_aq_free(rvu, block->aq);
+ }
++
++void rvu_npa_lf_teardown(struct rvu *rvu, u16 pcifunc, int npalf)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	struct hwctx_disable_req ctx_req;
++
++	/* Disable all pools */
++	ctx_req.hdr.pcifunc = pcifunc;
++	ctx_req.ctype = NPA_AQ_CTYPE_POOL;
++	npa_lf_hwctx_disable(rvu, &ctx_req);
++
++	/* Disable all auras */
++	ctx_req.ctype = NPA_AQ_CTYPE_AURA;
++	npa_lf_hwctx_disable(rvu, &ctx_req);
++
++	npa_ctx_free(rvu, pfvf);
++}
+-- 
+2.17.1
+

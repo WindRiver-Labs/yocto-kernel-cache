@@ -1,0 +1,212 @@
+From 3b43b3f0f59dd55fbc0dfbcad43ec60caa03bf89 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 16 Oct 2018 16:57:18 +0530
+Subject: [PATCH 034/255] octeontx2-af: Alloc bitmaps for NIX Tx scheduler
+ queues
+
+commit 709a4f0c254c06289283593b92b233451656bac3 upstream
+
+Allocate bitmaps and memory for PFVF mapping info for
+maintaining NIX transmit scheduler queues maintenance.
+PF/VF drivers will request for alloc, free e.t.c of
+Tx schedulers via mailbox.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/common.h    | 11 +++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   | 16 ++++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 88 ++++++++++++++++++-
+ 3 files changed, 114 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/common.h b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+index dc55e3416daa..28eb691185f4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+@@ -132,6 +132,17 @@ struct npa_aq_pool_res {
+ 	struct	npa_pool_s	ctx_mask;
+ };
+ 
++/* NIX Transmit schedulers */
++enum nix_scheduler {
++	NIX_TXSCH_LVL_SMQ = 0x0,
++	NIX_TXSCH_LVL_MDQ = 0x0,
++	NIX_TXSCH_LVL_TL4 = 0x1,
++	NIX_TXSCH_LVL_TL3 = 0x2,
++	NIX_TXSCH_LVL_TL2 = 0x3,
++	NIX_TXSCH_LVL_TL1 = 0x4,
++	NIX_TXSCH_LVL_CNT = 0x5,
++};
++
+ /* NIX LSO format indices.
+  * As of now TSO is the only one using, so statically assigning indices.
+  */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index d6aca2e23d79..135f2638dd96 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -91,12 +91,28 @@ struct rvu_pfvf {
+ 	u8		mac_addr[ETH_ALEN]; /* MAC address of this PF/VF */
+ };
+ 
++struct nix_txsch {
++	struct rsrc_bmap schq;
++	u8   lvl;
++	u16  *pfvf_map;
++};
++
++struct nix_hw {
++	struct nix_txsch txsch[NIX_TXSCH_LVL_CNT]; /* Tx schedulers */
++};
++
+ struct rvu_hwinfo {
+ 	u8	total_pfs;   /* MAX RVU PFs HW supports */
+ 	u16	total_vfs;   /* Max RVU VFs HW supports */
+ 	u16	max_vfs_per_pf; /* Max VFs that can be attached to a PF */
++	u8	cgx;
++	u8	lmac_per_cgx;
++	u8	cgx_links;
++	u8	lbk_links;
++	u8	sdp_links;
+ 
+ 	struct rvu_block block[BLK_COUNT]; /* Block info */
++	struct nix_hw    *nix0;
+ };
+ 
+ struct rvu {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 401f87fc5415..4d4cf5a1ac41 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -346,6 +346,60 @@ int rvu_mbox_handler_NIX_LF_FREE(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
++static inline struct nix_hw *get_nix_hw(struct rvu_hwinfo *hw, int blkaddr)
++{
++	if (blkaddr == BLKADDR_NIX0 && hw->nix0)
++		return hw->nix0;
++
++	return NULL;
++}
++
++static int nix_setup_txschq(struct rvu *rvu, struct nix_hw *nix_hw, int blkaddr)
++{
++	struct nix_txsch *txsch;
++	u64 cfg, reg;
++	int err, lvl;
++
++	/* Get scheduler queue count of each type and alloc
++	 * bitmap for each for alloc/free/attach operations.
++	 */
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
++		txsch = &nix_hw->txsch[lvl];
++		txsch->lvl = lvl;
++		switch (lvl) {
++		case NIX_TXSCH_LVL_SMQ:
++			reg = NIX_AF_MDQ_CONST;
++			break;
++		case NIX_TXSCH_LVL_TL4:
++			reg = NIX_AF_TL4_CONST;
++			break;
++		case NIX_TXSCH_LVL_TL3:
++			reg = NIX_AF_TL3_CONST;
++			break;
++		case NIX_TXSCH_LVL_TL2:
++			reg = NIX_AF_TL2_CONST;
++			break;
++		case NIX_TXSCH_LVL_TL1:
++			reg = NIX_AF_TL1_CONST;
++			break;
++		}
++		cfg = rvu_read64(rvu, blkaddr, reg);
++		txsch->schq.max = cfg & 0xFFFF;
++		err = rvu_alloc_bitmap(&txsch->schq);
++		if (err)
++			return err;
++
++		/* Allocate memory for scheduler queues to
++		 * PF/VF pcifunc mapping info.
++		 */
++		txsch->pfvf_map = devm_kcalloc(rvu->dev, txsch->schq.max,
++					       sizeof(u16), GFP_KERNEL);
++		if (!txsch->pfvf_map)
++			return -ENOMEM;
++	}
++	return 0;
++}
++
+ static int nix_calibrate_x2p(struct rvu *rvu, int blkaddr)
+ {
+ 	int idx, err;
+@@ -431,6 +485,7 @@ int rvu_nix_init(struct rvu *rvu)
+ 	struct rvu_hwinfo *hw = rvu->hw;
+ 	struct rvu_block *block;
+ 	int blkaddr, err;
++	u64 cfg;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, 0);
+ 	if (blkaddr < 0)
+@@ -442,6 +497,14 @@ int rvu_nix_init(struct rvu *rvu)
+ 	if (err)
+ 		return err;
+ 
++	/* Set num of links of each type */
++	cfg = rvu_read64(rvu, blkaddr, NIX_AF_CONST);
++	hw->cgx = (cfg >> 12) & 0xF;
++	hw->lmac_per_cgx = (cfg >> 8) & 0xF;
++	hw->cgx_links = hw->cgx * hw->lmac_per_cgx;
++	hw->lbk_links = 1;
++	hw->sdp_links = 1;
++
+ 	/* Initialize admin queue */
+ 	err = nix_aq_init(rvu, block);
+ 	if (err)
+@@ -453,6 +516,16 @@ int rvu_nix_init(struct rvu *rvu)
+ 	/* Configure segmentation offload formats */
+ 	nix_setup_lso(rvu, blkaddr);
+ 
++	if (blkaddr == BLKADDR_NIX0) {
++		hw->nix0 = devm_kzalloc(rvu->dev,
++					sizeof(struct nix_hw), GFP_KERNEL);
++		if (!hw->nix0)
++			return -ENOMEM;
++
++		err = nix_setup_txschq(rvu, hw->nix0, blkaddr);
++		if (err)
++			return err;
++	}
+ 	return 0;
+ }
+ 
+@@ -460,7 +533,9 @@ void rvu_nix_freemem(struct rvu *rvu)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
+ 	struct rvu_block *block;
+-	int blkaddr;
++	struct nix_txsch *txsch;
++	struct nix_hw *nix_hw;
++	int blkaddr, lvl;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, 0);
+ 	if (blkaddr < 0)
+@@ -468,4 +543,15 @@ void rvu_nix_freemem(struct rvu *rvu)
+ 
+ 	block = &hw->block[blkaddr];
+ 	rvu_aq_free(rvu, block->aq);
++
++	if (blkaddr == BLKADDR_NIX0) {
++		nix_hw = get_nix_hw(rvu->hw, blkaddr);
++		if (!nix_hw)
++			return;
++
++		for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
++			txsch = &nix_hw->txsch[lvl];
++			kfree(txsch->schq.bmap);
++		}
++	}
+ }
+-- 
+2.17.1
+

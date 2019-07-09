@@ -1,0 +1,421 @@
+From 46c9e3fcfb5547be19d25acaf98ab37473b4c794 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 16 Oct 2018 16:57:11 +0530
+Subject: [PATCH 027/255] octeontx2-af: NPA block admin queue init
+
+commit 7a37245ef23f75223263930e086aa0a8678e161f upstream
+
+Initialize NPA admin queue (AQ) i.e alloc memory for
+AQ instructions and for the results. All NPA LFs will submit
+instructions to AQ to init/write/read Aura/Pool contexts
+and in case of read, get context from result memory.
+
+Added some common APIs for allocating memory for a queue
+and get IOVA in return, these APIs will be used by
+NIX AQ and for other purposes.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/Makefile    |  2 +-
+ .../ethernet/marvell/octeontx2/af/common.h    | 99 +++++++++++++++++++
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   | 46 +++++++++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   | 13 ++-
+ .../ethernet/marvell/octeontx2/af/rvu_npa.c   | 86 ++++++++++++++++
+ .../marvell/octeontx2/af/rvu_struct.h         | 65 ++++++++++++
+ 6 files changed, 309 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/af/common.h
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/Makefile b/drivers/net/ethernet/marvell/octeontx2/af/Makefile
+index eaac26424486..bdb4f98572a0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/Makefile
++++ b/drivers/net/ethernet/marvell/octeontx2/af/Makefile
+@@ -7,4 +7,4 @@ obj-$(CONFIG_OCTEONTX2_MBOX) += octeontx2_mbox.o
+ obj-$(CONFIG_OCTEONTX2_AF) += octeontx2_af.o
+ 
+ octeontx2_mbox-y := mbox.o
+-octeontx2_af-y := cgx.o rvu.o rvu_cgx.o
++octeontx2_af-y := cgx.o rvu.o rvu_cgx.o rvu_npa.o
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/common.h b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+new file mode 100644
+index 000000000000..ec493bad33fc
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+@@ -0,0 +1,99 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Marvell OcteonTx2 RVU Admin Function driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef COMMON_H
++#define COMMON_H
++
++#include "rvu_struct.h"
++
++#define OTX2_ALIGN			128  /* Align to cacheline */
++
++#define Q_SIZE_16		0ULL /* 16 entries */
++#define Q_SIZE_64		1ULL /* 64 entries */
++#define Q_SIZE_256		2ULL
++#define Q_SIZE_1K		3ULL
++#define Q_SIZE_4K		4ULL
++#define Q_SIZE_16K		5ULL
++#define Q_SIZE_64K		6ULL
++#define Q_SIZE_256K		7ULL
++#define Q_SIZE_1M		8ULL /* Million entries */
++#define Q_SIZE_MIN		Q_SIZE_16
++#define Q_SIZE_MAX		Q_SIZE_1M
++
++#define Q_COUNT(x)		(16ULL << (2 * x))
++#define Q_SIZE(x, n)		((ilog2(x) - (n)) / 2)
++
++/* Admin queue info */
++
++/* Since we intend to add only one instruction at a time,
++ * keep queue size to it's minimum.
++ */
++#define AQ_SIZE			Q_SIZE_16
++/* HW head & tail pointer mask */
++#define AQ_PTR_MASK		0xFFFFF
++
++struct qmem {
++	void            *base;
++	dma_addr_t	iova;
++	int		alloc_sz;
++	u8		entry_sz;
++	u8		align;
++	u32		qsize;
++};
++
++static inline int qmem_alloc(struct device *dev, struct qmem **q,
++			     int qsize, int entry_sz)
++{
++	struct qmem *qmem;
++	int aligned_addr;
++
++	if (!qsize)
++		return -EINVAL;
++
++	*q = devm_kzalloc(dev, sizeof(*qmem), GFP_KERNEL);
++	if (!*q)
++		return -ENOMEM;
++	qmem = *q;
++
++	qmem->entry_sz = entry_sz;
++	qmem->alloc_sz = (qsize * entry_sz) + OTX2_ALIGN;
++	qmem->base = dma_zalloc_coherent(dev, qmem->alloc_sz,
++					 &qmem->iova, GFP_KERNEL);
++	if (!qmem->base)
++		return -ENOMEM;
++
++	qmem->qsize = qsize;
++
++	aligned_addr = ALIGN((u64)qmem->iova, OTX2_ALIGN);
++	qmem->align = (aligned_addr - qmem->iova);
++	qmem->base += qmem->align;
++	qmem->iova += qmem->align;
++	return 0;
++}
++
++static inline void qmem_free(struct device *dev, struct qmem *qmem)
++{
++	if (!qmem)
++		return;
++
++	if (qmem->base)
++		dma_free_coherent(dev, qmem->alloc_sz,
++				  qmem->base - qmem->align,
++				  qmem->iova - qmem->align);
++	devm_kfree(dev, qmem);
++}
++
++struct admin_queue {
++	struct qmem	*inst;
++	struct qmem	*res;
++	spinlock_t	lock; /* Serialize inst enqueue from PFs */
++};
++
++#endif /* COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 85994ab3ed17..14255f2a78db 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -552,6 +552,8 @@ static void rvu_free_hw_resources(struct rvu *rvu)
+ 	int id, max_msix;
+ 	u64 cfg;
+ 
++	rvu_npa_freemem(rvu);
++
+ 	/* Free block LF bitmaps */
+ 	for (id = 0; id < BLK_COUNT; id++) {
+ 		block = &hw->block[id];
+@@ -755,6 +757,50 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 		rvu_scan_block(rvu, block);
+ 	}
+ 
++	err = rvu_npa_init(rvu);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++/* NPA and NIX admin queue APIs */
++void rvu_aq_free(struct rvu *rvu, struct admin_queue *aq)
++{
++	if (!aq)
++		return;
++
++	qmem_free(rvu->dev, aq->inst);
++	qmem_free(rvu->dev, aq->res);
++	devm_kfree(rvu->dev, aq);
++}
++
++int rvu_aq_alloc(struct rvu *rvu, struct admin_queue **ad_queue,
++		 int qsize, int inst_size, int res_size)
++{
++	struct admin_queue *aq;
++	int err;
++
++	*ad_queue = devm_kzalloc(rvu->dev, sizeof(*aq), GFP_KERNEL);
++	if (!*ad_queue)
++		return -ENOMEM;
++	aq = *ad_queue;
++
++	/* Alloc memory for instructions i.e AQ */
++	err = qmem_alloc(rvu->dev, &aq->inst, qsize, inst_size);
++	if (err) {
++		devm_kfree(rvu->dev, aq);
++		return err;
++	}
++
++	/* Alloc memory for results */
++	err = qmem_alloc(rvu->dev, &aq->res, qsize, res_size);
++	if (err) {
++		rvu_aq_free(rvu, aq);
++		return err;
++	}
++
++	spin_lock_init(&aq->lock);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 88454cb90bb4..999dc2c3a03c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -12,6 +12,7 @@
+ #define RVU_H
+ 
+ #include "rvu_struct.h"
++#include "common.h"
+ #include "mbox.h"
+ 
+ /* PCI device IDs */
+@@ -41,7 +42,8 @@ struct rsrc_bmap {
+ };
+ 
+ struct rvu_block {
+-	struct rsrc_bmap lf;
++	struct rsrc_bmap	lf;
++	struct admin_queue	*aq; /* NIX/NPA AQ */
+ 	u16  *fn_map; /* LF to pcifunc mapping */
+ 	bool multislot;
+ 	bool implemented;
+@@ -155,6 +157,11 @@ int rvu_get_lf(struct rvu *rvu, struct rvu_block *block, u16 pcifunc, u16 slot);
+ int rvu_get_blkaddr(struct rvu *rvu, int blktype, u16 pcifunc);
+ int rvu_poll_reg(struct rvu *rvu, u64 block, u64 offset, u64 mask, bool zero);
+ 
++/* NPA/NIX AQ APIs */
++int rvu_aq_alloc(struct rvu *rvu, struct admin_queue **ad_queue,
++		 int qsize, int inst_size, int res_size);
++void rvu_aq_free(struct rvu *rvu, struct admin_queue *aq);
++
+ /* CGX APIs */
+ static inline bool is_pf_cgxmapped(struct rvu *rvu, u8 pf)
+ {
+@@ -196,4 +203,8 @@ int rvu_mbox_handler_CGX_INTLBK_ENABLE(struct rvu *rvu, struct msg_req *req,
+ 				       struct msg_rsp *rsp);
+ int rvu_mbox_handler_CGX_INTLBK_DISABLE(struct rvu *rvu, struct msg_req *req,
+ 					struct msg_rsp *rsp);
++
++/* NPA APIs */
++int rvu_npa_init(struct rvu *rvu);
++int rvu_npa_freemem(struct rvu *rvu);
+ #endif /* RVU_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+new file mode 100644
+index 000000000000..506e6ae50c9c
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 RVU Admin Function driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/pci.h>
++
++#include "rvu_struct.h"
++#include "rvu_reg.h"
++#include "rvu.h"
++
++static int npa_aq_init(struct rvu *rvu, struct rvu_block *block)
++{
++	u64 cfg;
++	int err;
++
++	/* Set admin queue endianness */
++	cfg = rvu_read64(rvu, block->addr, NPA_AF_GEN_CFG);
++#ifdef __BIG_ENDIAN
++	cfg |= BIT_ULL(1);
++	rvu_write64(rvu, block->addr, NPA_AF_GEN_CFG, cfg);
++#else
++	cfg &= ~BIT_ULL(1);
++	rvu_write64(rvu, block->addr, NPA_AF_GEN_CFG, cfg);
++#endif
++
++	/* Do not bypass NDC cache */
++	cfg = rvu_read64(rvu, block->addr, NPA_AF_NDC_CFG);
++	cfg &= ~0x03DULL;
++	rvu_write64(rvu, block->addr, NPA_AF_NDC_CFG, cfg);
++
++	/* Result structure can be followed by Aura/Pool context at
++	 * RES + 128bytes and a write mask at RES + 256 bytes, depending on
++	 * operation type. Alloc sufficient result memory for all operations.
++	 */
++	err = rvu_aq_alloc(rvu, &block->aq,
++			   Q_COUNT(AQ_SIZE), sizeof(struct npa_aq_inst_s),
++			   ALIGN(sizeof(struct npa_aq_res_s), 128) + 256);
++	if (err)
++		return err;
++
++	rvu_write64(rvu, block->addr, NPA_AF_AQ_CFG, AQ_SIZE);
++	rvu_write64(rvu, block->addr,
++		    NPA_AF_AQ_BASE, (u64)block->aq->inst->iova);
++	return 0;
++}
++
++int rvu_npa_init(struct rvu *rvu)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	int blkaddr, err;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, 0);
++	if (blkaddr < 0)
++		return 0;
++
++	block = &hw->block[blkaddr];
++
++	/* Initialize admin queue */
++	err = npa_aq_init(rvu, &hw->block[blkaddr]);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++void rvu_npa_freemem(struct rvu *rvu)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	int blkaddr, err;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, 0);
++	if (blkaddr < 0)
++		return;
++
++	block = &hw->block[blkaddr];
++	rvu_aq_free(rvu, &block->aq);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
+index 92e05817ffe7..ae1c18d75cb6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
+@@ -71,4 +71,69 @@ enum rvu_pf_int_vec_e {
+ 	RVU_PF_INT_VEC_CNT	  = 0x7,
+ };
+ 
++/* NPA admin queue completion enumeration */
++enum npa_aq_comp {
++	NPA_AQ_COMP_NOTDONE    = 0x0,
++	NPA_AQ_COMP_GOOD       = 0x1,
++	NPA_AQ_COMP_SWERR      = 0x2,
++	NPA_AQ_COMP_CTX_POISON = 0x3,
++	NPA_AQ_COMP_CTX_FAULT  = 0x4,
++	NPA_AQ_COMP_LOCKERR    = 0x5,
++};
++
++/* NPA admin queue context types */
++enum npa_aq_ctype {
++	NPA_AQ_CTYPE_AURA = 0x0,
++	NPA_AQ_CTYPE_POOL = 0x1,
++};
++
++/* NPA admin queue instruction opcodes */
++enum npa_aq_instop {
++	NPA_AQ_INSTOP_NOP    = 0x0,
++	NPA_AQ_INSTOP_INIT   = 0x1,
++	NPA_AQ_INSTOP_WRITE  = 0x2,
++	NPA_AQ_INSTOP_READ   = 0x3,
++	NPA_AQ_INSTOP_LOCK   = 0x4,
++	NPA_AQ_INSTOP_UNLOCK = 0x5,
++};
++
++/* NPA admin queue instruction structure */
++struct npa_aq_inst_s {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 doneint               : 1;	/* W0 */
++	u64 reserved_44_62        : 19;
++	u64 cindex                : 20;
++	u64 reserved_17_23        : 7;
++	u64 lf                    : 9;
++	u64 ctype                 : 4;
++	u64 op                    : 4;
++#else
++	u64 op                    : 4;
++	u64 ctype                 : 4;
++	u64 lf                    : 9;
++	u64 reserved_17_23        : 7;
++	u64 cindex                : 20;
++	u64 reserved_44_62        : 19;
++	u64 doneint               : 1;
++#endif
++	u64 res_addr;			/* W1 */
++};
++
++/* NPA admin queue result structure */
++struct npa_aq_res_s {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 reserved_17_63        : 47; /* W0 */
++	u64 doneint               : 1;
++	u64 compcode              : 8;
++	u64 ctype                 : 4;
++	u64 op                    : 4;
++#else
++	u64 op                    : 4;
++	u64 ctype                 : 4;
++	u64 compcode              : 8;
++	u64 doneint               : 1;
++	u64 reserved_17_63        : 47;
++#endif
++	u64 reserved_64_127;		/* W1 */
++};
+ #endif /* RVU_STRUCT_H */
+-- 
+2.17.1
+

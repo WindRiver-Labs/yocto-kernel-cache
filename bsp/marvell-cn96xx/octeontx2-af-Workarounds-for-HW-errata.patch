@@ -1,0 +1,153 @@
+From bd88c62c1e6ed307150ed497a3127bb505842fb8 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 19 Nov 2018 16:17:43 +0530
+Subject: [PATCH 078/255] octeontx2-af: Workarounds for HW errata
+
+commit e12890f44ca22a853df3be0eb7b25819162bdc72 upstream
+
+Errata 35038
+  Software sets NIX_AF_RX_SW_SYNC[ENA] to sync (flush) in-flight packets
+  the RX data path before configuration changes (e.g. disabling one or
+  more RQs). Hardware clears [ENA] to indicate sync is done
+
+  An issue exists whereby NIX may clear NIX_AF_RX_SW_SYNC [ENA] too
+  early.
+
+Errata 35057
+  NIX may corrupt internal state when conditional clocks turn off.
+  So turnon all clocks by default.
+
+Errata 35786
+ Parse nibble enable NPC configuration for KEY generation has to be
+ identical for both Rx and Tx interfaces.
+
+Also corrected endianness configuration for NIX i.e NIX_AF_CFG[AF_BE]
+is bit8 and not bit1.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Jerin Jacob <jerinj@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.h    | 12 ++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c    | 18 ++++++++++++++++--
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c    | 12 +++++++++---
+ 3 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 8936cfbf10e0..c8409bc5d9c3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -11,6 +11,7 @@
+ #ifndef RVU_H
+ #define RVU_H
+ 
++#include <linux/pci.h>
+ #include "rvu_struct.h"
+ #include "common.h"
+ #include "mbox.h"
+@@ -18,6 +19,9 @@
+ /* PCI device IDs */
+ #define	PCI_DEVID_OCTEONTX2_RVU_AF		0xA065
+ 
++/* Subsystem Device ID */
++#define PCI_SUBSYS_DEVID_96XX                  0xB200
++
+ /* PCI BAR nos */
+ #define	PCI_AF_REG_BAR_NUM			0
+ #define	PCI_PF_REG_BAR_NUM			2
+@@ -255,6 +259,14 @@ static inline u64 rvupf_read64(struct rvu *rvu, u64 offset)
+ 	return readq(rvu->pfreg_base + offset);
+ }
+ 
++static inline bool is_rvu_9xxx_A0(struct rvu *rvu)
++{
++	struct pci_dev *pdev = rvu->pdev;
++
++	return (pdev->revision == 0x00) &&
++		(pdev->subsystem_device == PCI_SUBSYS_DEVID_96XX);
++}
++
+ /* Function Prototypes
+  * RVU
+  */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index e46db89e91f9..b7998f6be386 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -114,6 +114,12 @@ static void nix_rx_sync(struct rvu *rvu, int blkaddr)
+ 	err = rvu_poll_reg(rvu, blkaddr, NIX_AF_RX_SW_SYNC, BIT_ULL(0), true);
+ 	if (err)
+ 		dev_err(rvu->dev, "NIX RX software sync failed\n");
++
++	/* As per a HW errata in 9xxx A0 silicon, HW may clear SW_SYNC[ENA]
++	 * bit too early. Hence wait for 50us more.
++	 */
++	if (is_rvu_9xxx_A0(rvu))
++		usleep_range(50, 60);
+ }
+ 
+ static bool is_valid_txschq(struct rvu *rvu, int blkaddr,
+@@ -2135,10 +2141,10 @@ static int nix_aq_init(struct rvu *rvu, struct rvu_block *block)
+ 	/* Set admin queue endianness */
+ 	cfg = rvu_read64(rvu, block->addr, NIX_AF_CFG);
+ #ifdef __BIG_ENDIAN
+-	cfg |= BIT_ULL(1);
++	cfg |= BIT_ULL(8);
+ 	rvu_write64(rvu, block->addr, NIX_AF_CFG, cfg);
+ #else
+-	cfg &= ~BIT_ULL(1);
++	cfg &= ~BIT_ULL(8);
+ 	rvu_write64(rvu, block->addr, NIX_AF_CFG, cfg);
+ #endif
+ 
+@@ -2175,6 +2181,14 @@ int rvu_nix_init(struct rvu *rvu)
+ 		return 0;
+ 	block = &hw->block[blkaddr];
+ 
++	/* As per a HW errata in 9xxx A0 silicon, NIX may corrupt
++	 * internal state when conditional clocks are turned off.
++	 * Hence enable them.
++	 */
++	if (is_rvu_9xxx_A0(rvu))
++		rvu_write64(rvu, blkaddr, NIX_AF_CFG,
++			    rvu_read64(rvu, blkaddr, NIX_AF_CFG) | 0x5EULL);
++
+ 	/* Calibrate X2P bus to check if CGX/LBK links are fine */
+ 	err = nix_calibrate_x2p(rvu, blkaddr);
+ 	if (err)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index d93397e27e05..6ea2b0e2df42 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -970,7 +970,7 @@ int rvu_npc_init(struct rvu *rvu)
+ 	struct npc_pkind *pkind = &rvu->hw->pkind;
+ 	u64 keyz = NPC_MCAM_KEY_X2;
+ 	int blkaddr, entry, bank, err;
+-	u64 cfg;
++	u64 cfg, nibble_ena;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+ 	if (blkaddr < 0) {
+@@ -1019,10 +1019,16 @@ int rvu_npc_init(struct rvu *rvu)
+ 	/* Set RX and TX side MCAM search key size.
+ 	 * LA..LD (ltype only) + Channel
+ 	 */
++	nibble_ena = 0x49247;
+ 	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_KEX_CFG(NIX_INTF_RX),
+-			((keyz & 0x3) << 32) | 0x49247);
++			((keyz & 0x3) << 32) | nibble_ena);
++	/* Due to an errata (35786) in A0 pass silicon, parse nibble enable
++	 * configuration has to be identical for both Rx and Tx interfaces.
++	 */
++	if (!is_rvu_9xxx_A0(rvu))
++		nibble_ena = (1ULL << 19) - 1;
+ 	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_KEX_CFG(NIX_INTF_TX),
+-			((keyz & 0x3) << 32) | ((1ULL << 19) - 1));
++			((keyz & 0x3) << 32) | nibble_ena);
+ 
+ 	err = npc_mcam_rsrcs_init(rvu, blkaddr);
+ 	if (err)
+-- 
+2.17.1
+

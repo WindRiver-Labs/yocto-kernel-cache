@@ -1,0 +1,224 @@
+From 0aac84c2120f74d9e356cf5a68e35608c842f195 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 16 Oct 2018 16:57:17 +0530
+Subject: [PATCH 033/255] octeontx2-af: NIX LSO config for TSOv4/v6 offload
+
+commit 59360e9809daecb59c3c42ee10918155bfded615 upstream
+
+Config LSO formats for TSOv4 and TSOv6 offloads.
+These formats tell HW which fields in the TCP packet's
+headers have to be updated while performing segmentation
+offload.
+
+Also report PF/VF drivers the LSO format indices as part
+of response to NIX_LF_ALLOC mbox msg. These indices are
+used in SQE extension headers while framing SQE for pkt
+transmission with TSO offload.
+
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/common.h    |  6 ++
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  2 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 95 +++++++++++++++++++
+ .../marvell/octeontx2/af/rvu_struct.h         | 35 +++++++
+ 4 files changed, 138 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/common.h b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+index d183ad89a3f7..dc55e3416daa 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/common.h
+@@ -132,6 +132,12 @@ struct npa_aq_pool_res {
+ 	struct	npa_pool_s	ctx_mask;
+ };
+ 
++/* NIX LSO format indices.
++ * As of now TSO is the only one using, so statically assigning indices.
++ */
++#define NIX_LSO_FORMAT_IDX_TSOV4	0
++#define NIX_LSO_FORMAT_IDX_TSOV6	1
++
+ /* RSS info */
+ #define MAX_RSS_GROUPS			8
+ /* Group 0 has to be used in default pkt forwarding MCAM entries
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 5718b55b2608..2f24e5d29cdc 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -374,6 +374,8 @@ struct nix_lf_alloc_req {
+ struct nix_lf_alloc_rsp {
+ 	struct mbox_msghdr hdr;
+ 	u16	sqb_size;
++	u8	lso_tsov4_idx;
++	u8	lso_tsov6_idx;
+ 	u8      mac_addr[ETH_ALEN];
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 1f41c7c76417..401f87fc5415 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -16,6 +16,96 @@
+ #include "rvu.h"
+ #include "cgx.h"
+ 
++static void nix_setup_lso_tso_l3(struct rvu *rvu, int blkaddr,
++				 u64 format, bool v4, u64 *fidx)
++{
++	struct nix_lso_format field = {0};
++
++	/* IP's Length field */
++	field.layer = NIX_TXLAYER_OL3;
++	/* In ipv4, length field is at offset 2 bytes, for ipv6 it's 4 */
++	field.offset = v4 ? 2 : 4;
++	field.sizem1 = 1; /* i.e 2 bytes */
++	field.alg = NIX_LSOALG_ADD_PAYLEN;
++	rvu_write64(rvu, blkaddr,
++		    NIX_AF_LSO_FORMATX_FIELDX(format, (*fidx)++),
++		    *(u64 *)&field);
++
++	/* No ID field in IPv6 header */
++	if (!v4)
++		return;
++
++	/* IP's ID field */
++	field.layer = NIX_TXLAYER_OL3;
++	field.offset = 4;
++	field.sizem1 = 1; /* i.e 2 bytes */
++	field.alg = NIX_LSOALG_ADD_SEGNUM;
++	rvu_write64(rvu, blkaddr,
++		    NIX_AF_LSO_FORMATX_FIELDX(format, (*fidx)++),
++		    *(u64 *)&field);
++}
++
++static void nix_setup_lso_tso_l4(struct rvu *rvu, int blkaddr,
++				 u64 format, u64 *fidx)
++{
++	struct nix_lso_format field = {0};
++
++	/* TCP's sequence number field */
++	field.layer = NIX_TXLAYER_OL4;
++	field.offset = 4;
++	field.sizem1 = 3; /* i.e 4 bytes */
++	field.alg = NIX_LSOALG_ADD_OFFSET;
++	rvu_write64(rvu, blkaddr,
++		    NIX_AF_LSO_FORMATX_FIELDX(format, (*fidx)++),
++		    *(u64 *)&field);
++
++	/* TCP's flags field */
++	field.layer = NIX_TXLAYER_OL4;
++	field.offset = 12;
++	field.sizem1 = 0; /* not needed */
++	field.alg = NIX_LSOALG_TCP_FLAGS;
++	rvu_write64(rvu, blkaddr,
++		    NIX_AF_LSO_FORMATX_FIELDX(format, (*fidx)++),
++		    *(u64 *)&field);
++}
++
++static void nix_setup_lso(struct rvu *rvu, int blkaddr)
++{
++	u64 cfg, idx, fidx = 0;
++
++	/* Enable LSO */
++	cfg = rvu_read64(rvu, blkaddr, NIX_AF_LSO_CFG);
++	/* For TSO, set first and middle segment flags to
++	 * mask out PSH, RST & FIN flags in TCP packet
++	 */
++	cfg &= ~((0xFFFFULL << 32) | (0xFFFFULL << 16));
++	cfg |= (0xFFF2ULL << 32) | (0xFFF2ULL << 16);
++	rvu_write64(rvu, blkaddr, NIX_AF_LSO_CFG, cfg | BIT_ULL(63));
++
++	/* Configure format fields for TCPv4 segmentation offload */
++	idx = NIX_LSO_FORMAT_IDX_TSOV4;
++	nix_setup_lso_tso_l3(rvu, blkaddr, idx, true, &fidx);
++	nix_setup_lso_tso_l4(rvu, blkaddr, idx, &fidx);
++
++	/* Set rest of the fields to NOP */
++	for (; fidx < 8; fidx++) {
++		rvu_write64(rvu, blkaddr,
++			    NIX_AF_LSO_FORMATX_FIELDX(idx, fidx), 0x0ULL);
++	}
++
++	/* Configure format fields for TCPv6 segmentation offload */
++	idx = NIX_LSO_FORMAT_IDX_TSOV6;
++	fidx = 0;
++	nix_setup_lso_tso_l3(rvu, blkaddr, idx, false, &fidx);
++	nix_setup_lso_tso_l4(rvu, blkaddr, idx, &fidx);
++
++	/* Set rest of the fields to NOP */
++	for (; fidx < 8; fidx++) {
++		rvu_write64(rvu, blkaddr,
++			    NIX_AF_LSO_FORMATX_FIELDX(idx, fidx), 0x0ULL);
++	}
++}
++
+ static void nix_ctx_free(struct rvu *rvu, struct rvu_pfvf *pfvf)
+ {
+ 	if (pfvf->rq_ctx)
+@@ -219,6 +309,8 @@ int rvu_mbox_handler_NIX_LF_ALLOC(struct rvu *rvu,
+ 	/* set SQB size info */
+ 	cfg = rvu_read64(rvu, blkaddr, NIX_AF_SQ_CONST);
+ 	rsp->sqb_size = (cfg >> 34) & 0xFFFF;
++	rsp->lso_tsov4_idx = NIX_LSO_FORMAT_IDX_TSOV4;
++	rsp->lso_tsov6_idx = NIX_LSO_FORMAT_IDX_TSOV6;
+ 	return rc;
+ }
+ 
+@@ -358,6 +450,9 @@ int rvu_nix_init(struct rvu *rvu)
+ 	/* Restore CINT timer delay to HW reset values */
+ 	rvu_write64(rvu, blkaddr, NIX_AF_CINT_DELAY, 0x0ULL);
+ 
++	/* Configure segmentation offload formats */
++	nix_setup_lso(rvu, blkaddr);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
+index 0981f67d6175..fe55f09e9ef3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
+@@ -426,4 +426,39 @@ struct nix_aq_res_s {
+ 	u64 reserved_64_127;		/* W1 */
+ };
+ 
++enum nix_lsoalg {
++	NIX_LSOALG_NOP,
++	NIX_LSOALG_ADD_SEGNUM,
++	NIX_LSOALG_ADD_PAYLEN,
++	NIX_LSOALG_ADD_OFFSET,
++	NIX_LSOALG_TCP_FLAGS,
++};
++
++enum nix_txlayer {
++	NIX_TXLAYER_OL3,
++	NIX_TXLAYER_OL4,
++	NIX_TXLAYER_IL3,
++	NIX_TXLAYER_IL4,
++};
++
++struct nix_lso_format {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 rsvd_19_63		: 45;
++	u64 alg			: 3;
++	u64 rsvd_14_15		: 2;
++	u64 sizem1		: 2;
++	u64 rsvd_10_11		: 2;
++	u64 layer		: 2;
++	u64 offset		: 8;
++#else
++	u64 offset		: 8;
++	u64 layer		: 2;
++	u64 rsvd_10_11		: 2;
++	u64 sizem1		: 2;
++	u64 rsvd_14_15		: 2;
++	u64 alg			: 3;
++	u64 rsvd_19_63		: 45;
++#endif
++};
++
+ #endif /* RVU_STRUCT_H */
+-- 
+2.17.1
+

@@ -1,0 +1,256 @@
+From 8a123a4cc4bbd3fa056d3e08d3a68745d499ed1d Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Tue, 26 Mar 2019 10:51:55 +0530
+Subject: [PATCH 182/255] octeontx2-af: Add support for importing firmware data
+
+commit 40a9a9cc5bc5b162f72c31386f715373daf66f01 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Firmware data is essentially a block of one time configuration data
+exported from firmware to kernel through shared memory. Base address
+of this memory is obtained through CGX firmware interface commands.
+
+With this in place, MAC address of CGX mapped functions are inited
+from firmware data if available else they are inited with
+random MAC address.
+
+Change-Id: I51e8cd0c4cac66f89f6411587ccc418bc3c08394
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/cgx.c   | 18 +++++
+ .../net/ethernet/marvell/octeontx2/af/cgx.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/cgx_fw_if.h |  7 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   | 69 ++++++++++++++++++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   | 22 ++++++
+ 5 files changed, 114 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index 555cdcb0a363..87f96ba1e8ef 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -792,6 +792,24 @@ int cgx_lmac_evh_unregister(void *cgxd, int lmac_id)
+ }
+ EXPORT_SYMBOL(cgx_lmac_evh_unregister);
+ 
++int cgx_get_fwdata_base(u64 *base)
++{
++	u64 req = 0, resp;
++	struct cgx *cgx;
++	int err;
++
++	cgx = list_first_entry(&cgx_list, struct cgx, cgx_list);
++	if (!cgx)
++		return -ENXIO;
++
++	req = FIELD_SET(CMDREG_ID, CGX_CMD_GET_FWD_BASE, req);
++	err = cgx_fwi_cmd_generic(req, &resp, cgx, 0);
++	if (!err)
++		*base = FIELD_GET(RESP_FWD_BASE, resp);
++
++	return err;
++}
++
+ static int cgx_fwi_link_change(struct cgx *cgx, int lmac_id, bool enable)
+ {
+ 	u64 req = 0;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+index 8fff5a913f13..65f0fb129ffe 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+@@ -127,6 +127,7 @@ int cgx_lmac_internal_loopback(void *cgxd, int lmac_id, bool enable);
+ int cgx_get_link_info(void *cgxd, int lmac_id,
+ 		      struct cgx_link_user_info *linfo);
+ int cgx_lmac_linkup_start(void *cgxd);
++int cgx_get_fwdata_base(u64 *base);
+ int cgx_get_mkex_prfl_info(u64 *addr, u64 *size);
+ int cgx_lmac_get_pause_frm(void *cgxd, int lmac_id,
+ 			   u8 *tx_pause, u8 *rx_pause);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx_fw_if.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx_fw_if.h
+index 80d2a3a6e416..caa1cc336396 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx_fw_if.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx_fw_if.h
+@@ -81,7 +81,8 @@ enum cgx_cmd_id {
+ 	CGX_CMD_MODE_CHANGE,		/* hot plug support */
+ 	CGX_CMD_INTF_SHUTDOWN,
+ 	CGX_CMD_GET_MKEX_PRFL_SIZE,
+-	CGX_CMD_GET_MKEX_PRFL_ADDR
++	CGX_CMD_GET_MKEX_PRFL_ADDR,
++	CGX_CMD_GET_FWD_BASE,
+ };
+ 
+ /* async event ids */
+@@ -150,6 +151,10 @@ enum cgx_cmd_own {
+  * CGX_STAT_SUCCESS
+  */
+ #define RESP_MKEX_PRFL_ADDR		GENMASK_ULL(63, 9)
++/* Response to cmd ID as CGX_CMD_GET_FWD_BASE with cmd status as
++ * CGX_STAT_SUCCESS
++ */
++#define RESP_FWD_BASE		GENMASK_ULL(56, 9)
+ 
+ /* Response to cmd ID - CGX_CMD_LINK_BRING_UP/DOWN, event ID CGX_EVT_LINK_CHANGE
+  * status can be either CGX_STAT_FAIL or CGX_STAT_SUCCESS
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index dc8dafa54d0a..270242bbf3d8 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -661,6 +661,62 @@ static void rvu_free_hw_resources(struct rvu *rvu)
+ 	mutex_destroy(&rvu->rsrc_lock);
+ }
+ 
++static void rvu_setup_pfvf_macaddress(struct rvu *rvu)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	int pf, vf, numvfs, hwvf;
++	struct rvu_pfvf *pfvf;
++	u64 *mac;
++
++	for (pf = 0; pf < hw->total_pfs; pf++) {
++		if (!is_pf_cgxmapped(rvu, pf))
++			continue;
++		/* Assign MAC address to PF */
++		pfvf = &rvu->pf[pf];
++		mac = &rvu->fwdata->pf_macs[pf];
++		if (rvu->fwdata && pf < PF_MACNUM_MAX && *mac)
++			u64_to_ether_addr(*mac, pfvf->mac_addr);
++		else
++			eth_random_addr(pfvf->mac_addr);
++
++		/* Assign MAC address to VFs*/
++		rvu_get_pf_numvfs(rvu, pf, &numvfs, &hwvf);
++		for (vf = 0; vf < numvfs; vf++, hwvf++) {
++			pfvf =  &rvu->hwvf[hwvf];
++			mac = &rvu->fwdata->vf_macs[hwvf];
++			if (rvu->fwdata && hwvf < VF_MACNUM_MAX && *mac)
++				u64_to_ether_addr(*mac, pfvf->mac_addr);
++			else
++				eth_random_addr(pfvf->mac_addr);
++		}
++	}
++}
++
++static void rvu_fwdata_init(struct rvu *rvu)
++{
++	u64 fwdbase;
++	int err;
++
++	/* Get firmware data base address */
++	err = cgx_get_fwdata_base(&fwdbase);
++	if (err)
++		return;
++	rvu->fwdata = ioremap_wc(fwdbase, sizeof(struct rvu_fwdata));
++	if (!rvu->fwdata)
++		return;
++	if (!is_rvu_fwdata_valid(rvu)) {
++		iounmap(rvu->fwdata);
++		rvu->fwdata = NULL;
++		return;
++	}
++}
++
++static void rvu_fwdata_exit(struct rvu *rvu)
++{
++	if (rvu->fwdata)
++		iounmap(rvu->fwdata);
++}
++
+ static int rvu_setup_hw_resources(struct rvu *rvu)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
+@@ -839,13 +895,18 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 		rvu_scan_block(rvu, block);
+ 	}
+ 
++	rvu_fwdata_init(rvu);
++
+ 	err = rvu_npc_init(rvu);
+ 	if (err)
+-		goto msix_err;
++		goto fwdata_err;
+ 
+ 	err = rvu_cgx_init(rvu);
+ 	if (err)
+-		goto msix_err;
++		goto fwdata_err;
++
++	/* Assign MACs for CGX mapped functions */
++	rvu_setup_pfvf_macaddress(rvu);
+ 
+ 	err = rvu_npa_init(rvu);
+ 	if (err)
+@@ -871,6 +932,8 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 
+ cgx_err:
+ 	rvu_cgx_exit(rvu);
++fwdata_err:
++	rvu_fwdata_exit(rvu);
+ msix_err:
+ 	rvu_reset_msix(rvu);
+ 	return err;
+@@ -2629,6 +2692,7 @@ static int rvu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	rvu_mbox_destroy(&rvu->afpf_wq_info);
+ err_hwsetup:
+ 	rvu_cgx_exit(rvu);
++	rvu_fwdata_exit(rvu);
+ 	rvu_reset_all_blocks(rvu);
+ 	rvu_free_hw_resources(rvu);
+ 	rvu_clear_rvum_blk_revid(rvu);
+@@ -2652,6 +2716,7 @@ static void rvu_remove(struct pci_dev *pdev)
+ 	rvu_unregister_interrupts(rvu);
+ 	rvu_flr_wq_destroy(rvu);
+ 	rvu_cgx_exit(rvu);
++	rvu_fwdata_exit(rvu);
+ 	rvu_mbox_destroy(&rvu->afpf_wq_info);
+ 	rvu_disable_sriov(rvu);
+ 	rvu_reset_all_blocks(rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index d0c4bccc63d5..a6e913439f45 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -329,6 +329,19 @@ struct mbox_wq_info {
+ 	struct workqueue_struct *mbox_wq;
+ };
+ 
++struct rvu_fwdata {
++#define RVU_FWDATA_HEADER_MAGIC	0xCFDA	/*Custom Firmware Data*/
++#define RVU_FWDATA_VERSION	0x0000
++	u32 header_magic;
++	u32 version;		/* version id */
++
++	/* MAC address */
++#define PF_MACNUM_MAX	32
++#define VF_MACNUM_MAX	256
++	u64 pf_macs[PF_MACNUM_MAX];
++	u64 vf_macs[VF_MACNUM_MAX];
++};
++
+ struct rvu {
+ 	void __iomem		*afreg_base;
+ 	void __iomem		*pfreg_base;
+@@ -374,6 +387,9 @@ struct rvu {
+ 
+ 	char mkex_pfl_name[MKEX_NAME_LEN]; /* Configured MKEX profile name */
+ 
++	/* Firmware data */
++	struct rvu_fwdata	*fwdata;
++
+ /* CONFIG_DEBUG_FS */
+ #ifdef CONFIG_DEBUG_FS
+ 	struct rvu_debugfs	rvu_dbg;
+@@ -416,6 +432,12 @@ static inline int is_afvf(u16 pcifunc)
+ 	return !(pcifunc & ~RVU_PFVF_FUNC_MASK);
+ }
+ 
++static inline bool is_rvu_fwdata_valid(struct rvu *rvu)
++{
++	return (rvu->fwdata->header_magic == RVU_FWDATA_HEADER_MAGIC) &&
++		(rvu->fwdata->version == RVU_FWDATA_VERSION);
++}
++
+ int rvu_alloc_bitmap(struct rsrc_bmap *rsrc);
+ int rvu_alloc_rsrc(struct rsrc_bmap *rsrc);
+ void rvu_free_rsrc(struct rsrc_bmap *rsrc, int id);
+-- 
+2.17.1
+

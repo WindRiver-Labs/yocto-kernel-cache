@@ -1,0 +1,102 @@
+From f71a3b5763561d35ac25be9cd212ca54e0740475 Mon Sep 17 00:00:00 2001
+From: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Date: Mon, 25 Mar 2019 15:31:26 +0530
+Subject: [PATCH 170/255] octeontx2-af: enable cgx lmac tx link while flush
+
+commit ebc8dd9e0cf673fc01da3bf462e290a4cc5769ff from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+If CGX transmit is disabled during SMQ flush,
+CGX FIFO might get full and backpressure NIX which in turn
+effects SMQ flush. To address this, enable CGX transmit if
+it is disabled temporarily for SMQ flush to complete.
+
+Change-Id: I46e38169cf694c0a99e0115d6fa5e122984ab67f
+Signed-off-by: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/cgx.c   | 21 +++++++++++++++++++
+ .../net/ethernet/marvell/octeontx2/af/cgx.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 13 +++++++++++-
+ 3 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index 831bb17e1f37..b570a9beec1b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -350,6 +350,27 @@ int cgx_lmac_rx_tx_enable(void *cgxd, int lmac_id, bool enable)
+ }
+ EXPORT_SYMBOL(cgx_lmac_rx_tx_enable);
+ 
++int cgx_lmac_tx_enable(void *cgxd, int lmac_id, bool enable)
++{
++	struct cgx *cgx = cgxd;
++	u64 cfg, last;
++
++	if (!cgx || lmac_id >= cgx->lmac_count)
++		return -ENODEV;
++
++	cfg = cgx_read(cgx, lmac_id, CGXX_CMRX_CFG);
++	last = cfg;
++	if (enable)
++		cfg |= DATA_PKT_TX_EN;
++	else
++		cfg &= ~DATA_PKT_TX_EN;
++
++	if (cfg != last)
++		cgx_write(cgx, lmac_id, CGXX_CMRX_CFG, cfg);
++	return !!(last & DATA_PKT_TX_EN);
++}
++EXPORT_SYMBOL(cgx_lmac_tx_enable);
++
+ /* CGX Firmware interface low level support */
+ static int cgx_fwi_cmd_send(u64 req, u64 *resp, struct lmac *lmac)
+ {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+index 02a2e364383d..c1d4f8407fe5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+@@ -108,6 +108,7 @@ int cgx_lmac_evh_unregister(void *cgxd, int lmac_id);
+ int cgx_get_tx_stats(void *cgxd, int lmac_id, int idx, u64 *tx_stat);
+ int cgx_get_rx_stats(void *cgxd, int lmac_id, int idx, u64 *rx_stat);
+ int cgx_lmac_rx_tx_enable(void *cgxd, int lmac_id, bool enable);
++int cgx_lmac_tx_enable(void *cgxd, int lmac_id, bool enable);
+ int cgx_lmac_addr_set(u8 cgx_id, u8 lmac_id, u8 *mac_addr);
+ u64 cgx_lmac_addr_get(u8 cgx_id, u8 lmac_id);
+ void cgx_lmac_promisc_config(int cgx_id, int lmac_id, bool enable);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 4af8d2474bc9..abf9399a0d15 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -1248,9 +1248,17 @@ static void nix_smq_flush(struct rvu *rvu, int blkaddr,
+ 			  int smq, u16 pcifunc, int nixlf)
+ {
+ 	int pf = rvu_get_pf(pcifunc);
+-	int err;
++	u8 cgx_id = 0, lmac_id = 0;
++	int err, restore_tx_en = 0;
+ 	u64 cfg;
+ 
++	/* enable cgx tx if disabled */
++	if (is_pf_cgxmapped(rvu, pf)) {
++		rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++		restore_tx_en = !cgx_lmac_tx_enable(rvu_cgx_pdata(cgx_id, rvu),
++						    lmac_id, true);
++	}
++
+ 	cfg = rvu_read64(rvu, blkaddr, NIX_AF_SMQX_CFG(smq));
+ 	/* Do SMQ flush and set enqueue xoff */
+ 	cfg |= BIT_ULL(50) | BIT_ULL(49);
+@@ -1269,6 +1277,9 @@ static void nix_smq_flush(struct rvu *rvu, int blkaddr,
+ 			"NIXLF%d: SMQ%d flush failed\n", nixlf, smq);
+ 
+ 	rvu_cgx_enadis_rx_bp(rvu, pf, true);
++	/* restore cgx tx state */
++	if (restore_tx_en)
++		cgx_lmac_tx_enable(rvu_cgx_pdata(cgx_id, rvu), lmac_id, false);
+ }
+ 
+ static int nix_txschq_free(struct rvu *rvu, u16 pcifunc)
+-- 
+2.17.1
+

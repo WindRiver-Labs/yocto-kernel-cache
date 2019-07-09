@@ -1,0 +1,255 @@
+From 6e5b60a8cb6b51cb4947900e6ae51d485a7c6d67 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Fri, 30 Nov 2018 17:55:35 +0530
+Subject: [PATCH 131/255] octeontx2-pf: Init NPA and NIX LF's context's memory
+
+commit b5e0c7543ff91c14a48d8da907e2f898254456fe from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Request admin function (RVU AF) to allocate memory for NPA aura/pool
+and NIX RQ/SQ/CQ HW contexts. Upon receiving response, save
+some of the HW constants like number of pointers per stack page,
+size of send queue buffer (where SQEs are queued by HW) e.t.c
+which are later used to initialize queues.
+
+Change-Id: Id3e46256f1016146c7cd71737d043aae16954242
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 78 +++++++++++++++++++
+ .../marvell/octeontx2/nic/otx2_common.h       | 29 ++++++-
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 21 +++++
+ .../marvell/octeontx2/nic/otx2_struct.h       | 20 +++++
+ 4 files changed, 147 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 9d62d2499f64..d9328d88990b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -13,6 +13,68 @@
+ 
+ #include "otx2_reg.h"
+ #include "otx2_common.h"
++#include "otx2_struct.h"
++
++int otx2_config_nix(struct otx2_nic *pfvf)
++{
++	struct nix_lf_alloc_req  *nixlf;
++
++	pfvf->qset.xqe_size = NIX_XQESZ_W16 ? 128 : 512;
++
++	/* Get memory to put this msg */
++	nixlf = otx2_mbox_alloc_msg_nix_lf_alloc(&pfvf->mbox);
++	if (!nixlf)
++		return -ENOMEM;
++
++	/* Set RQ/SQ/CQ counts */
++	nixlf->rq_cnt = pfvf->hw.rx_queues;
++	nixlf->sq_cnt = pfvf->hw.tx_queues;
++	nixlf->cq_cnt = pfvf->qset.cq_cnt;
++	nixlf->xqe_sz = NIX_XQESZ_W16;
++	/* We don't know absolute NPA LF idx attached.
++	 * AF will replace 'RVU_DEFAULT_PF_FUNC' with
++	 * NPA LF attached to this RVU PF/VF.
++	 */
++	nixlf->npa_func = RVU_DEFAULT_PF_FUNC;
++	/* Disable alignment pad, enable L2 length check,
++	 * enable L4 TCP/UDP checksum verification.
++	 */
++	nixlf->rx_cfg = BIT_ULL(33) | BIT_ULL(35) | BIT_ULL(37);
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
++
++int otx2_config_npa(struct otx2_nic *pfvf)
++{
++	struct otx2_qset *qset = &pfvf->qset;
++	struct npa_lf_alloc_req  *npalf;
++	struct otx2_hw *hw = &pfvf->hw;
++	int aura_cnt;
++
++	/* Pool - Stack of free buffer pointers
++	 * Aura - Alloc/frees pointers from/to pool for NIX DMA.
++	 */
++
++	/* Rx and Tx queues will have their own aura & pool in a 1:1 config */
++	hw->pool_cnt = hw->rx_queues + hw->tx_queues;
++
++	qset->pool = devm_kzalloc(pfvf->dev, sizeof(struct otx2_pool) *
++				  hw->pool_cnt, GFP_KERNEL);
++	if (!qset->pool)
++		return -ENOMEM;
++
++	/* Get memory to put this msg */
++	npalf = otx2_mbox_alloc_msg_npa_lf_alloc(&pfvf->mbox);
++	if (!npalf)
++		return -ENOMEM;
++
++	/* Set aura and pool counts */
++	npalf->nr_pools = hw->pool_cnt;
++	aura_cnt = ilog2(roundup_pow_of_two(hw->pool_cnt));
++	npalf->aura_sz = (aura_cnt >= ilog2(128)) ? (aura_cnt - 6) : 1;
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
+ 
+ int otx2_detach_resources(struct mbox *mbox)
+ {
+@@ -68,6 +130,22 @@ int otx2_attach_npa_nix(struct otx2_nic *pfvf)
+ }
+ 
+ /* Mbox message handlers */
++void mbox_handler_npa_lf_alloc(struct otx2_nic *pfvf,
++			       struct npa_lf_alloc_rsp *rsp)
++{
++	pfvf->hw.stack_pg_ptrs = rsp->stack_pg_ptrs;
++	pfvf->hw.stack_pg_bytes = rsp->stack_pg_bytes;
++}
++
++void mbox_handler_nix_lf_alloc(struct otx2_nic *pfvf,
++			       struct nix_lf_alloc_rsp *rsp)
++{
++	pfvf->hw.sqb_size = rsp->sqb_size;
++	pfvf->rx_chan_base = rsp->rx_chan_base;
++	pfvf->tx_chan_base = rsp->tx_chan_base;
++	ether_addr_copy(pfvf->netdev->dev_addr, rsp->mac_addr);
++}
++
+ void mbox_handler_msix_offset(struct otx2_nic *pfvf,
+ 			      struct msix_offset_rsp *rsp)
+ {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 4ebbbf7f927f..bb55dcf18078 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -24,6 +24,17 @@
+ 
+ #define NAME_SIZE                               32
+ 
++struct otx2_pool {
++	struct qmem		*stack;
++};
++
++struct otx2_qset {
++#define OTX2_MAX_CQ_CNT		64
++	u16			cq_cnt;
++	u16			xqe_size; /* Size of CQE i.e 128 or 512 bytes*/
++	struct otx2_pool	*pool;
++};
++
+ struct  mbox {
+ 	struct otx2_mbox	mbox;
+ 	struct work_struct	mbox_wrk;
+@@ -38,6 +49,12 @@ struct otx2_hw {
+ 	u16                     rx_queues;
+ 	u16                     tx_queues;
+ 	u16			max_queues;
++	u16			pool_cnt;
++
++	/* NPA */
++	u32			stack_pg_ptrs;  /* No of ptrs per stack page */
++	u32			stack_pg_bytes; /* Size of stack page */
++	u16			sqb_size;
+ 
+ 	/* MSI-X*/
+ 	u16			npa_msixoff; /* Offset of NPA vectors */
+@@ -52,10 +69,13 @@ struct otx2_nic {
+ 	struct device		*dev;
+ 	struct net_device	*netdev;
+ 
++	struct otx2_qset	qset;
+ 	struct otx2_hw		hw;
+ 	struct mbox		mbox;
+ 	struct workqueue_struct *mbox_wq;
+ 	u16			pcifunc;
++	u16			rx_chan_base;
++	u16			tx_chan_base;
+ };
+ 
+ /* Register read/write APIs */
+@@ -166,8 +186,15 @@ MBOX_MESSAGES
+ /* RVU block related APIs */
+ int otx2_attach_npa_nix(struct otx2_nic *pfvf);
+ int otx2_detach_resources(struct mbox *mbox);
++int otx2_config_npa(struct otx2_nic *pfvf);
++int otx2_config_nix(struct otx2_nic *pfvf);
+ 
+ /* Mbox handlers */
+-void mbox_handler_msix_offset(struct otx2_nic *pf, struct msix_offset_rsp *rsp);
++void mbox_handler_msix_offset(struct otx2_nic *pfvf,
++			      struct msix_offset_rsp *rsp);
++void mbox_handler_npa_lf_alloc(struct otx2_nic *pfvf,
++			       struct npa_lf_alloc_rsp *rsp);
++void mbox_handler_nix_lf_alloc(struct otx2_nic *pfvf,
++			       struct nix_lf_alloc_rsp *rsp);
+ 
+ #endif /* OTX2_COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index bf9de2e3f176..9fe6011beac6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -58,6 +58,12 @@ static void otx2_process_pfaf_mbox_msg(struct otx2_nic *pf,
+ 	case MBOX_MSG_MSIX_OFFSET:
+ 		mbox_handler_msix_offset(pf, (struct msix_offset_rsp *)msg);
+ 		break;
++	case MBOX_MSG_NPA_LF_ALLOC:
++		mbox_handler_npa_lf_alloc(pf, (struct npa_lf_alloc_rsp *)msg);
++		break;
++	case MBOX_MSG_NIX_LF_ALLOC:
++		mbox_handler_nix_lf_alloc(pf, (struct nix_lf_alloc_rsp *)msg);
++		break;
+ 	default:
+ 		if (msg->rc)
+ 			dev_err(pf->dev,
+@@ -261,6 +267,21 @@ static int otx2_open(struct net_device *netdev)
+ 	if (err)
+ 		return err;
+ 
++	pf->qset.cq_cnt = pf->hw.rx_queues + pf->hw.tx_queues;
++
++	/* Check if MAC address from AF is valid or else set a random MAC */
++	if (is_zero_ether_addr(netdev->dev_addr))
++		eth_hw_addr_random(netdev);
++
++	/* NPA init */
++	err = otx2_config_npa(pf);
++	if (err)
++		return err;
++
++	/* NIX init */
++	err = otx2_config_nix(pf);
++	if (err)
++		return err;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+new file mode 100644
+index 000000000000..d4b8b939c7e1
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Marvell OcteonTx2 RVU Ethernet driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef OTX2_STRUCT_H
++#define OTX2_STRUCT_H
++
++/* NIX WQE/CQE size 128 byte or 512 byte */
++enum nix_cqesz_e {
++	NIX_XQESZ_W64 = 0x0,
++	NIX_XQESZ_W16 = 0x1,
++};
++
++#endif /* OTX2_STRUCT_H */
+-- 
+2.17.1
+
