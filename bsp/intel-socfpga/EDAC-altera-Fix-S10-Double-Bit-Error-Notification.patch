@@ -1,0 +1,162 @@
+From b8f821f36fd83f9ef285c37b882047baf8ff6382 Mon Sep 17 00:00:00 2001
+From: Li Wang <li.wang@windriver.com>
+Date: Mon, 13 May 2019 14:57:36 +0800
+Subject: [PATCH 1/4] EDAC, altera: Fix S10 Double Bit Error Notification
+
+the patch comes from:
+https://github.com/altera-opensource/linux-socfpga/commit/5d7c07471661af5094a59c751b83a24fdf6d51bb
+
+[backport 'commit 1bd76ff ("EDAC, altera: Fix S10 Double
+                                 Bit Error Notification")']
+
+Backported from linux-edac-next
+
+Stratix10 Double Bit Error Address was always read from SDRAM Address
+register instead of each device's Address register.
+
+To determine which device had the DBE, cycle through the EDAC devices
+comparing the DBE value to the db_irq value. Once found, report the DBE
+Address from the device registers as well as the device name.
+
+Finally, notify the system via an SMC call and indicate the panic should
+result in a system reboot. Change a run-time check to a Stratix10
+compile-time check for a clean SMC notification.
+
+Fixes: d5fc912 ("EDAC, altera: Combine Stratix10 and Arria10 probe functions")
+Signed-off-by: Thor Thayer <thor.thayer@linux.intel.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: James Morse <james.morse@arm.com>
+Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: https://lkml.kernel.org/r/1552490842-25440-1-git-send-email-thor.thayer@linux.intel.com
+Signed-off-by: Li Wang <li.wang@windriver.com>
+---
+ drivers/edac/altera_edac.c | 47 +++++++++++++++++++++++++++++++-------
+ drivers/edac/altera_edac.h | 20 ++++++++++++++++
+ 2 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/edac/altera_edac.c b/drivers/edac/altera_edac.c
+index 5762c3c383f2..48898a07b57a 100644
+--- a/drivers/edac/altera_edac.c
++++ b/drivers/edac/altera_edac.c
+@@ -2074,6 +2074,15 @@ static int altr_edac_a10_device_add(struct altr_arria10_edac *edac,
+ 		goto err_release_group1;
+ 	}
+ 
++#ifdef CONFIG_ARCH_STRATIX10
++	/* Use IRQ to determine SError origin instead of assigning IRQ */
++	rc = of_property_read_u32_index(np, "interrupts", 0, &altdev->db_irq);
++	if (rc) {
++		edac_printk(KERN_ERR, EDAC_DEVICE,
++			    "Unable to parse DB IRQ index\n");
++		goto err_release_group1;
++	}
++#else
+ 	altdev->db_irq = irq_of_parse_and_map(np, 1);
+ 	if (!altdev->db_irq) {
+ 		edac_printk(KERN_ERR, EDAC_DEVICE, "Error allocating DBIRQ\n");
+@@ -2087,6 +2096,7 @@ static int altr_edac_a10_device_add(struct altr_arria10_edac *edac,
+ 		edac_printk(KERN_ERR, EDAC_DEVICE, "No DBERR IRQ resource\n");
+ 		goto err_release_group1;
+ 	}
++#endif
+ 
+ 	rc = edac_device_add_device(dci);
+ 	if (rc) {
+@@ -2239,6 +2249,9 @@ module_platform_driver(altr_edac_a10_driver);
+ 
+ #define to_s10edac(p, m) container_of(p, struct altr_stratix10_edac, m)
+ 
++/* panic routine issues reboot on non-zero panic_timeout */
++extern int panic_timeout;
++
+ /*
+  * The double bit error is handled through SError which is fatal. This is
+  * called as a panic notifier to printout ECC error info as part of the panic.
+@@ -2253,14 +2266,32 @@ static int s10_edac_dberr_handler(struct notifier_block *this,
+ 			       &dberror);
+ 	/* Remember the UE Errors for a reboot */
+ 	s10_protected_reg_write(edac, S10_SYSMGR_UE_VAL_OFST, dberror);
+-	if (dberror & S10_DDR0_IRQ_MASK) {
+-		s10_protected_reg_read(edac, S10_DERRADDR_OFST, &err_addr);
+-		/* Remember the UE Error address */
+-		s10_protected_reg_write(edac, S10_SYSMGR_UE_ADDR_OFST,
+-					err_addr);
+-		edac_printk(KERN_ERR, EDAC_MC,
+-			    "EDAC: [Uncorrectable errors @ 0x%08X]\n\n",
+-			    err_addr);
++	if (dberror & S10_DBE_IRQ_MASK) {
++		struct list_head *position;
++		struct altr_edac_device_dev *ed;
++		struct arm_smccc_res result;
++
++		/* Find the matching DBE in the list of devices */
++		list_for_each(position, &edac->s10_ecc_devices) {
++			ed = list_entry(position, struct altr_edac_device_dev,
++					next);
++			if (!(BIT(ed->db_irq) & dberror))
++				continue;
++
++			writel(ALTR_A10_ECC_DERRPENA,
++			       ed->base + ALTR_A10_ECC_INTSTAT_OFST);
++			err_addr = readl(ed->base + ALTR_S10_DERR_ADDRA_OFST);
++			s10_protected_reg_write(edac, S10_SYSMGR_UE_ADDR_OFST,
++			                        err_addr);
++			edac_printk(KERN_ERR, EDAC_DEVICE,
++				    "EDAC: [Fatal DBE on %s @ 0x%08X]\n",
++				    ed->edac_dev_name, err_addr);
++			break;
++		}
++		/* Notify the System through SMC. Reboot delay = 1 second */
++		panic_timeout = 1;
++		arm_smccc_smc(INTEL_SIP_SMC_ECC_DBE, dberror, 0, 0, 0, 0,
++			      0, 0, &result);
+ 	}
+ 
+ 	return NOTIFY_DONE;
+diff --git a/drivers/edac/altera_edac.h b/drivers/edac/altera_edac.h
+index 81f0554e09de..a8a036a7a119 100644
+--- a/drivers/edac/altera_edac.h
++++ b/drivers/edac/altera_edac.h
+@@ -317,6 +317,7 @@ struct altr_sdram_mc_data {
+ #define ALTR_A10_ECC_INIT_WATCHDOG_10US      10000
+ 
+ /************* Stratix10 Defines **************/
++#define ALTR_S10_DERR_ADDRA_OFST          0x2C
+ 
+ /* Stratix10 ECC Manager Defines */
+ #define S10_SYSMGR_ECC_INTMASK_VAL_OFST   0xFFD12090
+@@ -327,6 +328,7 @@ struct altr_sdram_mc_data {
+ #define S10_SYSMGR_ECC_INTSTAT_DERR_OFST  0xFFD120A0
+ 
+ #define S10_DDR0_IRQ_MASK                 BIT(16)
++#define S10_DBE_IRQ_MASK                  0x3FE
+ 
+ struct altr_edac_device_dev;
+ 
+@@ -446,4 +448,22 @@ struct altr_stratix10_edac {
+ 	struct notifier_block	panic_notifier;
+ };
+ 
++/*
++ * Request INTEL_SIP_SMC_ECC_DBE
++ *
++ * Sync call used by service driver at EL1 alert EL3 that a Double Bit
++ * ECC error has occurred.
++ *
++ * Call register usage:
++ * a0 INTEL_SIP_SMC_ECC_DBE
++ * a1 SysManager Double Bit Error value
++ * a2-7 not used
++ *
++ * Return status
++ * a0 INTEL_SIP_SMC_STATUS_OK
++ */
++#define INTEL_SIP_SMC_FUNCID_ECC_DBE 13
++#define INTEL_SIP_SMC_ECC_DBE \
++	INTEL_SIP_SMC_FAST_CALL_VAL(INTEL_SIP_SMC_FUNCID_ECC_DBE)
++
+ #endif	/* #ifndef _ALTERA_EDAC_H */
+-- 
+2.17.1
+
