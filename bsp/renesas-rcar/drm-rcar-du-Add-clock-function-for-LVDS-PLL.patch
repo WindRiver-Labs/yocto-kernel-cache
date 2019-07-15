@@ -1,0 +1,268 @@
+From c87073064fe1013801ad3dab997f45dbe76b2c80 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Wed, 26 Sep 2018 19:46:12 +0900
+Subject: [PATCH 333/909] drm: rcar-du: Add clock function for LVDS PLL
+
+commit e69fabc4a6fe42c03ef7ad24e9dbb76b75efa27d from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+Since it is necessary to set PLL initialization of LVDS before DU,
+register the clock function and this patch adds its processing.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/rcar-du/rcar_du_crtc.c | 14 ++++++
+ drivers/gpu/drm/rcar-du/rcar_lvds.c    | 70 ++++++++++++++++++++++----
+ drivers/gpu/drm/rcar-du/rcar_lvds.h    | 25 +++++++++
+ 3 files changed, 100 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/gpu/drm/rcar-du/rcar_lvds.h
+
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+index e635fc8a5d7b..5656d1d3c66d 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+@@ -12,7 +12,9 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
+ #include <linux/mutex.h>
++#include <linux/of_platform.h>
+ #include <linux/sys_soc.h>
+ 
+ #include <drm/drmP.h>
+@@ -30,6 +32,7 @@
+ #include "rcar_du_plane.h"
+ #include "rcar_du_regs.h"
+ #include "rcar_du_vsp.h"
++#include "rcar_lvds.h"
+ 
+ static u32 rcar_du_crtc_read(struct rcar_du_crtc *rcrtc, u32 reg)
+ {
+@@ -512,6 +515,13 @@ static void rcar_du_crtc_wait_page_flip(struct rcar_du_crtc *rcrtc)
+ 
+ static void rcar_du_crtc_setup(struct rcar_du_crtc *rcrtc)
+ {
++	const struct drm_display_mode *mode = &rcrtc->crtc.state->adjusted_mode;
++	struct rcar_du_device *rcdu = rcrtc->group->dev;
++	unsigned long mode_clock = mode->clock * 1000;
++
++	if (rcar_du_has(rcdu, RCAR_DU_FEATURE_R8A7799X))
++		rcar_lvds_pll_round_rate(rcrtc->index, mode_clock);
++
+ 	/* Set display off and background to black */
+ 	rcar_du_crtc_write(rcrtc, DOOR, DOOR_RGB(0, 0, 0));
+ 	rcar_du_crtc_write(rcrtc, BPOR, BPOR_RGB(0, 0, 0));
+@@ -624,6 +634,7 @@ static void rcar_du_crtc_disable_planes(struct rcar_du_crtc *rcrtc)
+ 
+ static void rcar_du_crtc_stop(struct rcar_du_crtc *rcrtc)
+ {
++	struct rcar_du_device *rcdu = rcrtc->group->dev;
+ 	struct drm_crtc *crtc = &rcrtc->crtc;
+ 
+ 	/*
+@@ -663,6 +674,9 @@ static void rcar_du_crtc_stop(struct rcar_du_crtc *rcrtc)
+ 				     DSYSR_TVM_SWITCH);
+ 
+ 	rcar_du_group_start_stop(rcrtc->group, false);
++
++	if (rcar_du_has(rcdu, RCAR_DU_FEATURE_R8A7799X))
++		rcar_lvds_pll_round_rate(rcrtc->index, 0);
+ }
+ 
+ /* -----------------------------------------------------------------------------
+diff --git a/drivers/gpu/drm/rcar-du/rcar_lvds.c b/drivers/gpu/drm/rcar-du/rcar_lvds.c
+index b6a213d7318f..29b2707ce2c1 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_lvds.c
++++ b/drivers/gpu/drm/rcar-du/rcar_lvds.c
+@@ -23,9 +23,11 @@
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/drm_panel.h>
+ 
++#include "rcar_lvds.h"
+ #include "rcar_lvds_regs.h"
+ 
+ struct rcar_lvds;
++static struct rcar_lvds *g_lvds[RCAR_LVDS_MAX_NUM];
+ 
+ /* Keep in sync with the LVDCR0.LVMD hardware register values. */
+ enum rcar_lvds_mode {
+@@ -67,6 +69,7 @@ struct rcar_lvds {
+ 
+ 	struct drm_display_mode display_mode;
+ 	enum rcar_lvds_mode mode;
++	u32 id;
+ };
+ 
+ #define bridge_to_rcar_lvds(bridge) \
+@@ -375,11 +378,12 @@ static void rcar_lvds_enable(struct drm_bridge *bridge)
+ 
+ 	WARN_ON(lvds->enabled);
+ 
+-	reset_control_deassert(lvds->rstc);
+-
+-	ret = clk_prepare_enable(lvds->clocks.mod);
+-	if (ret < 0)
+-		return;
++	if (!(lvds->info->quirks & RCAR_LVDS_QUIRK_EXT_PLL)) {
++		reset_control_deassert(lvds->rstc);
++		ret = clk_prepare_enable(lvds->clocks.mod);
++		if (ret < 0)
++			return;
++	}
+ 
+ 	/*
+ 	 * Hardcode the channels and control signals routing for now.
+@@ -408,7 +412,8 @@ static void rcar_lvds_enable(struct drm_bridge *bridge)
+ 	}
+ 
+ 	/* PLL clock configuration. */
+-	lvds->info->pll_setup(lvds, mode->clock * 1000);
++	if (lvds->info->pll_setup)
++		lvds->info->pll_setup(lvds, mode->clock * 1000);
+ 
+ 	/* Set the LVDS mode and select the input. */
+ 	lvdcr0 = lvds->mode << LVDCR0_LVMD_SHIFT;
+@@ -465,7 +470,7 @@ static void rcar_lvds_enable(struct drm_bridge *bridge)
+ 	lvds->enabled = true;
+ }
+ 
+-static void rcar_lvds_disable(struct drm_bridge *bridge)
++static void __rcar_lvds_disable(struct drm_bridge *bridge)
+ {
+ 	struct rcar_lvds *lvds = bridge_to_rcar_lvds(bridge);
+ 	u32 lvdcr0 = 0;
+@@ -505,6 +510,16 @@ static void rcar_lvds_disable(struct drm_bridge *bridge)
+ 	lvds->enabled = false;
+ }
+ 
++static void rcar_lvds_disable(struct drm_bridge *bridge)
++{
++	struct rcar_lvds *lvds = bridge_to_rcar_lvds(bridge);
++
++	if (lvds->info->quirks & RCAR_LVDS_QUIRK_EXT_PLL)
++		return;
++
++	__rcar_lvds_disable(bridge);
++}
++
+ static bool rcar_lvds_mode_fixup(struct drm_bridge *bridge,
+ 				 const struct drm_display_mode *mode,
+ 				 struct drm_display_mode *adjusted_mode)
+@@ -632,6 +647,7 @@ static int rcar_lvds_parse_dt(struct rcar_lvds *lvds)
+ 	struct device_node *node;
+ 	bool is_bridge = false;
+ 	int ret = 0;
++	u32 id;
+ 
+ 	local_output = of_graph_get_endpoint_by_regs(lvds->dev->of_node, 1, 0);
+ 	if (!local_output) {
+@@ -681,6 +697,12 @@ static int rcar_lvds_parse_dt(struct rcar_lvds *lvds)
+ 			ret = -EPROBE_DEFER;
+ 	}
+ 
++	/* Make sure LVDS id is present and sane */
++	if (!of_property_read_u32(lvds->dev->of_node, "renesas,id", &id))
++		lvds->id = id;
++	else
++		lvds->id = 0;
++
+ done:
+ 	of_node_put(local_output);
+ 	of_node_put(remote_input);
+@@ -689,6 +711,33 @@ static int rcar_lvds_parse_dt(struct rcar_lvds *lvds)
+ 	return ret;
+ }
+ 
++int rcar_lvds_pll_round_rate(u32 index, unsigned long rate)
++{
++	struct rcar_lvds *lvds;
++	int ret;
++
++	if (index >= RCAR_LVDS_MAX_NUM)
++		return 0;
++
++	lvds = g_lvds[index];
++
++	if (!(lvds->info->quirks & RCAR_LVDS_QUIRK_EXT_PLL))
++		return 0;
++
++	if (rate == 0) {
++		__rcar_lvds_disable(&lvds->bridge);
++	} else {
++		reset_control_deassert(lvds->rstc);
++		ret = clk_prepare_enable(lvds->clocks.mod);
++		if (ret < 0)
++			return ret;
++		rcar_lvds_pll_setup_d3_e3(lvds, rate);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(rcar_lvds_pll_round_rate);
++
+ static struct clk *rcar_lvds_get_clock(struct rcar_lvds *lvds, const char *name,
+ 				       bool optional)
+ {
+@@ -784,6 +833,11 @@ static int rcar_lvds_probe(struct platform_device *pdev)
+ 
+ 	drm_bridge_add(&lvds->bridge);
+ 
++	if (!(lvds->info->quirks & RCAR_LVDS_QUIRK_EXT_PLL))
++		return 0;
++
++	g_lvds[lvds->id] = lvds;
++
+ 	return 0;
+ }
+ 
+@@ -823,14 +877,12 @@ static const struct rcar_lvds_device_info rcar_lvds_r8a77990_info = {
+ 	.gen = 3,
+ 	.quirks = RCAR_LVDS_QUIRK_GEN3_LVEN | RCAR_LVDS_QUIRK_EXT_PLL
+ 		| RCAR_LVDS_QUIRK_DUAL_LINK,
+-	.pll_setup = rcar_lvds_pll_setup_d3_e3,
+ };
+ 
+ static const struct rcar_lvds_device_info rcar_lvds_r8a77995_info = {
+ 	.gen = 3,
+ 	.quirks = RCAR_LVDS_QUIRK_GEN3_LVEN | RCAR_LVDS_QUIRK_PWD
+ 		| RCAR_LVDS_QUIRK_EXT_PLL | RCAR_LVDS_QUIRK_DUAL_LINK,
+-	.pll_setup = rcar_lvds_pll_setup_d3_e3,
+ };
+ 
+ static const struct of_device_id rcar_lvds_of_table[] = {
+diff --git a/drivers/gpu/drm/rcar-du/rcar_lvds.h b/drivers/gpu/drm/rcar-du/rcar_lvds.h
+new file mode 100644
+index 000000000000..7aec146420ed
+--- /dev/null
++++ b/drivers/gpu/drm/rcar-du/rcar_lvds.h
+@@ -0,0 +1,25 @@
++/*
++ * rcar_lvds.h  --  R-Car LVDS Unit
++ *
++ * Copyright (C) 2018 Renesas Electronics Corporation
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef __RCAR_LVDS_H__
++#define __RCAR_LVDS_H__
++
++#define RCAR_LVDS_MAX_NUM	2
++
++#if IS_ENABLED(CONFIG_DRM_RCAR_LVDS)
++int rcar_lvds_pll_round_rate(u32 index, unsigned long rate);
++#else
++static inline int rcar_lvds_pll_round_rate(u32 index, unsigned long rate)
++{
++	return 0;
++};
++#endif
++#endif /* __RCAR_LVDS_H__ */
+-- 
+2.17.1
+

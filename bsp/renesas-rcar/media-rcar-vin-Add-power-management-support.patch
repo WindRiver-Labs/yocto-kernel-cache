@@ -1,0 +1,258 @@
+From e21b3b9a66fb25296853e85c03e1f48cbb9792c7 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Wed, 5 Sep 2018 12:23:32 +0900
+Subject: [PATCH 352/909] media: rcar-vin: Add power management support
+
+commit 68fd9bb57174d521664a6638a47fc8445641324d from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+The timing of the queue buf start may be executed before
+the processing of the delay work (setup of VIN, video decoder and CSI2)
+at the time of resume, and recovery processing could not be done well.
+
+When queue buf starts, it modifies it so that it restarts after
+waiting for setup process executed at resume.
+
+In addition, add procedure for waiting for capture stop when suspending.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+---
+ drivers/media/platform/rcar-vin/rcar-core.c | 51 +++++++++++++
+ drivers/media/platform/rcar-vin/rcar-dma.c  | 79 +++++++++++++++++++++
+ drivers/media/platform/rcar-vin/rcar-vin.h  | 18 +++++
+ 3 files changed, 148 insertions(+)
+
+diff --git a/drivers/media/platform/rcar-vin/rcar-core.c b/drivers/media/platform/rcar-vin/rcar-core.c
+index a241547492d1..505290931579 100644
+--- a/drivers/media/platform/rcar-vin/rcar-core.c
++++ b/drivers/media/platform/rcar-vin/rcar-core.c
+@@ -1159,6 +1159,13 @@ static int rcar_vin_probe(struct platform_device *pdev)
+ 	pm_suspend_ignore_children(&pdev->dev, true);
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	vin->work_queue = create_singlethread_workqueue(dev_name(vin->dev));
++	if (!vin->work_queue) {
++		ret = -ENOMEM;
++		goto error;
++	}
++	INIT_DELAYED_WORK(&vin->rvin_resume, rvin_resume_start_streaming);
++
+ 	return 0;
+ error:
+ 	rvin_dma_unregister(vin);
+@@ -1193,9 +1200,53 @@ static int rcar_vin_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static int rcar_vin_suspend(struct device *dev)
++{
++	struct rvin_dev *vin = dev_get_drvdata(dev);
++
++	if (vin->state == STOPPED)
++		return 0;
++
++	rvin_suspend_stop_streaming(vin);
++
++	pm_runtime_put(vin->dev);
++
++	return 0;
++}
++
++static int rcar_vin_resume(struct device *dev)
++{
++	struct rvin_dev *vin = dev_get_drvdata(dev);
++	struct rvin_dev *master;
++
++	if (vin->state == STOPPED)
++		return 0;
++
++	pm_runtime_get_sync(vin->dev);
++
++	if (vin->info->use_mc) {
++		master = vin->group->vin[rvin_group_id_to_master(vin->id)];
++		rvin_set_channel_routing(master, master->chsel);
++	}
++
++	queue_delayed_work_on(0, vin->work_queue, &vin->rvin_resume,
++			      msecs_to_jiffies(CONNECTION_TIME));
++
++	return 0;
++}
++
++static SIMPLE_DEV_PM_OPS(rcar_vin_pm_ops,
++			rcar_vin_suspend, rcar_vin_resume);
++#define DEV_PM_OPS (&rcar_vin_pm_ops)
++#else
++#define DEV_PM_OPS NULL
++#endif /* CONFIG_PM_SLEEP */
++
+ static struct platform_driver rcar_vin_driver = {
+ 	.driver = {
+ 		.name = "rcar-vin",
++		.pm = DEV_PM_OPS,
+ 		.of_match_table = rvin_of_id_table,
+ 	},
+ 	.probe = rcar_vin_probe,
+diff --git a/drivers/media/platform/rcar-vin/rcar-dma.c b/drivers/media/platform/rcar-vin/rcar-dma.c
+index 0ad70d826fa2..13262a99422f 100644
+--- a/drivers/media/platform/rcar-vin/rcar-dma.c
++++ b/drivers/media/platform/rcar-vin/rcar-dma.c
+@@ -1253,6 +1253,20 @@ static void rvin_buffer_queue(struct vb2_buffer *vb)
+ 	struct rvin_dev *vin = vb2_get_drv_priv(vb->vb2_queue);
+ 	unsigned long flags;
+ 
++	if (vin->suspend) {
++		if (!wait_event_timeout(vin->setup_wait,
++					!vin->suspend,
++					msecs_to_jiffies(SETUP_WAIT_TIME))) {
++			dev_warn(vin->dev, "set up timeout\n");
++			spin_lock_irqsave(&vin->qlock, flags);
++			return_all_buffers(vin, VB2_BUF_STATE_ERROR);
++			spin_unlock_irqrestore(&vin->qlock, flags);
++		}
++
++		rvin_capture_start(vin);
++		vin->suspend = false;
++	}
++
+ 	spin_lock_irqsave(&vin->qlock, flags);
+ 
+ 	list_add_tail(to_buf_list(vbuf), &vin->buf_list);
+@@ -1493,6 +1507,67 @@ static void rvin_stop_streaming(struct vb2_queue *vq)
+ 				  vin->scratch, vin->scratch_phys);
+ }
+ 
++void rvin_resume_start_streaming(struct work_struct *work)
++{
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct rvin_dev *vin =
++			container_of(dwork, struct rvin_dev, rvin_resume);
++	unsigned long flags;
++	int ret;
++
++	ret = rvin_set_stream(vin, 1);
++	if (ret) {
++		dev_warn(vin->dev, "Warning at streaming when resuming.\n");
++		spin_lock_irqsave(&vin->qlock, flags);
++		return_all_buffers(vin, VB2_BUF_STATE_ERROR);
++		spin_unlock_irqrestore(&vin->qlock, flags);
++	}
++
++	spin_lock_irqsave(&vin->qlock, flags);
++	vin->sequence = 0;
++	spin_unlock_irqrestore(&vin->qlock, flags);
++
++	vin->suspend = false;
++	wake_up(&vin->setup_wait);
++}
++
++void rvin_suspend_stop_streaming(struct rvin_dev *vin)
++{
++	unsigned long flags;
++	int retries = 0;
++
++	spin_lock_irqsave(&vin->qlock, flags);
++
++	/* Wait for streaming to stop */
++	while (retries++ < RVIN_RETRIES) {
++		rvin_capture_stop(vin);
++
++		/* Check if HW is stopped */
++		if (!rvin_capture_active(vin))
++			break;
++
++		spin_unlock_irqrestore(&vin->qlock, flags);
++		msleep(RVIN_TIMEOUT_MS);
++		spin_lock_irqsave(&vin->qlock, flags);
++	}
++
++	/* Release all active buffers */
++	return_all_buffers(vin, VB2_BUF_STATE_ERROR);
++
++	spin_unlock_irqrestore(&vin->qlock, flags);
++
++	rvin_set_stream(vin, 0);
++
++	/* disable UDS */
++	if (vin->info->model == RCAR_GEN3)
++		rvin_disable_uds(vin);
++
++	/* disable interrupts */
++	rvin_disable_interrupts(vin);
++
++	vin->suspend = true;
++}
++
+ static const struct vb2_ops rvin_qops = {
+ 	.queue_setup		= rvin_queue_setup,
+ 	.buf_prepare		= rvin_buffer_prepare,
+@@ -1526,6 +1601,8 @@ int rvin_dma_register(struct rvin_dev *vin, int irq)
+ 	spin_lock_init(&vin->qlock);
+ 
+ 	vin->state = STOPPED;
++	vin->suspend = false;
++	init_waitqueue_head(&vin->setup_wait);
+ 
+ 	for (i = 0; i < HW_BUFFER_NUM; i++)
+ 		vin->queue_buf[i] = NULL;
+@@ -1589,6 +1666,8 @@ int rvin_set_channel_routing(struct rvin_dev *vin, u8 chsel)
+ 
+ 	ifmd = VNCSI_IFMD_DES1 | VNCSI_IFMD_DES0 | VNCSI_IFMD_CSI_CHSEL(chsel);
+ 
++	vin->chsel = chsel;
++
+ 	rvin_write(vin, ifmd, VNCSI_IFMD_REG);
+ 
+ 	vin_dbg(vin, "Set IFMD 0x%x\n", ifmd);
+diff --git a/drivers/media/platform/rcar-vin/rcar-vin.h b/drivers/media/platform/rcar-vin/rcar-vin.h
+index 89ed89109a70..00183857b0db 100644
+--- a/drivers/media/platform/rcar-vin/rcar-vin.h
++++ b/drivers/media/platform/rcar-vin/rcar-vin.h
+@@ -36,6 +36,10 @@
+ /* Max number on VIN instances that can be in a system */
+ #define RCAR_VIN_NUM 8
+ 
++/* Time until source device reconnects */
++#define CONNECTION_TIME 2000
++#define SETUP_WAIT_TIME 3000
++
+ struct rvin_group;
+ 
+ enum model_id {
+@@ -191,6 +195,11 @@ struct rvin_info {
+  * @compose:		active composing
+  * @source:		active size of the video source
+  * @std:		active video standard of the video source
++ * @work_queue:		work queue at resuming
++ * @rvin_resume:	delayed work at resuming
++ * @chsel:		channel selection
++ * @setup_wait:		wait queue used to setup VIN
++ * @suspend:		suspend flag
+  */
+ struct rvin_dev {
+ 	struct device *dev;
+@@ -227,6 +236,12 @@ struct rvin_dev {
+ 	struct v4l2_rect compose;
+ 	struct v4l2_rect source;
+ 	v4l2_std_id std;
++
++	struct workqueue_struct *work_queue;
++	struct delayed_work rvin_resume;
++	unsigned int chsel;
++	wait_queue_head_t setup_wait;
++	bool suspend;
+ };
+ 
+ #define vin_to_source(vin)		((vin)->digital->subdev)
+@@ -278,4 +293,7 @@ const struct rvin_video_format *rvin_format_from_pixel(u32 pixelformat);
+ int rvin_set_channel_routing(struct rvin_dev *vin, u8 chsel);
+ u32 rvin_get_chsel(struct rvin_dev *vin);
+ 
++void rvin_resume_start_streaming(struct work_struct *work);
++void rvin_suspend_stop_streaming(struct rvin_dev *vin);
++
+ #endif
+-- 
+2.17.1
+

@@ -1,0 +1,165 @@
+From 07a70a5e0e238574e16bab868f13ded399692b33 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Mon, 10 Sep 2018 20:01:25 +0900
+Subject: [PATCH 317/909] rcar-fcp: Add FCPVD reset sequence for VSPD
+
+commit bb747ca045bc17d122e2d6a47216db2bf9b844e6 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+According to H/W manual v1.00, VSPD must be excecuted
+FCP_RST.SOFTRST after VI6_SRESET.SRST. So this patch adds it.
+VSPDL is not applicable.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/rcar-fcp.c       | 52 +++++++++++++++++++++++++
+ drivers/media/platform/vsp1/vsp1_pipe.c |  6 +++
+ include/media/rcar-fcp.h                |  5 +++
+ 3 files changed, 63 insertions(+)
+
+diff --git a/drivers/media/platform/rcar-fcp.c b/drivers/media/platform/rcar-fcp.c
+index 2988031d285d..5822ecf051b7 100644
+--- a/drivers/media/platform/rcar-fcp.c
++++ b/drivers/media/platform/rcar-fcp.c
+@@ -12,6 +12,8 @@
+  */
+ 
+ #include <linux/device.h>
++#include <linux/delay.h>
++#include <linux/io.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -24,14 +26,31 @@
+ struct rcar_fcp_device {
+ 	struct list_head list;
+ 	struct device *dev;
++	void __iomem *base;
+ };
+ 
+ static LIST_HEAD(fcp_devices);
+ static DEFINE_MUTEX(fcp_lock);
+ 
++#define FCP_VCR			0x00
++#define FCP_CFG0		0x04
++#define FCP_RST			0x10
++#define FCP_RST_SOFTRST		BIT(0)
++#define FCP_STA			0x18
++#define FCP_STA_ACT		BIT(0)
++
+ /* -----------------------------------------------------------------------------
+  * Public API
+  */
++static void fcp_write(struct rcar_fcp_device *fcp, u32 value, u32 offset)
++{
++	iowrite32(value, fcp->base + offset);
++}
++
++static u32 fcp_read(struct rcar_fcp_device *fcp, u32 offset)
++{
++	return ioread32(fcp->base + offset);
++}
+ 
+ /**
+  * rcar_fcp_get - Find and acquire a reference to an FCP instance
+@@ -129,9 +148,34 @@ EXPORT_SYMBOL_GPL(rcar_fcp_disable);
+  * Platform Driver
+  */
+ 
++int rcar_fcp_reset(struct rcar_fcp_device *fcp)
++{
++	unsigned int timeout;
++	u32 status;
++
++	fcp_write(fcp, FCP_RST_SOFTRST, FCP_RST);
++
++	for (timeout = 10; timeout > 0; --timeout) {
++		status = fcp_read(fcp, FCP_STA);
++		if (!(status & FCP_STA_ACT))
++			break;
++
++		usleep_range(1000, 2000);
++	}
++
++	if (!timeout) {
++		dev_err(fcp->dev, "failed to reset\n");
++		return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(rcar_fcp_reset);
++
+ static int rcar_fcp_probe(struct platform_device *pdev)
+ {
+ 	struct rcar_fcp_device *fcp;
++	struct resource *mem;
+ 
+ 	fcp = devm_kzalloc(&pdev->dev, sizeof(*fcp), GFP_KERNEL);
+ 	if (fcp == NULL)
+@@ -139,6 +183,14 @@ static int rcar_fcp_probe(struct platform_device *pdev)
+ 
+ 	fcp->dev = &pdev->dev;
+ 
++	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!mem)
++		return -EINVAL;
++
++	fcp->base = devm_ioremap_resource(fcp->dev, mem);
++	if (IS_ERR(fcp->base))
++		return PTR_ERR(fcp->base);
++
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	mutex_lock(&fcp_lock);
+diff --git a/drivers/media/platform/vsp1/vsp1_pipe.c b/drivers/media/platform/vsp1/vsp1_pipe.c
+index 07eae19f20c7..17b98121e2b5 100644
+--- a/drivers/media/platform/vsp1/vsp1_pipe.c
++++ b/drivers/media/platform/vsp1/vsp1_pipe.c
+@@ -13,6 +13,7 @@
+ #include <linux/wait.h>
+ 
+ #include <media/media-entity.h>
++#include <media/rcar-fcp.h>
+ #include <media/v4l2-subdev.h>
+ 
+ #include "vsp1.h"
+@@ -267,6 +268,11 @@ int vsp1_pipeline_stop(struct vsp1_pipeline *pipe)
+ 			pipe->state = VSP1_PIPELINE_STOPPED;
+ 			spin_unlock_irqrestore(&pipe->irqlock, flags);
+ 		}
++
++		if ((vsp1->version & VI6_IP_VERSION_MODEL_MASK) ==
++		    VI6_IP_VERSION_MODEL_VSPD_GEN3)
++			ret = rcar_fcp_reset(vsp1->fcp);
++
+ 	} else {
+ 		/* Otherwise just request a stop and wait. */
+ 		spin_lock_irqsave(&pipe->irqlock, flags);
+diff --git a/include/media/rcar-fcp.h b/include/media/rcar-fcp.h
+index b60a7b176c37..c83668a081ad 100644
+--- a/include/media/rcar-fcp.h
++++ b/include/media/rcar-fcp.h
+@@ -22,6 +22,7 @@ void rcar_fcp_put(struct rcar_fcp_device *fcp);
+ struct device *rcar_fcp_get_device(struct rcar_fcp_device *fcp);
+ int rcar_fcp_enable(struct rcar_fcp_device *fcp);
+ void rcar_fcp_disable(struct rcar_fcp_device *fcp);
++int rcar_fcp_reset(struct rcar_fcp_device *fcp);
+ #else
+ static inline struct rcar_fcp_device *rcar_fcp_get(const struct device_node *np)
+ {
+@@ -37,6 +38,10 @@ static inline int rcar_fcp_enable(struct rcar_fcp_device *fcp)
+ 	return 0;
+ }
+ static inline void rcar_fcp_disable(struct rcar_fcp_device *fcp) { }
++static inline int rcar_fcp_reset(struct rcar_fcp_device *fcp)
++{
++	return 0;
++}
+ #endif
+ 
+ #endif /* __MEDIA_RCAR_FCP_H__ */
+-- 
+2.17.1
+

@@ -1,0 +1,171 @@
+From 73687a7fcd112c5bbe22f58925e7ee68c9e1e204 Mon Sep 17 00:00:00 2001
+From: Masaharu Hayakawa <masaharu.hayakawa.ry@renesas.com>
+Date: Wed, 22 Nov 2017 11:02:56 +0900
+Subject: [PATCH 206/909] mmc: renesas_sdhi: Add internal DMA transfer end
+
+commit d2bc9d266bebb9a115e4319b47cd5e3e3bd57f58 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+Although the completion of the data transfer processing was judged only
+by the Access End interrupt of SDHI, the Transfer End interruption of
+DMAC was also added to the condition.
+
+Signed-off-by: Masaharu Hayakawa <masaharu.hayakawa.ry@renesas.com>
+[saito: adjust context.]
+Signed-off-by: Takeshi Saito <takeshi.saito.xv@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/mmc/host/renesas_sdhi_core.c          | 18 ++++++++
+ drivers/mmc/host/renesas_sdhi_internal_dmac.c | 43 ++++++++++++++++++-
+ 2 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/renesas_sdhi_core.c b/drivers/mmc/host/renesas_sdhi_core.c
+index 916a2fb48450..9361469a7591 100644
+--- a/drivers/mmc/host/renesas_sdhi_core.c
++++ b/drivers/mmc/host/renesas_sdhi_core.c
+@@ -35,6 +35,7 @@
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/pinctrl/pinctrl-state.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/sys_soc.h>
+ 
+ #include "renesas_sdhi.h"
+ #include "tmio_mmc.h"
+@@ -48,6 +49,18 @@
+ #define SDHI_VER_GEN3_SD	0xcc10
+ #define SDHI_VER_GEN3_SDMMC	0xcd10
+ 
++static const struct soc_device_attribute sdhi_quirks_match[]  = {
++	{ .soc_id = "r8a7795", .revision = "ES1.*",
++	  .data = (void *)DTRAEND1_SET_BIT17, },
++	{ .soc_id = "r8a7795", .revision = "ES2.0",
++	  .data = 0, },
++	{ .soc_id = "r8a7796", .revision = "ES1.0",
++	  .data = (void *)DTRAEND1_SET_BIT17, },
++	{ .soc_id = "r8a7796", .revision = "ES1.1",
++	  .data = 0, },
++	{/*sentinel*/},
++};
++
+ static void renesas_sdhi_sdbuf_width(struct tmio_mmc_host *host, int width)
+ {
+ 	u32 val;
+@@ -485,6 +498,7 @@ int renesas_sdhi_probe(struct platform_device *pdev,
+ 	struct tmio_mmc_host *host;
+ 	struct renesas_sdhi *priv;
+ 	struct resource *res;
++	const struct soc_device_attribute *attr;
+ 	int irq, ret, i;
+ 
+ 	of_data = of_device_get_match_data(&pdev->dev);
+@@ -535,6 +549,10 @@ int renesas_sdhi_probe(struct platform_device *pdev,
+ 	if (IS_ERR(host))
+ 		return PTR_ERR(host);
+ 
++	attr = soc_device_match(sdhi_quirks_match);
++	if (attr)
++		host->sdhi_quirks = (uintptr_t)attr->data;
++
+ 	if (of_data) {
+ 		mmc_data->flags |= of_data->tmio_flags;
+ 		mmc_data->ocr_mask = of_data->tmio_ocr_mask;
+diff --git a/drivers/mmc/host/renesas_sdhi_internal_dmac.c b/drivers/mmc/host/renesas_sdhi_internal_dmac.c
+index 4a7991151918..7b1e51c99342 100644
+--- a/drivers/mmc/host/renesas_sdhi_internal_dmac.c
++++ b/drivers/mmc/host/renesas_sdhi_internal_dmac.c
+@@ -50,7 +50,8 @@
+ /* DM_CM_INFO1 and DM_CM_INFO1_MASK */
+ #define INFO1_CLEAR		0
+ #define INFO1_MASK_CLEAR	GENMASK_ULL(31, 0)
+-#define INFO1_DTRANEND1		BIT(17)
++#define INFO1_DTRANEND1_BIT20	BIT(20)
++#define INFO1_DTRANEND1_BIT17	BIT(17)
+ #define INFO1_DTRANEND0		BIT(16)
+ 
+ /* DM_CM_INFO2 and DM_CM_INFO2_MASK */
+@@ -114,6 +115,12 @@ renesas_sdhi_internal_dmac_dm_write(struct tmio_mmc_host *host,
+ 	writeq(val, host->ctl + addr);
+ }
+ 
++static u32
++renesas_sdhi_internal_dmac_dm_read(struct tmio_mmc_host *host, int addr)
++{
++	return readl(host->ctl + addr);
++}
++
+ static void
+ renesas_sdhi_internal_dmac_enable_dma(struct tmio_mmc_host *host, bool enable)
+ {
+@@ -126,8 +133,12 @@ renesas_sdhi_internal_dmac_enable_dma(struct tmio_mmc_host *host, bool enable)
+ 		renesas_sdhi_internal_dmac_dm_write(host, DM_CM_INFO1,
+ 						    INFO1_CLEAR);
+ 
+-	if (priv->dma_priv.enable)
++	if (priv->dma_priv.enable) {
++		host->dma_irq_mask = ~(host->dma_tranend1 | INFO1_DTRANEND0);
+ 		priv->dma_priv.enable(host, enable);
++		renesas_sdhi_internal_dmac_dm_write(host, DM_CM_INFO1_MASK,
++						    host->dma_irq_mask);
++	}
+ }
+ 
+ static void
+@@ -177,6 +188,7 @@ renesas_sdhi_internal_dmac_start_dma(struct tmio_mmc_host *host,
+ 		dtran_mode |= DTRAN_MODE_CH_NUM_CH0;
+ 	}
+ 
++	tmio_mmc_clear_transtate(host);
+ 	renesas_sdhi_internal_dmac_enable_dma(host, true);
+ 
+ 	/* set dma parameters */
+@@ -232,6 +244,29 @@ static void renesas_sdhi_internal_dmac_complete_tasklet_fn(unsigned long arg)
+ 	spin_unlock_irq(&host->lock);
+ }
+ 
++static bool renesas_sdhi_internal_dmac_dma_irq(struct tmio_mmc_host *host)
++{
++	unsigned int ireg, status;
++
++	status = renesas_sdhi_internal_dmac_dm_read(host, DM_CM_INFO1);
++	ireg = status & ~host->dma_irq_mask;
++
++	if (ireg & INFO1_DTRANEND0) {
++		renesas_sdhi_internal_dmac_dm_write(host, DM_CM_INFO1, ireg &
++						    ~INFO1_DTRANEND0);
++		tmio_mmc_set_transtate(host, TMIO_TRANSTATE_DEND);
++		return true;
++	}
++
++	if (ireg & host->dma_tranend1) {
++		renesas_sdhi_internal_dmac_dm_write(host, DM_CM_INFO1, ireg &
++						    ~host->dma_tranend1);
++		tmio_mmc_set_transtate(host, TMIO_TRANSTATE_DEND);
++		return true;
++	}
++	return false;
++}
++
+ static void
+ renesas_sdhi_internal_dmac_request_dma(struct tmio_mmc_host *host,
+ 				       struct tmio_mmc_data *pdata)
+@@ -247,6 +282,9 @@ renesas_sdhi_internal_dmac_request_dma(struct tmio_mmc_host *host,
+ 	/* Each value is set to non-zero to assume "enabling" each DMA */
+ 	host->chan_rx = host->chan_tx = (void *)0xdeadbeaf;
+ 
++	host->dma_tranend1 = (host->sdhi_quirks & DTRAEND1_SET_BIT17) ?
++		INFO1_DTRANEND1_BIT17 : INFO1_DTRANEND1_BIT20;
++
+ 	tasklet_init(&priv->dma_priv.dma_complete,
+ 		     renesas_sdhi_internal_dmac_complete_tasklet_fn,
+ 		     (unsigned long)host);
+@@ -269,6 +307,7 @@ static const struct tmio_mmc_dma_ops renesas_sdhi_internal_dmac_dma_ops = {
+ 	.release = renesas_sdhi_internal_dmac_release_dma,
+ 	.abort = renesas_sdhi_internal_dmac_abort_dma,
+ 	.dataend = renesas_sdhi_internal_dmac_dataend_dma,
++	.dma_irq = renesas_sdhi_internal_dmac_dma_irq,
+ };
+ 
+ /*
+-- 
+2.17.1
+

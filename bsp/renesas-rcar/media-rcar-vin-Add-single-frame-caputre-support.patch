@@ -1,0 +1,200 @@
+From 4e6bf1d7aad9acaac45597251ef92a3a2e843595 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Tue, 4 Sep 2018 14:38:20 +0900
+Subject: [PATCH 350/909] media: rcar-vin: Add single frame caputre support
+
+commit df3f5d295f6ea061b68536cbb00f4322f042b4fa from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/rcar-vin/rcar-dma.c | 66 ++++++++++++++++++----
+ drivers/media/platform/rcar-vin/rcar-vin.h |  6 +-
+ 2 files changed, 59 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/media/platform/rcar-vin/rcar-dma.c b/drivers/media/platform/rcar-vin/rcar-dma.c
+index 91fb6eff257e..fb3ca0c5067c 100644
+--- a/drivers/media/platform/rcar-vin/rcar-dma.c
++++ b/drivers/media/platform/rcar-vin/rcar-dma.c
+@@ -771,8 +771,12 @@ static int rvin_setup(struct rvin_dev *vin)
+ 		vnmc = VNMC_IM_FULL | VNMC_FOC;
+ 		break;
+ 	case V4L2_FIELD_NONE:
+-		vnmc = VNMC_IM_ODD_EVEN;
+-		progressive = true;
++		if (vin->continuous) {
++			vnmc = VNMC_IM_ODD_EVEN;
++			progressive = true;
++		} else {
++			vnmc = VNMC_IM_ODD;
++		}
+ 		break;
+ 	default:
+ 		vnmc = VNMC_IM_ODD;
+@@ -998,11 +1002,25 @@ static void rvin_fill_hw_slot(struct rvin_dev *vin, int slot)
+ 	rvin_set_slot_addr(vin, slot, phys_addr);
+ }
+ 
++static void rvin_capture_on(struct rvin_dev *vin)
++{
++	vin_dbg(vin, "Capture on in %s mode\n",
++		vin->continuous ? "continuous" : "single");
++
++	if (vin->continuous)
++		/* Continuous Frame Capture Mode */
++		rvin_write(vin, VNFC_C_FRAME, VNFC_REG);
++	else
++		/* Single Frame Capture Mode */
++		rvin_write(vin, VNFC_S_FRAME, VNFC_REG);
++}
++
+ static int rvin_capture_start(struct rvin_dev *vin)
+ {
+-	int slot, ret;
++	int slot, ret, limit;
+ 
+-	for (slot = 0; slot < HW_BUFFER_NUM; slot++)
++	limit = vin->continuous ? HW_BUFFER_NUM : 1;
++	for (slot = 0; slot < limit; slot++)
+ 		rvin_fill_hw_slot(vin, slot);
+ 
+ 	rvin_crop_scale_comp(vin);
+@@ -1011,10 +1029,7 @@ static int rvin_capture_start(struct rvin_dev *vin)
+ 	if (ret)
+ 		return ret;
+ 
+-	vin_dbg(vin, "Starting to capture\n");
+-
+-	/* Continuous Frame Capture Mode */
+-	rvin_write(vin, VNFC_C_FRAME, VNFC_REG);
++	rvin_capture_on(vin);
+ 
+ 	vin->state = RUNNING;
+ 
+@@ -1102,6 +1117,17 @@ static irqreturn_t rvin_irq(int irq, void *data)
+ 
+ 	/* Prepare for next frame */
+ 	rvin_fill_hw_slot(vin, slot);
++
++	/*
++	 * The single capturing requires an explicit capture
++	 * operation to fetch the next frame.
++	 */
++	if (!vin->continuous) {
++		if (vin->queue_buf[slot])
++			rvin_capture_on(vin);
++		else
++			vin->state = STALLED;
++	}
+ done:
+ 	spin_unlock_irqrestore(&vin->qlock, flags);
+ 
+@@ -1173,6 +1199,14 @@ static void rvin_buffer_queue(struct vb2_buffer *vb)
+ 	list_add_tail(to_buf_list(vbuf), &vin->buf_list);
+ 
+ 	spin_unlock_irqrestore(&vin->qlock, flags);
++
++	if (!vin->continuous) {
++		if (vin->state == STALLED) {
++			rvin_fill_hw_slot(vin, 0);
++			rvin_capture_on(vin);
++			vin->state = RUNNING;
++		}
++	}
+ }
+ 
+ static int rvin_mc_validate_format(struct rvin_dev *vin, struct v4l2_subdev *sd,
+@@ -1294,6 +1328,12 @@ static int rvin_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	unsigned long flags;
+ 	int ret;
+ 
++	/* Continuous capture requires more buffers then there are HW slots */
++	vin->continuous = count > HW_BUFFER_NUM;
++
++	if (!vin->continuous)
++		goto buffer_skip;
++
+ 	/* Allocate scratch buffer. */
+ 	vin->scratch = dma_alloc_coherent(vin->dev, vin->format.sizeimage,
+ 					  &vin->scratch_phys, GFP_KERNEL);
+@@ -1305,6 +1345,7 @@ static int rvin_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 		return -ENOMEM;
+ 	}
+ 
++buffer_skip:
+ 	ret = rvin_set_stream(vin, 1);
+ 	if (ret) {
+ 		spin_lock_irqsave(&vin->qlock, flags);
+@@ -1325,7 +1366,7 @@ static int rvin_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 
+ 	spin_unlock_irqrestore(&vin->qlock, flags);
+ out:
+-	if (ret)
++	if (ret && vin->continuous)
+ 		dma_free_coherent(vin->dev, vin->format.sizeimage, vin->scratch,
+ 				  vin->scratch_phys);
+ 
+@@ -1383,8 +1424,9 @@ static void rvin_stop_streaming(struct vb2_queue *vq)
+ 	rvin_disable_interrupts(vin);
+ 
+ 	/* Free scratch buffer. */
+-	dma_free_coherent(vin->dev, vin->format.sizeimage, vin->scratch,
+-			  vin->scratch_phys);
++	if (vin->continuous)
++		dma_free_coherent(vin->dev, vin->format.sizeimage,
++				  vin->scratch, vin->scratch_phys);
+ }
+ 
+ static const struct vb2_ops rvin_qops = {
+@@ -1433,7 +1475,7 @@ int rvin_dma_register(struct rvin_dev *vin, int irq)
+ 	q->ops = &rvin_qops;
+ 	q->mem_ops = &vb2_dma_contig_memops;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+-	q->min_buffers_needed = 4;
++	q->min_buffers_needed = 1;
+ 	q->dev = vin->dev;
+ 
+ 	ret = vb2_queue_init(q);
+diff --git a/drivers/media/platform/rcar-vin/rcar-vin.h b/drivers/media/platform/rcar-vin/rcar-vin.h
+index 1ce7809f2ecb..89ed89109a70 100644
+--- a/drivers/media/platform/rcar-vin/rcar-vin.h
++++ b/drivers/media/platform/rcar-vin/rcar-vin.h
+@@ -56,11 +56,13 @@ enum rvin_csi_id {
+ /**
+  * STOPPED  - No operation in progress
+  * RUNNING  - Operation in progress have buffers
++ * STALLED  - No operation in progress have no buffers
+  * STOPPING - Stopping operation
+  */
+ enum rvin_dma_state {
+ 	STOPPED = 0,
+ 	RUNNING,
++	STALLED,
+ 	STOPPING,
+ };
+ 
+@@ -173,10 +175,11 @@ struct rvin_info {
+  * @scratch:		cpu address for scratch buffer
+  * @scratch_phys:	physical address of the scratch buffer
+  *
+- * @qlock:		protects @queue_buf, @buf_list, @sequence
++ * @qlock:		protects @queue_buf, @buf_list, @continuous, @sequence
+  *			@state
+  * @queue_buf:		Keeps track of buffers given to HW slot
+  * @buf_list:		list of queued buffers
++ * @continuous:		tracks if active operation is continuous or single mode
+  * @sequence:		V4L2 buffers sequence number
+  * @state:		keeps track of operation state
+  *
+@@ -212,6 +215,7 @@ struct rvin_dev {
+ 	spinlock_t qlock;
+ 	struct vb2_v4l2_buffer *queue_buf[HW_BUFFER_NUM];
+ 	struct list_head buf_list;
++	bool continuous;
+ 	unsigned int sequence;
+ 	enum rvin_dma_state state;
+ 
+-- 
+2.17.1
+

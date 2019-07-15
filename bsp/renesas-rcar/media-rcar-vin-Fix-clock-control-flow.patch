@@ -1,0 +1,261 @@
+From 5c31f8b17a98056b3e55956a057448944c35e1e8 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Thu, 11 Oct 2018 12:48:21 +0900
+Subject: [PATCH 353/909] media: rcar-vin: Fix clock control flow
+
+commit c00dec285f5294eedf69f38eae7df5e0c92628db from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+About VIN drivers sequence at using CSI2, it is nesessary that
+CPG (Clock Pulse Generator) reset/release is added according to
+H/W manual. So this patch adds it.
+In addition, CPG stop status check. The start check of CPG is
+unnecessary because the CPG enable side is already supported
+by the Clock driver.
+
+Also, if the enable/disable of CPG is implemented with an open or
+release function, it may be called wastefully from another process,
+so this patch modifies it to control CPG when Stream ON/OFF.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/rcar-vin/rcar-core.c | 25 ++++++++--
+ drivers/media/platform/rcar-vin/rcar-dma.c  | 55 +++++++++++++++++++++
+ drivers/media/platform/rcar-vin/rcar-v4l2.c |  7 ---
+ drivers/media/platform/rcar-vin/rcar-vin.h  |  8 +++
+ 4 files changed, 84 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/rcar-vin/rcar-core.c b/drivers/media/platform/rcar-vin/rcar-core.c
+index 505290931579..b1952071f855 100644
+--- a/drivers/media/platform/rcar-vin/rcar-core.c
++++ b/drivers/media/platform/rcar-vin/rcar-core.c
+@@ -14,6 +14,8 @@
+  * option) any later version.
+  */
+ 
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -1166,6 +1168,22 @@ static int rcar_vin_probe(struct platform_device *pdev)
+ 	}
+ 	INIT_DELAYED_WORK(&vin->rvin_resume, rvin_resume_start_streaming);
+ 
++	vin->rstc = devm_reset_control_get(&pdev->dev, NULL);
++	if (IS_ERR(vin->rstc)) {
++		dev_err(&pdev->dev, "failed to get cpg reset %s\n",
++			dev_name(vin->dev));
++		ret = PTR_ERR(vin->rstc);
++		goto error;
++	}
++
++	vin->clk = devm_clk_get(&pdev->dev, NULL);
++	if (IS_ERR(vin->clk)) {
++		dev_err(&pdev->dev, "failed to get clock%s\n",
++			dev_name(vin->dev));
++		ret = PTR_ERR(vin->clk);
++		goto error;
++	}
++
+ 	return 0;
+ error:
+ 	rvin_dma_unregister(vin);
+@@ -1210,8 +1228,6 @@ static int rcar_vin_suspend(struct device *dev)
+ 
+ 	rvin_suspend_stop_streaming(vin);
+ 
+-	pm_runtime_put(vin->dev);
+-
+ 	return 0;
+ }
+ 
+@@ -1223,9 +1239,10 @@ static int rcar_vin_resume(struct device *dev)
+ 	if (vin->state == STOPPED)
+ 		return 0;
+ 
+-	pm_runtime_get_sync(vin->dev);
+-
+ 	if (vin->info->use_mc) {
++		pm_runtime_force_resume(vin->dev);
++		pm_runtime_get_sync(vin->dev);
++
+ 		master = vin->group->vin[rvin_group_id_to_master(vin->id)];
+ 		rvin_set_channel_routing(master, master->chsel);
+ 	}
+diff --git a/drivers/media/platform/rcar-vin/rcar-dma.c b/drivers/media/platform/rcar-vin/rcar-dma.c
+index 13262a99422f..39e2755203c6 100644
+--- a/drivers/media/platform/rcar-vin/rcar-dma.c
++++ b/drivers/media/platform/rcar-vin/rcar-dma.c
+@@ -18,6 +18,7 @@
+ #define DEBUG
+ #endif
+ 
++#include <linux/clk-provider.h>
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
+@@ -1424,6 +1425,9 @@ static int rvin_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	}
+ 
+ buffer_skip:
++	if (vin->info->use_mc)
++		pm_runtime_get_sync(vin->dev);
++
+ 	ret = rvin_set_stream(vin, 1);
+ 	if (ret) {
+ 		spin_lock_irqsave(&vin->qlock, flags);
+@@ -1439,11 +1443,18 @@ static int rvin_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	ret = rvin_capture_start(vin);
+ 	if (ret) {
+ 		return_all_buffers(vin, VB2_BUF_STATE_QUEUED);
++		spin_unlock_irqrestore(&vin->qlock, flags);
+ 		rvin_set_stream(vin, 0);
++		goto out;
+ 	}
+ 
+ 	spin_unlock_irqrestore(&vin->qlock, flags);
++
++	return 0;
+ out:
++	if (vin->info->use_mc)
++		pm_runtime_put(vin->dev);
++
+ 	if (ret && vin->continuous)
+ 		dma_free_coherent(vin->dev, vin->format.sizeimage, vin->scratch,
+ 				  vin->scratch_phys);
+@@ -1501,6 +1512,27 @@ static void rvin_stop_streaming(struct vb2_queue *vq)
+ 	/* disable interrupts */
+ 	rvin_disable_interrupts(vin);
+ 
++	if (vin->info->use_mc) {
++		u32 timeout = MSTP_WAIT_TIME;
++
++		pm_runtime_put_sync(vin->dev);
++		while (1) {
++			bool enable;
++
++			enable = __clk_is_enabled(vin->clk);
++			if (!enable)
++				break;
++			if (!timeout) {
++				dev_warn(vin->dev, "MSTP status timeout\n");
++				break;
++			}
++			usleep_range(10, 15);
++			timeout--;
++		}
++		reset_control_assert(vin->rstc);
++		reset_control_deassert(vin->rstc);
++	}
++
+ 	/* Free scratch buffer. */
+ 	if (vin->continuous)
+ 		dma_free_coherent(vin->dev, vin->format.sizeimage,
+@@ -1565,6 +1597,29 @@ void rvin_suspend_stop_streaming(struct rvin_dev *vin)
+ 	/* disable interrupts */
+ 	rvin_disable_interrupts(vin);
+ 
++	if (vin->info->use_mc) {
++		u32 timeout = MSTP_WAIT_TIME;
++
++		pm_runtime_put_sync(vin->dev);
++		pm_runtime_force_suspend(vin->dev);
++
++		while (1) {
++			bool enable;
++
++			enable = __clk_is_enabled(vin->clk);
++			if (!enable)
++				break;
++			if (!timeout) {
++				dev_warn(vin->dev, "MSTP status timeout\n");
++				break;
++			}
++			usleep_range(10, 15);
++			timeout--;
++		}
++		reset_control_assert(vin->rstc);
++		reset_control_deassert(vin->rstc);
++	}
++
+ 	vin->suspend = true;
+ }
+ 
+diff --git a/drivers/media/platform/rcar-vin/rcar-v4l2.c b/drivers/media/platform/rcar-vin/rcar-v4l2.c
+index 1d44348854f8..b81be2db3905 100644
+--- a/drivers/media/platform/rcar-vin/rcar-v4l2.c
++++ b/drivers/media/platform/rcar-vin/rcar-v4l2.c
+@@ -1014,10 +1014,6 @@ static int rvin_mc_open(struct file *file)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = pm_runtime_get_sync(vin->dev);
+-	if (ret < 0)
+-		goto err_unlock;
+-
+ 	rvin_get_sd_format(vin, &vin->format);
+ 
+ 	ret = v4l2_pipeline_pm_use(&vin->vdev.entity, 1);
+@@ -1036,8 +1032,6 @@ static int rvin_mc_open(struct file *file)
+ err_v4l2pm:
+ 	v4l2_pipeline_pm_use(&vin->vdev.entity, 0);
+ err_pm:
+-	pm_runtime_put(vin->dev);
+-err_unlock:
+ 	mutex_unlock(&vin->lock);
+ 
+ 	return ret;
+@@ -1054,7 +1048,6 @@ static int rvin_mc_release(struct file *file)
+ 	ret = _vb2_fop_release(file, NULL);
+ 
+ 	v4l2_pipeline_pm_use(&vin->vdev.entity, 0);
+-	pm_runtime_put(vin->dev);
+ 
+ 	mutex_unlock(&vin->lock);
+ 
+diff --git a/drivers/media/platform/rcar-vin/rcar-vin.h b/drivers/media/platform/rcar-vin/rcar-vin.h
+index 00183857b0db..76b034a444e8 100644
+--- a/drivers/media/platform/rcar-vin/rcar-vin.h
++++ b/drivers/media/platform/rcar-vin/rcar-vin.h
+@@ -17,7 +17,9 @@
+ #ifndef __RCAR_VIN__
+ #define __RCAR_VIN__
+ 
++#include <linux/clk.h>
+ #include <linux/kref.h>
++#include <linux/reset.h>
+ 
+ #include <media/v4l2-async.h>
+ #include <media/v4l2-ctrls.h>
+@@ -40,6 +42,8 @@
+ #define CONNECTION_TIME 2000
+ #define SETUP_WAIT_TIME 3000
+ 
++#define MSTP_WAIT_TIME 100
++
+ struct rvin_group;
+ 
+ enum model_id {
+@@ -169,6 +173,8 @@ struct rvin_info {
+  * @ctrl_handler:	V4L2 control handler
+  * @notifier:		V4L2 asynchronous subdevs notifier
+  * @digital:		entity in the DT for local digital subdevice
++ * @rstc:		CPG reset/release control
++ * @clk:		CPG clock control
+  *
+  * @group:		Gen3 CSI group
+  * @id:			Gen3 group id for this VIN
+@@ -211,6 +217,8 @@ struct rvin_dev {
+ 	struct v4l2_ctrl_handler ctrl_handler;
+ 	struct v4l2_async_notifier notifier;
+ 	struct rvin_graph_entity *digital;
++	struct reset_control *rstc;
++	struct clk *clk;
+ 
+ 	struct rvin_group *group;
+ 	unsigned int id;
+-- 
+2.17.1
+

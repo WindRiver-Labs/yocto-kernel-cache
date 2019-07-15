@@ -1,0 +1,552 @@
+From 01c354a1b969d1dd68ad9fccb3a96ebbe7b083f2 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Mon, 10 Sep 2018 15:59:06 +0900
+Subject: [PATCH 291/909] v4l: vsp1: Add write back support
+
+commit 2a69f385fd8bc02fd39cc73450f93b1d46681087 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+Execute this function, and a user get screen of one shot.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/rcar-du/rcar_du_drv.c   |   4 +-
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.c   |  87 ++++++++++++++++++++-
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.h   |   7 ++
+ drivers/media/platform/vsp1/vsp1_drm.c  | 100 +++++++++++++++++++++++-
+ drivers/media/platform/vsp1/vsp1_drm.h  |   4 +-
+ drivers/media/platform/vsp1/vsp1_drv.c  |  19 ++++-
+ drivers/media/platform/vsp1/vsp1_pipe.c |   3 +
+ drivers/media/platform/vsp1/vsp1_pipe.h |   4 +
+ drivers/media/platform/vsp1/vsp1_regs.h |   4 +-
+ drivers/media/platform/vsp1/vsp1_rwpf.h |   3 +
+ drivers/media/platform/vsp1/vsp1_wpf.c  |  19 ++++-
+ include/media/vsp1.h                    |  11 +++
+ include/uapi/drm/rcar_du_drm.h          |  15 ++++
+ 13 files changed, 270 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_drv.c b/drivers/gpu/drm/rcar-du/rcar_du_drv.c
+index bc183f92da60..69e9cdf572b4 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_drv.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_drv.c
+@@ -329,7 +329,9 @@ static void rcar_du_lastclose(struct drm_device *dev)
+ 
+ static const struct drm_ioctl_desc rcar_du_ioctls[] = {
+ 	DRM_IOCTL_DEF_DRV(RCAR_DU_SET_VMUTE, rcar_du_set_vmute,
+-			  DRM_UNLOCKED | DRM_CONTROL_ALLOW),
++			  DRM_UNLOCKED),
++	DRM_IOCTL_DEF_DRV(RCAR_DU_SCRSHOT, rcar_du_vsp_write_back,
++			  DRM_UNLOCKED),
+ };
+ 
+ DEFINE_DRM_GEM_CMA_FOPS(rcar_du_fops);
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+index ebe9e7e6346c..fffa29689a4f 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+@@ -357,6 +357,91 @@ static void rcar_du_vsp_plane_reset(struct drm_plane *plane)
+ 	plane->state->plane = plane;
+ }
+ 
++int rcar_du_vsp_write_back(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv)
++{
++	int ret;
++	struct rcar_du_screen_shot *sh = (struct rcar_du_screen_shot *)data;
++	struct drm_mode_object *obj;
++	struct drm_crtc *crtc;
++	struct rcar_du_crtc *rcrtc;
++	struct rcar_du_device *rcdu;
++	const struct drm_display_mode *mode;
++	u32 pixelformat, bpp;
++	unsigned int pitch;
++	dma_addr_t mem[3];
++
++	obj = drm_mode_object_find(dev, file_priv, sh->crtc_id, DRM_MODE_OBJECT_CRTC);
++	if (!obj)
++		return -EINVAL;
++
++	crtc = obj_to_crtc(obj);
++	rcrtc = to_rcar_crtc(crtc);
++	rcdu = rcrtc->group->dev;
++	mode = &rcrtc->crtc.state->adjusted_mode;
++
++	switch (sh->fmt) {
++	case DRM_FORMAT_RGB565:
++		bpp = 16;
++		pixelformat = V4L2_PIX_FMT_RGB565;
++		break;
++	case DRM_FORMAT_ARGB1555:
++		bpp = 16;
++		pixelformat = V4L2_PIX_FMT_ARGB555;
++		break;
++	case DRM_FORMAT_ARGB8888:
++		bpp = 32;
++		pixelformat = V4L2_PIX_FMT_ABGR32;
++		break;
++	default:
++		dev_err(rcdu->dev, "specified format is not supported.\n");
++		return -EINVAL;
++	}
++
++	pitch = mode->hdisplay * bpp / 8;
++
++	mem[0] = sh->buff;
++	mem[1] = 0;
++	mem[2] = 0;
++
++	if (sh->width != mode->hdisplay ||
++	    sh->height != mode->vdisplay)
++		return -EINVAL;
++
++	if ((pitch * mode->vdisplay) > sh->buff_len)
++		return -EINVAL;
++
++	ret = vsp1_du_setup_wb(rcrtc->vsp->vsp, pixelformat, pitch, mem,
++			       rcrtc->vsp_pipe);
++	if (ret != 0)
++		return ret;
++
++	ret = vsp1_du_wait_wb(rcrtc->vsp->vsp, WB_STAT_CATP_SET,
++			      rcrtc->vsp_pipe);
++	if (ret != 0)
++		return ret;
++
++	ret = rcar_du_async_commit(dev, crtc);
++	if (ret != 0)
++		return ret;
++
++	ret = vsp1_du_wait_wb(rcrtc->vsp->vsp, WB_STAT_CATP_START,
++			      rcrtc->vsp_pipe);
++	if (ret != 0)
++		return ret;
++
++	ret = rcar_du_async_commit(dev, crtc);
++	if (ret != 0)
++		return ret;
++
++	ret = vsp1_du_wait_wb(rcrtc->vsp->vsp, WB_STAT_CATP_DONE,
++			      rcrtc->vsp_pipe);
++	if (ret != 0)
++		return ret;
++
++	return ret;
++}
++
+ int rcar_du_set_vmute(struct drm_device *dev, void *data,
+ 		      struct drm_file *file_priv)
+ {
+@@ -370,7 +455,7 @@ int rcar_du_set_vmute(struct drm_device *dev, void *data,
+ 	dev_dbg(dev->dev, "CRTC[%d], display:%s\n",
+ 		vmute->crtc_id, vmute->on ? "off" : "on");
+ 
+-	obj = drm_mode_object_find(dev, vmute->crtc_id, DRM_MODE_OBJECT_CRTC);
++	obj = drm_mode_object_find(dev, file_priv, vmute->crtc_id, DRM_MODE_OBJECT_CRTC);
+ 	if (!obj)
+ 		return -EINVAL;
+ 
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_vsp.h b/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
+index cc7e09a2ef8e..3915d2f962f0 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
+@@ -67,6 +67,8 @@ void rcar_du_vsp_atomic_begin(struct rcar_du_crtc *crtc);
+ void rcar_du_vsp_atomic_flush(struct rcar_du_crtc *crtc);
+ int rcar_du_set_vmute(struct drm_device *dev, void *data,
+ 		      struct drm_file *file_priv);
++int rcar_du_vsp_write_back(struct drm_device *dev, void *data,
++			   struct drm_file *file_priv);
+ #else
+ static inline int rcar_du_vsp_init(struct rcar_du_vsp *vsp,
+ 				   struct device_node *np,
+@@ -80,6 +82,11 @@ static inline void rcar_du_vsp_atomic_begin(struct rcar_du_crtc *crtc) { };
+ static inline void rcar_du_vsp_atomic_flush(struct rcar_du_crtc *crtc) { };
+ static inline int rcar_du_set_vmute(struct drm_device *dev, void *data,
+ 				    struct drm_file *file_priv) { return 0; };
++static inline int rcar_du_vsp_write_back(struct drm_device *dev, void *data,
++					 struct drm_file *file_priv)
++{
++	return 0;
++};
+ #endif
+ 
+ #endif /* __RCAR_DU_VSP_H__ */
+diff --git a/drivers/media/platform/vsp1/vsp1_drm.c b/drivers/media/platform/vsp1/vsp1_drm.c
+index fb51c6e0f740..14a5d5c56dad 100644
+--- a/drivers/media/platform/vsp1/vsp1_drm.c
++++ b/drivers/media/platform/vsp1/vsp1_drm.c
+@@ -30,6 +30,36 @@
+  * Interrupt Handling
+  */
+ 
++void vsp1_drm_display_start(struct vsp1_device *vsp1, unsigned int pipe_index,
++			    struct vsp1_pipeline *pipe)
++{
++	if (pipe->output->write_back == WB_STAT_CATP_REQUEST) {
++		pipe->output->write_back = WB_STAT_CATP_SET;
++		wake_up_interruptible(&pipe->event_wait);
++	} else if (pipe->completed) {
++		bool writeback;
++		u32 offset = 0x100 * pipe_index;
++
++		if ((vsp1_read(vsp1, VI6_WPF_WRBCK_CTRL + offset) &
++		    VI6_WPF_WRBCK_CTRL_WBMD) == VI6_WPF_WRBCK_CTRL_WBMD)
++			writeback = true;
++		else
++			writeback = false;
++
++		if (pipe->output->write_back == WB_STAT_CATP_SET &&
++		    writeback) {
++			pipe->output->write_back = WB_STAT_CATP_START;
++			wake_up_interruptible(&pipe->event_wait);
++		} else if (pipe->output->write_back == WB_STAT_CATP_START &&
++			   !writeback) {
++			pipe->output->write_back = WB_STAT_CATP_DONE;
++			wake_up_interruptible(&pipe->event_wait);
++		}
++	}
++
++	pipe->completed = false;
++}
++
+ static void vsp1_du_pipeline_frame_end(struct vsp1_pipeline *pipe,
+ 				       unsigned int completion)
+ {
+@@ -716,8 +746,8 @@ int vsp1_du_setup_lif(struct device *dev, unsigned int pipe_index,
+ 	drm_pipe->du_private = cfg->callback_data;
+ 
+ 	/* Disable the display interrupts. */
+-	vsp1_write(vsp1, VI6_DISP_IRQ_STA, 0);
+-	vsp1_write(vsp1, VI6_DISP_IRQ_ENB, 0);
++	vsp1_write(vsp1, VI6_DISP_IRQ_STA(pipe_index), 0);
++	vsp1_write(vsp1, VI6_DISP_IRQ_ENB(pipe_index), VI6_DISP_IRQ_ENB_DSTE);
+ 
+ 	/* Configure all entities in the pipeline. */
+ 	vsp1_du_pipeline_configure(pipe);
+@@ -906,6 +936,70 @@ void vsp1_du_unmap_sg(struct device *dev, struct sg_table *sgt)
+ }
+ EXPORT_SYMBOL_GPL(vsp1_du_unmap_sg);
+ 
++int vsp1_du_setup_wb(struct device *dev, u32 pixelformat, unsigned int pitch,
++		     dma_addr_t mem[2], unsigned int pipe_index)
++{
++	struct vsp1_device *vsp1 = dev_get_drvdata(dev);
++	struct vsp1_drm_pipeline *drm_pipe = &vsp1->drm->pipe[pipe_index];
++	struct vsp1_pipeline *pipe = &drm_pipe->pipe;
++	struct vsp1_rwpf *wpf = pipe->output;
++	const struct vsp1_format_info *fmtinfo;
++	bool interlaced = false;
++	int i;
++
++	fmtinfo = vsp1_get_format_info(vsp1, pixelformat);
++	if (!fmtinfo) {
++		dev_err(vsp1->dev, "Unsupport pixel format %08x for RPF\n",
++			pixelformat);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < vsp1->info->rpf_count; ++i) {
++		if (!pipe->inputs[i])
++			continue;
++
++		interlaced = pipe->inputs[i]->interlaced;
++	}
++
++	if (interlaced) {
++		dev_err(vsp1->dev, "Prohibited in interlaced mode\n");
++		return -EINVAL;
++	}
++
++	wpf->fmtinfo = fmtinfo;
++	wpf->format.num_planes = fmtinfo->planes;
++	wpf->format.plane_fmt[0].bytesperline = pitch;
++	wpf->format.plane_fmt[1].bytesperline = pitch;
++
++	for (i = 0; i < wpf->format.num_planes; ++i)
++		wpf->buf_addr[i] = mem[i];
++
++	pipe->output->write_back = WB_STAT_CATP_REQUEST;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(vsp1_du_setup_wb);
++
++int vsp1_du_wait_wb(struct device *dev, u32 count, unsigned int pipe_index)
++{
++	struct vsp1_device *vsp1 = dev_get_drvdata(dev);
++	struct vsp1_drm_pipeline *drm_pipe = &vsp1->drm->pipe[pipe_index];
++	struct vsp1_pipeline *pipe = &drm_pipe->pipe;
++	int tmp_wb;
++
++	wait_event_interruptible_timeout(pipe->event_wait,
++					 ((tmp_wb = pipe->output->write_back)
++					 <= count), HZ / 10);
++
++	if (tmp_wb != count) {
++		dev_dbg(vsp1->dev,
++			"State transition fail, because high load.\n");
++		return -1;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(vsp1_du_wait_wb);
++
+ /* -----------------------------------------------------------------------------
+  * Initialization
+  */
+@@ -941,6 +1035,8 @@ int vsp1_drm_init(struct vsp1_device *vsp1)
+ 		pipe->output->entity.pipe = pipe;
+ 		pipe->output->entity.sink = pipe->lif;
+ 		pipe->output->entity.sink_pad = 0;
++		pipe->output->write_back = WB_STAT_CATP_DONE;
++		init_waitqueue_head(&pipe->event_wait);
+ 		list_add_tail(&pipe->output->entity.list_pipe, &pipe->entities);
+ 
+ 		pipe->lif->pipe = pipe;
+diff --git a/drivers/media/platform/vsp1/vsp1_drm.h b/drivers/media/platform/vsp1/vsp1_drm.h
+index 8dfd274a59e2..3425111153e2 100644
+--- a/drivers/media/platform/vsp1/vsp1_drm.h
++++ b/drivers/media/platform/vsp1/vsp1_drm.h
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_drm.h  --  R-Car VSP1 DRM/KMS Interface
+  *
+- * Copyright (C) 2015 Renesas Electronics Corporation
++ * Copyright (C) 2015-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -72,5 +72,7 @@ to_vsp1_drm_pipeline(struct vsp1_pipeline *pipe)
+ 
+ int vsp1_drm_init(struct vsp1_device *vsp1);
+ void vsp1_drm_cleanup(struct vsp1_device *vsp1);
++void vsp1_drm_display_start(struct vsp1_device *vsp1, unsigned int pipe_index,
++			    struct vsp1_pipeline *pipe);
+ 
+ #endif /* __VSP1_DRM_H__ */
+diff --git a/drivers/media/platform/vsp1/vsp1_drv.c b/drivers/media/platform/vsp1/vsp1_drv.c
+index e520386d4c92..c13ced37f1ee 100644
+--- a/drivers/media/platform/vsp1/vsp1_drv.c
++++ b/drivers/media/platform/vsp1/vsp1_drv.c
+@@ -164,7 +164,8 @@ static irqreturn_t vsp1_irq_handler(int irq, void *data)
+ 
+ 	for (i = 0; i < vsp1->info->wpf_count; ++i) {
+ 		struct vsp1_rwpf *wpf = vsp1->wpf[i];
+-		bool underrun = false;
++		bool underrun = false, disp_access = false;
++		u32 disp_st = 0;
+ 
+ 		if (wpf == NULL)
+ 			continue;
+@@ -172,6 +173,17 @@ static irqreturn_t vsp1_irq_handler(int irq, void *data)
+ 		status = vsp1_read(vsp1, VI6_WPF_IRQ_STA(i));
+ 		vsp1_write(vsp1, VI6_WPF_IRQ_STA(i), ~status & mask);
+ 
++		if (vsp1->info->lif_count == 2 && (i == 0 || i == 1))
++			disp_access = true;
++		else if (vsp1->info->lif_count == 1 && i == 0)
++			disp_access = true;
++
++		if (disp_access) {
++			disp_st = vsp1_read(vsp1, VI6_DISP_IRQ_STA(i));
++			vsp1_write(vsp1, VI6_DISP_IRQ_STA(i),
++				   ~disp_st & VI6_DISP_IRQ_STA_DST);
++		}
++
+ 		if (status & VI6_WFP_IRQ_STA_UND)
+ 			underrun = true;
+ 
+@@ -187,6 +199,11 @@ static irqreturn_t vsp1_irq_handler(int irq, void *data)
+ 			ret = IRQ_HANDLED;
+ 		}
+ 
++		if (disp_st & VI6_DISP_IRQ_STA_DST) {
++			vsp1_drm_display_start(vsp1, i, wpf->entity.pipe);
++			ret = IRQ_HANDLED;
++		}
++
+ 		if ((vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND) && underrun)
+ 			vsp1_underrun_workaround(vsp1, false);
+ 	}
+diff --git a/drivers/media/platform/vsp1/vsp1_pipe.c b/drivers/media/platform/vsp1/vsp1_pipe.c
+index e3136bdb7bcf..07eae19f20c7 100644
+--- a/drivers/media/platform/vsp1/vsp1_pipe.c
++++ b/drivers/media/platform/vsp1/vsp1_pipe.c
+@@ -220,6 +220,7 @@ void vsp1_pipeline_init(struct vsp1_pipeline *pipe)
+ 	INIT_LIST_HEAD(&pipe->entities);
+ 	pipe->state = VSP1_PIPELINE_STOPPED;
+ 	pipe->vmute_flag = false;
++	pipe->completed = false;
+ }
+ 
+ /* Must be called with the pipe irqlock held. */
+@@ -335,6 +336,8 @@ void vsp1_pipeline_frame_end(struct vsp1_pipeline *pipe)
+ 	 * active frame was finished or postponed.
+ 	 */
+ 	flags = vsp1_dlm_irq_frame_end(pipe->output->dlm, interlaced);
++	if (flags & VSP1_DL_FRAME_END_COMPLETED)
++		pipe->completed = true;
+ 
+ 	if (pipe->hgo)
+ 		vsp1_hgo_frame_end(pipe->hgo);
+diff --git a/drivers/media/platform/vsp1/vsp1_pipe.h b/drivers/media/platform/vsp1/vsp1_pipe.h
+index 634ff059f3bb..969c3283e78d 100644
+--- a/drivers/media/platform/vsp1/vsp1_pipe.h
++++ b/drivers/media/platform/vsp1/vsp1_pipe.h
+@@ -108,6 +108,8 @@ struct vsp1_partition {
+  * @partition: The current partition for configuration to process
+  * @part_table: The pre-calculated partitions used by the pipeline
+  * @vmute_flag: Enable mute flag of VSPD
++ * @event_wait: wait queue to wait for write back state
++ * @completed: display update completion flag
+  */
+ struct vsp1_pipeline {
+ 	struct media_pipeline pipe;
+@@ -149,6 +151,8 @@ struct vsp1_pipeline {
+ 	struct vsp1_partition *part_table;
+ 
+ 	bool vmute_flag;
++	wait_queue_head_t event_wait;
++	bool completed;
+ };
+ 
+ void vsp1_pipeline_reset(struct vsp1_pipeline *pipe);
+diff --git a/drivers/media/platform/vsp1/vsp1_regs.h b/drivers/media/platform/vsp1/vsp1_regs.h
+index ae8942470dae..0e36fe8b9f7d 100644
+--- a/drivers/media/platform/vsp1/vsp1_regs.h
++++ b/drivers/media/platform/vsp1/vsp1_regs.h
+@@ -41,12 +41,12 @@
+ #define VI6_WFP_IRQ_STA_DFE		(1 << 1)
+ #define VI6_WFP_IRQ_STA_FRE		(1 << 0)
+ 
+-#define VI6_DISP_IRQ_ENB		0x0078
++#define VI6_DISP_IRQ_ENB(n)		(0x0078 + (n) * 60)
+ #define VI6_DISP_IRQ_ENB_DSTE		(1 << 8)
+ #define VI6_DISP_IRQ_ENB_MAEE		(1 << 5)
+ #define VI6_DISP_IRQ_ENB_LNEE(n)	(1 << (n))
+ 
+-#define VI6_DISP_IRQ_STA		0x007c
++#define VI6_DISP_IRQ_STA(n)		(0x007c + (n) * 60)
+ #define VI6_DISP_IRQ_STA_DST		(1 << 8)
+ #define VI6_DISP_IRQ_STA_MAE		(1 << 5)
+ #define VI6_DISP_IRQ_STA_LNE(n)		(1 << (n))
+diff --git a/drivers/media/platform/vsp1/vsp1_rwpf.h b/drivers/media/platform/vsp1/vsp1_rwpf.h
+index f4421a1b7be8..745c403f3ace 100644
+--- a/drivers/media/platform/vsp1/vsp1_rwpf.h
++++ b/drivers/media/platform/vsp1/vsp1_rwpf.h
+@@ -65,6 +65,9 @@ struct vsp1_rwpf {
+ 	struct vsp1_dl_manager *dlm;
+ 
+ 	bool interlaced;
++
++	int write_back;
++	dma_addr_t buf_addr[3];
+ };
+ 
+ static inline struct vsp1_rwpf *to_rwpf(struct v4l2_subdev *subdev)
+diff --git a/drivers/media/platform/vsp1/vsp1_wpf.c b/drivers/media/platform/vsp1/vsp1_wpf.c
+index 510d8ae0cdc5..75f9636212b7 100644
+--- a/drivers/media/platform/vsp1/vsp1_wpf.c
++++ b/drivers/media/platform/vsp1/vsp1_wpf.c
+@@ -255,7 +255,7 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 						   wpf->entity.config,
+ 						   RWPF_PAD_SOURCE);
+ 	/* Format */
+-	if (!pipe->lif) {
++	if (!pipe->lif || pipe->output->write_back == WB_STAT_CATP_SET) {
+ 		const struct v4l2_pix_format_mplane *format = &wpf->format;
+ 		const struct vsp1_format_info *fmtinfo = wpf->fmtinfo;
+ 
+@@ -295,7 +295,11 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 	vsp1_dl_body_write(dlb, VI6_DPR_WPF_FPORCH(wpf->entity.index),
+ 			   VI6_DPR_WPF_FPORCH_FP_WPFN);
+ 
+-	vsp1_dl_body_write(dlb, VI6_WPF_WRBCK_CTRL, 0);
++	if (pipe->output->write_back == WB_STAT_CATP_SET)
++		vsp1_wpf_write(wpf, dlb, VI6_WPF_WRBCK_CTRL,
++			       VI6_WPF_WRBCK_CTRL_WBMD);
++	else
++		vsp1_wpf_write(wpf, dlb, VI6_WPF_WRBCK_CTRL, 0);
+ 
+ 	/*
+ 	 * Sources. If the pipeline has a single input and BRx is not used,
+@@ -403,6 +407,17 @@ static void wpf_configure_partition(struct vsp1_entity *entity,
+ 		       (0 << VI6_WPF_SZCLIP_OFST_SHIFT) |
+ 		       (height << VI6_WPF_SZCLIP_SIZE_SHIFT));
+ 
++	if (wpf->write_back == WB_STAT_CATP_SET) {
++		vsp1_wpf_write(wpf, dlb, VI6_WPF_DSTM_ADDR_Y,
++			       wpf->buf_addr[0]);
++		if (format->num_planes > 1)
++			vsp1_wpf_write(wpf, dlb, VI6_WPF_DSTM_ADDR_C0,
++				       wpf->buf_addr[1]);
++		if (format->num_planes > 2)
++			vsp1_wpf_write(wpf, dlb, VI6_WPF_DSTM_ADDR_C1,
++				       wpf->buf_addr[2]);
++	}
++
+ 	if (pipe->lif)
+ 		return;
+ 
+diff --git a/include/media/vsp1.h b/include/media/vsp1.h
+index 881edc68fd13..54f0e8a8896b 100644
+--- a/include/media/vsp1.h
++++ b/include/media/vsp1.h
+@@ -17,6 +17,14 @@
+ #include <linux/types.h>
+ #include <linux/videodev2.h>
+ 
++/* write back stat */
++enum {
++	WB_STAT_CATP_DONE = 0,
++	WB_STAT_CATP_START,
++	WB_STAT_CATP_SET,
++	WB_STAT_CATP_REQUEST,
++};
++
+ struct device;
+ 
+ int vsp1_du_init(struct device *dev);
+@@ -101,5 +109,8 @@ void vsp1_du_atomic_flush(struct device *dev, unsigned int pipe_index,
+ int vsp1_du_map_sg(struct device *dev, struct sg_table *sgt);
+ void vsp1_du_unmap_sg(struct device *dev, struct sg_table *sgt);
+ int vsp1_du_if_set_mute(struct device *dev, bool on, unsigned int pipe_index);
++int vsp1_du_setup_wb(struct device *dev, u32 pixelformat, unsigned int pitch,
++		     dma_addr_t mem[2], unsigned int pipe_index);
++int vsp1_du_wait_wb(struct device *dev, u32 count, unsigned int pipe_index);
+ 
+ #endif /* __MEDIA_VSP1_H__ */
+diff --git a/include/uapi/drm/rcar_du_drm.h b/include/uapi/drm/rcar_du_drm.h
+index 1fca59ac435e..712b7293ade9 100644
+--- a/include/uapi/drm/rcar_du_drm.h
++++ b/include/uapi/drm/rcar_du_drm.h
+@@ -17,11 +17,26 @@ struct rcar_du_vmute {
+ 	int on;		/* Vmute function ON/OFF */
+ };
+ 
++/* DRM_IOCTL_RCAR_DU_SET_SCRSHOT:VSPD screen shot */
++struct rcar_du_screen_shot {
++	unsigned long	buff;
++	unsigned int	buff_len;
++	unsigned int	crtc_id;
++	unsigned int	fmt;
++	unsigned int	width;
++	unsigned int	height;
++};
++
+ /* rcar-du + vspd specific ioctls */
+ #define DRM_RCAR_DU_SET_VMUTE		0
++#define DRM_RCAR_DU_SCRSHOT		4
+ 
+ #define DRM_IOCTL_RCAR_DU_SET_VMUTE \
+ 	DRM_IOW(DRM_COMMAND_BASE + DRM_RCAR_DU_SET_VMUTE, \
+ 		struct rcar_du_vmute)
+ 
++#define DRM_IOCTL_RCAR_DU_SCRSHOT \
++	DRM_IOW(DRM_COMMAND_BASE + DRM_RCAR_DU_SCRSHOT, \
++		struct rcar_du_screen_shot)
++
+ #endif /* __RCAR_DU_DRM_H__ */
+-- 
+2.17.1
+

@@ -1,0 +1,88 @@
+From 50c838f020d82a00a14be5cc59f00ae9df927026 Mon Sep 17 00:00:00 2001
+From: Tho Vu <tho.vu.wh@rvc.renesas.com>
+Date: Wed, 13 Feb 2019 19:00:15 +0700
+Subject: [PATCH 749/909] USB: ohci-hcd.c: Add spinlock when disabling OHCI
+ interrupts in ohci_shutdown
+
+commit 42378b1937bb1b6af914cfc0f3bd79d0cd6125e8 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+This patch is used for fixing 'irq nobody care' issue during reboot
+
+How to reproduce:
+1)Prepare weston enabled environment
+2)Connect USB mouse
+3)Read input from the mouse and reboot
+$ od -tx /dev/input/event0 &
+$ reboot
+4)Move the mouse while system shutdown
+Don't need to move the mouse after "reboot: Restarting system"
+5)Repeat step 3 and step 4 until below error occurs
+
+Error log:
+usb 2-1: USB disconnect, device number 2
+irq 156: nobody cared (try booting with the "irqpoll" option)
+Workqueue: usb_hub_wq hub_event
+Call trace:
+...
+usbhid_disconnect+0x4c/0x78
+usb_unbind_interface+0x6c/0x2a8
+device_release_driver_internal+0x174/0x208
+device_release_driver+0x14/0x20
+bus_remove_device+0x114/0x128
+device_del+0x1ac/0x300
+usb_disable_device+0x8c/0x200
+usb_disconnect+0xb4/0x218
+...
+handlers:
+usb_hcd_irq
+Disabling IRQ #156
+
+This issue occurs due to race condition between ohci_irq()
+interrupt handler and ohci_shutdown()
+Adding spin_lock_irq() to prevent interrupt raising while ohci is shutting
+down can fix this issue.
+
+When host controller dies, lock will be held by io_watchdog_func before
+ohci_shutdown, so locking should be skipped in this case to prevent
+deadlock
+
+Signed-off-by: Tho Vu <tho.vu.wh@rvc.renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/usb/host/ohci-hcd.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/host/ohci-hcd.c b/drivers/usb/host/ohci-hcd.c
+index 210181fd98d2..4c6af1f6fc25 100644
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -424,8 +424,13 @@ ohci_shutdown (struct usb_hcd *hcd)
+ 	struct ohci_hcd *ohci;
+ 
+ 	ohci = hcd_to_ohci (hcd);
+-	ohci_writel(ohci, (u32) ~0, &ohci->regs->intrdisable);
+ 
++	/* Locking is not necessary if HC dies */
++	if (!test_bit(HCD_FLAG_DEAD, &hcd->flags))
++		spin_lock_irq(&ohci->lock);
++
++	/* Disable HC interrupts */
++	ohci_writel(ohci, (u32)~0, &ohci->regs->intrdisable);
+ 	/* Software reset, after which the controller goes into SUSPEND */
+ 	ohci_writel(ohci, OHCI_HCR, &ohci->regs->cmdstatus);
+ 	ohci_readl(ohci, &ohci->regs->cmdstatus);	/* flush the writes */
+@@ -433,6 +438,10 @@ ohci_shutdown (struct usb_hcd *hcd)
+ 
+ 	ohci_writel(ohci, ohci->fminterval, &ohci->regs->fminterval);
+ 	ohci->rh_state = OHCI_RH_HALTED;
++
++	if (!test_bit(HCD_FLAG_DEAD, &hcd->flags))
++		spin_unlock_irq(&ohci->lock);
++
+ }
+ 
+ /*-------------------------------------------------------------------------*
+-- 
+2.17.1
+

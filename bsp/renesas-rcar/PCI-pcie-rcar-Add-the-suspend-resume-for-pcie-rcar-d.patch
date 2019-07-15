@@ -1,0 +1,153 @@
+From 8b08387f77bc13bb48b2b92b0d0fb5f371dd04f3 Mon Sep 17 00:00:00 2001
+From: Kazufumi Ikeda <kaz-ikeda@xc.jp.nec.com>
+Date: Mon, 30 Jan 2017 20:29:07 +0900
+Subject: [PATCH 233/909] PCI: pcie-rcar: Add the suspend/resume for pcie-rcar
+ driver
+
+commit 5c9f9deb9e293380275c0000f573db75012f0b39 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+This adds the suspend/resume supports for pcie-rcar. The resume handler
+reprogram the hardware baseed on the software state kept in specific
+device structures. Also it doesn't need to save any registers.
+
+Signed-off-by: Kazufumi Ikeda <kaz-ikeda@xc.jp.nec.com>
+Signed-off-by: Gaku Inami <gaku.inami.xw@bp.renesas.com>
+Signed-off-by: Harunobu Kurokawa <harunobu.kurokawa.dn@renesas.com>
+Signed-off-by: Tho Vu <tho.vu.wh@rvc.renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/pci/controller/pcie-rcar.c | 91 +++++++++++++++++++++++++++++-
+ 1 file changed, 88 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/controller/pcie-rcar.c b/drivers/pci/controller/pcie-rcar.c
+index da58ccbf7661..08f482d86180 100644
+--- a/drivers/pci/controller/pcie-rcar.c
++++ b/drivers/pci/controller/pcie-rcar.c
+@@ -484,6 +484,36 @@ static void rcar_pcie_force_speedup(struct rcar_pcie *pcie)
+ 		 (macsr & LINK_SPEED) == LINK_SPEED_5_0GTS ? "5" : "2.5");
+ }
+ 
++static int rcar_pcie_hw_enable(struct rcar_pcie *pcie)
++{
++	struct resource_entry *win;
++	LIST_HEAD(res);
++	int i = 0;
++
++	/* Try setting 5 GT/s link speed */
++	rcar_pcie_force_speedup(pcie);
++
++	/* Setup PCI resources */
++	resource_list_for_each_entry(win, &pcie->resources) {
++		struct resource *res = win->res;
++
++		if (!res->flags)
++			continue;
++
++		switch (resource_type(res)) {
++		case IORESOURCE_IO:
++		case IORESOURCE_MEM:
++			rcar_pcie_setup_window(i, pcie, res);
++			i++;
++			break;
++		default:
++			continue;
++		}
++	}
++
++	return 0;
++}
++
+ static int rcar_pcie_enable(struct rcar_pcie *pcie)
+ {
+ 	struct device *dev = pcie->dev;
+@@ -921,6 +951,23 @@ static void rcar_pcie_unmap_msi(struct rcar_pcie *pcie)
+ 	irq_domain_remove(msi->domain);
+ }
+ 
++static int rcar_pcie_hw_enable_msi(struct rcar_pcie *pcie)
++{
++	struct rcar_msi *msi = &pcie->msi;
++	unsigned long base;
++
++	/* setup MSI data target */
++	base = virt_to_phys((void *)msi->pages);
++
++	rcar_pci_write_reg(pcie, base | MSIFE, PCIEMSIALR);
++	rcar_pci_write_reg(pcie, 0, PCIEMSIAUR);
++
++	/* enable all MSI interrupts */
++	rcar_pci_write_reg(pcie, 0xffffffff, PCIEMSIIER);
++
++	return 0;
++}
++
+ static int rcar_pcie_enable_msi(struct rcar_pcie *pcie)
+ {
+ 	struct device *dev = pcie->dev;
+@@ -1260,13 +1307,51 @@ static int rcar_pcie_probe(struct platform_device *pdev)
+ #ifdef CONFIG_PM_SLEEP
+ static int rcar_pcie_suspend(struct device *dev)
+ {
+-	/* Empty functino for now */
++	/* Processing is unnecesary */
+ 	return 0;
+ }
+ 
+ static int rcar_pcie_resume(struct device *dev)
+ {
+-	/* Empty function for now */
++	struct rcar_pcie *pcie = dev_get_drvdata(dev);
++	unsigned int data;
++	int err;
++	int (*hw_init_fn)(struct rcar_pcie *);
++
++	/* HW initialize on Resume */
++	if (!pcie) {
++		dev_warn(dev, "%s: %s: pcie NULL\n", __func__, dev_name(dev));
++		return 0; /* resume of the whole system continues */
++	}
++
++	err = rcar_pcie_parse_map_dma_ranges(pcie, dev->of_node);
++	if (err) {
++		dev_err(dev, "%s: %s: parse map dma ranges fail, err=%d\n",
++			__func__, dev_name(dev), err);
++		return 0; /* resume of the whole system continues */
++	}
++
++	/* Failure to get a link might just be that no cards are inserted */
++	hw_init_fn = of_device_get_match_data(dev);
++	err = hw_init_fn(pcie);
++	if (err) {
++		dev_err(dev, "PCIe link down\n");
++		dev_dbg(dev, "%s: %s: re-init hw fail, err=%d\n",
++			__func__, dev_name(dev), err);
++		pm_runtime_put(dev);
++		return 0; /* resume of the whole system continues */
++	}
++
++	data = rcar_pci_read_reg(pcie, MACSR);
++	dev_info(dev, "PCIe x%d: link up\n", (data >> 20) & 0x3f);
++
++	if (IS_ENABLED(CONFIG_PCI_MSI)) {
++		/* enable MSI */
++		rcar_pcie_hw_enable_msi(pcie);
++		dev_dbg(dev, "%s: %s: enable MSI\n", __func__, dev_name(dev));
++	}
++	rcar_pcie_hw_enable(pcie);
++
+ 	return 0;
+ }
+ 
+@@ -1275,7 +1360,7 @@ static SIMPLE_DEV_PM_OPS(rcar_pcie_pm_ops,
+ 			rcar_pcie_resume);
+ 
+ #define DEV_PM_OPS (&rcar_pcie_pm_ops)
+-#else
++#else /* CONFIG_PM_SLEEP */
+ #define DEV_PM_OPS NULL
+ #endif /* CONFIG_PM_SLEEP */
+ 
+-- 
+2.17.1
+

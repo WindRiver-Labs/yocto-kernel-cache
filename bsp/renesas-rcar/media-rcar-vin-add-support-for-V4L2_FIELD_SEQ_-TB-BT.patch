@@ -1,0 +1,240 @@
+From 4423eff85a819a2f19ab638c5c370d9f429908ec Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Fri, 28 Sep 2018 10:02:20 +0900
+Subject: [PATCH 351/909] media: rcar-vin: add support for
+ V4L2_FIELD_SEQ_{TB,BT}
+
+commit 56c6292e91a7a271a64935fb96f83e7a47973da4 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+The hardware do not support capturing the field types V4L2_FIELD_SEQ_TB
+and V4L2_FIELD_SEQ_BT. To capture in these formats the driver needs to
+change what field (top or bottom) is to be captured next and for every
+other capture adjust the offset of the capture buffer.
+
+This patch adds support for these sequential fields with the limitation
+that continues capture mode is not supported. This limitation have no
+visibility for user-space and the driver can already be running in
+single capture mode for all other field types if the driver is not feed
+buffers quickly enough.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+---
+ drivers/media/platform/rcar-vin/rcar-dma.c  | 64 +++++++++++++++++
+ drivers/media/platform/rcar-vin/rcar-v4l2.c | 80 ++++++++++++++++-----
+ 2 files changed, 127 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/media/platform/rcar-vin/rcar-dma.c b/drivers/media/platform/rcar-vin/rcar-dma.c
+index fb3ca0c5067c..0ad70d826fa2 100644
+--- a/drivers/media/platform/rcar-vin/rcar-dma.c
++++ b/drivers/media/platform/rcar-vin/rcar-dma.c
+@@ -106,6 +106,7 @@
+ #define VNMC_IM_ODD_EVEN	(1 << 3)
+ #define VNMC_IM_EVEN		(2 << 3)
+ #define VNMC_IM_FULL		(3 << 3)
++#define VNMC_IM_MASK		0x18
+ #define VNMC_BPS		(1 << 1)
+ #define VNMC_ME			(1 << 0)
+ 
+@@ -770,6 +771,12 @@ static int rvin_setup(struct rvin_dev *vin)
+ 	case V4L2_FIELD_INTERLACED_BT:
+ 		vnmc = VNMC_IM_FULL | VNMC_FOC;
+ 		break;
++	case V4L2_FIELD_SEQ_TB:
++		vnmc = VNMC_IM_ODD;
++		break;
++	case V4L2_FIELD_SEQ_BT:
++		vnmc = VNMC_IM_EVEN;
++		break;
+ 	case V4L2_FIELD_NONE:
+ 		if (vin->continuous) {
+ 			vnmc = VNMC_IM_ODD_EVEN;
+@@ -1059,6 +1066,55 @@ static void rvin_capture_stop(struct rvin_dev *vin)
+ #define RVIN_TIMEOUT_MS 100
+ #define RVIN_RETRIES 10
+ 
++static bool rvin_seq_field_done(struct rvin_dev *vin)
++{
++	dma_addr_t phys_addr;
++	u32 vnmc, next;
++
++	/* Only handle sequential formats */
++	if (vin->format.field != V4L2_FIELD_SEQ_TB &&
++	    vin->format.field != V4L2_FIELD_SEQ_BT)
++		return true;
++
++	/* Update field for next capture */
++	vnmc = rvin_read(vin, VNMC_REG);
++	next = (vnmc & VNMC_IM_MASK) == VNMC_IM_ODD ?
++		VNMC_IM_EVEN : VNMC_IM_ODD;
++
++	vin_dbg(vin, "SEQ Mode: %s Cap: %s Next: %s\n",
++		vin->format.field == V4L2_FIELD_SEQ_TB ? "TB" : "BT",
++		(vnmc & VNMC_IM_MASK) == VNMC_IM_ODD ? "T" : "B",
++		next == VNMC_IM_ODD ? "T" : "B");
++
++	vnmc = (vnmc & ~VNMC_IM_MASK) | next;
++	rvin_write(vin, vnmc, VNMC_REG);
++
++	/* If capture is second part of frame signal frame done */
++	if ((vin->format.field == V4L2_FIELD_SEQ_TB && next == VNMC_IM_ODD) ||
++	    (vin->format.field == V4L2_FIELD_SEQ_BT && next == VNMC_IM_EVEN)) {
++		vin_dbg(vin, "SEQ frame done\n");
++		return true;
++	}
++
++	/*
++	 * Need to capture second half of the frame. Increment the
++	 * offset for the capture buffer so it appends to the already
++	 * captured first field. Start one new capture (in single mode)
++	 * and signal that frame is not complete.
++	 */
++
++	vin_dbg(vin, "SEQ frame need to capture other half, frame not done\n");
++
++	phys_addr =
++		vb2_dma_contig_plane_dma_addr(&vin->queue_buf[0]->vb2_buf, 0) +
++		vin->format.sizeimage / 2;
++	rvin_set_slot_addr(vin, 0, phys_addr);
++
++	rvin_capture_on(vin);
++
++	return false;
++}
++
+ static irqreturn_t rvin_irq(int irq, void *data)
+ {
+ 	struct rvin_dev *vin = data;
+@@ -1096,6 +1152,9 @@ static irqreturn_t rvin_irq(int irq, void *data)
+ 		goto done;
+ 	}
+ 
++	if (!rvin_seq_field_done(vin))
++		goto done;
++
+ 	/* Prepare for capture and update state */
+ 	vnms = rvin_read(vin, VNMS_REG);
+ 	slot = (vnms & VNMS_FBS_MASK) >> VNMS_FBS_SHIFT;
+@@ -1331,6 +1390,11 @@ static int rvin_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	/* Continuous capture requires more buffers then there are HW slots */
+ 	vin->continuous = count > HW_BUFFER_NUM;
+ 
++	/* We can't support continues mode for sequential field formats */
++	if (vin->format.field == V4L2_FIELD_SEQ_TB ||
++	    vin->format.field == V4L2_FIELD_SEQ_BT)
++		vin->continuous = false;
++
+ 	if (!vin->continuous)
+ 		goto buffer_skip;
+ 
+diff --git a/drivers/media/platform/rcar-vin/rcar-v4l2.c b/drivers/media/platform/rcar-vin/rcar-v4l2.c
+index a0d368880c96..1d44348854f8 100644
+--- a/drivers/media/platform/rcar-vin/rcar-v4l2.c
++++ b/drivers/media/platform/rcar-vin/rcar-v4l2.c
+@@ -102,10 +102,33 @@ static u32 rvin_format_sizeimage(struct v4l2_pix_format *pix)
+ 	return pix->bytesperline * pix->height;
+ }
+ 
+-static void rvin_format_align(struct rvin_dev *vin, struct v4l2_pix_format *pix)
++static void __rvin_format_aling_update(struct rvin_dev *vin,
++				       struct v4l2_pix_format *pix)
+ {
+ 	u32 walign;
+ 
++	/* HW limit width to a multiple of 32 (2^5) for NV16/12 else 2 (2^1) */
++	if (pix->pixelformat == V4L2_PIX_FMT_NV12 ||
++	    pix->pixelformat == V4L2_PIX_FMT_NV16)
++		walign = 5;
++	else if (pix->pixelformat == V4L2_PIX_FMT_YUYV ||
++		 pix->pixelformat == V4L2_PIX_FMT_UYVY)
++		walign = 1;
++	else
++		walign = 0;
++
++	/* Limit to VIN capabilities */
++	v4l_bound_align_image(&pix->width, 5, vin->info->max_width, walign,
++			      &pix->height, 2, vin->info->max_height, 0, 0);
++
++	pix->bytesperline = rvin_format_bytesperline(pix);
++	pix->sizeimage = rvin_format_sizeimage(pix);
++}
++
++static void rvin_format_align(struct rvin_dev *vin, struct v4l2_pix_format *pix)
++{
++	int width;
++
+ 	if (!rvin_format_from_pixel(pix->pixelformat) ||
+ 	    (vin->info->model == RCAR_M1 &&
+ 	     pix->pixelformat == V4L2_PIX_FMT_XBGR32) ||
+@@ -125,6 +148,44 @@ static void rvin_format_align(struct rvin_dev *vin, struct v4l2_pix_format *pix)
+ 	case V4L2_FIELD_INTERLACED_BT:
+ 	case V4L2_FIELD_INTERLACED:
+ 		break;
++	case V4L2_FIELD_SEQ_TB:
++	case V4L2_FIELD_SEQ_BT:
++		/*
++		 * Due to extra hardware alignment restrictions on
++		 * buffer addresses for multi plane formats they
++		 * are not (yet) supported. This would be much simpler
++		 * once support for the UDS scaler is added.
++		 *
++		 * Support for multi plane formats could be supported
++		 * by having a different partitioning strategy when
++		 * capturing the second field (start capturing one
++		 * quarter in to the buffer instead of one half).
++		 */
++
++		if (pix->pixelformat == V4L2_PIX_FMT_NV16)
++			pix->pixelformat = RVIN_DEFAULT_FORMAT;
++
++		/*
++		 * For sequential formats it's needed to write to
++		 * the same buffer two times to capture both the top
++		 * and bottom field. The second time it is written
++		 * an offset is needed as to not overwrite the
++		 * previous captured field. Due to hardware limitations
++		 * the offsets must be a multiple of 128. Try to
++		 * increase the width of the image until a size is
++		 * found which can satisfy this constraint.
++		 */
++
++		width = pix->width;
++		while (width < vin->info->max_width) {
++			pix->width = width++;
++
++			__rvin_format_aling_update(vin, pix);
++
++			if (((pix->sizeimage / 2) & HW_BUFFER_MASK) == 0)
++				break;
++		}
++		break;
+ 	case V4L2_FIELD_ALTERNATE:
+ 		/*
+ 		 * Driver does not (yet) support outputting ALTERNATE to a
+@@ -139,22 +200,7 @@ static void rvin_format_align(struct rvin_dev *vin, struct v4l2_pix_format *pix)
+ 		break;
+ 	}
+ 
+-	/* HW limit width to a multiple of 32 (2^5) for NV16/12 else 2 (2^1) */
+-	if (pix->pixelformat == V4L2_PIX_FMT_NV12 ||
+-	    pix->pixelformat == V4L2_PIX_FMT_NV16)
+-		walign = 5;
+-	else if (pix->pixelformat == V4L2_PIX_FMT_YUYV ||
+-		 pix->pixelformat == V4L2_PIX_FMT_UYVY)
+-		walign = 1;
+-	else
+-		walign = 0;
+-
+-	/* Limit to VIN capabilities */
+-	v4l_bound_align_image(&pix->width, 5, vin->info->max_width, walign,
+-			      &pix->height, 2, vin->info->max_height, 0, 0);
+-
+-	pix->bytesperline = rvin_format_bytesperline(pix);
+-	pix->sizeimage = rvin_format_sizeimage(pix);
++	__rvin_format_aling_update(vin, pix);
+ 
+ 	vin_dbg(vin, "Format %ux%u bpl: %u size: %u\n",
+ 		pix->width, pix->height, pix->bytesperline, pix->sizeimage);
+-- 
+2.17.1
+

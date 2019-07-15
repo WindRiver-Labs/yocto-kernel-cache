@@ -1,0 +1,824 @@
+From e9fe63330952a2a47898ed75d6799b50dbbf4375 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Thu, 23 Aug 2018 17:08:42 +0900
+Subject: [PATCH 288/909] v4l: vsp1: Add interlaced mode support
+
+commit 693d3a96cbcf35d7729a5c880789fa830801d780 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+Set extended display list header, and set Auto-FLD mode for
+interlaced mode.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/rcar-du/rcar_du_crtc.c   |   3 +-
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.c    |   7 +-
+ drivers/media/platform/vsp1/vsp1.h       |   2 +
+ drivers/media/platform/vsp1/vsp1_dl.c    | 211 ++++++++++++++++++++++-
+ drivers/media/platform/vsp1/vsp1_dl.h    |  14 +-
+ drivers/media/platform/vsp1/vsp1_drm.c   |  11 +-
+ drivers/media/platform/vsp1/vsp1_drv.c   |  10 +-
+ drivers/media/platform/vsp1/vsp1_pipe.c  |  16 +-
+ drivers/media/platform/vsp1/vsp1_regs.h  |   6 +-
+ drivers/media/platform/vsp1/vsp1_rpf.c   |  85 +++++++--
+ drivers/media/platform/vsp1/vsp1_rwpf.h  |   4 +-
+ drivers/media/platform/vsp1/vsp1_video.c |   4 +-
+ include/media/vsp1.h                     |   3 +-
+ 13 files changed, 336 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+index 15dc9caa128b..dca944dac2f9 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+@@ -1,7 +1,7 @@
+ /*
+  * rcar_du_crtc.c  --  R-Car Display Unit CRTCs
+  *
+- * Copyright (C) 2013-2015 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  *
+@@ -289,6 +289,7 @@ static void rcar_du_crtc_set_display_timing(struct rcar_du_crtc *rcrtc)
+ 	/* Signal polarities */
+ 	value = ((mode->flags & DRM_MODE_FLAG_PVSYNC) ? DSMR_VSL : 0)
+ 	      | ((mode->flags & DRM_MODE_FLAG_PHSYNC) ? DSMR_HSL : 0)
++	      | ((mode->flags & DRM_MODE_FLAG_INTERLACE) ? DSMR_ODEV : 0)
+ 	      | DSMR_DIPM_DISP | DSMR_CSPM;
+ 	rcar_du_crtc_write(rcrtc, DSMR, value);
+ 
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+index 98a9798fc36b..23c25823b24f 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+@@ -1,7 +1,7 @@
+ /*
+  * rcar_du_vsp.h  --  R-Car Display Unit VSP-Based Compositor
+  *
+- * Copyright (C) 2015 Renesas Electronics Corporation
++ * Copyright (C) 2015-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  *
+@@ -185,6 +185,11 @@ static void rcar_du_vsp_plane_setup(struct rcar_du_vsp_plane *plane)
+ 	};
+ 	unsigned int i;
+ 
++	if (plane->plane.state->crtc->mode.flags & DRM_MODE_FLAG_INTERLACE)
++		cfg.interlaced = true;
++	else
++		cfg.interlaced = false;
++
+ 	cfg.src.left = state->state.src.x1 >> 16;
+ 	cfg.src.top = state->state.src.y1 >> 16;
+ 	cfg.src.width = drm_rect_width(&state->state.src) >> 16;
+diff --git a/drivers/media/platform/vsp1/vsp1.h b/drivers/media/platform/vsp1/vsp1.h
+index 67f1033f7ab7..077630250180 100644
+--- a/drivers/media/platform/vsp1/vsp1.h
++++ b/drivers/media/platform/vsp1/vsp1.h
+@@ -40,6 +40,8 @@ struct vsp1_uif;
+ 
+ /* Workaround for hung up at the time of underrun in R-Car H3(ES1.x) */
+ #define VSP1_UNDERRUN_WORKAROUND	BIT(0)
++/* Auto-FLD for Display List not support */
++#define VSP1_AUTO_FLD_NOT_SUPPORT	BIT(1)
+ 
+ #define VSP1_MAX_LIF		2
+ #define VSP1_MAX_RPF		5
+diff --git a/drivers/media/platform/vsp1/vsp1_dl.c b/drivers/media/platform/vsp1/vsp1_dl.c
+index 008346492dde..96b61d1dc1fd 100644
+--- a/drivers/media/platform/vsp1/vsp1_dl.c
++++ b/drivers/media/platform/vsp1/vsp1_dl.c
+@@ -17,8 +17,12 @@
+ 
+ #include "vsp1.h"
+ #include "vsp1_dl.h"
++#include "vsp1_drm.h"
++#include "vsp1_pipe.h"
++#include "vsp1_rwpf.h"
+ 
+ #define VSP1_DL_NUM_ENTRIES		256
++#define VSP1_DL_EXT_NUM_ENTRIES		160
+ 
+ #define VSP1_DLH_INT_ENABLE		(1 << 1)
+ #define VSP1_DLH_AUTO_START		(1 << 0)
+@@ -33,6 +37,24 @@ struct vsp1_dl_header {
+ 	struct vsp1_dl_header_list lists[8];
+ 	u32 next_header;
+ 	u32 flags;
++	/* if (VI6_DL_EXT_CTRL.EXT) */
++	u32 zero_bits;
++	/* zero_bits:6 + pre_ext_dl_exec:1 + */
++	/* post_ext_dl_exec:1 + zero_bits:8 + pre_ext_dl_num_cmd:16 */
++	u32 pre_post_num;
++	u32 pre_ext_dl_plist;
++	/* zero_bits:16 + post_ext_dl_num_cmd:16 */
++	u32 post_ext_dl_num_cmd;
++	u32 post_ext_dl_p_list;
++} __attribute__((__packed__));
++
++struct vsp1_ext_dl_body {
++	u32 ext_dl_cmd[2];
++	u32 ext_dl_data[2];
++} __attribute__((__packed__));
++
++struct vsp1_ext_addr {
++	u32 addr;
+ } __attribute__((__packed__));
+ 
+ struct vsp1_dl_entry {
+@@ -46,6 +68,10 @@ struct vsp1_dl_entry {
+  * @free: entry in the pool free body list
+  * @pool: pool to which this body belongs
+  * @vsp1: the VSP1 device
++ * @ext_body: display list extended body
++ * @ext_dma: DMA address for extended body
++ * @src_dst_addr: display list (Auto-FLD) source/destination address
++ * @ext_addr_dma: DMA address for display list (Auto-FLD)
+  * @entries: array of entries
+  * @dma: DMA address of the entries
+  * @size: size of the DMA memory in bytes
+@@ -61,6 +87,12 @@ struct vsp1_dl_body {
+ 	struct vsp1_dl_body_pool *pool;
+ 	struct vsp1_device *vsp1;
+ 
++	struct vsp1_ext_dl_body *ext_body;
++	dma_addr_t ext_dma;
++
++	struct vsp1_ext_addr *src_dst_addr;
++	dma_addr_t ext_addr_dma;
++
+ 	struct vsp1_dl_entry *entries;
+ 	dma_addr_t dma;
+ 	size_t size;
+@@ -212,6 +244,9 @@ vsp1_dl_body_pool_create(struct vsp1_device *vsp1, unsigned int num_bodies,
+ 
+ 	for (i = 0; i < num_bodies; ++i) {
+ 		struct vsp1_dl_body *dlb = &pool->bodies[i];
++		size_t header_offset;
++		size_t ex_body_offset;
++		size_t ex_addr_offset;
+ 
+ 		dlb->pool = pool;
+ 		dlb->max_entries = num_entries;
+@@ -219,6 +254,24 @@ vsp1_dl_body_pool_create(struct vsp1_device *vsp1, unsigned int num_bodies,
+ 		dlb->dma = pool->dma + i * dlb_size;
+ 		dlb->entries = pool->mem + i * dlb_size;
+ 
++		if (!(vsp1->ths_quirks & VSP1_AUTO_FLD_NOT_SUPPORT)) {
++			header_offset = dlb->max_entries *
++					sizeof(*dlb->entries);
++			ex_body_offset = sizeof(struct vsp1_dl_header);
++			ex_addr_offset = sizeof(struct vsp1_ext_dl_body);
++
++			dlb->ext_dma = pool->dma + (i * dlb_size) +
++					header_offset + ex_body_offset;
++			dlb->ext_body = pool->mem + (i * dlb_size) +
++					header_offset + ex_body_offset;
++			dlb->ext_addr_dma = pool->dma + (i * dlb_size) +
++					header_offset + ex_body_offset +
++					ex_addr_offset;
++			dlb->src_dst_addr = pool->mem + (i * dlb_size) +
++					header_offset + ex_body_offset +
++					ex_addr_offset;
++		}
++
+ 		list_add_tail(&dlb->free, &pool->free);
+ 	}
+ 
+@@ -318,6 +371,80 @@ void vsp1_dl_body_write(struct vsp1_dl_body *dlb, u32 reg, u32 data)
+  * Display List Transaction Management
+  */
+ 
++void vsp1_dl_set_addr_auto_fld(struct vsp1_dl_body *dlb,
++			       struct vsp1_rwpf *rpf,
++			       struct vsp1_rwpf_memory mem)
++{
++	const struct vsp1_format_info *fmtinfo = rpf->fmtinfo;
++	const struct v4l2_rect *crop;
++	u32 y_top_index, y_bot_index;
++	u32 u_top_index, u_bot_index;
++	u32 v_top_index, v_bot_index;
++	dma_addr_t y_top_addr, y_bot_addr;
++	dma_addr_t u_top_addr, u_bot_addr;
++	dma_addr_t v_top_addr, v_bot_addr;
++	u32 width, stride;
++
++	crop = vsp1_rwpf_get_crop(rpf, rpf->entity.config);
++	width = ALIGN(crop->width, 16);
++	stride = width * fmtinfo->bpp[0] / 8;
++
++	y_top_index = rpf->entity.index * 8;
++	y_bot_index = rpf->entity.index * 8 + 1;
++	u_top_index = rpf->entity.index * 8 + 2;
++	u_bot_index = rpf->entity.index * 8 + 3;
++	v_top_index = rpf->entity.index * 8 + 4;
++	v_bot_index = rpf->entity.index * 8 + 5;
++
++	switch (rpf->fmtinfo->fourcc) {
++	case V4L2_PIX_FMT_YUV420M:
++	case V4L2_PIX_FMT_YVU420M:
++		y_top_addr = mem.addr[0];
++		y_bot_addr = mem.addr[0] + stride;
++		u_top_addr = mem.addr[1];
++		u_bot_addr = mem.addr[1] + stride / 2;
++		v_top_addr = mem.addr[2];
++		v_bot_addr = mem.addr[2] + stride / 2;
++		break;
++
++	case V4L2_PIX_FMT_YUV422M:
++	case V4L2_PIX_FMT_YVU422M:
++		y_top_addr = mem.addr[0];
++		y_bot_addr = mem.addr[0] + stride * 2;
++		u_top_addr = mem.addr[1];
++		u_bot_addr = mem.addr[1] + stride;
++		v_top_addr = mem.addr[2];
++		v_bot_addr = mem.addr[2] + stride;
++		break;
++
++	case V4L2_PIX_FMT_YUV444M:
++	case V4L2_PIX_FMT_YVU444M:
++		y_top_addr = mem.addr[0];
++		y_bot_addr = mem.addr[0] + stride * 3;
++		u_top_addr = mem.addr[1];
++		u_bot_addr = mem.addr[1] + stride * 3;
++		v_top_addr = mem.addr[2];
++		v_bot_addr = mem.addr[2] + stride * 3;
++		break;
++
++	default:
++		y_top_addr = mem.addr[0];
++		y_bot_addr = mem.addr[0] + stride;
++		u_top_addr = mem.addr[1];
++		u_bot_addr = mem.addr[1] + stride;
++		v_top_addr = mem.addr[2];
++		v_bot_addr = mem.addr[2] + stride;
++		break;
++	}
++
++	dlb->src_dst_addr[y_top_index].addr = y_top_addr;
++	dlb->src_dst_addr[y_bot_index].addr = y_bot_addr;
++	dlb->src_dst_addr[u_top_index].addr = u_top_addr;
++	dlb->src_dst_addr[u_bot_index].addr = u_bot_addr;
++	dlb->src_dst_addr[v_top_index].addr = v_top_addr;
++	dlb->src_dst_addr[v_bot_index].addr = v_bot_addr;
++}
++
+ static struct vsp1_dl_list *vsp1_dl_list_alloc(struct vsp1_dl_manager *dlm)
+ {
+ 	struct vsp1_dl_list *dl;
+@@ -520,12 +647,17 @@ int vsp1_dl_list_add_chain(struct vsp1_dl_list *head,
+ 	return 0;
+ }
+ 
+-static void vsp1_dl_list_fill_header(struct vsp1_dl_list *dl, bool is_last)
++static void vsp1_dl_list_fill_header(struct vsp1_dl_list *dl, bool is_last,
++				     unsigned int pipe_index)
+ {
+ 	struct vsp1_dl_manager *dlm = dl->dlm;
+ 	struct vsp1_dl_header_list *hdr = dl->header->lists;
+ 	struct vsp1_dl_body *dlb;
+ 	unsigned int num_lists = 0;
++	struct vsp1_device *vsp1 = dlm->vsp1;
++	struct vsp1_drm_pipeline *drm_pipe = &vsp1->drm->pipe[pipe_index];
++	struct vsp1_pipeline *pipe = &drm_pipe->pipe;
++	unsigned int i, rpf_update = 0;
+ 
+ 	/*
+ 	 * Fill the header with the display list bodies addresses and sizes. The
+@@ -565,6 +697,36 @@ static void vsp1_dl_list_fill_header(struct vsp1_dl_list *dl, bool is_last)
+ 		 */
+ 		dl->header->next_header = dl->dma;
+ 		dl->header->flags = VSP1_DLH_INT_ENABLE | VSP1_DLH_AUTO_START;
++
++		for (i = 0; i < vsp1->info->rpf_count; ++i) {
++			if (!pipe->inputs[i])
++				continue;
++
++			rpf_update |= 0x01 << (16 + i);
++		}
++
++		if (!vsp1->info->uapi &&
++		    !(dl->dlm->vsp1->ths_quirks & VSP1_AUTO_FLD_NOT_SUPPORT)) {
++			/* Set extended display list header */
++			/* pre_ext_dl_exec = 1, pre_ext_dl_num_cmd = 1 */
++			dl->header->pre_post_num = (1 << 25) | (0x01);
++			dl->header->pre_ext_dl_plist = dl->body0->ext_dma;
++			dl->header->post_ext_dl_num_cmd = 0;
++			dl->header->post_ext_dl_p_list = 0;
++
++			/* Set extended display list (Auto-FLD) */
++			/* Set opecode */
++			dl->body0->ext_body->ext_dl_cmd[0] = 0x00000003;
++			/* RPF[0]-[4] address is updated */
++			dl->body0->ext_body->ext_dl_cmd[1] =
++						0x00000001 | rpf_update;
++
++			/* Set pointer of source/destination address */
++			dl->body0->ext_body->ext_dl_data[0] =
++						dl->body0->ext_addr_dma;
++			/* Should be set to 0 */
++			dl->body0->ext_body->ext_dl_data[1] = 0;
++		}
+ 	} else {
+ 		/*
+ 		 * Otherwise, in mem-to-mem mode, we work in single-shot mode
+@@ -679,7 +841,8 @@ static void vsp1_dl_list_commit_singleshot(struct vsp1_dl_list *dl)
+ 	dlm->active = dl;
+ }
+ 
+-void vsp1_dl_list_commit(struct vsp1_dl_list *dl, bool internal)
++void vsp1_dl_list_commit(struct vsp1_dl_list *dl, bool internal,
++			 unsigned int pipe_index)
+ {
+ 	struct vsp1_dl_manager *dlm = dl->dlm;
+ 	struct vsp1_dl_list *dl_child;
+@@ -687,12 +850,13 @@ void vsp1_dl_list_commit(struct vsp1_dl_list *dl, bool internal)
+ 
+ 	if (dlm->mode == VSP1_DL_MODE_HEADER) {
+ 		/* Fill the header for the head and chained display lists. */
+-		vsp1_dl_list_fill_header(dl, list_empty(&dl->chain));
++		vsp1_dl_list_fill_header(dl, list_empty(&dl->chain),
++					 pipe_index);
+ 
+ 		list_for_each_entry(dl_child, &dl->chain, chain) {
+ 			bool last = list_is_last(&dl_child->chain, &dl->chain);
+ 
+-			vsp1_dl_list_fill_header(dl_child, last);
++			vsp1_dl_list_fill_header(dl_child, last, pipe_index);
+ 		}
+ 	}
+ 
+@@ -729,8 +893,10 @@ void vsp1_dl_list_commit(struct vsp1_dl_list *dl, bool internal)
+  * has completed and had been queued with the internal notification flag.
+  * Internal notification is only supported for continuous mode.
+  */
+-unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm)
++unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm,
++				    bool interlaced)
+ {
++	struct vsp1_device *vsp1 = dlm->vsp1;
+ 	unsigned int flags = 0;
+ 
+ 	spin_lock(&dlm->lock);
+@@ -755,6 +921,10 @@ unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm)
+ 	if (vsp1_dl_list_hw_update_pending(dlm))
+ 		goto done;
+ 
++	if (interlaced && ((vsp1_read(vsp1, VI6_STATUS) &
++	    VI6_STATUS_FLD_STD(dlm->index)) !=
++	    VI6_STATUS_FLD_STD(dlm->index)))
++		goto done;
+ 	/*
+ 	 * The device starts processing the queued display list right after the
+ 	 * frame end interrupt. The display list thus becomes active.
+@@ -788,21 +958,28 @@ unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm)
+ }
+ 
+ /* Hardware Setup */
+-void vsp1_dlm_setup(struct vsp1_device *vsp1)
++void vsp1_dlm_setup(struct vsp1_device *vsp1, unsigned int pipe_index)
+ {
+ 	u32 ctrl = (256 << VI6_DL_CTRL_AR_WAIT_SHIFT)
+ 		 | VI6_DL_CTRL_DC2 | VI6_DL_CTRL_DC1 | VI6_DL_CTRL_DC0
+ 		 | VI6_DL_CTRL_DLE;
+ 
++	if (!vsp1->info->uapi &&
++	    !(vsp1->ths_quirks & VSP1_AUTO_FLD_NOT_SUPPORT)) {
++		vsp1_write(vsp1, VI6_DL_EXT_CTRL(pipe_index),
++			   (0x02 << VI6_DL_EXT_CTRL_POLINT_SHIFT) |
++			   VI6_DL_EXT_CTRL_DLPRI | VI6_DL_EXT_CTRL_EXT);
++	}
+ 	/*
+ 	 * The DRM pipeline operates with display lists in Continuous Frame
+ 	 * Mode, all other pipelines use manual start.
+ 	 */
+-	if (vsp1->drm)
++	if (vsp1->drm && vsp1->info->uapi)
+ 		ctrl |= VI6_DL_CTRL_CFM0 | VI6_DL_CTRL_NH0;
+ 
+ 	vsp1_write(vsp1, VI6_DL_CTRL, ctrl);
+-	vsp1_write(vsp1, VI6_DL_SWAP, VI6_DL_SWAP_LWS);
++	vsp1_write(vsp1, VI6_DL_SWAP(pipe_index), VI6_DL_SWAP_LWS |
++			 ((pipe_index == 1) ? VI6_DL_SWAP_IND : 0));
+ }
+ 
+ void vsp1_dlm_reset(struct vsp1_dl_manager *dlm)
+@@ -842,6 +1019,13 @@ struct vsp1_dl_manager *vsp1_dlm_create(struct vsp1_device *vsp1,
+ 	dlm->index = index;
+ 	dlm->mode = index == 0 && !vsp1->info->uapi
+ 		  ? VSP1_DL_MODE_HEADERLESS : VSP1_DL_MODE_HEADER;
++
++	if (((vsp1->version & VI6_IP_VERSION_MODEL_MASK) ==
++	    VI6_IP_VERSION_MODEL_VSPDL_GEN3) ||
++	    (vsp1->version & VI6_IP_VERSION_MODEL_MASK) ==
++	    VI6_IP_VERSION_MODEL_VSPD_GEN3)
++		dlm->mode = VSP1_DL_MODE_HEADER;
++
+ 	dlm->singleshot = vsp1->info->uapi;
+ 	dlm->vsp1 = vsp1;
+ 
+@@ -859,6 +1043,17 @@ struct vsp1_dl_manager *vsp1_dlm_create(struct vsp1_device *vsp1,
+ 		    ? ALIGN(sizeof(struct vsp1_dl_header), 8)
+ 		    : 0;
+ 
++	if (!vsp1->info->uapi &&
++	    !(vsp1->ths_quirks & VSP1_AUTO_FLD_NOT_SUPPORT)) {
++		size_t ex_addr_offset;
++		size_t ex_addr_size;
++
++		ex_addr_offset = sizeof(struct vsp1_ext_dl_body);
++		ex_addr_size = sizeof(struct vsp1_ext_dl_body)
++				* VSP1_DL_EXT_NUM_ENTRIES;
++		header_size += (ex_addr_offset + ex_addr_size);
++	}
++
+ 	dlm->pool = vsp1_dl_body_pool_create(vsp1, prealloc + 1,
+ 					     VSP1_DL_NUM_ENTRIES, header_size);
+ 	if (!dlm->pool)
+diff --git a/drivers/media/platform/vsp1/vsp1_dl.h b/drivers/media/platform/vsp1/vsp1_dl.h
+index 7f789461dffd..fc4bc74bf7b1 100644
+--- a/drivers/media/platform/vsp1/vsp1_dl.h
++++ b/drivers/media/platform/vsp1/vsp1_dl.h
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_dl.h  --  R-Car VSP1 Display List
+  *
+- * Copyright (C) 2015 Renesas Corporation
++ * Copyright (C) 2015-2018 Renesas Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -10,6 +10,7 @@
+ #define __VSP1_DL_H__
+ 
+ #include <linux/types.h>
++#include "vsp1_rwpf.h"
+ 
+ struct vsp1_device;
+ struct vsp1_dl_body;
+@@ -20,7 +21,7 @@ struct vsp1_dl_manager;
+ #define VSP1_DL_FRAME_END_COMPLETED		BIT(0)
+ #define VSP1_DL_FRAME_END_INTERNAL		BIT(1)
+ 
+-void vsp1_dlm_setup(struct vsp1_device *vsp1);
++void vsp1_dlm_setup(struct vsp1_device *vsp1, unsigned int pipe_index);
+ 
+ struct vsp1_dl_manager *vsp1_dlm_create(struct vsp1_device *vsp1,
+ 					unsigned int index,
+@@ -28,13 +29,15 @@ struct vsp1_dl_manager *vsp1_dlm_create(struct vsp1_device *vsp1,
+ bool vsp1_dlm_mode_headerless(struct vsp1_dl_manager *dlm);
+ void vsp1_dlm_destroy(struct vsp1_dl_manager *dlm);
+ void vsp1_dlm_reset(struct vsp1_dl_manager *dlm);
+-unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm);
++unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm,
++				    bool interlaced);
+ struct vsp1_dl_body *vsp1_dlm_dl_body_get(struct vsp1_dl_manager *dlm);
+ 
+ struct vsp1_dl_list *vsp1_dl_list_get(struct vsp1_dl_manager *dlm);
+ void vsp1_dl_list_put(struct vsp1_dl_list *dl);
+ struct vsp1_dl_body *vsp1_dl_list_get_body0(struct vsp1_dl_list *dl);
+-void vsp1_dl_list_commit(struct vsp1_dl_list *dl, bool internal);
++void vsp1_dl_list_commit(struct vsp1_dl_list *dl, bool internal,
++			 unsigned int pipe_index);
+ 
+ struct vsp1_dl_body_pool *
+ vsp1_dl_body_pool_create(struct vsp1_device *vsp1, unsigned int num_bodies,
+@@ -46,5 +49,8 @@ void vsp1_dl_body_put(struct vsp1_dl_body *dlb);
+ void vsp1_dl_body_write(struct vsp1_dl_body *dlb, u32 reg, u32 data);
+ int vsp1_dl_list_add_body(struct vsp1_dl_list *dl, struct vsp1_dl_body *dlb);
+ int vsp1_dl_list_add_chain(struct vsp1_dl_list *head, struct vsp1_dl_list *dl);
++void vsp1_dl_set_addr_auto_fld(struct vsp1_dl_body *dlb,
++			       struct vsp1_rwpf *rpf,
++			       struct vsp1_rwpf_memory mem);
+ 
+ #endif /* __VSP1_DL_H__ */
+diff --git a/drivers/media/platform/vsp1/vsp1_drm.c b/drivers/media/platform/vsp1/vsp1_drm.c
+index 7243cc99026c..e68733582df4 100644
+--- a/drivers/media/platform/vsp1/vsp1_drm.c
++++ b/drivers/media/platform/vsp1/vsp1_drm.c
+@@ -559,7 +559,7 @@ static void vsp1_du_pipeline_configure(struct vsp1_pipeline *pipe)
+ 		vsp1_entity_configure_partition(entity, pipe, dl, dlb);
+ 	}
+ 
+-	vsp1_dl_list_commit(dl, drm_pipe->force_brx_release);
++	vsp1_dl_list_commit(dl, drm_pipe->force_brx_release, pipe->lif->index);
+ }
+ 
+ /* -----------------------------------------------------------------------------
+@@ -820,6 +820,15 @@ int vsp1_du_atomic_update(struct device *dev, unsigned int pipe_index,
+ 		rpf->format.plane_fmt[1].bytesperline = cfg->pitch;
+ 	rpf->alpha = cfg->alpha;
+ 
++	rpf->interlaced = cfg->interlaced;
++
++	if ((vsp1->ths_quirks & VSP1_AUTO_FLD_NOT_SUPPORT) &&
++	    rpf->interlaced) {
++		dev_err(vsp1->dev,
++			"Interlaced mode is not supported.\n");
++		return -EINVAL;
++	}
++
+ 	rpf->mem.addr[0] = cfg->mem[0];
+ 	rpf->mem.addr[1] = cfg->mem[1];
+ 	rpf->mem.addr[2] = cfg->mem[2];
+diff --git a/drivers/media/platform/vsp1/vsp1_drv.c b/drivers/media/platform/vsp1/vsp1_drv.c
+index e30ef84c5cab..e520386d4c92 100644
+--- a/drivers/media/platform/vsp1/vsp1_drv.c
++++ b/drivers/media/platform/vsp1/vsp1_drv.c
+@@ -82,7 +82,8 @@ static const unsigned int fcpvd_offset[] = {
+ 
+ static const struct soc_device_attribute ths_quirks_match[]  = {
+ 	{ .soc_id = "r8a7795", .revision = "ES1.*",
+-	  .data = (void *)(VSP1_UNDERRUN_WORKAROUND), },
++	  .data = (void *)(VSP1_UNDERRUN_WORKAROUND |
++			   VSP1_AUTO_FLD_NOT_SUPPORT), },
+ 	{ .soc_id = "r8a7795", .revision = "ES2.0",
+ 	  .data = NULL, },
+ 	{ .soc_id = "r8a7796",
+@@ -674,7 +675,12 @@ static int vsp1_device_init(struct vsp1_device *vsp1)
+ 	vsp1_write(vsp1, VI6_DPR_HGT_SMPPT, (7 << VI6_DPR_SMPPT_TGW_SHIFT) |
+ 		   (VI6_DPR_NODE_UNUSED << VI6_DPR_SMPPT_PT_SHIFT));
+ 
+-	vsp1_dlm_setup(vsp1);
++	if (vsp1->info->lif_count == 2) {
++		vsp1_dlm_setup(vsp1, 0);
++		vsp1_dlm_setup(vsp1, 1);
++	} else {
++		vsp1_dlm_setup(vsp1, 0);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/vsp1/vsp1_pipe.c b/drivers/media/platform/vsp1/vsp1_pipe.c
+index 54ff539ffea0..619d53de6026 100644
+--- a/drivers/media/platform/vsp1/vsp1_pipe.c
++++ b/drivers/media/platform/vsp1/vsp1_pipe.c
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_pipe.c  --  R-Car VSP1 Pipeline
+  *
+- * Copyright (C) 2013-2015 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -311,17 +311,29 @@ bool vsp1_pipeline_ready(struct vsp1_pipeline *pipe)
+ 
+ void vsp1_pipeline_frame_end(struct vsp1_pipeline *pipe)
+ {
++	struct vsp1_device *vsp1;
+ 	unsigned int flags;
++	bool interlaced = false;
++	int i;
+ 
+ 	if (pipe == NULL)
+ 		return;
+ 
++	vsp1 = pipe->output->entity.vsp1;
++
++	for (i = 0; i < vsp1->info->rpf_count; ++i) {
++		if (!pipe->inputs[i])
++			continue;
++
++		interlaced = pipe->inputs[i]->interlaced;
++	}
++
+ 	/*
+ 	 * If the DL commit raced with the frame end interrupt, the commit ends
+ 	 * up being postponed by one frame. The returned flags tell whether the
+ 	 * active frame was finished or postponed.
+ 	 */
+-	flags = vsp1_dlm_irq_frame_end(pipe->output->dlm);
++	flags = vsp1_dlm_irq_frame_end(pipe->output->dlm, interlaced);
+ 
+ 	if (pipe->hgo)
+ 		vsp1_hgo_frame_end(pipe->hgo);
+diff --git a/drivers/media/platform/vsp1/vsp1_regs.h b/drivers/media/platform/vsp1/vsp1_regs.h
+index ae7a76294ca2..ae8942470dae 100644
+--- a/drivers/media/platform/vsp1/vsp1_regs.h
++++ b/drivers/media/platform/vsp1/vsp1_regs.h
+@@ -28,6 +28,7 @@
+ #define VI6_SRESET_SRTS(n)		(1 << (n))
+ 
+ #define VI6_STATUS			0x0038
++#define VI6_STATUS_FLD_STD(n)		(1 << ((n) + 28))
+ #define VI6_STATUS_SYS_ACT(n)		(1 << ((n) + 8))
+ 
+ #define VI6_WPF_IRQ_ENB(n)		(0x0048 + (n) * 12)
+@@ -69,12 +70,13 @@
+ 
+ #define VI6_DL_HDR_ADDR(n)		(0x0104 + (n) * 4)
+ 
+-#define VI6_DL_SWAP			0x0114
++#define VI6_DL_SWAP(n)			(0x0114 + (n) * 56)
++#define VI6_DL_SWAP_IND			(1 << 31)
+ #define VI6_DL_SWAP_LWS			(1 << 2)
+ #define VI6_DL_SWAP_WDS			(1 << 1)
+ #define VI6_DL_SWAP_BTS			(1 << 0)
+ 
+-#define VI6_DL_EXT_CTRL			0x011c
++#define VI6_DL_EXT_CTRL(n)		(0x011c + (n) * 36)
+ #define VI6_DL_EXT_CTRL_NWE		(1 << 16)
+ #define VI6_DL_EXT_CTRL_POLINT_MASK	(0x3f << 8)
+ #define VI6_DL_EXT_CTRL_POLINT_SHIFT	8
+diff --git a/drivers/media/platform/vsp1/vsp1_rpf.c b/drivers/media/platform/vsp1/vsp1_rpf.c
+index 5de26c25b6dc..4a8559854587 100644
+--- a/drivers/media/platform/vsp1/vsp1_rpf.c
++++ b/drivers/media/platform/vsp1/vsp1_rpf.c
+@@ -65,7 +65,10 @@ static void rpf_configure_stream(struct vsp1_entity *entity,
+ 		pstride |= format->plane_fmt[1].bytesperline
+ 			<< VI6_RPF_SRCM_PSTRIDE_C_SHIFT;
+ 
+-	vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_PSTRIDE, pstride);
++	if (rpf->interlaced)
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_PSTRIDE, pstride * 2);
++	else
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_PSTRIDE, pstride);
+ 
+ 	/* Format */
+ 	sink_format = vsp1_entity_get_pad_format(&rpf->entity,
+@@ -101,9 +104,14 @@ static void rpf_configure_stream(struct vsp1_entity *entity,
+ 		top = compose->top;
+ 	}
+ 
+-	vsp1_rpf_write(rpf, dlb, VI6_RPF_LOC,
+-		       (left << VI6_RPF_LOC_HCOORD_SHIFT) |
+-		       (top << VI6_RPF_LOC_VCOORD_SHIFT));
++	if (rpf->interlaced)
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_LOC,
++			       (left << VI6_RPF_LOC_HCOORD_SHIFT) |
++			       ((top / 2) << VI6_RPF_LOC_VCOORD_SHIFT));
++	else
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_LOC,
++			       (left << VI6_RPF_LOC_HCOORD_SHIFT) |
++			       (top << VI6_RPF_LOC_VCOORD_SHIFT));
+ 
+ 	/*
+ 	 * On Gen2 use the alpha channel (extended to 8 bits) when available or
+@@ -222,6 +230,7 @@ static void rpf_configure_partition(struct vsp1_entity *entity,
+ 	const struct vsp1_format_info *fmtinfo = rpf->fmtinfo;
+ 	const struct v4l2_pix_format_mplane *format = &rpf->format;
+ 	struct v4l2_rect crop;
++	u32 crop_width, crop_height, crop_x, crop_y, fourcc;
+ 
+ 	/*
+ 	 * Source size and crop offsets.
+@@ -248,21 +257,63 @@ static void rpf_configure_partition(struct vsp1_entity *entity,
+ 		crop.left += pipe->partition->rpf.left;
+ 	}
+ 
++	crop_width = crop.width;
++	crop_x = crop.left;
++	fourcc = rpf->fmtinfo->fourcc;
++
++	if (rpf->interlaced) {
++		crop_height = crop.height / 2;
++		crop_y = crop.top / 2;
++
++		if (fourcc == V4L2_PIX_FMT_UYVY ||
++		    fourcc == V4L2_PIX_FMT_VYUY ||
++		    fourcc == V4L2_PIX_FMT_YUYV ||
++		    fourcc == V4L2_PIX_FMT_YVYU) {
++			crop_width = round_down(crop_width, 2);
++			crop_x = round_down(crop_x, 2);
++		} else if ((fourcc == V4L2_PIX_FMT_NV12M) ||
++			   (fourcc == V4L2_PIX_FMT_NV21M)) {
++			crop_width = round_down(crop_width, 2);
++			crop_height = round_down(crop_height, 2);
++			crop_x = round_down(crop_x, 2);
++			crop_y = round_down(crop_y, 2);
++		} else if ((fourcc == V4L2_PIX_FMT_NV16M) ||
++			   (fourcc == V4L2_PIX_FMT_NV61M)) {
++			crop_width = round_down(crop_width, 2);
++			crop_x = round_down(crop_x, 2);
++		} else if ((fourcc == V4L2_PIX_FMT_YUV420M) ||
++			   (fourcc == V4L2_PIX_FMT_YUV444M) ||
++			   (fourcc == V4L2_PIX_FMT_YVU420M) ||
++			   (fourcc == V4L2_PIX_FMT_YVU444M)) {
++			crop_width = round_down(crop_width, 2);
++			crop_height = round_down(crop_height, 2);
++		} else if ((fourcc == V4L2_PIX_FMT_YUV422M) ||
++			   (fourcc == V4L2_PIX_FMT_YVU422M)) {
++			crop_width = round_down(crop_width, 2);
++			crop_height = round_down(crop_height, 2);
++			crop_x = round_down(crop_x, 2);
++			crop_y = round_down(crop_y, 2);
++		}
++	} else {
++		crop_height = crop.height;
++		crop_y = crop.top;
++	}
++
+ 	vsp1_rpf_write(rpf, dlb, VI6_RPF_SRC_BSIZE,
+-		       (crop.width << VI6_RPF_SRC_BSIZE_BHSIZE_SHIFT) |
+-		       (crop.height << VI6_RPF_SRC_BSIZE_BVSIZE_SHIFT));
++		       (crop_width << VI6_RPF_SRC_BSIZE_BHSIZE_SHIFT) |
++		       (crop_height << VI6_RPF_SRC_BSIZE_BVSIZE_SHIFT));
+ 	vsp1_rpf_write(rpf, dlb, VI6_RPF_SRC_ESIZE,
+-		       (crop.width << VI6_RPF_SRC_ESIZE_EHSIZE_SHIFT) |
+-		       (crop.height << VI6_RPF_SRC_ESIZE_EVSIZE_SHIFT));
++		       (crop_width << VI6_RPF_SRC_ESIZE_EHSIZE_SHIFT) |
++		       (crop_height << VI6_RPF_SRC_ESIZE_EVSIZE_SHIFT));
+ 
+-	mem.addr[0] += crop.top * format->plane_fmt[0].bytesperline
+-		     + crop.left * fmtinfo->bpp[0] / 8;
++	mem.addr[0] += crop_y * format->plane_fmt[0].bytesperline
++		     + crop_x * fmtinfo->bpp[0] / 8;
+ 
+ 	if (format->num_planes > 1) {
+ 		unsigned int offset;
+ 
+-		offset = crop.top * format->plane_fmt[1].bytesperline
+-		       + crop.left / fmtinfo->hsub
++		offset = crop_y * format->plane_fmt[1].bytesperline
++		       + crop_x / fmtinfo->hsub
+ 		       * fmtinfo->bpp[1] / 8;
+ 		mem.addr[1] += offset;
+ 		mem.addr[2] += offset;
+@@ -276,9 +327,13 @@ static void rpf_configure_partition(struct vsp1_entity *entity,
+ 	    fmtinfo->swap_uv)
+ 		swap(mem.addr[1], mem.addr[2]);
+ 
+-	vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_ADDR_Y, mem.addr[0]);
+-	vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_ADDR_C0, mem.addr[1]);
+-	vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_ADDR_C1, mem.addr[2]);
++	if (!(vsp1->ths_quirks & VSP1_AUTO_FLD_NOT_SUPPORT)) {
++		vsp1_dl_set_addr_auto_fld(dlb, rpf, mem);
++	} else {
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_ADDR_Y, mem.addr[0]);
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_ADDR_C0, mem.addr[1]);
++		vsp1_rpf_write(rpf, dlb, VI6_RPF_SRCM_ADDR_C1, mem.addr[2]);
++	}
+ }
+ 
+ static void rpf_partition(struct vsp1_entity *entity,
+diff --git a/drivers/media/platform/vsp1/vsp1_rwpf.h b/drivers/media/platform/vsp1/vsp1_rwpf.h
+index 70742ecf766f..f4421a1b7be8 100644
+--- a/drivers/media/platform/vsp1/vsp1_rwpf.h
++++ b/drivers/media/platform/vsp1/vsp1_rwpf.h
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_rwpf.h  --  R-Car VSP1 Read and Write Pixel Formatters
+  *
+- * Copyright (C) 2013-2014 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -63,6 +63,8 @@ struct vsp1_rwpf {
+ 	struct vsp1_rwpf_memory mem;
+ 
+ 	struct vsp1_dl_manager *dlm;
++
++	bool interlaced;
+ };
+ 
+ static inline struct vsp1_rwpf *to_rwpf(struct v4l2_subdev *subdev)
+diff --git a/drivers/media/platform/vsp1/vsp1_video.c b/drivers/media/platform/vsp1/vsp1_video.c
+index 81d47a09d7bc..3f30f3cfab8b 100644
+--- a/drivers/media/platform/vsp1/vsp1_video.c
++++ b/drivers/media/platform/vsp1/vsp1_video.c
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_video.c  --  R-Car VSP1 Video Node
+  *
+- * Copyright (C) 2013-2015 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -435,7 +435,7 @@ static void vsp1_video_pipeline_run(struct vsp1_pipeline *pipe)
+ 	}
+ 
+ 	/* Complete, and commit the head display list. */
+-	vsp1_dl_list_commit(dl, false);
++	vsp1_dl_list_commit(dl, false, 0);
+ 	pipe->configured = true;
+ 
+ 	vsp1_pipeline_run(pipe);
+diff --git a/include/media/vsp1.h b/include/media/vsp1.h
+index 678c24de1ac6..18b91b12f730 100644
+--- a/include/media/vsp1.h
++++ b/include/media/vsp1.h
+@@ -1,7 +1,7 @@
+ /*
+  * vsp1.h  --  R-Car VSP1 API
+  *
+- * Copyright (C) 2015 Renesas Electronics Corporation
++ * Copyright (C) 2015-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  *
+@@ -59,6 +59,7 @@ struct vsp1_du_atomic_config {
+ 	struct v4l2_rect dst;
+ 	unsigned int alpha;
+ 	unsigned int zpos;
++	bool interlaced;
+ };
+ 
+ /**
+-- 
+2.17.1
+

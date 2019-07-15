@@ -1,0 +1,146 @@
+From 71b286ea3b710e32fc287f5dd7c7b2f3ed67d338 Mon Sep 17 00:00:00 2001
+From: Vladimir Barinov <vladimir.barinov@cogentembedded.com>
+Date: Mon, 30 May 2016 01:51:47 +0300
+Subject: [PATCH 802/909] can: rcar_canfd: add enable and standby control pins
+
+commit e22e679c7dc63204157d70e04df1fc23cb5b009f from
+https://github.com/CogentEmbedded/meta-rcar.git
+
+Add enable and standby can transceiver control pins
+
+Signed-off-by: Vladimir Barinov <vladimir.barinov@cogentembedded.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ .../bindings/net/can/rcar_canfd.txt           |  5 +++
+ drivers/net/can/rcar/rcar_can.c               |  4 ++-
+ drivers/net/can/rcar/rcar_canfd.c             | 33 ++++++++++++++++++-
+ 3 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/net/can/rcar_canfd.txt b/Documentation/devicetree/bindings/net/can/rcar_canfd.txt
+index ac71daa46195..829604a30ad3 100644
+--- a/Documentation/devicetree/bindings/net/can/rcar_canfd.txt
++++ b/Documentation/devicetree/bindings/net/can/rcar_canfd.txt
+@@ -19,6 +19,7 @@ Required properties:
+ - clock-names: 3 clock input name strings: "fck", "canfd", "can_clk".
+ - pinctrl-0: pin control group to be used for this controller.
+ - pinctrl-names: must be "default".
++- gpios: GPIO used for controlling the enable pin and standby pin
+ 
+ Required child nodes:
+ The controller supports two channels and each is represented as a child node.
+@@ -62,6 +63,10 @@ SoC common .dtsi file:
+ 			power-domains = <&cpg>;
+ 			status = "disabled";
+ 
++			gpios = <&gpio5 29 GPIO_ACTIVE_HIGH /* enable */
++				 &gpio5 30 GPIO_ACTIVE_LOW /* standby */
++				>;
++
+ 			channel0 {
+ 				status = "disabled";
+ 			};
+diff --git a/drivers/net/can/rcar/rcar_can.c b/drivers/net/can/rcar/rcar_can.c
+index 1e2d6f05d8dd..e0ded2ebe31a 100644
+--- a/drivers/net/can/rcar/rcar_can.c
++++ b/drivers/net/can/rcar/rcar_can.c
+@@ -19,6 +19,7 @@
+ #include <linux/can/led.h>
+ #include <linux/can/dev.h>
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
+ #include <linux/can/platform/rcar_can.h>
+ #include <linux/of.h>
+ #include <linux/of_gpio.h>
+@@ -900,7 +901,8 @@ static int __maybe_unused rcar_can_suspend(struct device *dev)
+ 	writew(ctlr, &priv->regs->ctlr);
+ 	priv->can.state = CAN_STATE_SLEEPING;
+ 
+-	clk_disable(priv->clk);
++	if(__clk_is_enabled(priv->clk))
++		clk_disable(priv->clk);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/can/rcar/rcar_canfd.c b/drivers/net/can/rcar/rcar_canfd.c
+index 602c19e23f05..5b98f8c6c37e 100644
+--- a/drivers/net/can/rcar/rcar_canfd.c
++++ b/drivers/net/can/rcar/rcar_canfd.c
+@@ -38,6 +38,7 @@
+ #include <linux/clk.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
++#include <linux/of_gpio.h>
+ #include <linux/bitmap.h>
+ #include <linux/bitops.h>
+ #include <linux/iopoll.h>
+@@ -517,6 +518,8 @@ struct rcar_canfd_global {
+ 	enum rcar_canfd_fcanclk fcan;	/* CANFD or Ext clock */
+ 	unsigned long channels_mask;	/* Enabled channels mask */
+ 	bool fdmode;			/* CAN FD or Classical CAN only mode */
++	unsigned int enable_pin;	/* transceiver enable */
++	unsigned int standby_pin;	/* transceiver standby */
+ };
+ 
+ /* CAN FD mode nominal rate constants */
+@@ -1268,6 +1271,10 @@ static int rcar_canfd_open(struct net_device *ndev)
+ 	struct rcar_canfd_global *gpriv = priv->gpriv;
+ 	int err;
+ 
++	/* transceiver normal mode */
++	if (gpio_is_valid(gpriv->standby_pin))
++		gpio_set_value(gpriv->standby_pin, 1);
++
+ 	/* Peripheral clock is already enabled in probe */
+ 	err = clk_prepare_enable(gpriv->can_clk);
+ 	if (err) {
+@@ -1336,6 +1343,9 @@ static int rcar_canfd_close(struct net_device *ndev)
+ 	clk_disable_unprepare(gpriv->can_clk);
+ 	close_candev(ndev);
+ 	can_led_event(ndev, CAN_LED_EVENT_STOP);
++	/* transceiver stanby mode */
++	if (gpio_is_valid(gpriv->standby_pin))
++		gpio_set_value(gpriv->standby_pin, 0);
+ 	return 0;
+ }
+ 
+@@ -1639,8 +1649,9 @@ static int rcar_canfd_probe(struct platform_device *pdev)
+ 	struct rcar_canfd_global *gpriv;
+ 	struct device_node *of_child;
+ 	unsigned long channels_mask = 0;
+-	int err, ch_irq, g_irq;
++	int err, ret, ch_irq, g_irq;
+ 	bool fdmode = true;			/* CAN FD only mode - default */
++	enum of_gpio_flags enable_flags, standby_flags;
+ 
+ 	if (of_property_read_bool(pdev->dev.of_node, "renesas,no-can-fd"))
+ 		fdmode = false;			/* Classical CAN only mode */
+@@ -1785,6 +1796,26 @@ static int rcar_canfd_probe(struct platform_device *pdev)
+ 			goto fail_channel;
+ 	}
+ 
++	gpriv->enable_pin = of_get_gpio_flags(pdev->dev.of_node, 0, &enable_flags);
++	gpriv->standby_pin = of_get_gpio_flags(pdev->dev.of_node, 1, &standby_flags);
++
++	if (gpio_is_valid(gpriv->enable_pin)) {
++		int val = enable_flags & OF_GPIO_ACTIVE_LOW ?
++			  GPIOF_OUT_INIT_LOW : GPIOF_OUT_INIT_HIGH;
++		ret = devm_gpio_request_one(&pdev->dev, gpriv->enable_pin, val, "enable");
++		if (ret)
++			dev_info(&pdev->dev, "Failed to request enable pin\n");
++	}
++
++	if (gpio_is_valid(gpriv->standby_pin)) {
++		int val = standby_flags & OF_GPIO_ACTIVE_LOW ?
++			  GPIOF_OUT_INIT_LOW : GPIOF_OUT_INIT_HIGH;
++		/* transceiver standby mode */
++		ret = devm_gpio_request_one(&pdev->dev, gpriv->standby_pin, val, "standby");
++		if (ret)
++			dev_info(&pdev->dev, "Failed to request standby pin\n");
++	}
++
+ 	platform_set_drvdata(pdev, gpriv);
+ 	dev_info(&pdev->dev, "global operational state (clk %d, fdmode %d)\n",
+ 		 gpriv->fcan, gpriv->fdmode);
+-- 
+2.17.1
+

@@ -1,0 +1,173 @@
+From 45f344ce1b634d94d347992f5fcf498f10323299 Mon Sep 17 00:00:00 2001
+From: Masaharu Hayakawa <masaharu.hayakawa.ry@renesas.com>
+Date: Wed, 22 Nov 2017 11:02:22 +0900
+Subject: [PATCH 205/909] mmc: tmio: Add internal DMA transfer end
+
+commit c22d0dd44627603b1c1abb6803e75fe3e97d94c2 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+Although the completion of the data transfer processing was judged only
+by the Access End interrupt of SDHI, the Transfer End interruption of
+DMAC was also added to the condition.
+
+Signed-off-by: Masaharu Hayakawa <masaharu.hayakawa.ry@renesas.com>
+Signed-off-by: Takeshi Saito <takeshi.saito.xv@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/mmc/host/tmio_mmc.h      | 17 ++++++++++++
+ drivers/mmc/host/tmio_mmc_core.c | 45 ++++++++++++++++++++++++++++++--
+ 2 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/tmio_mmc.h b/drivers/mmc/host/tmio_mmc.h
+index 38fb80b611db..8aa70e1bc708 100644
+--- a/drivers/mmc/host/tmio_mmc.h
++++ b/drivers/mmc/host/tmio_mmc.h
+@@ -110,6 +110,12 @@
+ 		TMIO_STAT_CARD_REMOVE | TMIO_STAT_CARD_INSERT)
+ #define TMIO_MASK_IRQ     (TMIO_MASK_READOP | TMIO_MASK_WRITEOP | TMIO_MASK_CMD)
+ 
++#define TMIO_TRANSTATE_DEND	0x00000001
++#define TMIO_TRANSTATE_AEND	0x00000002
++
++/* Check LSI revisions and set specific quirk value */
++#define DTRAEND1_SET_BIT17	BIT(0)
++
+ struct tmio_mmc_data;
+ struct tmio_mmc_host;
+ 
+@@ -121,6 +127,7 @@ struct tmio_mmc_dma_ops {
+ 	void (*release)(struct tmio_mmc_host *host);
+ 	void (*abort)(struct tmio_mmc_host *host);
+ 	void (*dataend)(struct tmio_mmc_host *host);
++	bool (*dma_irq)(struct tmio_mmc_host *host);
+ };
+ 
+ struct tmio_mmc_host {
+@@ -145,6 +152,8 @@ struct tmio_mmc_host {
+ 	struct platform_device *pdev;
+ 	struct tmio_mmc_data *pdata;
+ 
++	u32			sdhi_quirks;
++
+ 	/* DMA support */
+ 	bool			force_pio;
+ 	struct dma_chan		*chan_rx;
+@@ -152,6 +161,7 @@ struct tmio_mmc_host {
+ 	struct tasklet_struct	dma_issue;
+ 	struct scatterlist	bounce_sg;
+ 	u8			*bounce_buf;
++	u32			dma_tranend1;
+ 
+ 	/* Track lost interrupts */
+ 	struct delayed_work	delayed_reset_work;
+@@ -160,6 +170,7 @@ struct tmio_mmc_host {
+ 	/* Cache */
+ 	u32			sdcard_irq_mask;
+ 	u32			sdio_irq_mask;
++	u32			dma_irq_mask;
+ 	unsigned int		clk_cache;
+ 
+ 	spinlock_t		lock;		/* protect host private data */
+@@ -168,6 +179,9 @@ struct tmio_mmc_host {
+ 	bool			native_hotplug;
+ 	bool			sdio_irq_enabled;
+ 
++	spinlock_t		trans_lock;	/* protect trans_state */
++	unsigned int		trans_state;
++
+ 	/* Mandatory callback */
+ 	int (*clk_enable)(struct tmio_mmc_host *host);
+ 
+@@ -203,6 +217,9 @@ int tmio_mmc_host_probe(struct tmio_mmc_host *host);
+ void tmio_mmc_host_remove(struct tmio_mmc_host *host);
+ void tmio_mmc_do_data_irq(struct tmio_mmc_host *host);
+ 
++void tmio_mmc_set_transtate(struct tmio_mmc_host *host, unsigned int state);
++void tmio_mmc_clear_transtate(struct tmio_mmc_host *host);
++
+ void tmio_mmc_enable_mmc_irqs(struct tmio_mmc_host *host, u32 i);
+ void tmio_mmc_disable_mmc_irqs(struct tmio_mmc_host *host, u32 i);
+ irqreturn_t tmio_mmc_irq(int irq, void *devid);
+diff --git a/drivers/mmc/host/tmio_mmc_core.c b/drivers/mmc/host/tmio_mmc_core.c
+index b3f3f55e22f6..7fdac847cf8e 100644
+--- a/drivers/mmc/host/tmio_mmc_core.c
++++ b/drivers/mmc/host/tmio_mmc_core.c
+@@ -111,6 +111,34 @@ void tmio_mmc_disable_mmc_irqs(struct tmio_mmc_host *host, u32 i)
+ }
+ EXPORT_SYMBOL_GPL(tmio_mmc_disable_mmc_irqs);
+ 
++void tmio_mmc_set_transtate(struct tmio_mmc_host *host, unsigned int state)
++{
++	unsigned long flags = 0;
++
++	spin_lock_irqsave(&host->trans_lock, flags);
++	host->trans_state |= state;
++
++	if (host->trans_state == (TMIO_TRANSTATE_DEND | TMIO_TRANSTATE_AEND)) {
++		spin_unlock_irqrestore(&host->trans_lock, flags);
++		tmio_mmc_dataend_dma(host);
++	} else {
++		spin_unlock_irqrestore(&host->trans_lock, flags);
++	}
++}
++EXPORT_SYMBOL_GPL(tmio_mmc_set_transtate);
++
++void tmio_mmc_clear_transtate(struct tmio_mmc_host *host)
++{
++	unsigned long flags = 0;
++
++	spin_lock_irqsave(&host->trans_lock, flags);
++
++	host->trans_state = 0;
++
++	spin_unlock_irqrestore(&host->trans_lock, flags);
++}
++EXPORT_SYMBOL_GPL(tmio_mmc_clear_transtate);
++
+ static void tmio_mmc_ack_mmc_irqs(struct tmio_mmc_host *host, u32 i)
+ {
+ 	sd_ctrl_write32_as_16_and_16(host, CTL_STATUS, ~i);
+@@ -571,11 +599,18 @@ static void tmio_mmc_data_irq(struct tmio_mmc_host *host, unsigned int stat)
+ 
+ 		if (done) {
+ 			tmio_mmc_disable_mmc_irqs(host, TMIO_STAT_DATAEND);
+-			tmio_mmc_dataend_dma(host);
++			if (!data->error)
++				tmio_mmc_set_transtate(host,
++						       TMIO_TRANSTATE_AEND);
++			else
++				tmio_mmc_dataend_dma(host);
+ 		}
+ 	} else if (host->chan_rx && (data->flags & MMC_DATA_READ) && !host->force_pio) {
+ 		tmio_mmc_disable_mmc_irqs(host, TMIO_STAT_DATAEND);
+-		tmio_mmc_dataend_dma(host);
++		if (!data->error)
++			tmio_mmc_set_transtate(host, TMIO_TRANSTATE_AEND);
++		else
++			tmio_mmc_dataend_dma(host);
+ 	} else {
+ 		tmio_mmc_do_data_irq(host);
+ 		tmio_mmc_disable_mmc_irqs(host, TMIO_MASK_READOP | TMIO_MASK_WRITEOP);
+@@ -739,6 +774,9 @@ irqreturn_t tmio_mmc_irq(int irq, void *devid)
+ 		return IRQ_HANDLED;
+ 	if (__tmio_mmc_sdcard_irq(host, ireg, status))
+ 		return IRQ_HANDLED;
++	if (host->dma_ops)
++		if (host->dma_ops->dma_irq(host))
++			return IRQ_HANDLED;
+ 
+ 	if (__tmio_mmc_sdio_irq(host))
+ 		return IRQ_HANDLED;
+@@ -1303,6 +1341,9 @@ int tmio_mmc_host_probe(struct tmio_mmc_host *_host)
+ 	spin_lock_init(&_host->lock);
+ 	mutex_init(&_host->ios_lock);
+ 
++	spin_lock_init(&_host->trans_lock);
++	_host->trans_state = 0;
++
+ 	/* Init delayed work for request timeouts */
+ 	INIT_DELAYED_WORK(&_host->delayed_reset_work, tmio_mmc_reset_work);
+ 	INIT_WORK(&_host->done, tmio_mmc_done_work);
+-- 
+2.17.1
+

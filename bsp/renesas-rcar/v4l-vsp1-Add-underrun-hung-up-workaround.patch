@@ -1,0 +1,420 @@
+From 80d141d77810800d90566c572bf839378115b5a5 Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Thu, 23 Aug 2018 15:47:02 +0900
+Subject: [PATCH 285/909] v4l: vsp1: Add underrun hung-up workaround
+
+commit 3469001c309853223a02878b897c78fdaef070c9 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+This workaround is required at the time of H3(WS1.x).
+This patch adds it.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/media/platform/vsp1/vsp1.h      |  12 ++-
+ drivers/media/platform/vsp1/vsp1_dl.c   |  11 ++-
+ drivers/media/platform/vsp1/vsp1_dl.h   |   1 +
+ drivers/media/platform/vsp1/vsp1_drv.c  | 115 +++++++++++++++++++++++-
+ drivers/media/platform/vsp1/vsp1_regs.h |  44 ++++++++-
+ drivers/media/platform/vsp1/vsp1_wpf.c  |   4 +-
+ 6 files changed, 178 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/vsp1/vsp1.h b/drivers/media/platform/vsp1/vsp1.h
+index 33f632331474..67f1033f7ab7 100644
+--- a/drivers/media/platform/vsp1/vsp1.h
++++ b/drivers/media/platform/vsp1/vsp1.h
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1.h  --  R-Car VSP1 Driver
+  *
+- * Copyright (C) 2013-2014 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -38,6 +38,9 @@ struct vsp1_sru;
+ struct vsp1_uds;
+ struct vsp1_uif;
+ 
++/* Workaround for hung up at the time of underrun in R-Car H3(ES1.x) */
++#define VSP1_UNDERRUN_WORKAROUND	BIT(0)
++
+ #define VSP1_MAX_LIF		2
+ #define VSP1_MAX_RPF		5
+ #define VSP1_MAX_UDS		3
+@@ -72,6 +75,7 @@ struct vsp1_device {
+ 	struct device *dev;
+ 	const struct vsp1_device_info *info;
+ 	u32 version;
++	u32 ths_quirks;
+ 
+ 	void __iomem *mmio;
+ 	struct rcar_fcp_device *fcp;
+@@ -100,11 +104,15 @@ struct vsp1_device {
+ 	struct media_entity_operations media_ops;
+ 
+ 	struct vsp1_drm *drm;
++
++	int index;
++	dma_addr_t dl_addr;
++	unsigned int dl_body;
+ };
+ 
+ int vsp1_device_get(struct vsp1_device *vsp1);
+ void vsp1_device_put(struct vsp1_device *vsp1);
+-
++void vsp1_underrun_workaround(struct vsp1_device *vsp1, bool reset);
+ int vsp1_reset_wpf(struct vsp1_device *vsp1, unsigned int index);
+ 
+ static inline u32 vsp1_read(struct vsp1_device *vsp1, u32 reg)
+diff --git a/drivers/media/platform/vsp1/vsp1_dl.c b/drivers/media/platform/vsp1/vsp1_dl.c
+index d9b9cdd8fbe2..008346492dde 100644
+--- a/drivers/media/platform/vsp1/vsp1_dl.c
++++ b/drivers/media/platform/vsp1/vsp1_dl.c
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_dl.c  --  R-Car VSP1 Display List
+  *
+- * Copyright (C) 2015 Renesas Corporation
++ * Copyright (C) 2015-2018 Renesas Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -12,6 +12,7 @@
+ #include <linux/gfp.h>
+ #include <linux/refcount.h>
+ #include <linux/slab.h>
++#include <linux/sys_soc.h>
+ #include <linux/workqueue.h>
+ 
+ #include "vsp1.h"
+@@ -609,6 +610,12 @@ static void vsp1_dl_list_hw_enqueue(struct vsp1_dl_list *dl)
+ 		vsp1_write(vsp1, VI6_DL_HDR_ADDR(0), dl->body0->dma);
+ 		vsp1_write(vsp1, VI6_DL_BODY_SIZE, VI6_DL_BODY_SIZE_UPD |
+ 			(dl->body0->num_entries * sizeof(*dl->header->lists)));
++		if (vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND) {
++			vsp1->dl_addr = dl->body0->dma;
++			vsp1->dl_body = VI6_DL_BODY_SIZE_UPD |
++					(dl->body0->num_entries *
++					sizeof(*dl->header->lists));
++		}
+ 	} else {
+ 		/*
+ 		 * In header mode, program the display list header address. If
+@@ -618,6 +625,8 @@ static void vsp1_dl_list_hw_enqueue(struct vsp1_dl_list *dl)
+ 		 * will be updated with the display list address.
+ 		 */
+ 		vsp1_write(vsp1, VI6_DL_HDR_ADDR(dlm->index), dl->dma);
++		if (vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND)
++			vsp1->dl_addr = dl->dma;
+ 	}
+ }
+ 
+diff --git a/drivers/media/platform/vsp1/vsp1_dl.h b/drivers/media/platform/vsp1/vsp1_dl.h
+index 7dba0469c92e..7f789461dffd 100644
+--- a/drivers/media/platform/vsp1/vsp1_dl.h
++++ b/drivers/media/platform/vsp1/vsp1_dl.h
+@@ -25,6 +25,7 @@ void vsp1_dlm_setup(struct vsp1_device *vsp1);
+ struct vsp1_dl_manager *vsp1_dlm_create(struct vsp1_device *vsp1,
+ 					unsigned int index,
+ 					unsigned int prealloc);
++bool vsp1_dlm_mode_headerless(struct vsp1_dl_manager *dlm);
+ void vsp1_dlm_destroy(struct vsp1_dl_manager *dlm);
+ void vsp1_dlm_reset(struct vsp1_dl_manager *dlm);
+ unsigned int vsp1_dlm_irq_frame_end(struct vsp1_dl_manager *dlm);
+diff --git a/drivers/media/platform/vsp1/vsp1_drv.c b/drivers/media/platform/vsp1/vsp1_drv.c
+index 5d82f6ee56ea..a76143f34fba 100644
+--- a/drivers/media/platform/vsp1/vsp1_drv.c
++++ b/drivers/media/platform/vsp1/vsp1_drv.c
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_drv.c  --  R-Car VSP1 Driver
+  *
+- * Copyright (C) 2013-2015 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -16,6 +16,7 @@
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/sys_soc.h>
+ #include <linux/videodev2.h>
+ 
+ #include <media/rcar-fcp.h>
+@@ -38,13 +39,87 @@
+ #include "vsp1_uif.h"
+ #include "vsp1_video.h"
+ 
++static void __iomem *fcpv_reg[4];
++static const unsigned int fcpvd_offset[] = {
++	FCPVD0_REG, FCPVD1_REG, FCPVD2_REG, FCPVD3_REG
++};
++
++static const struct soc_device_attribute ths_quirks_match[]  = {
++	{ .soc_id = "r8a7795", .revision = "ES1.*",
++	  .data = (void *)(VSP1_UNDERRUN_WORKAROUND), },
++	{ .soc_id = "r8a7795", .revision = "ES2.0",
++	  .data = NULL, },
++	{ .soc_id = "r8a7796",
++	  .data = NULL, },
++	{/*sentinel*/}
++};
++
++void vsp1_underrun_workaround(struct vsp1_device *vsp1, bool reset)
++{
++	unsigned int timeout = 0;
++
++	/* 1. Disable clock stop of VSP */
++	vsp1_write(vsp1, VI6_CLK_CTRL0, VI6_CLK_CTRL0_WORKAROUND);
++	vsp1_write(vsp1, VI6_CLK_CTRL1, VI6_CLK_CTRL1_WORKAROUND);
++	vsp1_write(vsp1, VI6_CLK_DCSWT, VI6_CLK_DCSWT_WORKAROUND1);
++	vsp1_write(vsp1, VI6_CLK_DCSM0, VI6_CLK_DCSM0_WORKAROUND);
++	vsp1_write(vsp1, VI6_CLK_DCSM1, VI6_CLK_DCSM1_WORKAROUND);
++
++	/* 2. Stop operation of VSP except bus access with module reset */
++	vsp1_write(vsp1, VI6_MRESET_ENB0, VI6_MRESET_ENB0_WORKAROUND1);
++	vsp1_write(vsp1, VI6_MRESET_ENB1, VI6_MRESET_ENB1_WORKAROUND);
++	vsp1_write(vsp1, VI6_MRESET, VI6_MRESET_WORKAROUND);
++
++	/* 3. Stop operation of FCPV with software reset */
++	iowrite32(FCP_RST_SOFTRST, fcpv_reg[vsp1->index] + FCP_RST_REG);
++
++	/* 4. Wait until FCP_STA.ACT become 0. */
++	while (1) {
++		if ((ioread32(fcpv_reg[vsp1->index] + FCP_STA_REG) &
++			FCP_STA_ACT) != FCP_STA_ACT)
++			break;
++
++		if (timeout == 100)
++			break;
++
++		timeout++;
++		udelay(1);
++	}
++
++	/* 5. Initialize the whole FCPV with module reset */
++	iowrite32(FCP_RST_WORKAROUND, fcpv_reg[vsp1->index] + FCP_RST_REG);
++
++	/* 6. Stop the whole operation of VSP with module reset */
++	/*    (note that register setting is not cleared) */
++	vsp1_write(vsp1, VI6_MRESET_ENB0, VI6_MRESET_ENB0_WORKAROUND2);
++	vsp1_write(vsp1, VI6_MRESET_ENB1, VI6_MRESET_ENB1_WORKAROUND);
++	vsp1_write(vsp1, VI6_MRESET, VI6_MRESET_WORKAROUND);
++
++	/* 7. Enable clock stop of VSP */
++	vsp1_write(vsp1, VI6_CLK_CTRL0, 0);
++	vsp1_write(vsp1, VI6_CLK_CTRL1, 0);
++	vsp1_write(vsp1, VI6_CLK_DCSWT, VI6_CLK_DCSWT_WORKAROUND2);
++	vsp1_write(vsp1, VI6_CLK_DCSM0, 0);
++	vsp1_write(vsp1, VI6_CLK_DCSM1, 0);
++
++	/* 8. Restart VSPD */
++	if (!reset) {
++		/* Necessary when headerless display list */
++		vsp1_write(vsp1, VI6_DL_HDR_ADDR(0), vsp1->dl_addr);
++		if (vsp1->dl_body)
++			vsp1_write(vsp1, VI6_DL_BODY_SIZE, vsp1->dl_body);
++		vsp1_write(vsp1, VI6_CMD(0), VI6_CMD_STRCMD);
++	}
++}
++
+ /* -----------------------------------------------------------------------------
+  * Interrupt Handling
+  */
+ 
+ static irqreturn_t vsp1_irq_handler(int irq, void *data)
+ {
+-	u32 mask = VI6_WFP_IRQ_STA_DFE | VI6_WFP_IRQ_STA_FRE;
++	u32 mask = VI6_WFP_IRQ_STA_DFE | VI6_WFP_IRQ_STA_FRE |
++		   VI6_WFP_IRQ_STA_UND;
+ 	struct vsp1_device *vsp1 = data;
+ 	irqreturn_t ret = IRQ_NONE;
+ 	unsigned int i;
+@@ -52,6 +127,7 @@ static irqreturn_t vsp1_irq_handler(int irq, void *data)
+ 
+ 	for (i = 0; i < vsp1->info->wpf_count; ++i) {
+ 		struct vsp1_rwpf *wpf = vsp1->wpf[i];
++		bool underrun = false;
+ 
+ 		if (wpf == NULL)
+ 			continue;
+@@ -59,10 +135,16 @@ static irqreturn_t vsp1_irq_handler(int irq, void *data)
+ 		status = vsp1_read(vsp1, VI6_WPF_IRQ_STA(i));
+ 		vsp1_write(vsp1, VI6_WPF_IRQ_STA(i), ~status & mask);
+ 
++		if (status & VI6_WFP_IRQ_STA_UND)
++			underrun = true;
++
+ 		if (status & VI6_WFP_IRQ_STA_DFE) {
+ 			vsp1_pipeline_frame_end(wpf->entity.pipe);
+ 			ret = IRQ_HANDLED;
+ 		}
++
++		if ((vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND) && underrun)
++			vsp1_underrun_workaround(vsp1, false);
+ 	}
+ 
+ 	return ret;
+@@ -489,7 +571,11 @@ int vsp1_reset_wpf(struct vsp1_device *vsp1, unsigned int index)
+ 	if (!(status & VI6_STATUS_SYS_ACT(index)))
+ 		return 0;
+ 
+-	vsp1_write(vsp1, VI6_SRESET, VI6_SRESET_SRTS(index));
++	if (vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND)
++		vsp1_underrun_workaround(vsp1, true);
++	else
++		vsp1_write(vsp1, VI6_SRESET, VI6_SRESET_SRTS(index));
++
+ 	for (timeout = 10; timeout > 0; --timeout) {
+ 		status = vsp1_read(vsp1, VI6_STATUS);
+ 		if (!(status & VI6_STATUS_SYS_ACT(index)))
+@@ -791,6 +877,7 @@ static int vsp1_probe(struct platform_device *pdev)
+ 	struct resource *io;
+ 	unsigned int i;
+ 	int ret;
++	const struct soc_device_attribute *attr;
+ 
+ 	vsp1 = devm_kzalloc(&pdev->dev, sizeof(*vsp1), GFP_KERNEL);
+ 	if (vsp1 == NULL)
+@@ -852,6 +939,12 @@ static int vsp1_probe(struct platform_device *pdev)
+ 	vsp1->version = vsp1_read(vsp1, VI6_IP_VERSION);
+ 	pm_runtime_put_sync(&pdev->dev);
+ 
++	attr = soc_device_match(ths_quirks_match);
++	if (attr)
++		vsp1->ths_quirks = (uintptr_t)attr->data;
++
++	pr_debug("%s: ths_quirks: 0x%x\n", __func__, vsp1->ths_quirks);
++
+ 	for (i = 0; i < ARRAY_SIZE(vsp1_device_infos); ++i) {
+ 		if ((vsp1->version & VI6_IP_VERSION_MODEL_MASK) ==
+ 		    vsp1_device_infos[i].version) {
+@@ -876,6 +969,19 @@ static int vsp1_probe(struct platform_device *pdev)
+ 		goto done;
+ 	}
+ 
++	/* Set VSPD index */
++	if (strcmp(dev_name(vsp1->dev), "fea20000.vsp") == 0)
++		vsp1->index = 0;
++	else if (strcmp(dev_name(vsp1->dev), "fea28000.vsp") == 0)
++		vsp1->index = 1;
++	else if (strcmp(dev_name(vsp1->dev), "fea30000.vsp") == 0)
++		vsp1->index = 2;
++	else if (strcmp(dev_name(vsp1->dev), "fea38000.vsp") == 0)
++		vsp1->index = 3;
++
++	if (vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND)
++		fcpv_reg[vsp1->index] =
++			ioremap(fcpvd_offset[vsp1->index], 0x20);
+ done:
+ 	if (ret)
+ 		pm_runtime_disable(&pdev->dev);
+@@ -892,6 +998,9 @@ static int vsp1_remove(struct platform_device *pdev)
+ 
+ 	pm_runtime_disable(&pdev->dev);
+ 
++	if (vsp1->ths_quirks & VSP1_UNDERRUN_WORKAROUND)
++		iounmap(fcpv_reg[vsp1->index]);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/media/platform/vsp1/vsp1_regs.h b/drivers/media/platform/vsp1/vsp1_regs.h
+index 0d249ff9f564..ae7a76294ca2 100644
+--- a/drivers/media/platform/vsp1/vsp1_regs.h
++++ b/drivers/media/platform/vsp1/vsp1_regs.h
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_regs.h  --  R-Car VSP1 Registers Definitions
+  *
+- * Copyright (C) 2013 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -31,10 +31,12 @@
+ #define VI6_STATUS_SYS_ACT(n)		(1 << ((n) + 8))
+ 
+ #define VI6_WPF_IRQ_ENB(n)		(0x0048 + (n) * 12)
++#define VI6_WFP_IRQ_ENB_UNDE		(1 << 16)
+ #define VI6_WFP_IRQ_ENB_DFEE		(1 << 1)
+ #define VI6_WFP_IRQ_ENB_FREE		(1 << 0)
+ 
+ #define VI6_WPF_IRQ_STA(n)		(0x004c + (n) * 12)
++#define VI6_WFP_IRQ_STA_UND		(1 << 16)
+ #define VI6_WFP_IRQ_STA_DFE		(1 << 1)
+ #define VI6_WFP_IRQ_STA_FRE		(1 << 0)
+ 
+@@ -845,4 +847,44 @@
+ #define VI6_FMT_Y_U_V_422		0x4b
+ #define VI6_FMT_Y_U_V_420		0x4c
+ 
++/* -----------------------------------------------------------------------------
++ * for workaround in H3(ES1.x)
++ */
++#define	FCPVD0_REG			0xfea27000
++#define	FCPVD1_REG			0xfea2f000
++#define	FCPVD2_REG			0xfea37000
++#define	FCPVD3_REG			0xfea3f000
++
++#define FCP_RST_REG			0x0010
++#define FCP_RST_SOFTRST			0x00000001
++#define FCP_RST_WORKAROUND		0x00000010
++
++#define FCP_STA_REG			0x0018
++#define FCP_STA_ACT			0x00000001
++
++#define VI6_CLK_CTRL0			0x0010
++#define VI6_CLK_CTRL0_WORKAROUND	0x10010f1f
++
++#define VI6_CLK_CTRL1			0x0014
++#define VI6_CLK_CTRL1_WORKAROUND	0xff00ffff
++
++#define VI6_CLK_DCSWT_WORKAROUND1	0x00130808
++#define VI6_CLK_DCSWT_WORKAROUND2	0x00000808
++
++#define VI6_CLK_DCSM0			0x001c
++#define VI6_CLK_DCSM0_WORKAROUND	0x1fff0f1f
++
++#define VI6_CLK_DCSM1			0x0020
++#define VI6_CLK_DCSM1_WORKAROUND	0xff00ffff
++
++#define VI6_MRESET_ENB0			0x002c
++#define VI6_MRESET_ENB0_WORKAROUND1	0x0000001f
++#define VI6_MRESET_ENB0_WORKAROUND2	0x30000f1f
++
++#define VI6_MRESET_ENB1			0x0030
++#define VI6_MRESET_ENB1_WORKAROUND	0xff00ffff
++
++#define VI6_MRESET			0x0034
++#define VI6_MRESET_WORKAROUND		0x00000001
++
+ #endif /* __VSP1_REGS_H__ */
+diff --git a/drivers/media/platform/vsp1/vsp1_wpf.c b/drivers/media/platform/vsp1/vsp1_wpf.c
+index 23c8f706b3f2..929093ed6968 100644
+--- a/drivers/media/platform/vsp1/vsp1_wpf.c
++++ b/drivers/media/platform/vsp1/vsp1_wpf.c
+@@ -2,7 +2,7 @@
+ /*
+  * vsp1_wpf.c  --  R-Car VSP1 Write Pixel Formatter
+  *
+- * Copyright (C) 2013-2014 Renesas Electronics Corporation
++ * Copyright (C) 2013-2018 Renesas Electronics Corporation
+  *
+  * Contact: Laurent Pinchart (laurent.pinchart@ideasonboard.com)
+  */
+@@ -320,7 +320,7 @@ static void wpf_configure_stream(struct vsp1_entity *entity,
+ 	/* Enable interrupts */
+ 	vsp1_dl_body_write(dlb, VI6_WPF_IRQ_STA(wpf->entity.index), 0);
+ 	vsp1_dl_body_write(dlb, VI6_WPF_IRQ_ENB(wpf->entity.index),
+-			   VI6_WFP_IRQ_ENB_DFEE);
++			   VI6_WFP_IRQ_ENB_DFEE | VI6_WFP_IRQ_ENB_UNDE);
+ }
+ 
+ static void wpf_configure_frame(struct vsp1_entity *entity,
+-- 
+2.17.1
+

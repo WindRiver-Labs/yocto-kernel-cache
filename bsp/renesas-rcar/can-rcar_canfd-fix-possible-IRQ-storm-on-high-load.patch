@@ -1,0 +1,67 @@
+From b70a2e2927d0c5350f8842faa505b642c2152039 Mon Sep 17 00:00:00 2001
+From: Nikita Yushchenko <nikita.yoush@cogentembedded.com>
+Date: Wed, 13 Mar 2019 18:49:28 +0300
+Subject: [PATCH 854/909] can: rcar_canfd: fix possible IRQ storm on high load
+
+commit 0c0b56e36d1b3479f5e3f6c2b8bf52b89caa3b78 from
+https://github.com/CogentEmbedded/meta-rcar.git
+
+We have observed rcar_canfd driver entering IRQ storm under high load,
+with following scenario:
+- rcar_canfd_global_interrupt() in entered due to Rx available,
+- napi_schedule_prep() is called, and sets NAPIF_STATE_SCHED in state
+- Rx fifo interrupts are masked,
+- rcar_canfd_global_interrupt() is entered again, this time due to
+  error interrupt (e.g. due to overflow),
+- since scheduled napi poller has not yet executed, condition for calling
+  napi_schedule_prep() from rcar_canfd_global_interrupt() remains true,
+  thus napi_schedule_prep() gets called and sets NAPIF_STATE_MISSED flag
+  in state,
+- later, napi poller function rcar_canfd_rx_poll() gets executed, and
+  calls napi_complete_done(),
+- due to NAPIF_STATE_MISSED flag in state, this call does not clear
+  NAPIF_STATE_SCHED flag from state,
+- on return from napi_complete_done(), rcar_canfd_rx_poll() unmasks Rx
+  interrutps,
+- Rx interrupt happens, rcar_canfd_global_interrupt() gets called
+  and calls napi_schedule_prep(),
+- since NAPIF_STATE_SCHED is set in state at this time, this call
+  returns false,
+- due to that false return, rcar_canfd_global_interrupt() returns
+  without masking Rx interrupt
+- and this results into IRQ storm: unmasked Rx interrupt happens again
+  and again is misprocessed in the same way.
+
+This patch fixes that scenario by unmasking Rx interrupts only when
+napi_complete_done() returns true, which means it has cleared
+NAPIF_STATE_SCHED in state.
+
+Signed-off-by: Nikita Yushchenko <nikita.yoush@cogentembedded.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/net/can/rcar/rcar_canfd.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/can/rcar/rcar_canfd.c b/drivers/net/can/rcar/rcar_canfd.c
+index 5b98f8c6c37e..0017ab9f345f 100644
+--- a/drivers/net/can/rcar/rcar_canfd.c
++++ b/drivers/net/can/rcar/rcar_canfd.c
+@@ -1522,10 +1522,11 @@ static int rcar_canfd_rx_poll(struct napi_struct *napi, int quota)
+ 
+ 	/* All packets processed */
+ 	if (num_pkts < quota) {
+-		napi_complete_done(napi, num_pkts);
+-		/* Enable Rx FIFO interrupts */
+-		rcar_canfd_set_bit(priv->base, RCANFD_RFCC(ridx),
+-				   RCANFD_RFCC_RFIE);
++		if (napi_complete_done(napi, num_pkts)) {
++			/* Enable Rx FIFO interrupts */
++			rcar_canfd_set_bit(priv->base, RCANFD_RFCC(ridx),
++					   RCANFD_RFCC_RFIE);
++		}
+ 	}
+ 	return num_pkts;
+ }
+-- 
+2.17.1
+

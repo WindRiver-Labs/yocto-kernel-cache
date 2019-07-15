@@ -1,0 +1,167 @@
+From a913aa1d264c851bb257b47ba7bc6ed34f7d60dc Mon Sep 17 00:00:00 2001
+From: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Date: Mon, 3 Sep 2018 19:16:51 +0900
+Subject: [PATCH 310/909] drm: rcar-du: Fix possible crtcs for plane when using
+ VSPDL
+
+commit 653e1374d0389bd4f1bd6f4005a3770b802d37c8 from
+git://git.kernel.org/pub/scm/linux/kernel/git/horms/renesas-bsp.git
+
+If two or more channels are specified for possible crtc of plane,
+if user move the overlay between monitors in the system test,
+the following error occurs.
+
+switching CRTC directly
+atomic core check failed
+
+In order to solve the problem, this patch fixes it by fixing
+assignment of possible crtc for each plane.
+
+In addtion, add an option to change the assignment of the
+overlay sharing with VSPDL.
+
+Signed-off-by: Koji Matsuoka <koji.matsuoka.xm@renesas.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/gpu/drm/rcar-du/rcar_du_crtc.c |  9 +++++++--
+ drivers/gpu/drm/rcar-du/rcar_du_drv.h  |  2 ++
+ drivers/gpu/drm/rcar-du/rcar_du_kms.c  | 15 ++++++++++++++
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.c  | 27 ++++++++++++++++++++++++++
+ drivers/gpu/drm/rcar-du/rcar_du_vsp.h  |  2 ++
+ 5 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+index 55d00d646d9b..3a1d31f09014 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_crtc.c
+@@ -1011,10 +1011,15 @@ int rcar_du_crtc_create(struct rcar_du_group *rgrp, unsigned int swindex,
+ 	rcrtc->mmio_offset = mmio_offsets[hwindex];
+ 	rcrtc->index = hwindex;
+ 
+-	if (rcar_du_has(rcdu, RCAR_DU_FEATURE_VSP1_SOURCE))
++	if (rcar_du_has(rcdu, RCAR_DU_FEATURE_VSP1_SOURCE)) {
++		/* If the BRS number of VSPDL is 0, skip CRTC initialization */
++		if (rcdu->vspdl_fix && rcrtc->vsp_pipe == 1 &&
++		    rcdu->brs_num == 0)
++			return 0;
+ 		primary = &rcrtc->vsp->planes[rcrtc->vsp_pipe].plane;
+-	else
++	} else {
+ 		primary = &rgrp->planes[swindex % 2].plane;
++	}
+ 
+ 	ret = drm_crtc_init_with_planes(rcdu->ddev, crtc, primary, NULL,
+ 					rcdu->info->gen <= 2 ?
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_drv.h b/drivers/gpu/drm/rcar-du/rcar_du_drv.h
+index 4461f9fa863b..d6346524194f 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_drv.h
++++ b/drivers/gpu/drm/rcar-du/rcar_du_drv.h
+@@ -94,6 +94,8 @@ struct rcar_du_device {
+ 
+ 	unsigned int dpad0_source;
+ 	unsigned int vspd1_sink;
++	bool vspdl_fix;
++	unsigned int brs_num;
+ };
+ 
+ static inline bool rcar_du_has(struct rcar_du_device *rcdu,
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_kms.c b/drivers/gpu/drm/rcar-du/rcar_du_kms.c
+index 45de72a51b4d..751723efabbd 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_kms.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_kms.c
+@@ -533,12 +533,18 @@ static int rcar_du_vsps_init(struct rcar_du_device *rcdu)
+ 
+ 	for (i = 0; i < rcdu->num_crtcs; ++i) {
+ 		unsigned int j;
++		unsigned int brs_num = 0;
+ 
+ 		ret = of_parse_phandle_with_fixed_args(np, "vsps", cells, i,
+ 						       &args);
+ 		if (ret < 0)
+ 			goto error;
+ 
++		ret = of_property_read_u32(args.np, "renesas,#brs", &brs_num);
++		if (brs_num > 2) {
++			dev_err(rcdu->dev, "error: brs number\n");
++			goto error;
++		}
+ 		/*
+ 		 * Add the VSP to the list or update the corresponding existing
+ 		 * entry if the VSP has already been added.
+@@ -558,6 +564,13 @@ static int rcar_du_vsps_init(struct rcar_du_device *rcdu)
+ 		/* Store the VSP pointer and pipe index in the CRTC. */
+ 		rcdu->crtcs[i].vsp = &rcdu->vsps[j];
+ 		rcdu->crtcs[i].vsp_pipe = cells >= 1 ? args.args[0] : 0;
++
++		/* Has VSPDL */
++		if (rcdu->crtcs[i].vsp_pipe) {
++			if (!ret)
++				rcdu->vspdl_fix = true;
++			rcdu->brs_num = brs_num;
++		}
+ 	}
+ 
+ 	/*
+@@ -621,6 +634,8 @@ int rcar_du_modeset_init(struct rcar_du_device *rcdu)
+ 	}
+ 
+ 	rcdu->num_crtcs = hweight8(rcdu->info->channels_mask);
++	rcdu->vspdl_fix = false;
++	rcdu->brs_num = 0;
+ 
+ 	ret = rcar_du_properties_init(rcdu);
+ 	if (ret < 0)
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+index 5b484308b8a4..37373b60b551 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.c
+@@ -569,6 +569,33 @@ int rcar_du_vsp_init(struct rcar_du_vsp *vsp, struct device_node *np,
+ 		plane->vsp = vsp;
+ 		plane->index = i;
+ 
++		/* Fix possible crtcs for plane when using VSPDL */
++		if (rcdu->vspdl_fix && vsp->index == VSPDL_CH) {
++			u32 pair_ch;
++			enum rcar_du_output pair_con = RCAR_DU_OUTPUT_DPAD0;
++
++			pair_ch = rcdu->info->routes[pair_con].possible_crtcs;
++
++			if (rcdu->brs_num == 0) {
++				crtcs = BIT(0);
++				if (i > 0)
++					type = DRM_PLANE_TYPE_OVERLAY;
++			} else if (rcdu->brs_num == 1) {
++				if (type == DRM_PLANE_TYPE_PRIMARY)
++					i == 1 ? (crtcs = pair_ch) :
++						 (crtcs = BIT(0));
++				else
++					crtcs = BIT(0);
++			} else {
++				if (type == DRM_PLANE_TYPE_PRIMARY)
++					i == 1 ? (crtcs = pair_ch) :
++						 (crtcs = BIT(0));
++				else
++					i == 4 ? (crtcs = pair_ch) :
++						 (crtcs = BIT(0));
++			}
++		}
++
+ 		ret = drm_universal_plane_init(rcdu->ddev, &plane->plane, crtcs,
+ 					       &rcar_du_vsp_plane_funcs,
+ 					       formats_kms,
+diff --git a/drivers/gpu/drm/rcar-du/rcar_du_vsp.h b/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
+index 4b0b02802ad8..93dbb9edbc81 100644
+--- a/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
++++ b/drivers/gpu/drm/rcar-du/rcar_du_vsp.h
+@@ -17,6 +17,8 @@
+ #include <drm/drmP.h>
+ #include <drm/drm_crtc.h>
+ 
++#define VSPDL_CH	0	/* VSPDL channel in r8a7795 and r8a77965 */
++
+ struct rcar_du_format_info;
+ struct rcar_du_vsp;
+ 
+-- 
+2.17.1
+
