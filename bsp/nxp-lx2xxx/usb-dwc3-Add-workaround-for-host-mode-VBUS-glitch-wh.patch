@@ -1,0 +1,144 @@
+From 5f809303786cb17958f3665ad54db0202627ea6b Mon Sep 17 00:00:00 2001
+From: Ran Wang <ran.wang_1@nxp.com>
+Date: Wed, 16 Jan 2019 13:23:17 +0800
+Subject: [PATCH 049/235] usb: dwc3: Add workaround for host mode VBUS glitch
+ when boot
+
+When DWC3 is set to host mode by programming register DWC3_GCTL, VBUS
+(or its control signal) will be turned on immediately on related Root Hub
+ports. Then, the VBUS is turned off for a little while(15us) when do xhci
+reset (conducted by xhci driver) and back to normal finally, we can
+observe a negative glitch of related signal happen.
+
+This VBUS glitch might cause some USB devices enumeration fail if kernel
+boot with them connected. Such as LS1012AFWRY/LS1043ARDB/LX2160AQDS
+/LS1088ARDB with Kingston 16GB USB2.0/Kingston USB3.0/JetFlash Transcend
+4GB USB2.0 drives. The fail cases include enumerated as full-speed device
+or report wrong device descriptor, etc.
+
+One SW workaround which can fix this is by programing all xhci PORTSC[PP]
+to 0 to turn off VBUS immediately after setting host mode in DWC3 driver
+(per signal measurement result, it will be too late to do it in
+xhci-plat.c or xhci.c). Then, after xhci reset complete in xhci driver,
+PORTSC[PP]s' value will back to 1 automatically and VBUS on at that time,
+no glitch happen and normal enumeration process has no impact.
+
+Signed-off-by: Ran Wang <ran.wang_1@nxp.com>
+[Xulin: Original patch taken from NXP LSDK-19.06.]
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/usb/dwc3/core.c | 47 +++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/dwc3/core.h | 11 ++++++++++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 0b8b578a0c00..59c1623e5634 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -91,6 +91,41 @@ static int dwc3_get_dr_mode(struct dwc3 *dwc)
+ 	return 0;
+ }
+ 
++/*
++ * dwc3_power_of_all_roothub_ports - Power off all Root hub ports
++ * @dwc3: Pointer to our controller context structure
++ */
++static void dwc3_power_off_all_roothub_ports(struct dwc3 *dwc)
++{
++	int i, port_num;
++	u32 reg, op_regs_base, offset;
++	void __iomem		*xhci_regs;
++
++	/* xhci regs is not mapped yet, do it temperary here */
++	if (dwc->xhci_resources[0].start) {
++		xhci_regs = ioremap(dwc->xhci_resources[0].start,
++				DWC3_XHCI_REGS_END);
++		if (IS_ERR(xhci_regs)) {
++			dev_err(dwc->dev, "Failed to ioremap xhci_regs\n");
++			return;
++		}
++
++		op_regs_base = HC_LENGTH(readl(xhci_regs));
++		reg = readl(xhci_regs + XHCI_HCSPARAMS1);
++		port_num = HCS_MAX_PORTS(reg);
++
++		for (i = 1; i <= port_num; i++) {
++			offset = op_regs_base + XHCI_PORTSC_BASE + 0x10*(i-1);
++			reg = readl(xhci_regs + offset);
++			reg &= ~PORT_POWER;
++			writel(reg, xhci_regs + offset);
++		}
++
++		iounmap(xhci_regs);
++	} else
++		dev_err(dwc->dev, "xhci base reg invalid\n");
++}
++
+ void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode)
+ {
+ 	u32 reg;
+@@ -100,6 +135,15 @@ void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode)
+ 	reg |= DWC3_GCTL_PRTCAPDIR(mode);
+ 	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
+ 
++	/*
++	 * We have to power off all Root hub ports immediately after DWC3 set
++	 * to host mode to avoid VBUS glitch happen when xhci get reset later.
++	 */
++	if (dwc->host_vbus_glitches) {
++		if (mode == DWC3_GCTL_PRTCAP_HOST)
++			dwc3_power_off_all_roothub_ports(dwc);
++	}
++
+ 	dwc->current_dr_role = mode;
+ }
+ 
+@@ -1271,6 +1315,9 @@ static void dwc3_get_properties(struct dwc3 *dwc)
+ 	dwc->dis_metastability_quirk = device_property_read_bool(dev,
+ 				"snps,dis_metastability_quirk");
+ 
++	dwc->host_vbus_glitches = device_property_read_bool(dev,
++				"snps,host-vbus-glitches");
++
+ 	dwc->lpm_nyet_threshold = lpm_nyet_threshold;
+ 	dwc->tx_de_emphasis = tx_de_emphasis;
+ 
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index bb62fcf5cfe6..6ee6577c28c1 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -610,6 +610,14 @@
+ #define DWC3_OSTS_VBUSVLD		BIT(1)
+ #define DWC3_OSTS_CONIDSTS		BIT(0)
+ 
++/* Partial XHCI Register and Bit fields for quirk */
++#define XHCI_HCSPARAMS1		0x4
++#define XHCI_PORTSC_BASE	0x400
++#define PORT_POWER			(1 << 9)
++#define HCS_MAX_PORTS(p)	(((p) >> 24) & 0x7f)
++#define XHCI_HC_LENGTH(p)	(((p)>>00)&0x00ff)
++#define HC_LENGTH(p)		XHCI_HC_LENGTH(p)
++
+ /* Structures */
+ 
+ struct dwc3_trb;
+@@ -1020,6 +1028,8 @@ struct dwc3_scratchpad_array {
+  * @quirk_stop_transfer_in_block: prevent block transmission from being
+  *				interrupted
+  * @quirk_stop_ep_in_u1: replace stop commad with disable slot command
++ * @host-vbus-glitches: set to avoid vbus glitch during
++ *                      xhci reset.
+  * @imod_interval: set the interrupt moderation interval in 250ns
+  *                 increments or 0 to disable.
+  */
+@@ -1200,6 +1210,7 @@ struct dwc3 {
+ 	unsigned                quirk_stop_ep_in_u1:1;
+ 
+ 	unsigned		dis_metastability_quirk:1;
++	unsigned		host_vbus_glitches:1;
+ 
+ 	u16			imod_interval;
+ };
+-- 
+2.17.1
+
