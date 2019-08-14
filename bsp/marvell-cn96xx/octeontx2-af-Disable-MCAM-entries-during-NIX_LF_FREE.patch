@@ -1,0 +1,527 @@
+From eccc50d64b7feb95441c4f2981da8b2a7204da45 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Fri, 17 May 2019 17:50:33 +0530
+Subject: [PATCH 046/138] octeontx2-af: Disable MCAM entries during NIX_LF_FREE
+
+commit b33c0c9a2ad462ffd10f82dc6c41e5b4e51b08c6 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Ntuple filters installed by user for a interface needs
+to be deleted by the user but currently those are
+deleted when interface is brought down say using
+ifconfig ethx down. Correct behavior is entries
+which target the down interface should be disabled
+hence traffic to that interface is dropped at MCAM.
+To fix the problem:
+ - A flag is added in NIXLF_FREE message for only disabling
+   MCAM entries.
+ - MCAM entries of a PF/VF are deleted during its FLR.
+ - For a VFn, entries which are owned by its parent PF
+   but direct traffic to VFn are disabled during FLR.
+ - Disabled entries are enabled when NIXLF_START mbox
+   message is called for the interface.
+
+Also some trivial changes like renaming variables are done.
+
+With these changes VF interface need not be initialized when
+installing a ntuple filter by its PF.
+
+Also debugfs is updated to show enable/disable status and
+target of an entry. MCAM rules are now displayed as:
+        PF1
+        target: PF1 VF0
+        mcam entry: 227
+        ether type  0x8100 0xffff
+        action: Direct to queue 0
+        enabled: yes
+        counter: 1
+        hits: 0
+
+Change-Id: I5f7716c9b5b9e3899b9bdbcf727df1fdbeea5324
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/10406
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |   9 +-
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |   4 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   3 +
+ .../marvell/octeontx2/af/rvu_debugfs.c        |  20 +++-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  14 ++-
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   |  45 +++++++-
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 101 ++++++++++++------
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |   7 +-
+ 8 files changed, 154 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index a2f9f5a80c00..1eca3396b484 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -247,7 +247,7 @@ M(NPC_MCAM_READ_ENTRY,	  0x600f, npc_mcam_read_entry,			\
+ /* NIX mbox IDs (range 0x8000 - 0xFFFF) */				\
+ M(NIX_LF_ALLOC,		0x8000, nix_lf_alloc,				\
+ 				 nix_lf_alloc_req, nix_lf_alloc_rsp)	\
+-M(NIX_LF_FREE,		0x8001, nix_lf_free, msg_req, msg_rsp)		\
++M(NIX_LF_FREE,		0x8001, nix_lf_free, nix_lf_free_req, msg_rsp)	\
+ M(NIX_AQ_ENQ,		0x8002, nix_aq_enq, nix_aq_enq_req, nix_aq_enq_rsp)  \
+ M(NIX_HWCTX_DISABLE,	0x8003, nix_hwctx_disable,			\
+ 				 hwctx_disable_req, msg_rsp)		\
+@@ -648,6 +648,12 @@ struct nix_lf_alloc_rsp {
+ 	u16	qints; /* NIX_AF_CONST2::QINTS */
+ };
+ 
++struct nix_lf_free_req {
++	struct mbox_msghdr hdr;
++#define NIX_LF_DISABLE_FLOWS	0x1
++	u64 flags;
++};
++
+ /* NIX AQ enqueue msg */
+ struct nix_aq_enq_req {
+ 	struct mbox_msghdr hdr;
+@@ -1289,7 +1295,6 @@ struct npc_delete_flow_req {
+ 	struct mbox_msghdr hdr;
+ 	u16 entry;
+ 	u8 all; /* PF + VFs */
+-	u8 all_vfs; /* VFs */
+ };
+ 
+ struct npc_mcam_read_entry_req {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index 331fb1309e08..f4fff4c8afa6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -309,12 +309,12 @@ struct rvu_npc_mcam_rule {
+ 	u64 vtag_action;
+ 	struct list_head list;
+ 	u64 features;
+-	u16 pcifunc;
++	u16 owner;
+ 	u16 entry;
+ 	u16 cntr;
+ 	bool has_cntr;
+ 	u8 default_rule;
+-	bool is_vf;
++	bool enable;
+ };
+ 
+ #endif /* NPC_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index cea09c27c4b3..01d8dc88c39d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -596,6 +596,7 @@ void rvu_npc_enable_promisc_entry(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_install_bcast_match_entry(struct rvu *rvu, u16 pcifunc,
+ 				       int nixlf, u64 chan);
+ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
++void rvu_npc_free_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_disable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_enable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+@@ -611,6 +612,8 @@ const char *npc_get_field_name(u8 hdr);
+ int rvu_npc_write_default_rule(struct rvu *rvu, int blkaddr, int nixlf,
+ 			       u16 pcifunc, u8 intf, struct mcam_entry *entry);
+ int npc_mcam_verify_channel(struct rvu *rvu, u16 pcifunc, u8 intf, u16 channel);
++int npc_get_bank(struct npc_mcam *mcam, int index);
++void npc_mcam_enable_flows(struct rvu *rvu, u16 target);
+ 
+ /* CPT APIs */
+ int rvu_cpt_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+index 4babbd7bd198..c7ffe6c02720 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+@@ -1457,19 +1457,28 @@ static int rvu_dbg_npc_mcam_show_rules(struct seq_file *s, void *unused)
+ 	struct npc_mcam *mcam;
+ 	int pf, vf = -1;
+ 	int blkaddr;
+-	u16 pf_func;
++	u16 target;
+ 	u64 hits;
+ 
+ 	mcam = &rvu->hw->mcam;
+ 
+ 	list_for_each_entry(iter, &mcam->mcam_rules, list) {
+-		pf_func = iter->action.pf_func;
++		target = iter->action.pf_func;
+ 
+-		pf = (pf_func >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
++		pf = (iter->owner >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
+ 		seq_printf(s, "\n\tPF%d ", pf);
+ 
+-		if (pf_func & RVU_PFVF_FUNC_MASK) {
+-			vf = (pf_func & RVU_PFVF_FUNC_MASK) - 1;
++		if (iter->owner & RVU_PFVF_FUNC_MASK) {
++			vf = (iter->owner & RVU_PFVF_FUNC_MASK) - 1;
++			seq_printf(s, "VF%d", vf);
++		}
++		seq_puts(s, "\n");
++
++		pf = (target >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
++		seq_printf(s, "\ttarget: PF%d ", pf);
++
++		if (target & RVU_PFVF_FUNC_MASK) {
++			vf = (target & RVU_PFVF_FUNC_MASK) - 1;
+ 			seq_printf(s, "VF%d", vf);
+ 		}
+ 		seq_puts(s, "\n");
+@@ -1477,6 +1486,7 @@ static int rvu_dbg_npc_mcam_show_rules(struct seq_file *s, void *unused)
+ 		seq_printf(s, "\tmcam entry: %d\n", iter->entry);
+ 		rvu_dbg_npc_mcam_show_flows(s, iter);
+ 		rvu_dbg_npc_mcam_show_action(s, iter);
++		seq_printf(s, "\tenabled: %s\n", iter->enable ? "yes" : "no");
+ 
+ 		if (!iter->has_cntr)
+ 			continue;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 5e5889c487cb..6072829da473 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -253,9 +253,6 @@ static void nix_interface_deinit(struct rvu *rvu, u16 pcifunc, u8 nixlf)
+ 			pcifunc);
+ 	}
+ 
+-	/* Free and disable any MCAM entries used by this NIX LF */
+-	rvu_npc_disable_mcam_entries(rvu, pcifunc, nixlf);
+-
+ 	/* Free any tx vtag def entries used by this NIX LF */
+ 	nix_free_tx_vtag_entries(rvu, pcifunc);
+ 
+@@ -1147,7 +1144,7 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	return rc;
+ }
+ 
+-int rvu_mbox_handler_nix_lf_free(struct rvu *rvu, struct msg_req *req,
++int rvu_mbox_handler_nix_lf_free(struct rvu *rvu, struct nix_lf_free_req *req,
+ 				 struct msg_rsp *rsp)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
+@@ -1166,6 +1163,11 @@ int rvu_mbox_handler_nix_lf_free(struct rvu *rvu, struct msg_req *req,
+ 	if (nixlf < 0)
+ 		return NIX_AF_ERR_AF_LF_INVALID;
+ 
++	if (req->flags & NIX_LF_DISABLE_FLOWS)
++		rvu_npc_disable_mcam_entries(rvu, pcifunc, nixlf);
++	else
++		rvu_npc_free_mcam_entries(rvu, pcifunc, nixlf);
++
+ 	nix_interface_deinit(rvu, pcifunc, nixlf);
+ 
+ 	/* Reset this NIX LF */
+@@ -3513,6 +3515,8 @@ int rvu_mbox_handler_nix_lf_start_rx(struct rvu *rvu, struct msg_req *req,
+ 
+ 	rvu_npc_enable_default_entries(rvu, pcifunc, nixlf);
+ 
++	npc_mcam_enable_flows(rvu, pcifunc);
++
+ 	return rvu_cgx_start_stop_io(rvu, pcifunc, true);
+ }
+ 
+@@ -3543,6 +3547,8 @@ void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int nixlf)
+ 	ctx_req.hdr.pcifunc = pcifunc;
+ 
+ 	/* Cleanup NPC MCAM entries, free Tx scheduler queues being used */
++	rvu_npc_disable_mcam_entries(rvu, pcifunc, nixlf);
++	rvu_npc_free_mcam_entries(rvu, pcifunc, nixlf);
+ 	nix_interface_deinit(rvu, pcifunc, nixlf);
+ 	nix_rx_sync(rvu, blkaddr);
+ 	nix_txschq_free(rvu, pcifunc);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index be48be55875c..5e1416ea135b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -137,7 +137,7 @@ static int npc_get_nixlf_mcam_index(struct npc_mcam *mcam,
+ 	return (mcam->nixlf_offset + (nixlf * RSVD_MCAM_ENTRIES_PER_NIXLF));
+ }
+ 
+-static int npc_get_bank(struct npc_mcam *mcam, int index)
++int npc_get_bank(struct npc_mcam *mcam, int index)
+ {
+ 	int bank = index / mcam->banksize;
+ 
+@@ -784,7 +784,9 @@ void rvu_npc_enable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ 
+ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ {
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
++	struct rvu_npc_mcam_rule *rule;
+ 	int blkaddr;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+@@ -793,12 +795,49 @@ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ 
+ 	mutex_lock(&mcam->lock);
+ 
+-	/* Disable and free all MCAM entries mapped to this 'pcifunc' */
++	/* Disable MCAM entries directing traffic to this 'pcifunc' */
++	list_for_each_entry(rule, &mcam->mcam_rules, list) {
++		if (rule->action.pf_func == pcifunc) {
++			npc_enable_mcam_entry(rvu, mcam, blkaddr,
++					      rule->entry, false);
++			rule->enable = false;
++			/* Indicate that default rule is disabled */
++			if (rule->default_rule)
++				pfvf->def_rule = NULL;
++		}
++	}
++
++	mutex_unlock(&mcam->lock);
++
++	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
++}
++
++void rvu_npc_free_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	struct rvu_npc_mcam_rule *rule, *tmp;
++	int blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return;
++
++	mutex_lock(&mcam->lock);
++
++	/* Disable and free all MCAM entries owned by this 'pcifunc' */
+ 	npc_mcam_free_all_entries(rvu, mcam, blkaddr, pcifunc);
+ 
+-	/* Free all MCAM counters mapped to this 'pcifunc' */
++	/* Free all MCAM counters owned by this 'pcifunc' */
+ 	npc_mcam_free_all_counters(rvu, mcam, pcifunc);
+ 
++	/* Delete MCAM entries owned by this 'pcifunc' from list */
++	list_for_each_entry_safe(rule, tmp, &mcam->mcam_rules, list) {
++		if (rule->owner == pcifunc && !rule->default_rule) {
++			list_del(&rule->list);
++			kfree(rule);
++		}
++	}
++
+ 	mutex_unlock(&mcam->lock);
+ 
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 6213774849d0..c331aad26e7f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -724,23 +724,22 @@ static void rvu_mcam_add_counter_to_rule(struct rvu *rvu, u16 pcifunc,
+ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 			    int nixlf, struct rvu_pfvf *pfvf,
+ 			    struct npc_install_flow_req *req,
+-			    struct npc_install_flow_rsp *rsp)
++			    struct npc_install_flow_rsp *rsp, bool enable)
+ {
+ 	u64 features, installed_features, missing_features = 0;
+ 	struct rvu_npc_mcam_rule *def_rule = pfvf->def_rule;
+ 	struct npc_mcam_write_entry_req write_req = { 0 };
+-	bool new = false, rule_for_vf, msg_from_vf;
++	bool new = false, msg_from_vf;
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct rvu_npc_mcam_rule dummy = { 0 };
+-	u16 requester = req->hdr.pcifunc;
+ 	struct rvu_npc_mcam_rule *rule;
++	u16 owner = req->hdr.pcifunc;
+ 	struct nix_rx_action action;
+-	struct mcam_entry *entry;
+ 	struct msg_rsp write_rsp;
++	struct mcam_entry *entry;
+ 	int entry_index, err;
+ 
+-	msg_from_vf = !!(requester & RVU_PFVF_FUNC_MASK);
+-	rule_for_vf = !!(target & RVU_PFVF_FUNC_MASK);
++	msg_from_vf = !!(owner & RVU_PFVF_FUNC_MASK);
+ 
+ 	installed_features = req->features;
+ 	features = req->features;
+@@ -812,22 +811,20 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 	if (req->default_rule)
+ 		goto update_rule;
+ 
+-	/* PF allocates mcam entries for its VFs hence use PF pcifunc */
+-
+ 	/* allocate new counter if rule has no counter */
+ 	if (req->set_cntr && !rule->has_cntr)
+-		rvu_mcam_add_counter_to_rule(rvu, requester, rule, rsp);
++		rvu_mcam_add_counter_to_rule(rvu, owner, rule, rsp);
+ 
+ 	/* if user wants to delete an existing counter for a rule then
+ 	 * free the counter
+ 	 */
+ 	if (!req->set_cntr && rule->has_cntr)
+-		rvu_mcam_remove_counter_from_rule(rvu, requester, rule);
++		rvu_mcam_remove_counter_from_rule(rvu, owner, rule);
+ 
+-	write_req.hdr.pcifunc = requester;
++	write_req.hdr.pcifunc = owner;
+ 	write_req.entry = req->entry;
+ 	write_req.intf = req->intf;
+-	write_req.enable_entry = 1;
++	write_req.enable_entry = (u8)enable;
+ 	/* if counter is available then clear and use it */
+ 	if (req->set_cntr && rule->has_cntr) {
+ 		rvu_write64(rvu, blkaddr, NPC_AF_MATCH_STATX(rule->cntr), 0x00);
+@@ -838,7 +835,7 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 	err = rvu_mbox_handler_npc_mcam_write_entry(rvu, &write_req,
+ 						    &write_rsp);
+ 	if (err) {
+-		rvu_mcam_remove_counter_from_rule(rvu, requester, rule);
++		rvu_mcam_remove_counter_from_rule(rvu, owner, rule);
+ 		if (new)
+ 			kfree(rule);
+ 		return err;
+@@ -851,8 +848,8 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 	rule->vtag_action = entry->vtag_action;
+ 	rule->features = installed_features;
+ 	rule->default_rule = req->default_rule;
+-	rule->pcifunc = requester;
+-	rule->is_vf = rule_for_vf;
++	rule->owner = owner;
++	rule->enable = enable;
+ 
+ 	if (new)
+ 		rvu_mcam_add_rule(mcam, rule);
+@@ -869,6 +866,7 @@ int rvu_mbox_handler_npc_install_flow(struct rvu *rvu,
+ 	bool from_vf = !!(req->hdr.pcifunc & RVU_PFVF_FUNC_MASK);
+ 	int blkaddr, nixlf, err;
+ 	struct rvu_pfvf *pfvf;
++	bool enable = true;
+ 	u16 target;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+@@ -895,31 +893,33 @@ int rvu_mbox_handler_npc_install_flow(struct rvu *rvu,
+ 	else
+ 		target = req->hdr.pcifunc;
+ 
+-	err = nix_get_nixlf(rvu, target, &nixlf);
+-	if (err)
+-		return err;
++	if (npc_check_unsupported_flows(rvu, req->features))
++		return -ENOTSUPP;
++
++	if (npc_mcam_verify_channel(rvu, target, req->intf, req->channel))
++		return -EINVAL;
+ 
+ 	pfvf = rvu_get_pfvf(rvu, target);
+ 
+-	if (!req->default_rule && !pfvf->def_rule) {
+-		dev_err(rvu->dev,
+-			"Cannot install rule target interface uninitialized\n");
+-		return -EINVAL;
+-	}
++	err = nix_get_nixlf(rvu, target, &nixlf);
+ 
+-	if (npc_check_unsupported_flows(rvu, req->features))
+-		return -ENOTSUPP;
++	/* If interface is uninitialized then do not enable entry */
++	if (err || (!req->default_rule && !pfvf->def_rule))
++		enable = false;
+ 
+-	if (npc_mcam_verify_channel(rvu, target, req->intf, req->channel))
++	/* Do not allow requests from uninitialized VFs */
++	if (from_vf && !enable)
+ 		return -EINVAL;
+ 
+ 	/* If message is from VF then its flow should not overlap with
+ 	 * reserved unicast flow.
+ 	 */
+-	if (from_vf && pfvf->def_rule->features & req->features)
++	if (from_vf && pfvf->def_rule &&
++	    pfvf->def_rule->features & req->features)
+ 		return -EINVAL;
+ 
+-	return npc_install_flow(rvu, blkaddr, target, nixlf, pfvf, req, rsp);
++	return npc_install_flow(rvu, blkaddr, target, nixlf, pfvf,
++				req, rsp, enable);
+ }
+ 
+ static int npc_delete_flow(struct rvu *rvu, u16 entry, u16 pcifunc)
+@@ -961,12 +961,11 @@ int rvu_mbox_handler_npc_delete_flow(struct rvu *rvu,
+ 	u16 pcifunc = req->hdr.pcifunc;
+ 	int err;
+ 
+-	if (!req->all && !req->all_vfs)
++	if (!req->all)
+ 		return npc_delete_flow(rvu, req->entry, pcifunc);
+ 
+ 	list_for_each_entry_safe(iter, tmp, &mcam->mcam_rules, list) {
+-		if (req->all ? iter->pcifunc == pcifunc :
+-		    (iter->pcifunc == pcifunc && iter->is_vf)) {
++		if (iter->owner == pcifunc) {
+ 			err = npc_delete_flow(rvu, iter->entry, pcifunc);
+ 			if (err)
+ 				return err;
+@@ -975,3 +974,43 @@ int rvu_mbox_handler_npc_delete_flow(struct rvu *rvu,
+ 
+ 	return 0;
+ }
++
++void npc_mcam_enable_flows(struct rvu *rvu, u16 target)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, target);
++	struct npc_mcam_ena_dis_entry_req ena_req = { 0 };
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	struct rvu_npc_mcam_rule *rule;
++	int blkaddr, bank, err;
++	struct msg_rsp rsp;
++	u64 def_action;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0) {
++		dev_err(rvu->dev, "%s: NPC block not implemented\n", __func__);
++		return;
++	}
++
++	list_for_each_entry(rule, &mcam->mcam_rules, list) {
++		if (rule->action.pf_func == target && !rule->enable) {
++			if (rule->action.op == NIX_RX_ACTION_DEFAULT) {
++				if (!pfvf->def_rule)
++					continue;
++				/* Use default unicast entry action */
++				rule->action = pfvf->def_rule->action;
++				def_action = *(u64 *)&pfvf->def_rule->action;
++				bank = npc_get_bank(mcam, rule->entry);
++				rvu_write64(rvu, blkaddr,
++					    NPC_AF_MCAMEX_BANKX_ACTION
++					    (rule->entry, bank), def_action);
++			}
++			ena_req.hdr.pcifunc = rule->owner;
++			ena_req.entry = rule->entry;
++			err = rvu_mbox_handler_npc_mcam_ena_entry(rvu, &ena_req,
++								  &rsp);
++			if (err)
++				continue;
++			rule->enable = true;
++		}
++	}
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 569a28f16296..c0f0643d0fd6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1420,6 +1420,7 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ {
+ 	struct otx2_qset *qset = &pf->qset;
++	struct nix_lf_free_req *free_req;
+ 	struct mbox *mbox = &pf->mbox;
+ 	struct otx2_snd_queue *sq;
+ 	struct otx2_cq_queue *cq;
+@@ -1478,9 +1479,11 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 
+ 	otx2_mbox_lock(mbox);
+ 	/* Reset NIX LF */
+-	req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
+-	if (req)
++	free_req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
++	if (free_req) {
++		free_req->flags = NIX_LF_DISABLE_FLOWS;
+ 		WARN_ON(otx2_sync_mbox_msg(mbox));
++	}
+ 	otx2_mbox_unlock(mbox);
+ 
+ 	/* Disable NPA Pool and Aura hw context */
+-- 
+2.17.1
+

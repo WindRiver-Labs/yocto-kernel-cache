@@ -1,0 +1,416 @@
+From 821047d91f8f0b78e157344b542fa6f828c072a5 Mon Sep 17 00:00:00 2001
+From: Sunil Kumar Kori <skori@marvell.com>
+Date: Thu, 6 Jun 2019 12:17:14 +0530
+Subject: [PATCH 026/138] octeontx2-af: CGX DMAC filtering support
+
+commit 4d4ed1a75905b2927413c453c8948de276ee4073 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+This patch implements following mbox messages:
+1. Message to add mac address into DMAC filter table.
+2. Message to delete mac address from DMAC filter table.
+3. Message to get maximum number of DMAC filters per lmac.
+
+Using above messages, CGX can be configured with DMAC filters
+so that packet can be dropped/accepted at CGX level for defined
+destination mac addresses.
+
+CGX DMAC filter table are logically divided among all the attached LMACs
+to it as given below:
+1. CGX0 is having 1 LMAC then maximum supported filters are 32 for LMAC
+   ranging from 0 to 31. First index is reserved for default MAC address.
+2. CGX1 is having 4 LMACs then maximum supported filters are 8 for each
+   LMACs ranging as given below:
+
+   a. Index 0-7 for LMAC0 and 0 is reserved for default MAC address.
+   b. Index 8-15 for LMAC1 and 8 is reserved for default MAC address.
+   c. Index 16-23 for LMAC2 and 16 is reserved for default MAC address.
+   d. Index 24-31 for LMAC3 and 24 is reserved for default MAC address.
+
+Change-Id: Ie9406accda04a8a1feeb74216d5e46570bfdfde2
+Signed-off-by: Sunil Kumar Kori <skori@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/cgx.c   | 102 +++++++++++++++++-
+ .../net/ethernet/marvell/octeontx2/af/cgx.h   |   5 +
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  38 +++++++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   1 +
+ .../ethernet/marvell/octeontx2/af/rvu_cgx.c   |  94 ++++++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |   3 +
+ 6 files changed, 242 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index ff05366dfb7c..f04ff98fa69c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -20,6 +20,7 @@
+ #include <linux/of_net.h>
+ 
+ #include "cgx.h"
++#include "rvu.h"
+ 
+ #define DRV_NAME	"octeontx2-cgx"
+ #define DRV_STRING      "Marvell OcteonTX2 CGX/MAC Driver"
+@@ -30,6 +31,7 @@
+  * @cmd_lock:		Lock to serialize the command interface
+  * @resp:		command response
+  * @link_info:		link related information
++ * @mac_to_index_bmap:	Mac address to CGX table index mapping
+  * @event_cb:		callback for linkchange events
+  * @event_cb_lock:	lock for serializing callback with unregister
+  * @cmd_pend:		flag set before new command is started
+@@ -43,6 +45,7 @@ struct lmac {
+ 	struct mutex cmd_lock;
+ 	u64 resp;
+ 	struct cgx_link_user_info link_info;
++	struct rsrc_bmap mac_to_index_bmap;
+ 	struct cgx_event_cb event_cb;
+ 	spinlock_t event_cb_lock;
+ 	bool cmd_pend;
+@@ -180,13 +183,100 @@ int cgx_lmac_addr_set(u8 cgx_id, u8 lmac_id, u8 *mac_addr)
+ 		  cfg | CGX_DMAC_CAM_ADDR_ENABLE | ((u64)lmac_id << 49));
+ 
+ 	cfg = cgx_read(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0);
+-	cfg |= CGX_DMAC_CTL0_CAM_ENABLE;
++	cfg |= (CGX_DMAC_CTL0_CAM_ENABLE | CGX_DMAC_BCAST_MODE |
++		CGX_DMAC_MCAST_MODE);
+ 	cgx_write(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0, cfg);
+ 
+ 	return 0;
+ }
+ EXPORT_SYMBOL(cgx_lmac_addr_set);
+ 
++int cgx_lmac_addr_add(u8 cgx_id, u8 lmac_id, u8 *mac_addr)
++{
++	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx_dev);
++	int index, idx;
++	u64 cfg = 0;
++
++	/* Get available index where entry is to be installed */
++	idx = rvu_alloc_rsrc(&lmac->mac_to_index_bmap);
++	if (idx < 0)
++		return idx;
++
++	/* Calculate real index of CGX DMAC table */
++	index = lmac_id * lmac->mac_to_index_bmap.max + idx;
++
++	cfg = mac2u64 (mac_addr);
++	cfg |= CGX_DMAC_CAM_ADDR_ENABLE;
++	cfg |= ((u64)lmac_id << 49);
++	cgx_write(cgx_dev, 0, (CGXX_CMRX_RX_DMAC_CAM0 + (index * 0x8)), cfg);
++
++	cfg = cgx_read(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0);
++	cfg |= (CGX_DMAC_BCAST_MODE | CGX_DMAC_MCAST_MODE |
++		CGX_DMAC_CAM_ACCEPT);
++	cgx_write(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0, cfg);
++
++	return idx;
++}
++EXPORT_SYMBOL(cgx_lmac_addr_add);
++
++int cgx_lmac_addr_reset(u8 cgx_id, u8 lmac_id)
++{
++	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx_dev);
++	u8 index = 0;
++	u64 cfg;
++
++	/*  Clear the reserved bit for default mac address */
++	clear_bit(0, lmac->mac_to_index_bmap.bmap);
++
++	index = lmac_id * lmac->mac_to_index_bmap.max + index;
++	cgx_write(cgx_dev, 0, (CGXX_CMRX_RX_DMAC_CAM0 + (index * 0x8)), 0);
++
++	/* Reset CGXX_CMRX_RX_DMAC_CTL0 register to default state */
++	cfg = cgx_read(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0);
++	cfg &= ~CGX_DMAC_CAM_ACCEPT;
++	cfg |= (CGX_DMAC_BCAST_MODE | CGX_DMAC_MCAST_MODE);
++	cgx_write(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0, cfg);
++
++	return 0;
++}
++EXPORT_SYMBOL(cgx_lmac_addr_reset);
++
++int cgx_lmac_addr_del(u8 cgx_id, u8 lmac_id, u8 index)
++{
++	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx_dev);
++
++	/* Validate the index */
++	if (index < 0 || index >= lmac->mac_to_index_bmap.max)
++		return -EINVAL;
++
++	/* Skip deletion for reserved index i.e. index 0 */
++	if (index == 0)
++		return 0;
++
++	rvu_free_rsrc(&lmac->mac_to_index_bmap, index);
++
++	index = lmac_id * lmac->mac_to_index_bmap.max + index;
++	cgx_write(cgx_dev, 0, (CGXX_CMRX_RX_DMAC_CAM0 + (index * 0x8)), 0);
++
++	return 0;
++}
++EXPORT_SYMBOL(cgx_lmac_addr_del);
++
++int cgx_lmac_addr_max_entries_get(u8 cgx_id, u8 lmac_id)
++{
++	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx_dev);
++
++	if (lmac)
++		return lmac->mac_to_index_bmap.max;
++
++	return 0;
++}
++EXPORT_SYMBOL(cgx_lmac_addr_max_entries_get);
++
+ u64 cgx_lmac_addr_get(u8 cgx_id, u8 lmac_id)
+ {
+ 	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
+@@ -964,6 +1054,15 @@ static int cgx_lmac_init(struct cgx *cgx)
+ 		sprintf(lmac->name, "cgx_fwi_%d_%d", cgx->cgx_id, i);
+ 		lmac->lmac_id = i;
+ 		lmac->cgx = cgx;
++		lmac->mac_to_index_bmap.max =
++				MAX_DMAC_ENTRIES_PER_CGX / cgx->lmac_count;
++		err = rvu_alloc_bitmap(&lmac->mac_to_index_bmap);
++		if (err)
++			return err;
++
++		/* Reserve first entry for default MAC address */
++		set_bit(0, lmac->mac_to_index_bmap.bmap);
++
+ 		init_waitqueue_head(&lmac->wq_cmd_cmplt);
+ 		mutex_init(&lmac->cmd_lock);
+ 		spin_lock_init(&lmac->event_cb_lock);
+@@ -1003,6 +1102,7 @@ static int cgx_lmac_exit(struct cgx *cgx)
+ 		if (!lmac)
+ 			continue;
+ 		free_irq(pci_irq_vector(cgx->pdev, CGX_LMAC_FWI + i * 9), lmac);
++		kfree(lmac->mac_to_index_bmap.bmap);
+ 		kfree(lmac->name);
+ 		kfree(lmac);
+ 	}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+index b980609621c0..3280cb6eac91 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+@@ -22,6 +22,7 @@
+ 
+ #define CGX_ID_MASK			0x7
+ #define MAX_LMAC_PER_CGX		4
++#define MAX_DMAC_ENTRIES_PER_CGX	32
+ #define CGX_FIFO_LEN			65536 /* 64K for both Rx & Tx */
+ #define CGX_OFFSET(x)			((x) * MAX_LMAC_PER_CGX)
+ 
+@@ -126,7 +127,11 @@ u64 cgx_get_lmac_tx_fifo_status(void *cgxd, int lmac_id);
+ int cgx_lmac_rx_tx_enable(void *cgxd, int lmac_id, bool enable);
+ int cgx_lmac_tx_enable(void *cgxd, int lmac_id, bool enable);
+ int cgx_lmac_addr_set(u8 cgx_id, u8 lmac_id, u8 *mac_addr);
++int cgx_lmac_addr_reset(u8 cgx_id, u8 lmac_id);
+ u64 cgx_lmac_addr_get(u8 cgx_id, u8 lmac_id);
++int cgx_lmac_addr_add(u8 cgx_id, u8 lmac_id, u8 *mac_addr);
++int cgx_lmac_addr_del(u8 cgx_id, u8 lmac_id, u8 index);
++int cgx_lmac_addr_max_entries_get(u8 cgx_id, u8 lmac_id);
+ void cgx_lmac_promisc_config(int cgx_id, int lmac_id, bool enable);
+ void cgx_lmac_enadis_rx_pause_fwding(void *cgxd, int lmac_id, bool enable);
+ int cgx_lmac_internal_loopback(void *cgxd, int lmac_id, bool enable);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 4391278ecdf4..07d09b4efd06 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -152,6 +152,12 @@ M(CGX_CFG_PAUSE_FRM,	0x20E, cgx_cfg_pause_frm, cgx_pause_frm_cfg,	\
+ 			       cgx_pause_frm_cfg)			\
+ M(CGX_FW_DATA_GET,	0x20F, cgx_get_aux_link_info, msg_req, cgx_fw_data) \
+ M(CGX_FEC_SET,		0x210, cgx_set_fec_param, fec_mode, fec_mode) \
++M(CGX_MAC_ADDR_ADD,	0x211, cgx_mac_addr_add, cgx_mac_addr_add_req,    \
++				cgx_mac_addr_add_rsp)		\
++M(CGX_MAC_ADDR_DEL,	0x212, cgx_mac_addr_del, cgx_mac_addr_del_req,    \
++				msg_rsp)		\
++M(CGX_MAC_MAX_ENTRIES_GET, 0x213, cgx_mac_max_entries_get, msg_req,    \
++				cgx_max_dmac_entries_get_rsp)		\
+ /* NPA mbox IDs (range 0x400 - 0x5FF) */				\
+ M(NPA_LF_ALLOC,		0x400, npa_lf_alloc,				\
+ 				npa_lf_alloc_req, npa_lf_alloc_rsp)	\
+@@ -398,6 +404,38 @@ struct cgx_mac_addr_set_or_get {
+ 	u8 mac_addr[ETH_ALEN];
+ };
+ 
++/* Structure for requesting the operation to
++ * add DMAC filter entry into CGX interface
++ */
++struct cgx_mac_addr_add_req {
++	struct mbox_msghdr hdr;
++	u8 mac_addr[ETH_ALEN];
++};
++
++/* Structure for response against the operation to
++ * add DMAC filter entry into CGX interface
++ */
++struct cgx_mac_addr_add_rsp {
++	struct mbox_msghdr hdr;
++	u8 index;
++};
++
++/* Structure for requesting the operation to
++ * delete DMAC filter entry from CGX interface
++ */
++struct cgx_mac_addr_del_req {
++	struct mbox_msghdr hdr;
++	u8 index;
++};
++
++/* Structure for response against the operation to
++ * get maximum supported DMAC filter entries
++ */
++struct cgx_max_dmac_entries_get_rsp {
++	struct mbox_msghdr hdr;
++	u8 max_dmac_filters;
++};
++
+ struct cgx_link_user_info {
+ 	uint64_t link_up:1;
+ 	uint64_t full_duplex:1;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 515aaf068b0b..aa60c6cc6703 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -538,6 +538,7 @@ int rvu_cgx_exit(struct rvu *rvu);
+ void *rvu_cgx_pdata(u8 cgx_id, struct rvu *rvu);
+ int rvu_cgx_config_rxtx(struct rvu *rvu, u16 pcifunc, bool start);
+ void rvu_cgx_enadis_rx_bp(struct rvu *rvu, int pf, bool enable);
++void rvu_cgx_disable_dmac_entries(struct rvu *rvu, u16 pcifunc);
+ 
+ /* SSO APIs */
+ int rvu_sso_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+index 679f954b3083..4cbe6b369717 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+@@ -367,6 +367,35 @@ int rvu_cgx_config_rxtx(struct rvu *rvu, u16 pcifunc, bool start)
+ 	return 0;
+ }
+ 
++void rvu_cgx_disable_dmac_entries(struct rvu *rvu, u16 pcifunc)
++{
++	int pf = rvu_get_pf(pcifunc);
++	int i = 0, lmac_count = 0;
++	u8 max_dmac_filters;
++	u8 cgx_id, lmac_id;
++	void *cgx_dev;
++
++	/* It is expected only from PFs that are mapped to CGX LMACs,
++	 * if received from other PF/VF simply ACK, nothing to do.
++	 */
++	if ((pcifunc & RVU_PFVF_FUNC_MASK) ||
++	    !is_pf_cgxmapped(rvu, pf))
++		return;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++	cgx_dev = cgx_get_pdata(cgx_id);
++	lmac_count = cgx_get_lmac_cnt(cgx_dev);
++	max_dmac_filters = MAX_DMAC_ENTRIES_PER_CGX / lmac_count;
++
++	for (i = 0; i < max_dmac_filters; i++)
++		cgx_lmac_addr_del(cgx_id, lmac_id, i);
++
++	/* As cgx_lmac_addr_del does not clear entry for index 0
++	 * so it needs to be done explicitly
++	 */
++	cgx_lmac_addr_reset(cgx_id, lmac_id);
++}
++
+ int rvu_mbox_handler_cgx_start_rxtx(struct rvu *rvu, struct msg_req *req,
+ 				    struct msg_rsp *rsp)
+ {
+@@ -432,6 +461,71 @@ int rvu_mbox_handler_cgx_mac_addr_set(struct rvu *rvu,
+ 	return 0;
+ }
+ 
++int rvu_mbox_handler_cgx_mac_addr_add(struct rvu *rvu,
++				      struct cgx_mac_addr_add_req *req,
++				      struct cgx_mac_addr_add_rsp *rsp)
++{
++	int pf = rvu_get_pf(req->hdr.pcifunc);
++	u8 cgx_id, lmac_id;
++	int rc = 0;
++
++	/* This msg is expected only from PFs that are mapped to CGX LMACs,
++	 * if received from other PF/VF, return error.
++	 */
++	if ((req->hdr.pcifunc & RVU_PFVF_FUNC_MASK) ||
++	    !is_pf_cgxmapped(rvu, pf))
++		return -ENODEV;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++	rc = cgx_lmac_addr_add(cgx_id, lmac_id, req->mac_addr);
++	if (rc >= 0) {
++		rsp->index = rc;
++		return 0;
++	}
++
++	return rc;
++}
++
++int rvu_mbox_handler_cgx_mac_addr_del(struct rvu *rvu,
++				      struct cgx_mac_addr_del_req *req,
++				      struct msg_rsp *rsp)
++{
++	int pf = rvu_get_pf(req->hdr.pcifunc);
++	u8 cgx_id, lmac_id;
++
++	/* This msg is expected only from PFs that are mapped to CGX LMACs,
++	 * if received from other PF/VF, return error.
++	 */
++	if ((req->hdr.pcifunc & RVU_PFVF_FUNC_MASK) ||
++	    !is_pf_cgxmapped(rvu, pf))
++		return -ENODEV;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++	return cgx_lmac_addr_del(cgx_id, lmac_id, req->index);
++}
++
++int rvu_mbox_handler_cgx_mac_max_entries_get(struct rvu *rvu,
++					     struct msg_req *req,
++				     struct cgx_max_dmac_entries_get_rsp *rsp)
++{
++	int pf = rvu_get_pf(req->hdr.pcifunc);
++	u8 cgx_id, lmac_id;
++
++	/* If msg is received from PFs(which are not mapped to CGX LMACs)
++	 * or VF then no entries are allocated for DMAC filters at CGX level.
++	 * So returning zero.
++	 */
++	if ((req->hdr.pcifunc & RVU_PFVF_FUNC_MASK) ||
++	    !is_pf_cgxmapped(rvu, pf)) {
++		rsp->max_dmac_filters = 0;
++		return 0;
++	}
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++	rsp->max_dmac_filters = cgx_lmac_addr_max_entries_get(cgx_id, lmac_id);
++	return 0;
++}
++
+ int rvu_mbox_handler_cgx_mac_addr_get(struct rvu *rvu,
+ 				      struct cgx_mac_addr_set_or_get *req,
+ 				      struct cgx_mac_addr_set_or_get *rsp)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index d845dce1868f..dfb261ae2ea7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -258,6 +258,9 @@ static void nix_interface_deinit(struct rvu *rvu, u16 pcifunc, u8 nixlf)
+ 
+ 	/* Free any tx vtag def entries used by this NIX LF */
+ 	nix_free_tx_vtag_entries(rvu, pcifunc);
++
++	/* Disable DMAC filters used */
++	rvu_cgx_disable_dmac_entries(rvu, pcifunc);
+ }
+ 
+ int rvu_mbox_handler_nix_bp_disable(struct rvu *rvu,
+-- 
+2.17.1
+

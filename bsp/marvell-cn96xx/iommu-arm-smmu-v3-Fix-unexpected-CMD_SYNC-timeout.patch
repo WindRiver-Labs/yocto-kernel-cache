@@ -1,0 +1,84 @@
+From 2087a71d9dc5ad65e3631bcd244a48645aadd86a Mon Sep 17 00:00:00 2001
+From: Zhen Lei <thunder.leizhen@huawei.com>
+Date: Sun, 19 Aug 2018 15:51:10 +0800
+Subject: [PATCH 091/138] iommu/arm-smmu-v3: Fix unexpected CMD_SYNC timeout
+
+commit 0f02477d16980938a84aba8688a4e3a303306116 upstream
+
+The condition break condition of:
+
+	(int)(VAL - sync_idx) >= 0
+
+in the __arm_smmu_sync_poll_msi() polling loop requires that sync_idx
+must be increased monotonically according to the sequence of the CMDs in
+the cmdq.
+
+However, since the msidata is populated using atomic_inc_return_relaxed()
+before taking the command-queue spinlock, then the following scenario
+can occur:
+
+CPU0			CPU1
+msidata=0
+			msidata=1
+			insert cmd1
+insert cmd0
+			smmu execute cmd1
+smmu execute cmd0
+			poll timeout, because msidata=1 is overridden by
+			cmd0, that means VAL=0, sync_idx=1.
+
+This is not a functional problem, since the caller will eventually either
+timeout or exit due to another CMD_SYNC, however it's clearly not what
+the code is supposed to be doing. Fix it, by incrementing the sequence
+count with the command-queue lock held, allowing us to drop the atomic
+operations altogether.
+
+Signed-off-by: Zhen Lei <thunder.leizhen@huawei.com>
+[will: dropped the specialised cmd building routine for now]
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/iommu/arm-smmu-v3.c | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index 43fa254a2b1c..2bad11101633 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -571,7 +571,7 @@ struct arm_smmu_device {
+ 
+ 	int				gerr_irq;
+ 	int				combined_irq;
+-	atomic_t			sync_nr;
++	u32				sync_nr;
+ 
+ 	unsigned long			ias; /* IPA */
+ 	unsigned long			oas; /* PA */
+@@ -974,14 +974,13 @@ static int __arm_smmu_cmdq_issue_sync_msi(struct arm_smmu_device *smmu)
+ 	struct arm_smmu_cmdq_ent ent = {
+ 		.opcode = CMDQ_OP_CMD_SYNC,
+ 		.sync	= {
+-			.msidata = atomic_inc_return_relaxed(&smmu->sync_nr),
+ 			.msiaddr = virt_to_phys(&smmu->sync_count),
+ 		},
+ 	};
+ 
+-	arm_smmu_cmdq_build_cmd(cmd, &ent);
+-
+ 	spin_lock_irqsave(&smmu->cmdq.lock, flags);
++	ent.sync.msidata = ++smmu->sync_nr;
++	arm_smmu_cmdq_build_cmd(cmd, &ent);
+ 	arm_smmu_cmdq_insert_cmd(smmu, cmd);
+ 	spin_unlock_irqrestore(&smmu->cmdq.lock, flags);
+ 
+@@ -2207,7 +2206,6 @@ static int arm_smmu_init_structures(struct arm_smmu_device *smmu)
+ {
+ 	int ret;
+ 
+-	atomic_set(&smmu->sync_nr, 0);
+ 	ret = arm_smmu_init_queues(smmu);
+ 	if (ret)
+ 		return ret;
+-- 
+2.17.1
+

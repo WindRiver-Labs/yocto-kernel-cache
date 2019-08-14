@@ -1,0 +1,153 @@
+From e117d04d91797fdd038077db21b6c20d62fe0ce9 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Thu, 6 Jun 2019 12:22:06 +0530
+Subject: [PATCH 028/138] octeontx2-af: Start/Stop traffic in CGX along with
+ NPC
+
+commit 40727ac6b2d39e7b1aa566e5ae9461454cd44b89 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Traffic for a CGX mapped NIXLF can be stopped by disabling entries
+in NPC MCAM or by configuring CGX and mailbox messages exist for the
+two options. If traffic is stopped at CGX then VFs of that PF are
+also effected hence CGX traffic should be started/stopped by
+tracking all the users of it. This patch implements that CGX users
+tracking. CGX is also configured along with NPC if required.
+
+Change-Id: I1289ada218548e8aa094466db4a7944353c28561
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  5 ++
+ .../ethernet/marvell/octeontx2/af/rvu_cgx.c   | 49 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  6 ++-
+ 3 files changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index aa60c6cc6703..19218e2922ee 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -269,6 +269,9 @@ struct rvu_pfvf {
+ 	struct kobject	*limits_kobj;
+ 
+ 	struct rvu_npc_mcam_rule *def_rule;
++
++	bool	cgx_in_use; /* this PF/VF using CGX? */
++	int	cgx_users;  /* number of cgx users - used only by PFs */
+ };
+ 
+ struct nix_txsch {
+@@ -427,6 +430,7 @@ struct rvu {
+ 	struct			workqueue_struct *cgx_evh_wq;
+ 	spinlock_t		cgx_evq_lock; /* cgx event queue lock */
+ 	struct list_head	cgx_evq_head; /* cgx event queue head */
++	struct mutex		cgx_cfg_lock; /* serialize cgx configuration */
+ 
+ 	char mkex_pfl_name[MKEX_NAME_LEN]; /* Configured MKEX profile name */
+ 
+@@ -539,6 +543,7 @@ void *rvu_cgx_pdata(u8 cgx_id, struct rvu *rvu);
+ int rvu_cgx_config_rxtx(struct rvu *rvu, u16 pcifunc, bool start);
+ void rvu_cgx_enadis_rx_bp(struct rvu *rvu, int pf, bool enable);
+ void rvu_cgx_disable_dmac_entries(struct rvu *rvu, u16 pcifunc);
++int rvu_cgx_start_stop_io(struct rvu *rvu, u16 pcifunc, bool start);
+ 
+ /* SSO APIs */
+ int rvu_sso_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+index 4cbe6b369717..11bda108f425 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+@@ -291,6 +291,8 @@ int rvu_cgx_init(struct rvu *rvu)
+ 	if (err)
+ 		return err;
+ 
++	mutex_init(&rvu->cgx_cfg_lock);
++
+ 	/* Ensure event handler registration is completed, before
+ 	 * we turn on the links
+ 	 */
+@@ -804,3 +806,50 @@ int rvu_mbox_handler_cgx_set_fec_param(struct rvu *rvu,
+ 	rsp->fec = cgx_set_fec(req->fec, cgx_id, lmac_id);
+ 	return 0;
+ }
++
++int rvu_cgx_start_stop_io(struct rvu *rvu, u16 pcifunc, bool start)
++{
++	struct rvu_pfvf *parent_pf, *pfvf;
++	int cgx_users, err = 0;
++
++	if (!is_pf_cgxmapped(rvu, rvu_get_pf(pcifunc)))
++		return 0;
++
++	parent_pf = &rvu->pf[rvu_get_pf(pcifunc)];
++	pfvf = rvu_get_pfvf(rvu, pcifunc);
++
++	mutex_lock(&rvu->cgx_cfg_lock);
++
++	if (start && pfvf->cgx_in_use)
++		goto exit;  /* CGX is already started hence nothing to do */
++	if (!start && !pfvf->cgx_in_use)
++		goto exit; /* CGX is already stopped hence nothing to do */
++
++	if (start) {
++		cgx_users = parent_pf->cgx_users;
++		parent_pf->cgx_users++;
++	} else {
++		parent_pf->cgx_users--;
++		cgx_users = parent_pf->cgx_users;
++	}
++
++	/* Start CGX when first of all NIXLFs is started.
++	 * Stop CGX when last of all NIXLFs is stopped.
++	 */
++	if (!cgx_users) {
++		err = rvu_cgx_config_rxtx(rvu, pcifunc & ~RVU_PFVF_FUNC_MASK,
++					  start);
++		if (err) {
++			dev_err(rvu->dev, "Unable to %s CGX\n",
++				start ? "start" : "stop");
++			/* Revert the usage count in case of error */
++			parent_pf->cgx_users = start ? parent_pf->cgx_users  - 1
++					       : parent_pf->cgx_users  + 1;
++			goto exit;
++		}
++	}
++	pfvf->cgx_in_use = start;
++exit:
++	mutex_unlock(&rvu->cgx_cfg_lock);
++	return err;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index dfb261ae2ea7..5e5889c487cb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -3513,7 +3513,7 @@ int rvu_mbox_handler_nix_lf_start_rx(struct rvu *rvu, struct msg_req *req,
+ 
+ 	rvu_npc_enable_default_entries(rvu, pcifunc, nixlf);
+ 
+-	return 0;
++	return rvu_cgx_start_stop_io(rvu, pcifunc, true);
+ }
+ 
+ int rvu_mbox_handler_nix_lf_stop_rx(struct rvu *rvu, struct msg_req *req,
+@@ -3528,7 +3528,7 @@ int rvu_mbox_handler_nix_lf_stop_rx(struct rvu *rvu, struct msg_req *req,
+ 
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ 
+-	return 0;
++	return rvu_cgx_start_stop_io(rvu, pcifunc, false);
+ }
+ 
+ void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int nixlf)
+@@ -3547,6 +3547,8 @@ void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int nixlf)
+ 	nix_rx_sync(rvu, blkaddr);
+ 	nix_txschq_free(rvu, pcifunc);
+ 
++	rvu_cgx_start_stop_io(rvu, pcifunc, false);
++
+ 	if (pfvf->sq_ctx) {
+ 		ctx_req.ctype = NIX_AQ_CTYPE_SQ;
+ 		err = nix_lf_hwctx_disable(rvu, &ctx_req);
+-- 
+2.17.1
+

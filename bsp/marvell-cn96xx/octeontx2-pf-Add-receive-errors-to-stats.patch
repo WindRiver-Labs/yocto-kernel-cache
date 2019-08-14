@@ -1,0 +1,326 @@
+From 1e0f030f2c35b391b886d37298d960240a49043b Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Sat, 27 Jul 2019 13:33:21 +0530
+Subject: [PATCH 114/138] octeontx2-pf: Add receive errors to stats
+
+commit 079c6019ea93e062120744efa10d97ceba976fc5 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Added receive packet errors like undesize, oversize, csum, fcs etc
+to ethtool stats. And also added support to pass on error packets
+to stack. This can be enabled/disabled by doing
+
+ethtool -k ethX rx-all on/off
+
+Also actual error codes and their levels can be dumped by doing
+
+ethtool -s ethX msglvl 0x40
+
+Note: If there are multiple errors in the packet then HW prioritizes
+and decides which error to be reported in the CQE_RX. Undersize error
+often gets overwritten by errors reported by NPC packet parser.
+
+Change-Id: Ibf2fb4fd3f73d82ab2858fc8de582d1d45e04d48
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/13139
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.h       |  41 +++++++
+ .../marvell/octeontx2/nic/otx2_ethtool.c      |  28 +++++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |   5 +-
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 111 +++++++++++++-----
+ 4 files changed, 154 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index c5c36c39001a..314bdea831de 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -53,6 +53,36 @@ struct otx2_rss_info {
+ 	u8  key[RSS_HASH_KEY_SIZE];
+ };
+ 
++/* NIX (or NPC) RX errors */
++enum otx2_errlvl {
++	NPC_ERRLVL_RE,
++	NPC_ERRLVL_LID_LA,
++	NPC_ERRLVL_LID_LB,
++	NPC_ERRLVL_LID_LC,
++	NPC_ERRLVL_LID_LD,
++	NPC_ERRLVL_LID_LE,
++	NPC_ERRLVL_LID_LF,
++	NPC_ERRLVL_LID_LG,
++	NPC_ERRLVL_LID_LH,
++	NPC_ERRLVL_NIX = 0x0F,
++};
++
++enum otx2_errcodes_re {
++	/* NPC_ERRLVL_RE errcodes */
++	ERRCODE_FCS = 0x7,
++	ERRCODE_FCS_RCV = 0x8,
++	ERRCODE_UNDERSIZE = 0x10,
++	ERRCODE_OVERSIZE = 0x11,
++	ERRCODE_OL2_LEN_MISMATCH = 0x12,
++	/* NPC_ERRLVL_NIX errcodes */
++	ERRCODE_OL3_LEN = 0x10,
++	ERRCODE_OL4_LEN = 0x11,
++	ERRCODE_OL4_CSUM = 0x12,
++	ERRCODE_IL3_LEN = 0x20,
++	ERRCODE_IL4_LEN = 0x21,
++	ERRCODE_IL4_CSUM = 0x22,
++};
++
+ /* NIX TX stats */
+ enum nix_stat_lf_tx {
+ 	TX_UCAST	= 0x0,
+@@ -96,6 +126,16 @@ struct  otx2_dev_stats {
+ 	u64 tx_drops;
+ };
+ 
++/* Driver counted stats */
++struct otx2_drv_stats {
++	atomic_t rx_fcs_errs;
++	atomic_t rx_oversize_errs;
++	atomic_t rx_undersize_errs;
++	atomic_t rx_csum_errs;
++	atomic_t rx_len_errs;
++	atomic_t rx_other_errs;
++};
++
+ struct  mbox {
+ 	struct otx2_mbox	mbox;
+ 	struct work_struct	mbox_wrk;
+@@ -112,6 +152,7 @@ struct otx2_hw {
+ 	struct pci_dev		*pdev;
+ 	struct otx2_rss_info	rss_info;
+ 	struct otx2_dev_stats	dev_stats;
++	struct otx2_drv_stats	drv_stats;
+ 	u16                     rx_queues;
+ 	u16                     tx_queues;
+ 	u16			max_queues;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index a944891a753f..fad6a0350a3e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -35,6 +35,7 @@ struct otx2_stat {
+ 	unsigned int index;
+ };
+ 
++/* HW device stats */
+ #define OTX2_DEV_STAT(stat) { \
+ 	.name = #stat, \
+ 	.index = offsetof(struct otx2_dev_stats, stat) / sizeof(u64), \
+@@ -56,12 +57,28 @@ static const struct otx2_stat otx2_dev_stats[] = {
+ 	OTX2_DEV_STAT(tx_drops),
+ };
+ 
++/* Driver level stats */
++#define OTX2_DRV_STAT(stat) { \
++	.name = #stat, \
++	.index = offsetof(struct otx2_drv_stats, stat) / sizeof(atomic_t), \
++}
++
++static const struct otx2_stat otx2_drv_stats[] = {
++	OTX2_DRV_STAT(rx_fcs_errs),
++	OTX2_DRV_STAT(rx_oversize_errs),
++	OTX2_DRV_STAT(rx_undersize_errs),
++	OTX2_DRV_STAT(rx_csum_errs),
++	OTX2_DRV_STAT(rx_len_errs),
++	OTX2_DRV_STAT(rx_other_errs),
++};
++
+ static const struct otx2_stat otx2_queue_stats[] = {
+ 	{ "bytes", 0 },
+ 	{ "frames", 1 },
+ };
+ 
+ static const unsigned int otx2_n_dev_stats = ARRAY_SIZE(otx2_dev_stats);
++static const unsigned int otx2_n_drv_stats = ARRAY_SIZE(otx2_drv_stats);
+ static const unsigned int otx2_n_queue_stats = ARRAY_SIZE(otx2_queue_stats);
+ 
+ static void otx2_get_drvinfo(struct net_device *netdev,
+@@ -113,6 +130,12 @@ static void otx2_get_strings(struct net_device *netdev, u32 sset, u8 *data)
+ 		memcpy(data, otx2_dev_stats[stats].name, ETH_GSTRING_LEN);
+ 		data += ETH_GSTRING_LEN;
+ 	}
++
++	for (stats = 0; stats < otx2_n_drv_stats; stats++) {
++		memcpy(data, otx2_drv_stats[stats].name, ETH_GSTRING_LEN);
++		data += ETH_GSTRING_LEN;
++	}
++
+ 	otx2_get_qset_strings(pfvf, &data, 0);
+ 
+ 	for (stats = 0; stats < CGX_RX_STATS_COUNT; stats++) {
+@@ -176,6 +199,11 @@ static void otx2_get_ethtool_stats(struct net_device *netdev,
+ 	for (stat = 0; stat < otx2_n_dev_stats; stat++)
+ 		*(data++) = ((u64 *)&pfvf->hw.dev_stats)
+ 				[otx2_dev_stats[stat].index];
++
++	for (stat = 0; stat < otx2_n_drv_stats; stat++)
++		*(data++) = atomic_read(&((atomic_t *)&pfvf->hw.drv_stats)
++						[otx2_drv_stats[stat].index]);
++
+ 	otx2_get_qset_stats(pfvf, stats, &data);
+ 	otx2_update_lmac_stats(pfvf);
+ 	for (stat = 0; stat < CGX_RX_STATS_COUNT; stat++)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index fe6dead4ce2d..7c03641805d3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -2174,7 +2174,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			       NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+ 			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);
+ 	netdev->features |= netdev->hw_features;
+-	netdev->hw_features |= NETIF_F_LOOPBACK | NETIF_F_NTUPLE;
++
++	netdev->hw_features |= NETIF_F_LOOPBACK | NETIF_F_NTUPLE |
++			       NETIF_F_RXALL;
++
+ 	netdev->priv_flags |= IFF_UNICAST_FLT;
+ 
+ 	netdev->gso_max_segs = OTX2_MAX_GSO_SEGS;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 62f1e3167bfa..923ac46457b4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -221,6 +221,83 @@ static inline void otx2_set_rxtstamp(struct otx2_nic *pfvf, struct sk_buff *skb)
+ 	__skb_pull(skb, 8);
+ }
+ 
++static inline bool otx2_check_rcv_errors(struct otx2_nic *pfvf,
++					 struct otx2_cq_queue *cq, void *cqe)
++{
++	struct otx2_drv_stats *stats = &pfvf->hw.drv_stats;
++	struct nix_rx_parse_s *parse;
++	struct nix_rx_sg_s *sg;
++	void *start, *end;
++	u64 *iova;
++	int seg;
++
++	parse = (struct nix_rx_parse_s *)(cqe + sizeof(struct nix_cqe_hdr_s));
++	if (netif_msg_rx_err(pfvf))
++		netdev_err(pfvf->netdev,
++			   "RQ%d: Error pkt with errlev:0x%x errcode:0x%x\n",
++			   cq->cq_idx, parse->errlev, parse->errcode);
++
++	if (parse->errlev == NPC_ERRLVL_RE) {
++		switch (parse->errcode) {
++		case ERRCODE_FCS:
++		case ERRCODE_FCS_RCV:
++			atomic_inc(&stats->rx_fcs_errs);
++			break;
++		case ERRCODE_UNDERSIZE:
++			atomic_inc(&stats->rx_undersize_errs);
++			break;
++		case ERRCODE_OVERSIZE:
++			atomic_inc(&stats->rx_oversize_errs);
++			break;
++		case ERRCODE_OL2_LEN_MISMATCH:
++			atomic_inc(&stats->rx_len_errs);
++			break;
++		default:
++			atomic_inc(&stats->rx_other_errs);
++			break;
++		}
++	} else if (parse->errlev == NPC_ERRLVL_NIX) {
++		switch (parse->errcode) {
++		case ERRCODE_OL3_LEN:
++		case ERRCODE_OL4_LEN:
++		case ERRCODE_IL3_LEN:
++		case ERRCODE_IL4_LEN:
++			atomic_inc(&stats->rx_len_errs);
++			break;
++		case ERRCODE_OL4_CSUM:
++		case ERRCODE_IL4_CSUM:
++			atomic_inc(&stats->rx_csum_errs);
++			break;
++		default:
++			atomic_inc(&stats->rx_other_errs);
++			break;
++		}
++	} else {
++		atomic_inc(&stats->rx_other_errs);
++	}
++
++	start = cqe + sizeof(struct nix_cqe_hdr_s) + sizeof(*parse);
++	end = start + ((parse->desc_sizem1 + 1) * 16);
++	while ((start + sizeof(*sg)) < end) {
++		sg = (struct nix_rx_sg_s *)start;
++		iova = (void *)sg + sizeof(*sg);
++
++		/* If RXALL is enabled pass on packets to stack */
++		if (sg->segs && pfvf->netdev->features & NETIF_F_RXALL)
++			return false;
++
++		for (seg = 0; seg < sg->segs; seg++) {
++			otx2_aura_freeptr(pfvf, cq->cq_idx, *iova & ~0x07ULL);
++			iova++;
++		}
++		if (sg->segs == 1)
++			start += sizeof(*sg) + sizeof(u64);
++		else
++			start += sizeof(*sg) + (3 * sizeof(u64));
++	}
++	return true;
++}
++
+ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 				 struct otx2_cq_queue *cq, void *cqe)
+ {
+@@ -236,6 +313,10 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 
+ 	/* CQE_HDR_S for a Rx pkt is always followed by RX_PARSE_S */
+ 	parse = (struct nix_rx_parse_s *)(cqe + sizeof(*cqe_hdr));
++	if (parse->errlev || parse->errcode) {
++		if (otx2_check_rcv_errors(pfvf, cq, cqe))
++			return;
++	}
+ 
+ 	start = cqe + sizeof(*cqe_hdr) + sizeof(*parse);
+ 	end = start + ((parse->desc_sizem1 + 1) * 16);
+@@ -243,40 +324,10 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 	/* Run through the each NIX_RX_SG_S subdc and frame the skb */
+ 	while ((start + sizeof(*sg)) < end) {
+ 		sg = (struct nix_rx_sg_s *)start;
+-		/* For a 128byte size CQE, NIX_RX_IMM_S is never expected */
+-		if (sg->subdc != NIX_SUBDC_SG) {
+-			if (netif_msg_rx_err(pfvf))
+-				netdev_err(pfvf->netdev,
+-					   "RQ%d: Unexpected SUBDC %d\n",
+-					   cq->cq_idx, sg->subdc);
+-			break;
+-		}
+-
+-		if (!sg->segs) {
+-			if (netif_msg_rx_err(pfvf))
+-				netdev_err(pfvf->netdev,
+-					   "RQ%d: Zero segment in NIX_RX_SG_S\n",
+-					   cq->cq_idx);
+-			break;
+-		}
+-
+ 		sg_lens = (void *)sg;
+ 		iova = (void *)sg + sizeof(*sg);
+ 
+ 		for (seg = 0; seg < sg->segs; seg++) {
+-			/* Check for errors */
+-			if (parse->errlev || parse->errcode) {
+-				if (netif_msg_rx_err(pfvf))
+-					netdev_err(pfvf->netdev,
+-						   "RQ%d: Error pkt received errlev:%x errcode:%x\n",
+-						   cq->cq_idx, parse->errlev,
+-						   parse->errcode);
+-				otx2_aura_freeptr(pfvf, cq->cq_idx,
+-						  *iova & ~0x07ULL);
+-				iova++;
+-				continue;
+-			}
+-
+ 			len = sg_lens[frag_num(seg)];
+ 			/* Starting IOVA's 2:0 bits give alignment
+ 			 * bytes after which packet data starts.
+-- 
+2.17.1
+
