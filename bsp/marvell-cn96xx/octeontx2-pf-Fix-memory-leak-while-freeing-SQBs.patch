@@ -1,0 +1,180 @@
+From 80eb52c5c8c7095635c91a3c8ce4f4bfae283446 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Fri, 30 Aug 2019 10:27:03 +0530
+Subject: [PATCH 24/27] octeontx2-pf: Fix memory leak while freeing SQBs
+
+commit b785026db2f2feec5d76d7a63421c41bc50294da from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Upon enabling SQ, HW immediately fetches 2 SQB pointers from
+the mapped Aura, these will not be freed back to Pool once SQ
+is disabled. So while cleanup if we do alloc pointer from Aura
+and free them to kernel then 2 SQB pointers will be leaked ie
+never freed. Hence Aura alloc pointer cannot be used, this patch
+fixes this issue by saving the SQB pointers freed to Pool in the
+driver itself and uses that list while cleanup.
+
+Change-Id: I0ecd2a71f55d0cbf16b9d5c57ec3bc983bcb1240
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/15089
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 45 ++++++++++++++++---
+ .../marvell/octeontx2/nic/otx2_common.h       |  1 +
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  8 ++--
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  2 +
+ 4 files changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 4655868f38a6..c4d90b455fd0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -875,6 +875,32 @@ int otx2_config_nix(struct otx2_nic *pfvf)
+ 	return rsp->hdr.rc;
+ }
+ 
++void otx2_sq_free_sqbs(struct otx2_nic *pfvf)
++{
++	struct otx2_qset *qset = &pfvf->qset;
++	struct otx2_hw *hw = &pfvf->hw;
++	struct otx2_snd_queue *sq;
++	int sqb, qidx;
++	u64 iova, pa;
++
++	for (qidx = 0; qidx < hw->tx_queues; qidx++) {
++		sq = &qset->sq[qidx];
++		if (!sq->sqb_ptrs)
++			continue;
++		for (sqb = 0; sqb < sq->sqb_count; sqb++) {
++			if (!sq->sqb_ptrs[sqb])
++				continue;
++			iova = sq->sqb_ptrs[sqb];
++			pa = otx2_iova_to_phys(pfvf->iommu_domain, iova);
++			dma_unmap_page_attrs(pfvf->dev, iova, hw->sqb_size,
++					     DMA_FROM_DEVICE,
++					     DMA_ATTR_SKIP_CPU_SYNC);
++			put_page(virt_to_page(phys_to_virt(pa)));
++		}
++		sq->sqb_count = 0;
++	}
++}
++
+ void otx2_free_aura_ptr(struct otx2_nic *pfvf, int type)
+ {
+ 	int pool_id, pool_start = 0, pool_end = 0, size = 0;
+@@ -1033,9 +1059,10 @@ static int otx2_pool_init(struct otx2_nic *pfvf, u16 pool_id,
+ 
+ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf)
+ {
+-	int sq, pool_id, stack_pages, num_sqbs;
++	int qidx, pool_id, stack_pages, num_sqbs;
+ 	struct otx2_qset *qset = &pfvf->qset;
+ 	struct otx2_hw *hw = &pfvf->hw;
++	struct otx2_snd_queue *sq;
+ 	struct otx2_pool *pool;
+ 	int err, ptr;
+ 	s64 bufptr;
+@@ -1052,8 +1079,8 @@ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf)
+ 	stack_pages =
+ 		(num_sqbs + hw->stack_pg_ptrs - 1) / hw->stack_pg_ptrs;
+ 
+-	for (sq = 0; sq < hw->tx_queues; sq++) {
+-		pool_id = otx2_get_pool_idx(pfvf, AURA_NIX_SQ, sq);
++	for (qidx = 0; qidx < hw->tx_queues; qidx++) {
++		pool_id = otx2_get_pool_idx(pfvf, AURA_NIX_SQ, qidx);
+ 		/* Initialize aura context */
+ 		err = otx2_aura_init(pfvf, pool_id, pool_id, num_sqbs);
+ 		if (err)
+@@ -1072,14 +1099,22 @@ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf)
+ 		goto fail;
+ 
+ 	/* Allocate pointers and free them to aura/pool */
+-	for (sq = 0; sq < hw->tx_queues; sq++) {
+-		pool_id = otx2_get_pool_idx(pfvf, AURA_NIX_SQ, sq);
++	for (qidx = 0; qidx < hw->tx_queues; qidx++) {
++		pool_id = otx2_get_pool_idx(pfvf, AURA_NIX_SQ, qidx);
+ 		pool = &pfvf->qset.pool[pool_id];
++
++		sq = &qset->sq[qidx];
++		sq->sqb_count = 0;
++		sq->sqb_ptrs = kcalloc(num_sqbs, sizeof(u64 *), GFP_KERNEL);
++		if (!sq->sqb_ptrs)
++			return -ENOMEM;
++
+ 		for (ptr = 0; ptr < num_sqbs; ptr++) {
+ 			bufptr = otx2_alloc_rbuf(pfvf, pool, GFP_KERNEL);
+ 			if (bufptr <= 0)
+ 				return bufptr;
+ 			otx2_aura_freeptr(pfvf, pool_id, bufptr);
++			sq->sqb_ptrs[sq->sqb_count++] = (u64)bufptr;
+ 		}
+ 		otx2_get_page(pool);
+ 	}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 2a0f5f50c1be..da0dc8e7b2d3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -554,6 +554,7 @@ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf);
+ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf);
+ void otx2_aura_pool_free(struct otx2_nic *pfvf);
+ void otx2_free_aura_ptr(struct otx2_nic *pfvf, int type);
++void otx2_sq_free_sqbs(struct otx2_nic *pfvf);
+ int otx2_config_nix(struct otx2_nic *pfvf);
+ int otx2_config_nix_queues(struct otx2_nic *pfvf);
+ int otx2_txschq_config(struct otx2_nic *pfvf, int lvl);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index f615fd0eb689..3a0bcddccd1e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1248,11 +1248,14 @@ static void otx2_free_sq_res(struct otx2_nic *pf)
+ 
+ 	/* Disable SQs */
+ 	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_SQ, false);
++	/* Free SQB pointers */
++	otx2_sq_free_sqbs(pf);
+ 	for (qidx = 0; qidx < pf->hw.tx_queues; qidx++) {
+ 		sq = &qset->sq[qidx];
+ 		qmem_free(pf->dev, sq->sqe);
+ 		qmem_free(pf->dev, sq->tso_hdrs);
+ 		kfree(sq->sg);
++		kfree(sq->sqb_ptrs);
+ 		qmem_free(pf->dev, sq->timestamps);
+ 	}
+ }
+@@ -1328,7 +1331,7 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ err_free_txsch:
+ 	otx2_txschq_stop(pf);
+ err_free_sq_ptrs:
+-	otx2_free_aura_ptr(pf, AURA_NIX_SQ);
++	otx2_sq_free_sqbs(pf);
+ err_free_rq_ptrs:
+ 	otx2_free_aura_ptr(pf, AURA_NIX_RQ);
+ 	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_POOL, true);
+@@ -1373,9 +1376,6 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 
+ 	otx2_free_sq_res(pf);
+ 
+-	/* Free SQB pointers */
+-	otx2_free_aura_ptr(pf, AURA_NIX_SQ);
+-
+ 	/* Disable RQs */
+ 	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_RQ, false);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index 11176a3ed0c9..7120ecf436a8 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -79,6 +79,8 @@ struct otx2_snd_queue {
+ 	struct sg_list		*sg;
+ 	struct qmem		*timestamps;
+ 	struct queue_stats	stats;
++	u16			sqb_count;
++	u64			*sqb_ptrs;
+ } ____cacheline_aligned_in_smp;
+ 
+ struct otx2_cq_poll {
+-- 
+2.17.1
+

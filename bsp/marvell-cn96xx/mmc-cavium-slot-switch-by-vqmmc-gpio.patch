@@ -1,0 +1,131 @@
+From c1af82c76bfaaf0739da64c5c83a8cb23d784650 Mon Sep 17 00:00:00 2001
+From: Peter Swain <pswain@cavium.com>
+Date: Mon, 26 Aug 2019 12:37:26 -0700
+Subject: [PATCH 20/27] mmc: cavium: slot switch by vqmmc/gpio
+
+commit 57e754ba6bf76913c99aeb2a0193d488831c96bc from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Octeon/OcteonTX MMC supports up to 3 mmc slots, but any
+level-shifting to accommodate different signal voltages is
+done by external hardware, under control of an optional
+vqmmc regulator object, typically controlled by gpio.
+
+See Documentation/devicetree/bindings/mmc/cavium-mmc.txt
+for a detailed explanation of device-tree control of MMC
+signals via GPIO at reset and slot-switching time.
+
+If any mmc-slots have a vqmmc-supply property,
+take it as a warning that we must switch carefully between
+slots (unless they have the same vqmmc object), tri-stating
+MMC signals to avoid any transient states as level-shifters
+are enabled/disabled, by zeroing MIO_EMM_CFG[bus_id].
+
+During this vqmmc-switching, care must be taken to never
+completely zero MIO_EMM_CFG, as this resets the host controller,
+so the "phantom" slot3 is enabled during the switch.
+
+There's no need to list vqmmc property if all the mmc-slots
+on a board run at same signal voltage, and have same width.
+In this case the old behavior, enabling all probed slots in
+MIO_EMM_CFG, allows faster slot-switching.
+
+Change-Id: I6061d88513920043a3dcef58684d8dcd85ba3cc3
+Signed-off-by: Peter Swain <pswain@cavium.com>
+Signed-off-by: Sujeet Baranwal <sbaranwal@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/14924
+Reviewed-by: Sujeet Kumar Baranwal <Sujeet.Baranwal@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/mmc/host/cavium.c | 31 ++++++++++++++++++++++++++++++-
+ drivers/mmc/host/cavium.h |  1 +
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mmc/host/cavium.c b/drivers/mmc/host/cavium.c
+index 4efa58d54104..6cb73076c09e 100644
+--- a/drivers/mmc/host/cavium.c
++++ b/drivers/mmc/host/cavium.c
+@@ -306,15 +306,37 @@ static bool pre_switch(struct cvm_mmc_host *host, u64 emm_switch)
+ 	int bus_id = get_bus_id(emm_switch);
+ 	struct cvm_mmc_slot *slot = host->slot[bus_id];
+ 	struct cvm_mmc_slot *old_slot;
++	bool same_vqmmc = false;
+ 
+ 	if (host->last_slot == bus_id)
+ 		return false;
+ 
++	/* when VQMMC is switched, tri-state CMDn over any slot change
++	 * to avoid transient states on D0-7 or CLK from level-shifters
++	 */
++	if (host->use_vqmmc) {
++		writeq(1ull << 3, host->base + MIO_EMM_CFG(host));
++		udelay(10);
++	}
++
+ 	if (host->last_slot >= 0 && host->slot[host->last_slot]) {
+ 		old_slot = host->slot[host->last_slot];
+ 		old_slot->cached_switch =
+ 		    readq(host->base + MIO_EMM_SWITCH(host));
+ 		old_slot->cached_rca = readq(host->base + MIO_EMM_RCA(host));
++
++		same_vqmmc = (slot->mmc->supply.vqmmc ==
++				old_slot->mmc->supply.vqmmc);
++		if (!same_vqmmc && !IS_ERR_OR_NULL(old_slot->mmc->supply.vqmmc))
++			regulator_disable(old_slot->mmc->supply.vqmmc);
++	}
++
++	if (!same_vqmmc && !IS_ERR_OR_NULL(slot->mmc->supply.vqmmc)) {
++		int e = regulator_enable(slot->mmc->supply.vqmmc);
++
++		if (e)
++			dev_err(host->dev, "mmc-slot@%d.vqmmc err %d\n",
++						bus_id, e);
+ 	}
+ 
+ 	host->last_slot = slot->bus_id;
+@@ -327,6 +349,12 @@ static void post_switch(struct cvm_mmc_host *host, u64 emm_switch)
+ 	int bus_id = get_bus_id(emm_switch);
+ 	struct cvm_mmc_slot *slot = host->slot[bus_id];
+ 
++	if (host->use_vqmmc) {
++		/* enable new CMDn */
++		writeq(1ull << bus_id, host->base + MIO_EMM_CFG(host));
++		udelay(10);
++	}
++
+ 	writeq(slot->cached_rca, host->base + MIO_EMM_RCA(host));
+ }
+ 
+@@ -1583,7 +1611,7 @@ static int cvm_mmc_init_lowlevel(struct cvm_mmc_slot *slot)
+ 	struct cvm_mmc_host *host = slot->host;
+ 	u64 emm_switch;
+ 
+-	/* Enable this bus slot */
++	/* Enable this bus slot. Overridden when vqmmc-switching engaged */
+ 	host->emm_cfg |= (1ull << slot->bus_id);
+ 	writeq(host->emm_cfg, slot->host->base + MIO_EMM_CFG(host));
+ 	udelay(10);
+@@ -1773,6 +1801,7 @@ int cvm_mmc_of_slot_probe(struct device *dev, struct cvm_mmc_host *host)
+ 
+ 	host->acquire_bus(host);
+ 	host->slot[id] = slot;
++	host->use_vqmmc |= !IS_ERR_OR_NULL(slot->mmc->supply.vqmmc);
+ 	cvm_mmc_init_lowlevel(slot);
+ 	cvm_mmc_switch_to(slot);
+ 	host->release_bus(host);
+diff --git a/drivers/mmc/host/cavium.h b/drivers/mmc/host/cavium.h
+index 532440460b28..9f37b45a62f7 100644
+--- a/drivers/mmc/host/cavium.h
++++ b/drivers/mmc/host/cavium.h
+@@ -111,6 +111,7 @@ struct cvm_mmc_host {
+ 	bool use_sg;
+ 	bool has_ciu3;
+ 	bool powered;
++	bool use_vqmmc; /* must disable slots over switch */
+ 	bool big_dma_addr;
+ 	bool need_irq_handler_lock;
+ 	spinlock_t irq_handler_lock;
+-- 
+2.17.1
+
