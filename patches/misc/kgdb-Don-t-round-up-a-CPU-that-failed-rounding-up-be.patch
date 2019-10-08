@@ -1,0 +1,144 @@
+From 7d9187b24c7fb110e9f5a59ab1fc603437b8aeb2 Mon Sep 17 00:00:00 2001
+From: Douglas Anderson <dianders@chromium.org>
+Date: Tue, 10 Sep 2019 10:55:02 +0800
+Subject: [PATCH 3/3] kgdb: Don't round up a CPU that failed rounding up before
+
+commit 87b095928584da7d5cb3149016f00b0b139c2292 upstream
+
+If we're using the default implementation of kgdb_roundup_cpus() that
+uses smp_call_function_single_async() we can end up hanging
+kgdb_roundup_cpus() if we try to round up a CPU that failed to round
+up before.
+
+Specifically smp_call_function_single_async() will try to wait on the
+csd lock for the CPU that we're trying to round up.  If the previous
+round up never finished then that lock could still be held and we'll
+just sit there hanging.
+
+There's not a lot of use trying to round up a CPU that failed to round
+up before.  Let's keep a flag that indicates whether the CPU started
+but didn't finish to round up before.  If we see that flag set then
+we'll skip the next round up.
+
+In general we have a few goals here:
+- We never want to end up calling smp_call_function_single_async()
+  when the csd is still locked.  This is accomplished because
+  flush_smp_call_function_queue() unlocks the csd _before_ invoking
+  the callback.  That means that when kgdb_nmicallback() runs we know
+  for sure the the csd is no longer locked.  Thus when we set
+  "rounding_up = false" we know for sure that the csd is unlocked.
+- If there are no timeouts rounding up we should never skip a round
+  up.
+
+NOTE #1: In general trying to continue running after failing to round
+up CPUs doesn't appear to be supported in the debugger.  When I
+simulate this I find that kdb reports "Catastrophic error detected"
+when I try to continue.  I can overrule and continue anyway, but it
+should be noted that we may be entering the land of dragons here.
+Possibly the "Catastrophic error detected" was added _because_ of the
+future failure to round up, but even so this is an area of the code
+that hasn't been strongly tested.
+
+NOTE #2: I did a bit of testing before and after this change.  I
+introduced a 10 second hang in the kernel while holding a spinlock
+that I could invoke on a certain CPU with 'taskset -c 3 cat /sys/...".
+
+Before this change if I did:
+- Invoke hang
+- Enter debugger
+- g (which warns about Catastrophic error, g again to go anyway)
+- g
+- Enter debugger
+
+...I'd hang the rest of the 10 seconds without getting a debugger
+prompt.  After this change I end up in the debugger the 2nd time after
+only 1 second with the standard warning about 'Timed out waiting for
+secondary CPUs.'
+
+I'll also note that once the CPU finished waiting I could actually
+debug it (aka "btc" worked)
+
+I won't promise that everything works perfectly if the errant CPU
+comes back at just the wrong time (like as we're entering or exiting
+the debugger) but it certainly seems like an improvement.
+
+NOTE #3: setting 'kgdb_info[cpu].rounding_up = false' is in
+kgdb_nmicallback() instead of kgdb_call_nmi_hook() because some
+implementations override kgdb_call_nmi_hook().  It shouldn't hurt to
+have it in kgdb_nmicallback() in any case.
+
+NOTE #4: this logic is really only needed because there is no API call
+like "smp_try_call_function_single_async()" or "smp_csd_is_locked()".
+If such an API existed then we'd use it instead, but it seemed a bit
+much to add an API like this just for kgdb.
+
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Acked-by: Daniel Thompson <daniel.thompson@linaro.org>
+Signed-off-by: Daniel Thompson <daniel.thompson@linaro.org>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ kernel/debug/debug_core.c | 20 +++++++++++++++++++-
+ kernel/debug/debug_core.h |  1 +
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/debug/debug_core.c b/kernel/debug/debug_core.c
+index e598296ce7d2..5cc608de6883 100644
+--- a/kernel/debug/debug_core.c
++++ b/kernel/debug/debug_core.c
+@@ -247,6 +247,7 @@ void __weak kgdb_roundup_cpus(void)
+ 	call_single_data_t *csd;
+ 	int this_cpu = raw_smp_processor_id();
+ 	int cpu;
++	int ret;
+ 
+ 	for_each_online_cpu(cpu) {
+ 		/* No need to roundup ourselves */
+@@ -254,8 +255,23 @@ void __weak kgdb_roundup_cpus(void)
+ 			continue;
+ 
+ 		csd = &per_cpu(kgdb_roundup_csd, cpu);
++
++		/*
++		 * If it didn't round up last time, don't try again
++		 * since smp_call_function_single_async() will block.
++		 *
++		 * If rounding_up is false then we know that the
++		 * previous call must have at least started and that
++		 * means smp_call_function_single_async() won't block.
++		 */
++		if (kgdb_info[cpu].rounding_up)
++			continue;
++		kgdb_info[cpu].rounding_up = true;
++
+ 		csd->func = kgdb_call_nmi_hook;
+-		smp_call_function_single_async(cpu, csd);
++		ret = smp_call_function_single_async(cpu, csd);
++		if (ret)
++			kgdb_info[cpu].rounding_up = false;
+ 	}
+ }
+ 
+@@ -792,6 +808,8 @@ int kgdb_nmicallback(int cpu, void *regs)
+ 	struct kgdb_state kgdb_var;
+ 	struct kgdb_state *ks = &kgdb_var;
+ 
++	kgdb_info[cpu].rounding_up = false;
++
+ 	memset(ks, 0, sizeof(struct kgdb_state));
+ 	ks->cpu			= cpu;
+ 	ks->linux_regs		= regs;
+diff --git a/kernel/debug/debug_core.h b/kernel/debug/debug_core.h
+index 127d9bc49fb4..b4a7c326d546 100644
+--- a/kernel/debug/debug_core.h
++++ b/kernel/debug/debug_core.h
+@@ -42,6 +42,7 @@ struct debuggerinfo_struct {
+ 	int			ret_state;
+ 	int			irq_depth;
+ 	int			enter_kgdb;
++	bool			rounding_up;
+ };
+ 
+ extern struct debuggerinfo_struct kgdb_info[];
+-- 
+2.17.1
+
