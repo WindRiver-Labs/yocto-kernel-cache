@@ -1,0 +1,160 @@
+From f7891acb4d483555c54841f726d71f288a01582a Mon Sep 17 00:00:00 2001
+From: Cyril Bur <cyrilbur@gmail.com>
+Date: Thu, 2 Nov 2017 14:09:03 +1100
+Subject: [PATCH 3/5] powerpc: Don't enable FP/Altivec if not checkpointed
+
+commit a7771176b4392fbc3a17399c51a8c11f2f681afe upstream
+
+Lazy save and restore of FP/Altivec means that a userspace process can
+be sent to userspace with FP or Altivec disabled and loaded only as
+required (by way of an FP/Altivec unavailable exception). Transactional
+Memory complicates this situation as a transaction could be started
+without FP/Altivec being loaded up. This causes the hardware to
+checkpoint incorrect registers. Handling FP/Altivec unavailable
+exceptions while a thread is transactional requires a reclaim and
+recheckpoint to ensure the CPU has correct state for both sets of
+registers.
+
+Lazy save and restore of FP/Altivec cannot be done if a process is
+transactional. If a facility was enabled it must remain enabled whenever
+a thread is transactional.
+
+Commit dc16b553c949 ("powerpc: Always restore FPU/VEC/VSX if hardware
+transactional memory in use") ensures that the facilities are always
+enabled if a thread is transactional. A bug in the introduced code may
+cause it to inadvertently enable a facility that was (and should remain)
+disabled. The problem with this extraneous enablement is that the
+registers for the erroneously enabled facility have not been correctly
+recheckpointed - the recheckpointing code assumed the facility would
+remain disabled.
+
+Further compounding the issue, the transactional {fp,altivec,vsx}
+unavailable code has been incorrectly using the MSR to enable
+facilities. The presence of the {FP,VEC,VSX} bit in the regs->msr simply
+means if the registers are live on the CPU, not if the kernel should
+load them before returning to userspace. This has worked due to the bug
+mentioned above.
+
+This causes transactional threads which return to their failure handler
+to observe incorrect checkpointed registers. Perhaps an example will
+help illustrate the problem:
+
+A userspace process is running and uses both FP and Altivec registers.
+This process then continues to run for some time without touching
+either sets of registers. The kernel subsequently disables the
+facilities as part of lazy save and restore. The userspace process then
+performs a tbegin and the CPU checkpoints 'junk' FP and Altivec
+registers. The process then performs a floating point instruction
+triggering a fp unavailable exception in the kernel.
+
+The kernel then loads the FP registers - and only the FP registers.
+Since the thread is transactional it must perform a reclaim and
+recheckpoint to ensure both the checkpointed registers and the
+transactional registers are correct. It then (correctly) enables
+MSR[FP] for the process. Later (on exception exist) the kernel also
+(inadvertently) enables MSR[VEC]. The process is then returned to
+userspace.
+
+Since the act of loading the FP registers doomed the transaction we know
+CPU will fail the transaction, restore its checkpointed registers, and
+return the process to its failure handler. The problem is that we're
+now running with Altivec enabled and the 'junk' checkpointed registers
+are restored. The kernel had only recheckpointed FP.
+
+This patch solves this by only activating FP/Altivec if userspace was
+using them when it entered the kernel and not simply if the process is
+transactional.
+
+Fixes: dc16b553c949 ("powerpc: Always restore FPU/VEC/VSX if hardware
+transactional memory in use")
+
+Signed-off-by: Cyril Bur <cyrilbur@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Stefan Ghinea <stefan.ghinea@windriver.com>
+---
+ arch/powerpc/kernel/process.c | 18 ++++++++++++++++--
+ arch/powerpc/kernel/traps.c   |  8 ++++----
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index 3a5d0905fab4..a80d52a7153a 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -97,9 +97,23 @@ static inline bool msr_tm_active(unsigned long msr)
+ {
+ 	return MSR_TM_ACTIVE(msr);
+ }
++
++static bool tm_active_with_fp(struct task_struct *tsk)
++{
++	return msr_tm_active(tsk->thread.regs->msr) &&
++		(tsk->thread.ckpt_regs.msr & MSR_FP);
++}
++
++static bool tm_active_with_altivec(struct task_struct *tsk)
++{
++	return msr_tm_active(tsk->thread.regs->msr) &&
++		(tsk->thread.ckpt_regs.msr & MSR_VEC);
++}
+ #else
+ static inline bool msr_tm_active(unsigned long msr) { return false; }
+ static inline void check_if_tm_restore_required(struct task_struct *tsk) { }
++static inline bool tm_active_with_fp(struct task_struct *tsk) { return false; }
++static inline bool tm_active_with_altivec(struct task_struct *tsk) { return false; }
+ #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+ 
+ bool strict_msr_control;
+@@ -232,7 +246,7 @@ EXPORT_SYMBOL(enable_kernel_fp);
+ 
+ static int restore_fp(struct task_struct *tsk)
+ {
+-	if (tsk->thread.load_fp || msr_tm_active(tsk->thread.regs->msr)) {
++	if (tsk->thread.load_fp || tm_active_with_fp(tsk)) {
+ 		load_fp_state(&current->thread.fp_state);
+ 		current->thread.load_fp++;
+ 		return 1;
+@@ -314,7 +328,7 @@ EXPORT_SYMBOL_GPL(flush_altivec_to_thread);
+ static int restore_altivec(struct task_struct *tsk)
+ {
+ 	if (cpu_has_feature(CPU_FTR_ALTIVEC) &&
+-		(tsk->thread.load_vec || msr_tm_active(tsk->thread.regs->msr))) {
++		(tsk->thread.load_vec || tm_active_with_altivec(tsk))) {
+ 		load_vr_state(&tsk->thread.vr_state);
+ 		tsk->thread.used_vr = 1;
+ 		tsk->thread.load_vec++;
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index d4e545d27ef9..69953b1fda00 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -1581,7 +1581,7 @@ void fp_unavailable_tm(struct pt_regs *regs)
+ 	/* Reclaim didn't save out any FPRs to transact_fprs. */
+ 
+ 	/* Enable FP for the task: */
+-	regs->msr |= (MSR_FP | current->thread.fpexc_mode);
++	current->thread.load_fp = 1;
+ 
+ 	/* This loads and recheckpoints the FP registers from
+ 	 * thread.fpr[].  They will remain in registers after the
+@@ -1610,7 +1610,7 @@ void altivec_unavailable_tm(struct pt_regs *regs)
+ 		 "MSR=%lx\n",
+ 		 regs->nip, regs->msr);
+ 	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+-	regs->msr |= MSR_VEC;
++	current->thread.load_vec = 1;
+ 	tm_recheckpoint(&current->thread, MSR_VEC);
+ 	current->thread.used_vr = 1;
+ 
+@@ -1647,8 +1647,8 @@ void vsx_unavailable_tm(struct pt_regs *regs)
+ 	/* This reclaims FP and/or VR regs if they're already enabled */
+ 	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+ 
+-	regs->msr |= MSR_VEC | MSR_FP | current->thread.fpexc_mode |
+-		MSR_VSX;
++	current->thread.load_vec = 1;
++	current->thread.load_fp = 1;
+ 
+ 	/* This loads & recheckpoints FP and VRs; but we have
+ 	 * to be sure not to overwrite previously-valid state.
+-- 
+2.17.1
+
