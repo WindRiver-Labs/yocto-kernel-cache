@@ -1,0 +1,108 @@
+From cdf48052b8e2d8613d49b31d0ac386ad540207de Mon Sep 17 00:00:00 2001
+From: Lukasz Bartosik <lbartosik@marvell.com>
+Date: Tue, 30 Apr 2019 13:32:05 +0200
+Subject: [PATCH 205/386] crypto: cpt - fix reordering of crypto requests
+
+Pending queue entry needs to be allocated and filled
+in critical section together with submitting CPT
+instruction to CPT instruction queue to make sure
+that order of CPT requests is the same in both
+pending and instruction queues.
+
+Change-Id: Ic81736ba0fbdbae049e9a51938cab62dde4caebe
+Signed-off-by: Lukasz Bartosik <lbartosik@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/8300
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Srujana Challa <schalla@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ drivers/crypto/cavium/cpt/8x/cpt8x_reqmgr.c   | 9 ++++-----
+ drivers/crypto/cavium/cpt/8x/cpt8x_vf.h       | 1 -
+ drivers/crypto/cavium/cpt/8x/cpt8x_vf_main.c  | 1 -
+ drivers/crypto/cavium/cpt/common/cpt_reqmgr.c | 9 ++++++++-
+ 4 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/crypto/cavium/cpt/8x/cpt8x_reqmgr.c b/drivers/crypto/cavium/cpt/8x/cpt8x_reqmgr.c
+index 8f18048f3063..ef77135b3ee2 100644
+--- a/drivers/crypto/cavium/cpt/8x/cpt8x_reqmgr.c
++++ b/drivers/crypto/cavium/cpt/8x/cpt8x_reqmgr.c
+@@ -116,11 +116,12 @@ static void cpt8x_send_cmd(union cpt_inst_s *cptinst, u32 db_count, void *obj)
+ 	struct cpt_vf *cptvf = (struct cpt_vf *) obj;
+ 	struct command_qinfo *qinfo = &cptvf->cqinfo;
+ 	struct command_queue *queue = &qinfo->queue[0];
+-	unsigned long flags;
+ 	u8 *ent;
+ 
+-	/* lock commad queue */
+-	spin_lock_irqsave(&queue->lock, flags);
++	/*
++	 * cpt8x_send_cmd is currently called only from critical section
++	 * therefore no locking is required for accessing instruction queue
++	 */
+ 	ent = &queue->qhead->head[queue->idx * qinfo->cmd_size];
+ 	memcpy(ent, (void *) cptinst, qinfo->cmd_size);
+ 
+@@ -136,8 +137,6 @@ static void cpt8x_send_cmd(union cpt_inst_s *cptinst, u32 db_count, void *obj)
+ 	/* make sure all memory stores are done before ringing doorbell */
+ 	smp_wmb();
+ 	cptvf_write_vq_doorbell(cptvf, db_count);
+-	/* unlock command queue */
+-	spin_unlock_irqrestore(&queue->lock, flags);
+ }
+ 
+ void cpt8x_send_cmds_in_batch(union cpt_inst_s *cptinst, u32 num, void *obj)
+diff --git a/drivers/crypto/cavium/cpt/8x/cpt8x_vf.h b/drivers/crypto/cavium/cpt/8x/cpt8x_vf.h
+index d43fb746d74f..34e9ade2a564 100644
+--- a/drivers/crypto/cavium/cpt/8x/cpt8x_vf.h
++++ b/drivers/crypto/cavium/cpt/8x/cpt8x_vf.h
+@@ -33,7 +33,6 @@ struct command_chunk {
+ };
+ 
+ struct command_queue {
+-	spinlock_t lock; /* command queue lock */
+ 	u32 idx; /* Command queue host write idx */
+ 	u32 nchunks; /* Number of command chunks */
+ 	struct command_chunk *qhead;	/* Command queue head, instructions
+diff --git a/drivers/crypto/cavium/cpt/8x/cpt8x_vf_main.c b/drivers/crypto/cavium/cpt/8x/cpt8x_vf_main.c
+index 33f13fd1bdf2..303702e6f451 100644
+--- a/drivers/crypto/cavium/cpt/8x/cpt8x_vf_main.c
++++ b/drivers/crypto/cavium/cpt/8x/cpt8x_vf_main.c
+@@ -263,7 +263,6 @@ static int alloc_command_queues(struct cpt_vf *cptvf,
+ 		curr = first;
+ 		*((u64 *)(&last->head[last->size])) = (u64)curr->dma_addr;
+ 		queue->qhead = curr;
+-		spin_lock_init(&queue->lock);
+ 	}
+ 	return 0;
+ 
+diff --git a/drivers/crypto/cavium/cpt/common/cpt_reqmgr.c b/drivers/crypto/cavium/cpt/common/cpt_reqmgr.c
+index d2b6c6eb56d5..b1aae7b3b7fa 100644
+--- a/drivers/crypto/cavium/cpt/common/cpt_reqmgr.c
++++ b/drivers/crypto/cavium/cpt/common/cpt_reqmgr.c
+@@ -215,7 +215,6 @@ inline int process_request(struct pci_dev *pdev, struct reqmgr_ops *ops,
+ 	info->pentry = pentry;
+ 	info->time_in = jiffies;
+ 	info->req = req;
+-	spin_unlock_bh(&pqueue->lock);
+ 
+ 	/* Fill in the command */
+ 	iq_cmd.cmd.u64 = 0;
+@@ -250,6 +249,14 @@ inline int process_request(struct pci_dev *pdev, struct reqmgr_ops *ops,
+ 	/* Send CPT command */
+ 	ops->send_cmd(&cptinst, 1, obj);
+ 
++	/*
++	 * We allocate and prepare pending queue entry in critical section
++	 * together with submitting CPT instruction to CPT instruction queue
++	 * to make sure that order of CPT requests is the same in both
++	 * pending and instruction queues
++	 */
++	spin_unlock_bh(&pqueue->lock);
++
+ 	ret = resume_sender ? -EBUSY : -EINPROGRESS;
+ 	return ret;
+ 
+-- 
+2.17.1
+

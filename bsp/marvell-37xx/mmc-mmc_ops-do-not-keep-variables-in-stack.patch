@@ -1,0 +1,170 @@
+From f0e304ae5f60c092345d68f7461ba51d437a957e Mon Sep 17 00:00:00 2001
+From: Grzegorz Jaszczyk <jaz@semihalf.com>
+Date: Wed, 24 Jul 2019 12:44:22 +0200
+Subject: [PATCH 362/386] mmc: mmc_ops: do not keep variables in stack
+
+The request end signalised via IRQ can arrive after mmc_panic_write
+ends. In this case interrupt handler will try to access data that was no
+longer available (during mmc_panic_write function epilogue the local
+variables were freed). Transferring those data to heap allows interrupt
+handler finalize the transaction even after mmc_panic_write stack is no
+longer valid.
+
+Signed-off-by: Grzegorz Jaszczyk <jaz@semihalf.com>
+Change-Id: Ib0374cc0a554a0fca706274f2e122d1da069d3b7
+Reviewed-on: https://sj1git1.cavium.com/12987
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+Reviewed-by: Marcin Wojtas <marcin@marvell.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ drivers/mmc/core/mmc_oops.c | 92 ++++++++++++++++++++++++-------------
+ 1 file changed, 59 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/mmc/core/mmc_oops.c b/drivers/mmc/core/mmc_oops.c
+index 4eab812d9d21..79ccb7f2d4f5 100644
+--- a/drivers/mmc/core/mmc_oops.c
++++ b/drivers/mmc/core/mmc_oops.c
+@@ -40,6 +40,7 @@ MODULE_PARM_DESC(dump_oops,
+ 
+ static struct mmcoops_context {
+ 	struct kmsg_dumper	dump;
++	struct mmc_request	*mrq;
+ 	struct mmc_card		*card;
+ 	unsigned long		start;
+ 	unsigned long		size;
+@@ -55,51 +56,39 @@ static void mmc_panic_write(struct mmcoops_context *cxt,
+ {
+ 	struct mmc_card *card = cxt->card;
+ 	struct mmc_host *host = card->host;
+-	struct mmc_request mrq;
+-	struct mmc_command cmd;
+-	struct mmc_command stop;
+-	struct mmc_data data;
++	struct mmc_request *mrq = cxt->mrq;
+ 	struct scatterlist sg;
+ 
+-	memset(&mrq, 0, sizeof(struct mmc_request));
+-	memset(&cmd, 0, sizeof(struct mmc_command));
+-	memset(&stop, 0, sizeof(struct mmc_command));
+-	memset(&data, 0, sizeof(struct mmc_data));
+-
+-	mrq.cmd = &cmd;
+-	mrq.data = &data;
+-	mrq.stop = &stop;
+-
+ 	sg_init_one(&sg, buf, (size << 9));
+ 
+ 	if (size > 1)
+-		cmd.opcode = MMC_WRITE_MULTIPLE_BLOCK;
++		mrq->cmd->opcode = MMC_WRITE_MULTIPLE_BLOCK;
+ 	else
+-		cmd.opcode = MMC_WRITE_BLOCK;
+-	cmd.arg = start;
+-	cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
++		mrq->cmd->opcode = MMC_WRITE_BLOCK;
++	mrq->cmd->arg = start;
++	mrq->cmd->flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+ 
+ 	if (size == 1)
+-		mrq.stop = NULL;
++		mrq->stop = NULL;
+ 	else {
+-		stop.opcode = MMC_STOP_TRANSMISSION;
+-		stop.arg = 0;
+-		stop.flags = MMC_RSP_R1B | MMC_CMD_AC;
++		mrq->stop->opcode = MMC_STOP_TRANSMISSION;
++		mrq->stop->arg = 0;
++		mrq->stop->flags = MMC_RSP_R1B | MMC_CMD_AC;
+ 	}
+ 
+-	data.blksz = 512;
+-	data.blocks = size;
+-	data.flags = MMC_DATA_WRITE;
+-	data.sg = &sg;
+-	data.sg_len = 1;
++	mrq->data->blksz = 512;
++	mrq->data->blocks = size;
++	mrq->data->flags = MMC_DATA_WRITE;
++	mrq->data->sg = &sg;
++	mrq->data->sg_len = 1;
+ 
+-	mmc_set_data_timeout(&data, card);
+-	mmc_wait_for_oops_req(host, &mrq);
++	mmc_set_data_timeout(mrq->data, card);
++	mmc_wait_for_oops_req(host, mrq);
+ 
+-	if (cmd.error)
+-		pr_info("%s: cmd error %d\n", __func__, cmd.error);
+-	if (data.error)
+-		pr_info("%s: data error %d\n", __func__, data.error);
++	if (mrq->cmd->error)
++		pr_info("%s: cmd error %d\n", __func__, mrq->cmd->error);
++	if (mrq->data->error)
++		pr_info("%s: data error %d\n", __func__, mrq->data->error);
+ 	/* wait busy */
+ 
+ 	cxt->count = (cxt->count + 1) % cxt->max_count;
+@@ -218,6 +207,38 @@ static int mmcoops_parse_dt(struct mmcoops_context *cxt)
+ 	return 0;
+ }
+ 
++static int mmc_alloc_req_resources(struct platform_device *pdev,
++				   struct mmcoops_context *cxt)
++{
++	struct mmc_request *mrq;
++	struct mmc_command *cmd, *stop;
++	struct mmc_data *data;
++
++	mrq = devm_kzalloc(&pdev->dev, sizeof(struct mmc_request), GFP_KERNEL);
++	if (!mrq)
++		return -ENOMEM;
++
++	cmd = devm_kzalloc(&pdev->dev, sizeof(struct mmc_command), GFP_KERNEL);
++	if (!cmd)
++		return -ENOMEM;
++
++	stop = devm_kzalloc(&pdev->dev, sizeof(struct mmc_command), GFP_KERNEL);
++	if (!stop)
++		return -ENOMEM;
++
++	data = devm_kzalloc(&pdev->dev, sizeof(struct mmc_data), GFP_KERNEL);
++	if (!mrq)
++		return -ENOMEM;
++
++	mrq->cmd = cmd;
++	mrq->data = data;
++	mrq->stop = stop;
++
++	cxt->mrq = mrq;
++
++	return 0;
++}
++
+ static int __init mmcoops_probe(struct platform_device *pdev)
+ {
+ 	struct mmcoops_context *cxt = &oops_cxt;
+@@ -237,13 +258,18 @@ static int __init mmcoops_probe(struct platform_device *pdev)
+ 		return err;
+ 	}
+ 
+-
+ 	cxt->max_count = (cxt->size << 9) / RECORD_SIZE;
+ 
+ 	cxt->virt_addr = kmalloc((cxt->size << 9), GFP_KERNEL);
+ 	if (!cxt->virt_addr)
+ 		goto kmalloc_failed;
+ 
++	err = mmc_alloc_req_resources(pdev, cxt);
++	if (err) {
++		pr_err("%s: failed to allocate req resources\n", __func__);
++		return err;
++	}
++
+ 	cxt->dump.dump = mmcoops_do_dump;
+ 
+ 	err = kmsg_dump_register(&cxt->dump);
+-- 
+2.17.1
+

@@ -1,0 +1,143 @@
+From 866b5d6e59af34dea0159d8f73907b8c4177812f Mon Sep 17 00:00:00 2001
+From: Russell King <rmk+kernel@armlinux.org.uk>
+Date: Fri, 8 Feb 2019 15:35:49 +0000
+Subject: [PATCH 099/386] net: marvell: mvpp2: only reprogram what is necessary
+ on mac_config
+
+mac_config() can be called at any point, and the expected behaviour
+from MAC drivers is to only reprogram when necessary - and certainly
+avoid taking the link down on every call.
+
+Unfortunately, mvpp2 does exactly that - it takes the link down, and
+reprograms everything, and then releases the forced-link down.
+
+This is bad, it can cause the link to bounce:
+
+- SFP detects signal, disables LOS indication.
+- SFP code calls into phylink, calling phylink_sfp_link_up() which
+  triggers a resolve.
+- phylink_resolve() calls phylink_get_mac_state() and finds the MAC
+  reporting link up.
+- phylink wants to configure the pause mode on the MAC, so calls
+  phylink_mac_config()
+- mvpp2 takes the link down temporarily, generating a MAC link down
+  event followed by another MAC link event.
+- phylink calls mac_link_up() and then processes the MAC link down
+  event.
+- phylink_resolve() gets called again, registers the link down, and
+  calls mach_link_down() before re-running itself.
+- phylink_resolve() starts again at step 3 above.  This sequence
+  repeats.
+
+GMAC versions prior to mvpp2 do not require the link to be taken down
+except when certain link properties (eg, switching between SGMII and
+1000base-X mode, or enabling/disabling in-band negotiation) are
+changed.  Implement this for mvpp2.
+
+Change-Id: I3e54455d6dd09d64779696abfd4ad03af430d33e
+Tested-by: Sven Auhagen <sven.auhagen@voleatech.de>
+Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[resolve conflicts]
+Signed-off-by: Marcin Wojtas <mw@semihalf.com>
+Reviewed-on: https://sj1git1.cavium.com/6466
+Tested-by: Stefan Chulski <Stefan.Chulski@cavium.com>
+Reviewed-by: Stefan Chulski <Stefan.Chulski@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 59 +++++++++++--------
+ 1 file changed, 35 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 15b62bfb79f4..88cd2d8a20c3 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -5989,30 +5989,21 @@ static void mvpp2_xlg_config(struct mvpp2_port *port, unsigned int mode,
+ static void mvpp2_gmac_config(struct mvpp2_port *port, unsigned int mode,
+ 			      const struct phylink_link_state *state)
+ {
+-	u32 an, ctrl0, ctrl2, ctrl4;
+-	u32 old_ctrl2;
++	u32 old_an, an;
++	u32 old_ctrl0, ctrl0;
++	u32 old_ctrl2, ctrl2;
++	u32 old_ctrl4, ctrl4;
+ 
+-	an = readl(port->base + MVPP2_GMAC_AUTONEG_CONFIG);
+-	ctrl0 = readl(port->base + MVPP2_GMAC_CTRL_0_REG);
+-	ctrl2 = readl(port->base + MVPP2_GMAC_CTRL_2_REG);
+-	ctrl4 = readl(port->base + MVPP22_GMAC_CTRL_4_REG);
+-
+-	old_ctrl2 = ctrl2;
+-
+-	/* Force link down */
+-	an &= ~MVPP2_GMAC_FORCE_LINK_PASS;
+-	an |= MVPP2_GMAC_FORCE_LINK_DOWN;
+-	writel(an, port->base + MVPP2_GMAC_AUTONEG_CONFIG);
+-
+-	/* Set the GMAC in a reset state */
+-	ctrl2 |= MVPP2_GMAC_PORT_RESET_MASK;
+-	ctrl2 &= ~MVPP2_GMAC_FLOW_CTRL_MASK;
+-	writel(ctrl2, port->base + MVPP2_GMAC_CTRL_2_REG);
++	old_an = an = readl(port->base + MVPP2_GMAC_AUTONEG_CONFIG);
++	old_ctrl0 = ctrl0 = readl(port->base + MVPP2_GMAC_CTRL_0_REG);
++	old_ctrl2 = ctrl2 = readl(port->base + MVPP2_GMAC_CTRL_2_REG);
++	old_ctrl4 = ctrl4 = readl(port->base + MVPP22_GMAC_CTRL_4_REG);
+ 
+ 	an &= ~(MVPP2_GMAC_CONFIG_MII_SPEED | MVPP2_GMAC_CONFIG_GMII_SPEED |
+ 		MVPP2_GMAC_AN_SPEED_EN | MVPP2_GMAC_FC_ADV_EN |
+ 		MVPP2_GMAC_FC_ADV_ASM_EN | MVPP2_GMAC_FLOW_CTRL_AUTONEG |
+-		MVPP2_GMAC_CONFIG_FULL_DUPLEX | MVPP2_GMAC_AN_DUPLEX_EN);
++		MVPP2_GMAC_CONFIG_FULL_DUPLEX | MVPP2_GMAC_AN_DUPLEX_EN |
++		MVPP2_GMAC_IN_BAND_AUTONEG | MVPP2_GMAC_IN_BAND_AUTONEG_BYPASS);
+ 	ctrl0 &= ~MVPP2_GMAC_PORT_TYPE_MASK;
+ 	ctrl2 &= ~(MVPP2_GMAC_INBAND_AN_MASK | MVPP2_GMAC_PORT_RESET_MASK |
+ 		   MVPP2_GMAC_PCS_ENABLE_MASK);
+@@ -6076,7 +6067,8 @@ static void mvpp2_gmac_config(struct mvpp2_port *port, unsigned int mode,
+ 		ctrl0 |= MVPP2_GMAC_PORT_TYPE_MASK;
+ 		an &= ~(MVPP2_GMAC_FORCE_LINK_DOWN |
+ 			MVPP2_GMAC_FORCE_LINK_PASS);
+-		an |= MVPP2_GMAC_CONFIG_GMII_SPEED |
++		an |= MVPP2_GMAC_IN_BAND_AUTONEG |
++		      MVPP2_GMAC_CONFIG_GMII_SPEED |
+ 		      MVPP2_GMAC_CONFIG_FULL_DUPLEX;
+ 
+ 		if (state->pause & MLO_PAUSE_AN && state->an_enabled)
+@@ -6088,10 +6080,29 @@ static void mvpp2_gmac_config(struct mvpp2_port *port, unsigned int mode,
+ 	if (state->pause & MLO_PAUSE_RX)
+ 		ctrl4 |= MVPP22_CTRL4_RX_FC_EN;
+ 
+-	writel(ctrl0, port->base + MVPP2_GMAC_CTRL_0_REG);
+-	writel(ctrl2, port->base + MVPP2_GMAC_CTRL_2_REG);
+-	writel(ctrl4, port->base + MVPP22_GMAC_CTRL_4_REG);
+-	writel(an, port->base + MVPP2_GMAC_AUTONEG_CONFIG);
++	if ((old_ctrl0 ^ ctrl0) & MVPP2_GMAC_PORT_TYPE_MASK ||
++	    (old_ctrl2 ^ ctrl2) & MVPP2_GMAC_INBAND_AN_MASK ||
++	    (old_an ^ an) & MVPP2_GMAC_IN_BAND_AUTONEG) {
++		/* Force link down */
++		old_an &= ~MVPP2_GMAC_FORCE_LINK_PASS;
++		old_an |= MVPP2_GMAC_FORCE_LINK_DOWN;
++		writel(old_an, port->base + MVPP2_GMAC_AUTONEG_CONFIG);
++
++		/* Set the GMAC in a reset state - do this in a way that
++		 * ensures we clear it below.
++		 */
++		old_ctrl2 |= MVPP2_GMAC_PORT_RESET_MASK;
++		writel(old_ctrl2, port->base + MVPP2_GMAC_CTRL_2_REG);
++	}
++
++	if (old_ctrl0 != ctrl0)
++		writel(ctrl0, port->base + MVPP2_GMAC_CTRL_0_REG);
++	if (old_ctrl2 != ctrl2)
++		writel(ctrl2, port->base + MVPP2_GMAC_CTRL_2_REG);
++	if (old_ctrl4 != ctrl4)
++		writel(ctrl4, port->base + MVPP22_GMAC_CTRL_4_REG);
++	if (old_an != an)
++		writel(an, port->base + MVPP2_GMAC_AUTONEG_CONFIG);
+ 
+ 	if (old_ctrl2 & MVPP2_GMAC_PORT_RESET_MASK) {
+ 		while (readl(port->base + MVPP2_GMAC_CTRL_2_REG) &
+-- 
+2.17.1
+

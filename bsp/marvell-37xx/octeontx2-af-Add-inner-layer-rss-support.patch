@@ -1,0 +1,190 @@
+From 3f49f29e7889b464dd406108f2297d937b698292 Mon Sep 17 00:00:00 2001
+From: Kiran Kumar K <kirankumark@marvell.com>
+Date: Mon, 8 Apr 2019 10:07:22 +0530
+Subject: [PATCH 150/386] octeontx2-af: Add inner layer rss support
+
+This patch will add support for inner layers to compute hash
+index. With this patch we have added support for layers like
+IP, IP6, TCP, UDP, SCTP, DMAC.
+
+Usage of both inner and outer layers is limited to the number of
+available free fields in flow_key_alg config (max 5) and the
+number of available bytes (max 40).
+
+With this patch we have added the following fields.
+
+NIX_FLOW_KEY_TYPE_INNR_IPV4 => Add inner IPV4 for calculation.
+NIX_FLOW_KEY_TYPE_INNR_IPV6 => Add inner IPV6 for calculation.
+NIX_FLOW_KEY_TYPE_INNR_TCP => Add inner TCP for calculation.
+NIX_FLOW_KEY_TYPE_INNR_SCTP => Add inner SCTP for calculation.
+NIX_FLOW_KEY_TYPE_INNR_UDP => Add inner UDP for calculation.
+NIX_FLOW_KEY_TYPE_INNR_ETH_DMAC => Add inner DMAC for calculation.
+
+for example if user wants to use IP4 + UDP + VXLAN for RSS hash.
+
+In case of outer layer alone it will be IPV4(8)+UDP(4)+UDP_VXLAN(4)+
+VXLAN(3) => 19B.
+
+In case of Inner layer alone it will be INNR_IPV4(8)+INNR_UDP(4) =>12B.
+
+In case of both outer and inner together it will be IPV4(8)+INNR_IPV4(8)+
+UDP(4)+INNR_UDP(4)+UDP_VXLAN(4)+VXLAN(3) => 31B.
+
+This patch will also add a change to rearrange the npc ltype LG
+to match with the outer layer LD by moving the NPC_LT_LG_TU_SCTP
+to value 4 and NPC_LT_LG_TU_ICMP to value 3 to make it sync with
+NPC_LT_LD_SCTP and NPC_LT_LD_ICMP. This change is required for RSS
+flow key algo configuration as it save some space in flow_key_algo.
+
+Change-Id: I3ae27ede5278095d04ea48a1d2f7472e1d0d043b
+Signed-off-by: Kiran Kumar K <kirankumark@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/7636
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  6 +++
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |  5 +-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 49 +++++++++++++++++--
+ 3 files changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index a71b406b37f4..9c2ee2efe275 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -703,6 +703,12 @@ struct nix_rss_flowkey_cfg {
+ #define NIX_FLOW_KEY_TYPE_UDP_VXLAN  BIT(12)
+ #define NIX_FLOW_KEY_TYPE_UDP_GENEVE BIT(13)
+ #define NIX_FLOW_KEY_TYPE_UDP_GTPU   BIT(14)
++#define NIX_FLOW_KEY_TYPE_INNR_IPV4     BIT(15)
++#define NIX_FLOW_KEY_TYPE_INNR_IPV6     BIT(16)
++#define NIX_FLOW_KEY_TYPE_INNR_TCP      BIT(17)
++#define NIX_FLOW_KEY_TYPE_INNR_UDP      BIT(18)
++#define NIX_FLOW_KEY_TYPE_INNR_SCTP     BIT(19)
++#define NIX_FLOW_KEY_TYPE_INNR_ETH_DMAC BIT(20)
+ 	u32	flowkey_cfg; /* Flowkey types selected */
+ 	u8	group;       /* RSS context or group */
+ };
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index 2dc5a6f726ba..eb0f49e2738b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -93,11 +93,14 @@ enum npc_kpu_lf_ltype {
+ 	NPC_LT_LF_TU_MPLS_ETHER,
+ };
+ 
++/* Don't modify Ltypes upto SCTP, otherwise it will
++ * effect flow tag calculation and thus RSS.
++ */
+ enum npc_kpu_lg_ltype {
+ 	NPC_LT_LG_TU_TCP = 1,
+ 	NPC_LT_LG_TU_UDP,
+-	NPC_LT_LG_TU_SCTP,
+ 	NPC_LT_LG_TU_ICMP,
++	NPC_LT_LG_TU_SCTP,
+ 	NPC_LT_LG_TU_IGMP,
+ 	NPC_LT_LG_TU_ICMP6,
+ 	NPC_LT_LG_TU_ESP,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 4aaa47abdbe1..8fd423108784 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -2335,16 +2335,26 @@ static int set_flowkey_fields(struct nix_rx_flowkey_alg *alg, u32 flow_cfg)
+ 			field->bytesm1 = 1;
+ 			break;
+ 		case NIX_FLOW_KEY_TYPE_IPV4:
++		case NIX_FLOW_KEY_TYPE_INNR_IPV4:
+ 			field->lid = NPC_LID_LC;
+ 			field->ltype_match = NPC_LT_LC_IP;
++			if (key_type == NIX_FLOW_KEY_TYPE_INNR_IPV4) {
++				field->lid = NPC_LID_LF;
++				field->ltype_match = NPC_LT_LF_TU_IP;
++			}
+ 			field->hdr_offset = 12; /* SIP offset */
+ 			field->bytesm1 = 7; /* SIP + DIP, 8 bytes */
+ 			field->ltype_mask = 0xF; /* Match only IPv4 */
+ 			keyoff_marker = false;
+ 			break;
+ 		case NIX_FLOW_KEY_TYPE_IPV6:
++		case NIX_FLOW_KEY_TYPE_INNR_IPV6:
+ 			field->lid = NPC_LID_LC;
+ 			field->ltype_match = NPC_LT_LC_IP6;
++			if (key_type == NIX_FLOW_KEY_TYPE_INNR_IPV6) {
++				field->lid = NPC_LID_LF;
++				field->ltype_match = NPC_LT_LF_TU_IP6;
++			}
+ 			field->hdr_offset = 8; /* SIP offset */
+ 			field->bytesm1 = 31; /* SIP + DIP, 32 bytes */
+ 			field->ltype_mask = 0xF; /* Match only IPv6 */
+@@ -2352,22 +2362,46 @@ static int set_flowkey_fields(struct nix_rx_flowkey_alg *alg, u32 flow_cfg)
+ 		case NIX_FLOW_KEY_TYPE_TCP:
+ 		case NIX_FLOW_KEY_TYPE_UDP:
+ 		case NIX_FLOW_KEY_TYPE_SCTP:
++		case NIX_FLOW_KEY_TYPE_INNR_TCP:
++		case NIX_FLOW_KEY_TYPE_INNR_UDP:
++		case NIX_FLOW_KEY_TYPE_INNR_SCTP:
+ 			field->lid = NPC_LID_LD;
++			if (key_type == NIX_FLOW_KEY_TYPE_INNR_TCP ||
++			    key_type == NIX_FLOW_KEY_TYPE_INNR_UDP ||
++			    key_type == NIX_FLOW_KEY_TYPE_INNR_SCTP)
++				field->lid = NPC_LID_LG;
+ 			field->bytesm1 = 3; /* Sport + Dport, 4 bytes */
+-			if (key_type == NIX_FLOW_KEY_TYPE_TCP && valid_key) {
++
++			/* Enum values for NPC_LID_LD and NPC_LID_LG are same,
++			 * so no need to change the ltype_match, just change
++			 * the lid for inner protocols
++			 */
++			BUILD_BUG_ON((int)NPC_LT_LD_TCP !=
++				     (int)NPC_LT_LG_TU_TCP);
++			BUILD_BUG_ON((int)NPC_LT_LD_UDP !=
++				     (int)NPC_LT_LG_TU_UDP);
++			BUILD_BUG_ON((int)NPC_LT_LD_SCTP !=
++				     (int)NPC_LT_LG_TU_SCTP);
++
++			if ((key_type == NIX_FLOW_KEY_TYPE_TCP ||
++			     key_type == NIX_FLOW_KEY_TYPE_INNR_TCP) &&
++			    valid_key) {
+ 				field->ltype_match |= NPC_LT_LD_TCP;
+ 				group_member = true;
+-			} else if (key_type == NIX_FLOW_KEY_TYPE_UDP &&
++			} else if ((key_type == NIX_FLOW_KEY_TYPE_UDP ||
++				    key_type == NIX_FLOW_KEY_TYPE_INNR_UDP) &&
+ 				   valid_key) {
+ 				field->ltype_match |= NPC_LT_LD_UDP;
+ 				group_member = true;
+-			} else if (key_type == NIX_FLOW_KEY_TYPE_SCTP &&
++			} else if ((key_type == NIX_FLOW_KEY_TYPE_SCTP ||
++				    key_type == NIX_FLOW_KEY_TYPE_INNR_SCTP) &&
+ 				   valid_key) {
+ 				field->ltype_match |= NPC_LT_LD_SCTP;
+ 				group_member = true;
+ 			}
+ 			field->ltype_mask = ~field->ltype_match;
+-			if (key_type == NIX_FLOW_KEY_TYPE_SCTP) {
++			if (key_type == NIX_FLOW_KEY_TYPE_SCTP ||
++			    key_type == NIX_FLOW_KEY_TYPE_INNR_SCTP) {
+ 				/* Handle the case where any of the group item
+ 				 * is enabled in the group but not the final one
+ 				 */
+@@ -2408,10 +2442,15 @@ static int set_flowkey_fields(struct nix_rx_flowkey_alg *alg, u32 flow_cfg)
+ 				keyoff_marker = true;
+ 			break;
+ 		case NIX_FLOW_KEY_TYPE_ETH_DMAC:
++		case NIX_FLOW_KEY_TYPE_INNR_ETH_DMAC:
+ 			field->lid = NPC_LID_LA;
++			field->ltype_match = NPC_LT_LA_ETHER;
++			if (key_type == NIX_FLOW_KEY_TYPE_INNR_ETH_DMAC) {
++				field->lid = NPC_LID_LE;
++				field->ltype_match = NPC_LT_LE_TU_ETHER;
++			}
+ 			field->hdr_offset = 0;
+ 			field->bytesm1 = 5; /* DMAC 6 Byte */
+-			field->ltype_match = NPC_LT_LA_ETHER;
+ 			field->ltype_mask = 0xF;
+ 			break;
+ 		case NIX_FLOW_KEY_TYPE_IPV6_EXT:
+-- 
+2.17.1
+

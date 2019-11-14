@@ -1,0 +1,124 @@
+From 8187efe427982208abc48a8cd1b2635fea46e16c Mon Sep 17 00:00:00 2001
+From: Harman Kalra <hkalra@marvell.com>
+Date: Tue, 25 Jun 2019 13:26:37 +0530
+Subject: [PATCH 346/386] octeontx2-af: Sending tsc value to the userspace
+
+This patch updates the existing PTP_OP_GET_CLOCK mbox message to
+return timestamp counter value, tsc (cntvct_el0 or pmccntr_el0)
+along with the PTP HI clock value.
+
+In some debugging scenarios user might need to read the PTP HI
+clock value in the fastpath, so as to know how many ticks have
+been spent till point from the reception of the packet, as packet
+reception tick value is already appended to the packet by CGX.
+If directly PTP_OP_GET_CLOCK mbox message is sent ever time user
+wants to record PTP HI clock value, it will bring down the
+performance to a great extent as mbox is a very expensive process.
+
+To handle this PTP HI clock can be derived from timestamp counter
+(tsc, which could be running at 100MHz or system freq) using two
+parameters freq multiplier (ratio of frequencies of PTP HI clock
+and tsc) and clock delta (by how much tsc is lagging from PTP HI
+clock). During configuration stage these parameters are calculated
+     freq_mult = (freq of PTP HI clock)/(freq of tsc counter)
+     clk_delta = (PTP_HI clock value / freq_mult) - (tsc val)
+   these PTP_HI val and tsc value are receieved by calling
+   PTP_OP_GET_CLOCK. Purpose of returing tsc at the same time
+   with PTP_HI value is to avoid mbox propogation delay.
+
+Now whenever user wants to know PTP HI clock, it can be derived
+from tsc counter and returned:
+     PTP_HI val = (tsc value + clk_delta) * freq_mult
+
+Change-Id: Ib93637f608d6aadb75e5e67e93c8285d7dfa96fb
+Signed-off-by: Harman Kalra <hkalra@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/12797
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h   |  2 ++
+ .../net/ethernet/marvell/octeontx2/af/ptp.c    | 18 ++++++++++++++++--
+ .../net/ethernet/marvell/octeontx2/af/ptp.h    |  2 +-
+ .../ethernet/marvell/octeontx2/af/rvu_ptp.c    |  3 ++-
+ 4 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 0d4383d2e50b..bf1771ff340a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -1386,11 +1386,13 @@ struct ptp_req {
+ 	struct mbox_msghdr hdr;
+ 	u8 op;
+ 	s64 scaled_ppm;
++	u8 is_pmu;
+ };
+ 
+ struct ptp_rsp {
+ 	struct mbox_msghdr hdr;
+ 	u64 clk;
++	u64 tsc;
+ };
+ 
+ struct get_hw_cap_rsp {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/ptp.c b/drivers/net/ethernet/marvell/octeontx2/af/ptp.c
+index e96efe95d64d..fc94fca70084 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/ptp.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/ptp.c
+@@ -127,9 +127,23 @@ int ptp_adjfine(struct ptp *ptp, long scaled_ppm)
+ 	return 0;
+ }
+ 
+-int ptp_get_clock(struct ptp *ptp, u64 *clk)
++static inline u64 get_tsc(bool is_pmu)
+ {
+-	*clk = readq(ptp->reg_base + PTP_CLOCK_HI);
++	return is_pmu ? read_sysreg(pmccntr_el0) : read_sysreg(cntvct_el0);
++}
++
++int ptp_get_clock(struct ptp *ptp, bool is_pmu, u64 *clk, u64 *tsc)
++{
++	u64 end, start;
++	u8 retries = 0;
++
++	do {
++		start = get_tsc(0);
++		*tsc = get_tsc(is_pmu);
++		*clk = readq(ptp->reg_base + PTP_CLOCK_HI);
++		end = get_tsc(0);
++		retries++;
++	} while (((end - start) > 50) && retries < 5);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/ptp.h b/drivers/net/ethernet/marvell/octeontx2/af/ptp.h
+index e332a07e33a9..91a7b8c9c27b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/ptp.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/ptp.h
+@@ -25,7 +25,7 @@ struct ptp *ptp_get(void);
+ void ptp_put(struct ptp *ptp);
+ 
+ int ptp_adjfine(struct ptp *ptp, long scaled_ppm);
+-int ptp_get_clock(struct ptp *ptp, u64 *clk);
++int ptp_get_clock(struct ptp *ptp, bool is_pmu, u64 *clki, u64 *tsc);
+ 
+ extern struct pci_driver ptp_driver;
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_ptp.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_ptp.c
+index 093ee093d68d..39cc31bcedb4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_ptp.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_ptp.c
+@@ -25,7 +25,8 @@ int rvu_mbox_handler_ptp_op(struct rvu *rvu, struct ptp_req *req,
+ 		err = ptp_adjfine(rvu->ptp, req->scaled_ppm);
+ 		break;
+ 	case PTP_OP_GET_CLOCK:
+-		err = ptp_get_clock(rvu->ptp, &rsp->clk);
++		err = ptp_get_clock(rvu->ptp, req->is_pmu, &rsp->clk,
++				    &rsp->tsc);
+ 		break;
+ 	default:
+ 		err = -EINVAL;
+-- 
+2.17.1
+

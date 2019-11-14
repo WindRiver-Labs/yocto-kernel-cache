@@ -1,0 +1,948 @@
+From e8c7f12010fd993481b082d79e52745901284893 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Mon, 25 Feb 2019 19:06:15 +0530
+Subject: [PATCH 044/386] octeontx2-pf: Protect mailbox access against race
+ conditions
+
+Mailbox access needs to be serialized from the time messages are
+allocated in mailbox and sent to AF or else it leads to race
+condition (say changing netdev settings and accessing
+PHC simultaneously)
+
+Change-Id: If4d8eaf57dbfa0968641a8617149860ef1689823
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/5687
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 112 +++++++++++++-----
+ .../marvell/octeontx2/nic/otx2_common.h       |  17 +++
+ .../marvell/octeontx2/nic/otx2_ethtool.c      |  61 ++++++++--
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 110 +++++++++++++----
+ .../ethernet/marvell/octeontx2/nic/otx2_ptp.c |  16 ++-
+ .../marvell/octeontx2/nic/otx2_txrx.c         |  10 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |   1 +
+ 7 files changed, 259 insertions(+), 68 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index bc4f1f743d18..0bd85294e55b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -25,13 +25,17 @@ static inline void otx2_nix_sq_op_stats(struct queue_stats *stats,
+ int otx2_install_rxvlan_offload_flow(struct otx2_nic *pfvf)
+ {
+ 	struct npc_install_flow_req *req;
++	int err;
+ 
+ 	if (!pfvf->rxvlan_alloc)
+ 		return -EINVAL;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_install_flow(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->entry = pfvf->rxvlan_entry;
+ 	req->intf = NIX_INTF_RX;
+@@ -42,30 +46,32 @@ int otx2_install_rxvlan_offload_flow(struct otx2_nic *pfvf)
+ 	req->vtag0_type = 0;
+ 
+ 	/* Send message to AF */
+-	if (otx2_sync_mbox_msg(&pfvf->mbox))
+-		return -EINVAL;
+-
+-	return 0;
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ EXPORT_SYMBOL(otx2_install_rxvlan_offload_flow);
+ 
+ int otx2_delete_rxvlan_offload_flow(struct otx2_nic *pfvf)
+ {
+ 	struct npc_delete_flow_req *req;
++	int err;
+ 
+ 	if (!pfvf->rxvlan_alloc)
+ 		return -EINVAL;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_delete_flow(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->entry = pfvf->rxvlan_entry;
+ 	/* Send message to AF */
+-	if (otx2_sync_mbox_msg(&pfvf->mbox))
+-		return -EINVAL;
+-
+-	return 0;
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ EXPORT_SYMBOL(otx2_delete_rxvlan_offload_flow);
+ 
+@@ -75,11 +81,16 @@ void otx2_update_lmac_stats(struct otx2_nic *pfvf)
+ 
+ 	if (!netif_running(pfvf->netdev))
+ 		return;
++
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_cgx_stats(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return;
++	}
+ 
+ 	otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
+ }
+ 
+ int otx2_update_rq_stats(struct otx2_nic *pfvf, int qidx)
+@@ -155,14 +166,20 @@ EXPORT_SYMBOL(otx2_get_stats64);
+ int otx2_hw_set_mac_addr(struct otx2_nic *pfvf, struct net_device *netdev)
+ {
+ 	struct nix_set_mac_addr *req;
++	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_nix_set_mac_addr(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	ether_addr_copy(req->mac_addr, netdev->dev_addr);
+ 
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ 
+ int otx2_set_mac_address(struct net_device *netdev, void *p)
+@@ -184,14 +201,20 @@ EXPORT_SYMBOL(otx2_set_mac_address);
+ int otx2_hw_set_mtu(struct otx2_nic *pfvf, int mtu)
+ {
+ 	struct nix_frs_cfg *req;
++	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_nix_set_hw_frs(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->update_smq = true;
+ 	req->maxlen = mtu + OTX2_ETH_HLEN;
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ 
+ int otx2_change_mtu(struct net_device *netdev, int new_mtu)
+@@ -215,15 +238,21 @@ int otx2_set_flowkey_cfg(struct otx2_nic *pfvf)
+ {
+ 	struct otx2_rss_info *rss = &pfvf->hw.rss_info;
+ 	struct nix_rss_flowkey_cfg *req;
++	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_nix_rss_flowkey_cfg(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 	req->mcam_index = -1; /* Default or reserved index */
+ 	req->flowkey_cfg = rss->flowkey_cfg;
+ 	req->group = DEFAULT_RSS_CONTEXT_GROUP;
+ 
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ 
+ int otx2_set_rss_table(struct otx2_nic *pfvf)
+@@ -233,6 +262,7 @@ int otx2_set_rss_table(struct otx2_nic *pfvf)
+ 	struct nix_aq_enq_req *aq;
+ 	int idx, err;
+ 
++	otx2_mbox_lock(mbox);
+ 	/* Get memory to put this msg */
+ 	for (idx = 0; idx < rss->rss_size; idx++) {
+ 		aq = otx2_mbox_alloc_msg_nix_aq_enq(mbox);
+@@ -241,11 +271,15 @@ int otx2_set_rss_table(struct otx2_nic *pfvf)
+ 			 * Flush it and retry
+ 			 */
+ 			err = otx2_sync_mbox_msg(mbox);
+-			if (err)
++			if (err) {
++				otx2_mbox_unlock(mbox);
+ 				return err;
++			}
+ 			aq = otx2_mbox_alloc_msg_nix_aq_enq(mbox);
+-			if (!aq)
++			if (!aq) {
++				otx2_mbox_unlock(mbox);
+ 				return -ENOMEM;
++			}
+ 		}
+ 
+ 		aq->rss.rq = rss->ind_tbl[idx];
+@@ -255,7 +289,9 @@ int otx2_set_rss_table(struct otx2_nic *pfvf)
+ 		aq->ctype = NIX_AQ_CTYPE_RSS;
+ 		aq->op = NIX_AQ_INSTOP_INIT;
+ 	}
+-	return otx2_sync_mbox_msg(mbox);
++	err = otx2_sync_mbox_msg(mbox);
++	otx2_mbox_unlock(mbox);
++	return err;
+ }
+ 
+ void otx2_set_rss_key(struct otx2_nic *pfvf)
+@@ -469,13 +505,17 @@ int otx2_txschq_stop(struct otx2_nic *pfvf)
+ 	struct nix_txsch_free_req *free_req;
+ 	int lvl, schq;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	/* Free the transmit schedulers */
+ 	free_req = otx2_mbox_alloc_msg_nix_txsch_free(&pfvf->mbox);
+-	if (!free_req)
++	if (!free_req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	free_req->flags = TXSCHQ_FREE_ALL;
+ 	WARN_ON(otx2_sync_mbox_msg(&pfvf->mbox));
++	otx2_mbox_unlock(&pfvf->mbox);
+ 
+ 	/* Clear the txschq list */
+ 	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
+@@ -1077,15 +1117,19 @@ int otx2_detach_resources(struct mbox *mbox)
+ {
+ 	struct rsrc_detach *detach;
+ 
++	otx2_mbox_lock(mbox);
+ 	detach = otx2_mbox_alloc_msg_detach_resources(mbox);
+-	if (!detach)
++	if (!detach) {
++		otx2_mbox_unlock(mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	/* detach all */
+ 	detach->partial = false;
+ 
+ 	/* Send detach request to AF */
+ 	otx2_mbox_msg_send(&mbox->mbox, 0);
++	otx2_mbox_unlock(mbox);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(otx2_detach_resources);
+@@ -1096,27 +1140,37 @@ int otx2_attach_npa_nix(struct otx2_nic *pfvf)
+ 	struct msg_req *msix;
+ 	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	/* Get memory to put this msg */
+ 	attach = otx2_mbox_alloc_msg_attach_resources(&pfvf->mbox);
+-	if (!attach)
++	if (!attach) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	attach->npalf = true;
+ 	attach->nixlf = true;
+ 
+ 	/* Send attach request to AF */
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
+ 
+ 	/* Get NPA and NIX MSIX vector offsets */
+ 	msix = otx2_mbox_alloc_msg_msix_offset(&pfvf->mbox);
+-	if (!msix)
++	if (!msix) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
++	otx2_mbox_unlock(&pfvf->mbox);
+ 
+ 	if (pfvf->hw.npa_msixoff == MSIX_VECTOR_INVALID ||
+ 	    pfvf->hw.nix_msixoff == MSIX_VECTOR_INVALID) {
+@@ -1132,18 +1186,22 @@ void otx2_ctx_disable(struct mbox *mbox, int type, bool npa)
+ {
+ 	struct hwctx_disable_req *req;
+ 
++	otx2_mbox_lock(mbox);
+ 	/* Request AQ to disable this context */
+ 	if (npa)
+ 		req = otx2_mbox_alloc_msg_npa_hwctx_disable(mbox);
+ 	else
+ 		req = otx2_mbox_alloc_msg_nix_hwctx_disable(mbox);
+ 
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(mbox);
+ 		return;
++	}
+ 
+ 	req->ctype = type;
+ 
+ 	WARN_ON(otx2_sync_mbox_msg(mbox));
++	otx2_mbox_unlock(mbox);
+ }
+ 
+ int otx2_nix_config_bp(struct otx2_nic *pfvf, bool enable)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 9cd72c973524..f9c2d2e03f57 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -102,6 +102,7 @@ struct  mbox {
+ 	struct work_struct	mbox_up_wrk;
+ 	struct otx2_nic		*pfvf;
+ 	void *bbuf_base; /* Bounce buffer for mbox memory */
++	atomic_t		lock; /* serialize mailbox access */
+ };
+ 
+ struct otx2_hw {
+@@ -404,6 +405,22 @@ static inline void otx2_sync_mbox_bbuf(struct otx2_mbox *mbox, int devid)
+ 	       hw_mbase + mbox->rx_start, msg_size + msgs_offset);
+ }
+ 
++static inline void otx2_mbox_lock_init(struct mbox *mbox)
++{
++	atomic_set(&mbox->lock, 0);
++}
++
++static inline void otx2_mbox_lock(struct mbox *mbox)
++{
++	while (!(atomic_add_return(1, &mbox->lock) == 1))
++		cpu_relax();
++}
++
++static inline void otx2_mbox_unlock(struct mbox *mbox)
++{
++	atomic_set(&mbox->lock, 0);
++}
++
+ /* Time to wait before watchdog kicks off.
+  * Due to PSE deadlock errata, XOFF on TL2 transmission
+  * queues takes more time than default watchdog timeout.
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index e2ee2be033c5..5d2ca27cc1d7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -709,13 +709,20 @@ static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ 	struct npc_install_flow_req *req;
+ 	int err, vf = 0;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_install_flow(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	err = otx2_prepare_flow_request(&flow->flow_spec, req);
+-	if (err)
++	if (err) {
++		/* free the allocated msg above */
++		otx2_mbox_reset(&pfvf->mbox.mbox, 0);
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
+ 
+ 	req->entry = flow->entry;
+ 	req->intf = NIX_INTF_RX;
+@@ -727,8 +734,10 @@ static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ 		req->op = NIX_RX_ACTIONOP_UCAST;
+ 		req->index = ethtool_get_flow_spec_ring(ring_cookie);
+ 		vf = ethtool_get_flow_spec_ring_vf(ring_cookie);
+-		if (vf > pci_num_vf(pfvf->pdev))
++		if (vf > pci_num_vf(pfvf->pdev)) {
++			otx2_mbox_unlock(&pfvf->mbox);
+ 			return -EINVAL;
++		}
+ 	}
+ 
+ 	/* ethtool ring_cookie has (VF + 1) for VF */
+@@ -738,7 +747,9 @@ static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ 	}
+ 
+ 	/* Send message to AF */
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ 
+ static int otx2_alloc_mcam_entries(struct otx2_nic *pfvf)
+@@ -747,19 +758,27 @@ static int otx2_alloc_mcam_entries(struct otx2_nic *pfvf)
+ 	struct npc_mcam_alloc_entry_rsp *rsp;
+ 	int i;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_mcam_alloc_entry(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->contig = false;
+ 	req->count = pfvf->max_flows;
+ 
+ 	/* Send message to AF */
+-	if (otx2_sync_mbox_msg(&pfvf->mbox))
++	if (otx2_sync_mbox_msg(&pfvf->mbox)) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -EINVAL;
++	}
+ 
+ 	rsp = (struct npc_mcam_alloc_entry_rsp *)otx2_mbox_get_rsp
+ 	       (&pfvf->mbox.mbox, 0, &req->hdr);
++
++	otx2_mbox_unlock(&pfvf->mbox);
++
+ 	if (rsp->count != pfvf->max_flows)
+ 		netdev_info(pfvf->netdev, "number of rules truncated to %d\n",
+ 			    rsp->count);
+@@ -823,17 +842,23 @@ static int otx2_add_flow(struct otx2_nic *pfvf,
+ static int otx2_remove_flow_msg(struct otx2_nic *pfvf, u16 entry, bool all)
+ {
+ 	struct npc_delete_flow_req *req;
++	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_delete_flow(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->entry = entry;
+ 	if (all)
+ 		req->all = 1;
+ 
+ 	/* Send message to AF */
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+ 
+ static int otx2_remove_flow(struct otx2_nic *pfvf, u32 location)
+@@ -1156,17 +1181,23 @@ int otx2_destroy_ethtool_flows(struct otx2_nic *pfvf)
+ 		pfvf->nr_flows--;
+ 	}
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_mcam_free_entry(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->all = 1;
+ 	/* Send message to AF to free MCAM entries */
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
+ 
+ 	pfvf->entries_alloc = false;
++	otx2_mbox_unlock(&pfvf->mbox);
+ 
+ 	return 0;
+ }
+@@ -1177,16 +1208,22 @@ int otx2_delete_vf_ethtool_flows(struct otx2_nic *pfvf)
+ 	struct otx2_flow *iter, *tmp;
+ 	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_delete_flow(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->all_vfs = 1;
+ 	/* Send message to AF */
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
+ 
++	otx2_mbox_unlock(&pfvf->mbox);
+ 	/* AF deleted VF entries now remove from ethtool list */
+ 	list_for_each_entry_safe(iter, tmp, &pfvf->flows, list) {
+ 		if (iter->is_vf) {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index a3d514c3b5ea..41bf21160589 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -83,6 +83,8 @@ static int otx2_forward_vf_mbox_msgs(struct otx2_nic *pf,
+ 			return -EINVAL;
+ 
+ 		dst_mdev = &dst_mbox->mbox.dev[0];
++
++		otx2_mbox_lock(&pf->mbox);
+ 		dst_mdev->mbase = src_mdev->mbase;
+ 		dst_mdev->msg_size = mbox_hdr->msg_size;
+ 		dst_mdev->num_msgs = mbox_hdr->num_msgs;
+@@ -90,13 +92,17 @@ static int otx2_forward_vf_mbox_msgs(struct otx2_nic *pf,
+ 		if (err) {
+ 			dev_warn(pf->dev,
+ 				 "AF not responding to VF%d messages\n", vf);
++			otx2_mbox_unlock(&pf->mbox);
+ 			return err;
+ 		}
++		otx2_mbox_unlock(&pf->mbox);
+ 	} else if (dir == MBOX_DIR_PFVF) {
++		otx2_mbox_lock(&pf->mbox);
+ 		otx2_forward_msg_pfvf(&src_mbox->dev[0],
+ 				      &pf->mbox_pfvf[0].mbox,
+ 				      pf->mbox.bbuf_base,
+ 				      vf);
++		otx2_mbox_unlock(&pf->mbox);
+ 	} else if (dir == MBOX_DIR_PFVF_UP) {
+ 		src_mdev = &src_mbox->dev[0];
+ 		mbox_hdr = src_mbox->hwbase + src_mbox->rx_start;
+@@ -784,6 +790,7 @@ static int otx2_pfaf_mbox_init(struct otx2_nic *pf)
+ 
+ 	INIT_WORK(&mbox->mbox_wrk, otx2_pfaf_mbox_handler);
+ 	INIT_WORK(&mbox->mbox_up_wrk, otx2_pfaf_mbox_up_handler);
++	otx2_mbox_lock_init(&pf->mbox);
+ 
+ 	return 0;
+ exit:
+@@ -794,31 +801,43 @@ static int otx2_pfaf_mbox_init(struct otx2_nic *pf)
+ static int otx2_cgx_config_linkevents(struct otx2_nic *pf, bool enable)
+ {
+ 	struct msg_req *msg;
++	int err;
+ 
++	otx2_mbox_lock(&pf->mbox);
+ 	if (enable)
+ 		msg = otx2_mbox_alloc_msg_cgx_start_linkevents(&pf->mbox);
+ 	else
+ 		msg = otx2_mbox_alloc_msg_cgx_stop_linkevents(&pf->mbox);
+ 
+-	if (!msg)
++	if (!msg) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+-	return otx2_sync_mbox_msg(&pf->mbox);
++	err = otx2_sync_mbox_msg(&pf->mbox);
++	otx2_mbox_unlock(&pf->mbox);
++	return err;
+ }
+ 
+ static int otx2_cgx_config_loopback(struct otx2_nic *pf, bool enable)
+ {
+ 	struct msg_req *msg;
++	int err;
+ 
++	otx2_mbox_lock(&pf->mbox);
+ 	if (enable)
+ 		msg = otx2_mbox_alloc_msg_cgx_intlbk_enable(&pf->mbox);
+ 	else
+ 		msg = otx2_mbox_alloc_msg_cgx_intlbk_disable(&pf->mbox);
+ 
+-	if (!msg)
++	if (!msg) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+-	return otx2_sync_mbox_msg(&pf->mbox);
++	err = otx2_sync_mbox_msg(&pf->mbox);
++	otx2_mbox_unlock(&pf->mbox);
++	return err;
+ }
+ 
+ static int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable)
+@@ -837,9 +856,12 @@ static int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable)
+ 			return err;
+ 	}
+ 
++	otx2_mbox_lock(&pf->mbox);
+ 	req = otx2_mbox_alloc_msg_nix_vtag_cfg(&pf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->vtag_size = 0;
+ 	req->cfg_type = 1;
+@@ -849,13 +871,18 @@ static int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable)
+ 	req->rx.capture_vtag = enable;
+ 
+ 	err = otx2_sync_mbox_msg(&pf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return err;
++	}
+ 
+ 	rsp_hdr = otx2_mbox_get_rsp(&pf->mbox.mbox, 0, &req->hdr);
+-	if (IS_ERR(rsp_hdr))
++	if (IS_ERR(rsp_hdr)) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return PTR_ERR(rsp_hdr);
++	}
+ 
++	otx2_mbox_unlock(&pf->mbox);
+ 	return rsp_hdr->rc;
+ }
+ 
+@@ -887,20 +914,29 @@ static void otx2_alloc_rxvlan(struct otx2_nic *pf)
+ 	struct npc_mcam_alloc_entry_rsp *rsp;
+ 	int err;
+ 
++	otx2_mbox_lock(&pf->mbox);
+ 	req = otx2_mbox_alloc_msg_npc_mcam_alloc_entry(&pf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return;
++	}
+ 
+ 	req->contig = false;
+ 	req->count = 1;
+ 	/* Send message to AF */
+-	if (otx2_sync_mbox_msg(&pf->mbox))
++	err = otx2_sync_mbox_msg(&pf->mbox);
++	if (err) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return;
++	}
+ 	rsp = (struct npc_mcam_alloc_entry_rsp *)otx2_mbox_get_rsp
+ 						 (&pf->mbox.mbox, 0, &req->hdr);
+-	if (IS_ERR(rsp))
++	if (IS_ERR(rsp)) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return;
++	}
+ 
++	otx2_mbox_unlock(&pf->mbox);
+ 	pf->rxvlan_entry = rsp->entry_list[0];
+ 	pf->rxvlan_alloc = true;
+ 
+@@ -1032,7 +1068,7 @@ static void otx2_disable_napi(struct otx2_nic *pf)
+ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ {
+ 	struct otx2_hw *hw = &pf->hw;
+-	int err, lvl;
++	int err = 0, lvl;
+ 
+ 	/* Set required NPA LF's pool counts
+ 	 * Auras and Pools are used in a 1:1 mapping,
+@@ -1042,15 +1078,16 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	hw->sqpool_cnt = hw->tx_queues;
+ 	hw->pool_cnt = hw->rqpool_cnt + hw->sqpool_cnt;
+ 
++	otx2_mbox_lock(&pf->mbox);
+ 	/* NPA init */
+ 	err = otx2_config_npa(pf);
+ 	if (err)
+-		return err;
++		goto exit;
+ 
+ 	/* NIX init */
+ 	err = otx2_config_nix(pf);
+ 	if (err)
+-		return err;
++		goto exit;
+ 
+ 	/* Enable backpressure */
+ 	otx2_nix_config_bp(pf, true);
+@@ -1058,28 +1095,29 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	/* Init Auras and pools used by NIX RQ, for free buffer ptrs */
+ 	err = otx2_rq_aura_pool_init(pf);
+ 	if (err)
+-		return err;
++		goto exit;
+ 
+ 	/* Init Auras and pools used by NIX SQ, for queueing SQEs */
+ 	err = otx2_sq_aura_pool_init(pf);
+ 	if (err)
+-		return err;
++		goto exit;
+ 
+ 	err = otx2_txsch_alloc(pf);
+ 	if (err)
+-		return err;
++		goto exit;
+ 
+ 	err = otx2_config_nix_queues(pf);
+ 	if (err)
+-		return err;
++		goto exit;
+ 
+ 	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
+ 		err = otx2_txschq_config(pf, lvl);
+ 		if (err)
+-			return err;
++			goto exit;
+ 	}
+-
+-	return 0;
++exit:
++	otx2_mbox_unlock(&pf->mbox);
++	return err;
+ }
+ 
+ static void otx2_free_hw_resources(struct otx2_nic *pf)
+@@ -1096,9 +1134,11 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 	if (err)
+ 		dev_err(pf->dev, "RVUPF: Failed to stop/free TX schedulers\n");
+ 
++	otx2_mbox_lock(mbox);
+ 	/* Disable backpressure */
+ 	if (!(pf->pcifunc & RVU_PFVF_FUNC_MASK))
+ 		otx2_nix_config_bp(pf, false);
++	otx2_mbox_unlock(mbox);
+ 
+ 	/* Disable SQs */
+ 	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_SQ, false);
+@@ -1136,20 +1176,24 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 		qmem_free(pf->dev, cq->cqe);
+ 	}
+ 
++	otx2_mbox_lock(mbox);
+ 	/* Reset NIX LF */
+ 	req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
+ 	if (req)
+ 		WARN_ON(otx2_sync_mbox_msg(mbox));
++	otx2_mbox_unlock(mbox);
+ 
+ 	/* Disable NPA Pool and Aura hw context */
+ 	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_POOL, true);
+ 	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_AURA, true);
+ 	otx2_aura_pool_free(pf);
+ 
++	otx2_mbox_lock(mbox);
+ 	/* Reset NPA LF */
+ 	req = otx2_mbox_alloc_msg_npa_lf_free(mbox);
+ 	if (req)
+ 		WARN_ON(otx2_sync_mbox_msg(mbox));
++	otx2_mbox_unlock(mbox);
+ }
+ 
+ static netdev_tx_t otx2_xmit(struct sk_buff *skb, struct net_device *netdev)
+@@ -1426,9 +1470,12 @@ static void otx2_set_rx_mode(struct net_device *netdev)
+ 	if (!(netdev->flags & IFF_UP))
+ 		return;
+ 
++	otx2_mbox_lock(&pf->mbox);
+ 	req = otx2_mbox_alloc_msg_nix_set_rx_mode(&pf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pf->mbox);
+ 		return;
++	}
+ 
+ 	req->mode = NIX_RX_MODE_UCAST;
+ 
+@@ -1439,6 +1486,7 @@ static void otx2_set_rx_mode(struct net_device *netdev)
+ 		req->mode |= NIX_RX_MODE_ALLMULTI;
+ 
+ 	otx2_sync_mbox_msg_busy_poll(&pf->mbox);
++	otx2_mbox_unlock(&pf->mbox);
+ }
+ 
+ static void otx2_reset_task(struct work_struct *work)
+@@ -1483,17 +1531,23 @@ static int otx2_config_hw_rx_tstamp(struct otx2_nic *pfvf, bool enable)
+ 	if (!!pfvf->hw_rx_tstamp == enable)
+ 		return 0;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	if (enable)
+ 		req = otx2_mbox_alloc_msg_cgx_ptp_rx_enable(&pfvf->mbox);
+ 	else
+ 		req = otx2_mbox_alloc_msg_cgx_ptp_rx_disable(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
+ 
++	otx2_mbox_unlock(&pfvf->mbox);
+ 	pfvf->hw_rx_tstamp = enable;
+ 	return 0;
+ }
+@@ -1506,17 +1560,23 @@ static int otx2_config_hw_tx_tstamp(struct otx2_nic *pfvf, bool enable)
+ 	if (!!pfvf->hw_tx_tstamp == enable)
+ 		return 0;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	if (enable)
+ 		req = otx2_mbox_alloc_msg_nix_lf_ptp_tx_enable(&pfvf->mbox);
+ 	else
+ 		req = otx2_mbox_alloc_msg_nix_lf_ptp_tx_disable(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
+ 
++	otx2_mbox_unlock(&pfvf->mbox);
+ 	pfvf->hw_tx_tstamp = enable;
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ptp.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ptp.c
+index 94ae954b9da8..e19ad143519a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ptp.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ptp.c
+@@ -83,7 +83,9 @@ static int otx2_ptp_adjtime(struct ptp_clock_info *ptp_info, s64 delta)
+ 	struct otx2_ptp *ptp = container_of(ptp_info, struct otx2_ptp,
+ 					    ptp_info);
+ 
++	otx2_mbox_lock(&ptp->nic->mbox);
+ 	timecounter_adjtime(&ptp->time_counter, delta);
++	otx2_mbox_unlock(&ptp->nic->mbox);
+ 
+ 	return 0;
+ }
+@@ -95,7 +97,9 @@ static int otx2_ptp_gettime(struct ptp_clock_info *ptp_info,
+ 					    ptp_info);
+ 	u64 nsec;
+ 
++	otx2_mbox_lock(&ptp->nic->mbox);
+ 	nsec = timecounter_read(&ptp->time_counter);
++	otx2_mbox_unlock(&ptp->nic->mbox);
+ 
+ 	*ts = ns_to_timespec64(nsec);
+ 
+@@ -111,7 +115,9 @@ static int otx2_ptp_settime(struct ptp_clock_info *ptp_info,
+ 
+ 	nsec = timespec64_to_ns(ts);
+ 
++	otx2_mbox_lock(&ptp->nic->mbox);
+ 	timecounter_init(&ptp->time_counter, &ptp->cycle_counter, nsec);
++	otx2_mbox_unlock(&ptp->nic->mbox);
+ 
+ 	return 0;
+ }
+@@ -128,16 +134,22 @@ int otx2_ptp_init(struct otx2_nic *pfvf)
+ 	struct ptp_req *req;
+ 	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	/* check if PTP block is available */
+ 	req = otx2_mbox_alloc_msg_ptp_op(&pfvf->mbox);
+-	if (!req)
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+ 	req->op = PTP_OP_GET_CLOCK;
+ 
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err)
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return err;
++	}
++	otx2_mbox_unlock(&pfvf->mbox);
+ 
+ 	mutex_lock(&ptp_mutex);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 66c27e219cec..652ade01d7b5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -855,14 +855,20 @@ EXPORT_SYMBOL(otx2_sq_append_skb);
+ int otx2_rxtx_enable(struct otx2_nic *pfvf, bool enable)
+ {
+ 	struct msg_req *msg;
++	int err;
+ 
++	otx2_mbox_lock(&pfvf->mbox);
+ 	if (enable)
+ 		msg = otx2_mbox_alloc_msg_nix_lf_start_rx(&pfvf->mbox);
+ 	else
+ 		msg = otx2_mbox_alloc_msg_nix_lf_stop_rx(&pfvf->mbox);
+ 
+-	if (!msg)
++	if (!msg) {
++		otx2_mbox_unlock(&pfvf->mbox);
+ 		return -ENOMEM;
++	}
+ 
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index fdecb0a26b46..1d145fbe4fa5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -332,6 +332,7 @@ static int otx2vf_vfaf_mbox_init(struct otx2_nic *vf)
+ 
+ 	INIT_WORK(&mbox->mbox_wrk, otx2vf_vfaf_mbox_handler);
+ 	INIT_WORK(&mbox->mbox_up_wrk, otx2vf_vfaf_mbox_up_handler);
++	otx2_mbox_lock_init(&vf->mbox);
+ 
+ 	return 0;
+ exit:
+-- 
+2.17.1
+

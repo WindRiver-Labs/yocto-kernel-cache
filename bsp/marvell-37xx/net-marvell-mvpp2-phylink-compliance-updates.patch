@@ -1,0 +1,197 @@
+From 7a1749ca85066901aae62900668b05f12aef172a Mon Sep 17 00:00:00 2001
+From: Russell King <rmk+kernel@armlinux.org.uk>
+Date: Fri, 8 Feb 2019 15:35:38 +0000
+Subject: [PATCH 098/386] net: marvell: mvpp2: phylink compliance updates
+
+Sven Auhagen reported issues with negotiation on a couple of his
+platforms using a mixture of SFP and PHYs in various different
+modes.  Debugging to root cause proved difficult, but essentially
+the problem comes down to the mvpp2 phylink implementation being
+slightly at odds with what is expected.
+
+phylink operates in three modes: phy, fixed-link, and in-band mode.
+
+In the first two modes, the expected behaviour from a MAC driver is
+that phylink resolves the operating mode and passes the mode to the
+MAC driver for it to program, including when the link should be
+brought up or taken down.  This is basically the same as the libphy
+approach.  This does not negate the requirement to advertise a correct
+control word for interface modes that have control words where that
+can be reasonably controlled.
+
+The second mode is in-band mode, where the MAC is expected to use the
+in-band control word to determine the operating mode.
+
+The mvneta driver implements the correct pattern required to support
+this: configure the port interface type separately from the in-band
+mode(s).  This is now specified in the phylink documentation patches.
+
+mvpp2 was programming in-band mode for SGMII and the 802.3z modes no
+what, and avoided forcing the link up in fixed/phy modes.  This caused
+a problem with some boards where the PHY is by default programmed to
+enter AN bypass mode, the PHY would report that the link was up, but
+the mvpp2 never completed the exchange of control word.
+
+Another issue that mvpp2 has is it sets SGMII AN format control word
+for both SGMII and 802.3z modes. The format of the control word is
+defined by MVPP2_GMAC_INBAND_AN_MASK, which should be set for SGMII
+and clear for 802.3z. Available Marvell documentation for earlier
+GMAC implementations does not make this clear, but this has been
+ascertained via extensive testing on earlier GMAC implementations,
+and then confirmed with a Macchiatobin Single Shot connected to a
+Clearfog: when MVPP2_GMAC_INBAND_AN_MASK is set, the clearfog does
+not receive the advertised pause mode settings.
+
+Lastly, there is no flow control in the in-band control word in Cisco
+SGMII, setting the flow control autonegotiation bit even with a PHY
+that has the Marvell extension to send this information does not result
+in the flow control being enabled at the MAC.  We need to do this
+manually using the information provided via phylink.
+
+Re-code mvpp2's mac_config() and mac_link_up() to follow this pattern.
+This allows Sven Auhagen's board and Macchiatobin to reliably bring
+the link up with the 88e1512 PHY with phylink operating in PHY mode
+with COMPHY built as a module but the rest of the networking built-in,
+and u-boot having brought up the interface.  in-band mode requires an
+additional patch to resolve another problem.
+
+Change-Id: I531ea21ee2c8d878b6d3c1d3753ee2aa3a3b0c71
+Tested-by: Sven Auhagen <sven.auhagen@voleatech.de>
+Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[resolve conflicts and clean checkpatch]
+Signed-off-by: Marcin Wojtas <mw@semihalf.com>
+Reviewed-on: https://sj1git1.cavium.com/6464
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Stefan Chulski <Stefan.Chulski@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 87 +++++++++++--------
+ 1 file changed, 53 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 2682c2376659..15b62bfb79f4 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -6012,26 +6012,33 @@ static void mvpp2_gmac_config(struct mvpp2_port *port, unsigned int mode,
+ 	an &= ~(MVPP2_GMAC_CONFIG_MII_SPEED | MVPP2_GMAC_CONFIG_GMII_SPEED |
+ 		MVPP2_GMAC_AN_SPEED_EN | MVPP2_GMAC_FC_ADV_EN |
+ 		MVPP2_GMAC_FC_ADV_ASM_EN | MVPP2_GMAC_FLOW_CTRL_AUTONEG |
+-		MVPP2_GMAC_CONFIG_FULL_DUPLEX | MVPP2_GMAC_AN_DUPLEX_EN |
+-		MVPP2_GMAC_FORCE_LINK_DOWN);
++		MVPP2_GMAC_CONFIG_FULL_DUPLEX | MVPP2_GMAC_AN_DUPLEX_EN);
+ 	ctrl0 &= ~MVPP2_GMAC_PORT_TYPE_MASK;
+-	ctrl2 &= ~(MVPP2_GMAC_PORT_RESET_MASK | MVPP2_GMAC_PCS_ENABLE_MASK);
++	ctrl2 &= ~(MVPP2_GMAC_INBAND_AN_MASK | MVPP2_GMAC_PORT_RESET_MASK |
++		   MVPP2_GMAC_PCS_ENABLE_MASK);
++	ctrl4 &= ~(MVPP22_CTRL4_RX_FC_EN | MVPP22_CTRL4_TX_FC_EN);
+ 
++	/* Configure port type */
+ 	if (phy_interface_mode_is_8023z(state->interface)) {
+-		/* 1000BaseX and 2500BaseX ports cannot negotiate speed nor can
+-		 * they negotiate duplex: they are always operating with a fixed
+-		 * speed of 1000/2500Mbps in full duplex, so force 1000/2500
+-		 * speed and full duplex here.
+-		 */
+-		ctrl0 |= MVPP2_GMAC_PORT_TYPE_MASK;
+-		an |= MVPP2_GMAC_CONFIG_GMII_SPEED |
+-		      MVPP2_GMAC_CONFIG_FULL_DUPLEX;
+-	} else if (!phy_interface_mode_is_rgmii(state->interface)) {
+-		an |= MVPP2_GMAC_AN_SPEED_EN | MVPP2_GMAC_FLOW_CTRL_AUTONEG;
++		ctrl2 |= MVPP2_GMAC_PCS_ENABLE_MASK;
++		ctrl4 &= ~MVPP22_CTRL4_EXT_PIN_GMII_SEL;
++		ctrl4 |= MVPP22_CTRL4_SYNC_BYPASS_DIS |
++			 MVPP22_CTRL4_DP_CLK_SEL |
++			 MVPP22_CTRL4_QSGMII_BYPASS_ACTIVE;
++	} else if (state->interface == PHY_INTERFACE_MODE_SGMII) {
++		ctrl2 |= MVPP2_GMAC_PCS_ENABLE_MASK | MVPP2_GMAC_INBAND_AN_MASK;
++		ctrl4 &= ~MVPP22_CTRL4_EXT_PIN_GMII_SEL;
++		ctrl4 |= MVPP22_CTRL4_SYNC_BYPASS_DIS |
++			 MVPP22_CTRL4_DP_CLK_SEL |
++			 MVPP22_CTRL4_QSGMII_BYPASS_ACTIVE;
++	} else if (phy_interface_mode_is_rgmii(state->interface)) {
++		ctrl4 &= ~MVPP22_CTRL4_DP_CLK_SEL;
++		ctrl4 |= MVPP22_CTRL4_EXT_PIN_GMII_SEL |
++			 MVPP22_CTRL4_SYNC_BYPASS_DIS |
++			 MVPP22_CTRL4_QSGMII_BYPASS_ACTIVE;
+ 	}
+ 
+-	if (state->duplex)
+-		an |= MVPP2_GMAC_CONFIG_FULL_DUPLEX;
++	/* Configure advertisement bits */
+ 	if (phylink_test(state->advertising, Pause))
+ 		an |= MVPP2_GMAC_FC_ADV_EN;
+ 	if (phylink_test(state->advertising, Asym_Pause))
+@@ -6039,28 +6046,41 @@ static void mvpp2_gmac_config(struct mvpp2_port *port, unsigned int mode,
+ 
+ 	ctrl4 &= ~(MVPP22_CTRL4_RX_FC_EN | MVPP22_CTRL4_TX_FC_EN);
+ 
+-	if (phy_interface_mode_is_8023z(state->interface) ||
+-	    state->interface == PHY_INTERFACE_MODE_SGMII) {
+-		an |= MVPP2_GMAC_IN_BAND_AUTONEG;
+-		ctrl2 |= MVPP2_GMAC_INBAND_AN_MASK | MVPP2_GMAC_PCS_ENABLE_MASK;
++	/* Configure negotiation style */
++	if (!phylink_autoneg_inband(mode)) {
++		/* Phy or fixed speed - no in-band AN */
++		if (state->duplex)
++			an |= MVPP2_GMAC_CONFIG_FULL_DUPLEX;
+ 
+-		ctrl4 &= ~MVPP22_CTRL4_EXT_PIN_GMII_SEL;
+-		ctrl4 |= MVPP22_CTRL4_SYNC_BYPASS_DIS |
+-			 MVPP22_CTRL4_DP_CLK_SEL |
+-			 MVPP22_CTRL4_QSGMII_BYPASS_ACTIVE;
+-
+-	} else if (phy_interface_mode_is_rgmii(state->interface)) {
+-		an |= MVPP2_GMAC_IN_BAND_AUTONEG_BYPASS;
+-
+-		if (state->speed == SPEED_1000)
++		if (state->speed == SPEED_1000 || state->speed == SPEED_2500)
+ 			an |= MVPP2_GMAC_CONFIG_GMII_SPEED;
+ 		else if (state->speed == SPEED_100)
+ 			an |= MVPP2_GMAC_CONFIG_MII_SPEED;
+ 
+-		ctrl4 &= ~MVPP22_CTRL4_DP_CLK_SEL;
+-		ctrl4 |= MVPP22_CTRL4_EXT_PIN_GMII_SEL |
+-			 MVPP22_CTRL4_SYNC_BYPASS_DIS |
+-			 MVPP22_CTRL4_QSGMII_BYPASS_ACTIVE;
++	} else if (state->interface == PHY_INTERFACE_MODE_SGMII) {
++		/* SGMII in-band mode receives the speed and duplex from
++		 * the PHY. Flow control information is not received.
++		 */
++		an &= ~(MVPP2_GMAC_FORCE_LINK_DOWN |
++			MVPP2_GMAC_FORCE_LINK_PASS);
++		an |= MVPP2_GMAC_IN_BAND_AUTONEG |
++		      MVPP2_GMAC_AN_SPEED_EN |
++		      MVPP2_GMAC_AN_DUPLEX_EN;
++
++	} else if (phy_interface_mode_is_8023z(state->interface)) {
++		/* 1000BaseX and 2500BaseX ports cannot negotiate speed nor can
++		 * they negotiate duplex: they are always operating with a fixed
++		 * speed of 1000/2500Mbps in full duplex, so force 1000/2500
++		 * speed and full duplex here.
++		 */
++		ctrl0 |= MVPP2_GMAC_PORT_TYPE_MASK;
++		an &= ~(MVPP2_GMAC_FORCE_LINK_DOWN |
++			MVPP2_GMAC_FORCE_LINK_PASS);
++		an |= MVPP2_GMAC_CONFIG_GMII_SPEED |
++		      MVPP2_GMAC_CONFIG_FULL_DUPLEX;
++
++		if (state->pause & MLO_PAUSE_AN && state->an_enabled)
++			an |= MVPP2_GMAC_FLOW_CTRL_AUTONEG;
+ 	}
+ 
+ 	if (state->pause & MLO_PAUSE_TX)
+@@ -6158,8 +6178,7 @@ static void mvpp2_mac_link_up(struct net_device *dev, unsigned int mode,
+ 	     interface != PHY_INTERFACE_MODE_5GKR)) {
+ 		val = readl(port->base + MVPP2_GMAC_AUTONEG_CONFIG);
+ 		val &= ~MVPP2_GMAC_FORCE_LINK_DOWN;
+-		if (phy_interface_mode_is_rgmii(interface))
+-			val |= MVPP2_GMAC_FORCE_LINK_PASS;
++		val |= MVPP2_GMAC_FORCE_LINK_PASS;
+ 		writel(val, port->base + MVPP2_GMAC_AUTONEG_CONFIG);
+ 	}
+ 
+-- 
+2.17.1
+

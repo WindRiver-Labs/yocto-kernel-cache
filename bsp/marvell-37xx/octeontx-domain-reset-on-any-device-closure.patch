@@ -1,0 +1,1008 @@
+From 4a15f7b995761e8c95f9ba33e57f325926ef0490 Mon Sep 17 00:00:00 2001
+From: Angela Czubak <aczubak@marvell.com>
+Date: Thu, 16 May 2019 17:48:56 +0200
+Subject: [PATCH 289/386] octeontx: domain reset on any device closure
+
+A change in DTS was made, enabling new generic driver for SMMU,
+which by default creates unique translation context for each PCI
+device, whereas, previously, IOVA translation was bypassed.
+If an ODP application exits unexpectedly, the order of device closure
+is random, which may lead to releasing translation contexts before
+performing domain reset.
+So far domain reset has been triggered when the first SSO in domain
+gets closed. It has been agreed we may now need to trigger reset on any
+device closure (ODP side will keep all of them opened, so that there
+will not be any random reset).
+
+Change-Id: Ic461bd40aa8b051f603d54d4030e566e95fafc6f
+Signed-off-by: Angela Czubak <aczubak@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/9373
+Reviewed-by: Stanislaw Kardach <Stanislaw.Kardach@cavium.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ .../crypto/cavium/cpt/8x/cpt8x_pf_domain.c    |  19 ++-
+ .../net/ethernet/cavium/octeontx-83xx/cpt.h   |   2 +-
+ .../net/ethernet/cavium/octeontx-83xx/dpi.h   |   2 +-
+ .../cavium/octeontx-83xx/dpipf_main.c         |  16 +-
+ .../ethernet/cavium/octeontx-83xx/octeontx.h  |  16 +-
+ .../cavium/octeontx-83xx/octeontx_main.c      | 146 ++++++++++--------
+ .../net/ethernet/cavium/octeontx-83xx/pki.h   |   2 +-
+ .../ethernet/cavium/octeontx-83xx/pki_main.c  |  23 ++-
+ .../net/ethernet/cavium/octeontx-83xx/pko.h   |   2 +-
+ .../cavium/octeontx-83xx/pkopf_main.c         |  15 +-
+ .../net/ethernet/cavium/octeontx-83xx/sso.h   |   2 +-
+ .../cavium/octeontx-83xx/ssowpf_main.c        |  12 +-
+ .../net/ethernet/cavium/octeontx-83xx/tim.h   |   2 +-
+ .../cavium/octeontx-83xx/timpf_main.c         |  16 +-
+ .../net/ethernet/cavium/octeontx-83xx/zip.h   |   2 +-
+ .../cavium/octeontx-83xx/zippf_main.c         |  16 +-
+ drivers/pci/quirks.c                          | 100 ++++++++++--
+ 17 files changed, 246 insertions(+), 147 deletions(-)
+
+diff --git a/drivers/crypto/cavium/cpt/8x/cpt8x_pf_domain.c b/drivers/crypto/cavium/cpt/8x/cpt8x_pf_domain.c
+index 298afb666673..5ef4b141958e 100644
+--- a/drivers/crypto/cavium/cpt/8x/cpt8x_pf_domain.c
++++ b/drivers/crypto/cavium/cpt/8x/cpt8x_pf_domain.c
+@@ -83,7 +83,7 @@ static int cpt_pf_remove_domain(u32 node, u16 domain_id, struct kobject *kobj)
+ 	return 0;
+ }
+ 
+-static int cpt_pf_create_domain(u32 node, u16 domain_id,
++static u64 cpt_pf_create_domain(u32 node, u16 domain_id,
+ 				u32 num_vfs, struct kobject *kobj)
+ {
+ 	struct cpt_device *cpt = NULL;
+@@ -93,9 +93,10 @@ static int cpt_pf_create_domain(u32 node, u16 domain_id,
+ 	resource_size_t vf_start;
+ 	int vf_idx = 0, ret = 0;
+ 	int i;
++	unsigned long cpt_mask = 0;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 
+ 	mutex_lock(&octeontx_cpt_devices_lock);
+ 	list_for_each_entry(curr, &octeontx_cpt_devices, list) {
+@@ -105,10 +106,8 @@ static int cpt_pf_create_domain(u32 node, u16 domain_id,
+ 		}
+ 	}
+ 
+-	if (!cpt) {
+-		ret = -ENODEV;
++	if (!cpt)
+ 		goto err_unlock;
+-	}
+ 
+ 	for (i = 0; i < cpt->vfs_enabled; i++) {
+ 		vf = &cpt->vf[i];
+@@ -145,6 +144,7 @@ static int cpt_pf_create_domain(u32 node, u16 domain_id,
+ 		cpt_config_gmctl(cpt, i, i + 1, vf->domain.gmid);
+ 		identify(vf, domain_id, vf_idx);
+ 
++		set_bit(i, &cpt_mask);
+ 		vf_idx++;
+ 		if (vf_idx == num_vfs) {
+ 			cpt->vfs_in_use += num_vfs;
+@@ -152,17 +152,16 @@ static int cpt_pf_create_domain(u32 node, u16 domain_id,
+ 		}
+ 	}
+ 
+-	if (vf_idx != num_vfs) {
+-		ret = -ENODEV;
++	if (vf_idx != num_vfs)
+ 		goto err_unlock;
+-	}
++
+ 	mutex_unlock(&octeontx_cpt_devices_lock);
+-	return ret;
++	return cpt_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_cpt_devices_lock);
+ 	cpt_pf_remove_domain(node, domain_id, kobj);
+-	return ret;
++	return 0;
+ }
+ 
+ static int cpt_reset_domain(u32 node, u16 domain_id)
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/cpt.h b/drivers/net/ethernet/cavium/octeontx-83xx/cpt.h
+index 0e9d73083e66..6cce0edbda17 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/cpt.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/cpt.h
+@@ -14,7 +14,7 @@
+ #include "octeontx.h"
+ 
+ struct cptpf_com_s {
+-	int (*create_domain)(u32, u16, u32, struct kobject *kobj);
++	u64 (*create_domain)(u32, u16, u32, struct kobject *kobj);
+ 	int (*destroy_domain)(u32 id, u16 domain_id, struct kobject *kobj);
+ 	int (*reset_domain)(u32, u16);
+ };
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/dpi.h b/drivers/net/ethernet/cavium/octeontx-83xx/dpi.h
+index e0ba61ee93e8..96e5f1af970e 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/dpi.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/dpi.h
+@@ -195,7 +195,7 @@ struct dpipf {
+ };
+ 
+ struct dpipf_com_s {
+-	int (*create_domain)(u32 id, u16 domain_id, u32 num_vfs,
++	u64 (*create_domain)(u32 id, u16 domain_id, u32 num_vfs,
+ 			     void *master, void *master_data,
+ 			     struct kobject *kobj);
+ 	int (*destroy_domain)(u32 id, u16 domain_id, struct kobject *kobj);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c
+index 4c7bfe7539f4..5ce0ffef34a9 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/dpipf_main.c
+@@ -113,7 +113,7 @@ static int dpi_pf_destroy_domain(u32 id, u16 domain_id, struct kobject *kobj)
+ 	return 0;
+ }
+ 
+-static int dpi_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
++static u64 dpi_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 				void *master, void *master_data,
+ 				struct kobject *kobj)
+ {
+@@ -123,9 +123,10 @@ static int dpi_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 	int vf_idx = 0, ret = 0;
+ 	resource_size_t vf_start;
+ 	struct pci_dev *virtfn;
++	unsigned long dpi_mask = 0;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 
+ 	mutex_lock(&octeontx_dpi_devices_lock);
+ 	list_for_each_entry(curr, &octeontx_dpi_devices, list) {
+@@ -135,10 +136,8 @@ static int dpi_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 		}
+ 	}
+ 
+-	if (!dpi) {
+-		ret = -ENODEV;
++	if (!dpi)
+ 		goto err_unlock;
+-	}
+ 
+ 	for (i = 0; i < dpi->total_vfs; i++) {
+ 		if (dpi->vf[i].domain.in_use) {
+@@ -196,6 +195,7 @@ static int dpi_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 			dev_dbg(&dpi->pdev->dev, "DPI_DMA%llx_IDS: 0x%016llx\n",
+ 				i, dpi_reg_read(dpi, DPI_DMAX_IDS(i)));
+ 
++			set_bit(i, &dpi_mask);
+ 			vf_idx++;
+ 			if (vf_idx == num_vfs) {
+ 				dpi->vfs_in_use += num_vfs;
+@@ -207,14 +207,14 @@ static int dpi_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 	mutex_unlock(&octeontx_dpi_devices_lock);
+ 
+ 	if (vf_idx != num_vfs) {
+-		ret = -ENODEV;
++		dpi_mask = 0;
+ 		dpi_pf_destroy_domain(id, domain_id, kobj);
+ 	}
+-	return ret;
++	return dpi_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_dpi_devices_lock);
+-	return ret;
++	return 0;
+ }
+ 
+ static struct dpipf_vf *get_vf(u32 id, u16 domain_id, u16 subdomain_id,
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/octeontx.h b/drivers/net/ethernet/cavium/octeontx-83xx/octeontx.h
+index 6305618e6c14..785f941d5ff4 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/octeontx.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/octeontx.h
+@@ -164,7 +164,21 @@ struct octtx_lbk_port {
+ #define LBK_PORT_GIDX_FULL_GEN(_i, _k) (((_i) << 4) | (_k))
+ #define LBK_PORT_GIDX_PRIM(_p) ((_p)->glb_port_idx & 0x1FF)
+ 
+-extern atomic_t octtx_sso_reset[];
++enum octtx_coprocessor {
++	OCTTX_SSO,
++	OCTTX_SSOW,
++	OCTTX_FPA,
++	OCTTX_PKI,
++	OCTTX_PKO,
++	OCTTX_TIM,
++	OCTTX_CPT,
++	OCTTX_DPI,
++	OCTTX_ZIP,
++	OCTTX_COPROCESSOR_CNT
++};
++
++extern atomic64_t octtx_vf_reset[];
++
+ /* Domain internal (SDP) port */
+ #define OCTTX_MAX_SDP_PORTS 1 /* Maximum SDP ports per System */
+ 
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c
+index a3c5cf28487b..9568ddf613b8 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/octeontx_main.c
+@@ -91,8 +91,7 @@ struct octtx_domain {
+ 	int zip_vf_count;
+ 	int cpt_vf_count;
+ 
+-	u64 aura_set;
+-	u64 grp_mask;
++	u64 vf_mask[OCTTX_COPROCESSOR_CNT];
+ 
+ 	int bgx_count;
+ 	int lbk_count;
+@@ -815,10 +814,11 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 
+ 	domain->fpa_vf_count = fpa_count;
+ 	if (domain->fpa_vf_count) {
+-		domain->aura_set = fpapf->create_domain(node, domain_id,
+-							domain->fpa_vf_count,
+-							domain->kobj);
+-		if (!domain->aura_set) {
++		domain->vf_mask[OCTTX_FPA] =
++			fpapf->create_domain(node, domain_id,
++					     domain->fpa_vf_count,
++					     domain->kobj);
++		if (!domain->vf_mask[OCTTX_FPA]) {
+ 			dev_err(octtx_device, "Failed to create FPA domain\n");
+ 			ret = -ENODEV;
+ 			goto error;
+@@ -827,19 +827,21 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 	}
+ 
+ 	domain->ssow_vf_count = ssow_count;
+-	ret = ssowpf->create_domain(node, domain_id, domain->ssow_vf_count,
+-				    &octtx_master_com, domain, domain->kobj);
+-	if (ret) {
++	domain->vf_mask[OCTTX_SSOW] =
++		ssowpf->create_domain(node, domain_id, domain->ssow_vf_count,
++				      &octtx_master_com, domain, domain->kobj);
++	if (!domain->vf_mask[OCTTX_SSOW]) {
+ 		dev_err(octtx_device, "Failed to create SSOW domain\n");
+ 		goto error;
+ 	}
+ 	domain->ssow_domain_created = true;
+ 
+ 	domain->sso_vf_count = sso_count;
+-	domain->grp_mask = ssopf->create_domain(node, domain_id,
+-				domain->sso_vf_count,
+-				&octtx_master_com, domain, domain->kobj);
+-	if (!domain->grp_mask) {
++	domain->vf_mask[OCTTX_SSO] = ssopf->create_domain(node, domain_id,
++							  domain->sso_vf_count,
++							  &octtx_master_com,
++							  domain, domain->kobj);
++	if (!domain->vf_mask[OCTTX_SSO]) {
+ 		dev_err(octtx_device, "Failed to create SSO domain\n");
+ 		goto error;
+ 	}
+@@ -858,9 +860,10 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 		goto error;
+ 	}
+ 
+-	ret = pki->create_domain(node, domain_id, &octtx_master_com, domain,
+-				 domain->kobj);
+-	if (ret) {
++	domain->vf_mask[OCTTX_PKI] = pki->create_domain(node, domain_id,
++							&octtx_master_com,
++							domain, domain->kobj);
++	if (!domain->vf_mask[OCTTX_PKI]) {
+ 		dev_err(octtx_device, "Failed to create PKI domain\n");
+ 		goto error;
+ 	}
+@@ -1021,14 +1024,18 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 	/* remove this once PKO init extends for LBK. */
+ 	domain->pko_vf_count = port_count;
+ 	if (domain->pko_vf_count) {
+-		ret = pkopf->create_domain(node, domain_id,
+-					domain->pko_vf_count,
+-					domain->bgx_port, domain->bgx_count,
+-					domain->lbk_port, domain->lbk_count,
+-					domain->sdp_port, domain->sdp_count,
+-					&octtx_master_com, domain,
+-					domain->kobj);
+-		if (ret) {
++		domain->vf_mask[OCTTX_PKO] =
++			pkopf->create_domain(node, domain_id,
++					     domain->pko_vf_count,
++					     domain->bgx_port,
++					     domain->bgx_count,
++					     domain->lbk_port,
++					     domain->lbk_count,
++					     domain->sdp_port,
++					     domain->sdp_count,
++					     &octtx_master_com,
++					     domain, domain->kobj);
++		if (!domain->vf_mask[OCTTX_PKO]) {
+ 			dev_err(octtx_device, "Failed to create PKO domain\n");
+ 			goto error;
+ 		}
+@@ -1037,10 +1044,12 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 
+ 	domain->tim_vf_count = tim_count;
+ 	if (domain->tim_vf_count) {
+-		ret = timpf->create_domain(node, domain_id,
+-			domain->tim_vf_count, &octtx_master_com, domain,
+-			domain->kobj);
+-		if (ret) {
++		domain->vf_mask[OCTTX_TIM] =
++			timpf->create_domain(node, domain_id,
++					     domain->tim_vf_count,
++					     &octtx_master_com,
++					     domain, domain->kobj);
++		if (!domain->vf_mask[OCTTX_TIM]) {
+ 			dev_err(octtx_device, "Failed to create TIM domain\n");
+ 			goto error;
+ 		}
+@@ -1049,9 +1058,11 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 
+ 	domain->cpt_vf_count = cpt_count;
+ 	if (domain->cpt_vf_count > 0) {
+-		ret = cptpf->create_domain(node, domain_id,
+-					   domain->cpt_vf_count, domain->kobj);
+-		if (ret) {
++		domain->vf_mask[OCTTX_CPT] =
++			cptpf->create_domain(node, domain_id,
++					     domain->cpt_vf_count,
++					     domain->kobj);
++		if (!domain->vf_mask[OCTTX_CPT]) {
+ 			dev_err(octtx_device, "Failed to create CPT domain\n");
+ 			goto error;
+ 		}
+@@ -1060,11 +1071,12 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 
+ 	domain->dpi_vf_count = dpi_count;
+ 	if (domain->dpi_vf_count > 0) {
+-		ret = dpipf->create_domain(node, domain_id,
+-					   domain->dpi_vf_count,
+-					   &octtx_master_com, domain,
+-					   domain->kobj);
+-		if (ret) {
++		domain->vf_mask[OCTTX_DPI] =
++			dpipf->create_domain(node, domain_id,
++					     domain->dpi_vf_count,
++					     &octtx_master_com,
++					     domain, domain->kobj);
++		if (!domain->vf_mask[OCTTX_DPI]) {
+ 			dev_err(octtx_device, "Failed to create DPI domain\n");
+ 			goto error;
+ 		}
+@@ -1073,10 +1085,12 @@ int octeontx_create_domain(const char *name, int type, int sso_count,
+ 
+ 	domain->zip_vf_count = zip_count;
+ 	if (domain->zip_vf_count) {
+-		ret = zippf->create_domain(node, domain_id,
+-			domain->zip_vf_count, &octtx_master_com, domain,
+-			domain->kobj);
+-		if (ret) {
++		domain->vf_mask[OCTTX_ZIP] =
++			zippf->create_domain(node, domain_id,
++					     domain->zip_vf_count,
++					     &octtx_master_com, domain,
++					     domain->kobj);
++		if (!domain->vf_mask[OCTTX_ZIP]) {
+ 			dev_err(octtx_device, "Failed to create ZIP domain\n");
+ 			goto error;
+ 		}
+@@ -1191,7 +1205,7 @@ static int octeontx_reset_domain(void *master_data)
+ 
+ 	if (domain->ssow_domain_created) {
+ 		ret = ssowpf->reset_domain(node, domain->domain_id,
+-					   domain->grp_mask);
++					   domain->vf_mask[OCTTX_SSO]);
+ 		if (ret) {
+ 			dev_err(octtx_device,
+ 				"Failed to reset SSOW of domain %d on node %d.\n",
+@@ -1288,34 +1302,44 @@ static void poll_for_link(struct work_struct *work)
+ 	queue_delayed_work(check_link, &dwork, HZ * 2);
+ }
+ 
++static void octtx_vf_reset_domain(struct octtx_domain *domain,
++				  u64 *mask, enum octtx_coprocessor cop)
++{
++	u64 val = atomic64_read(&octtx_vf_reset[cop]);
++
++	if (val & domain->vf_mask[cop]) {
++		if (domain->in_use) {
++			mutex_unlock(&octeontx_domains_lock);
++			octeontx_reset_domain(domain);
++			mutex_lock(&octeontx_domains_lock);
++		}
++		atomic64_andnot(domain->vf_mask[cop],
++				&octtx_vf_reset[cop]);
++	}
++	*mask &= ~domain->vf_mask[cop];
++}
++
+ void octtx_reset_domain(struct work_struct *work)
+ {
+ 	struct octtx_domain *domain;
+-	int i, master_sso;
+-	u64 mask = -1;
+-	u64 val;
++	u64 vf_mask[OCTTX_COPROCESSOR_CNT];
++	int i;
++
++	for (i = 0; i < OCTTX_COPROCESSOR_CNT; i++)
++		vf_mask[i] = -1;
+ 
+ 	mutex_lock(&octeontx_domains_lock);
+ 	list_for_each_entry(domain, &octeontx_domains, list) {
+-		/* find first SSO from domain */
+-		master_sso = __ffs(domain->grp_mask);
+-		for_each_set_bit(i, (unsigned long *)&domain->grp_mask,
+-				 sizeof(domain->grp_mask) * 8) {
+-			val = atomic_read(&octtx_sso_reset[i]);
+-			if ((master_sso == i) && val) {
+-				mutex_unlock(&octeontx_domains_lock);
+-				octeontx_reset_domain(domain);
+-				mutex_lock(&octeontx_domains_lock);
+-			}
+-			atomic_set(&octtx_sso_reset[i], 0);
+-		}
+-		mask &= ~domain->grp_mask;
++		/* check all possible VFs */
++		for (i = 0; i < OCTTX_COPROCESSOR_CNT; i++)
++			octtx_vf_reset_domain(domain, &vf_mask[i], i);
+ 	}
+ 
+-	for_each_set_bit(i, (unsigned long *)&mask, sizeof(mask) * 8) {
+-		if (atomic_read(&octtx_sso_reset[i]))
+-			atomic_set(&octtx_sso_reset[i], 0);
+-	}
++	/* clear devices that don't belong to any domain but may have been
++	 * probed and are waiting for our response
++	 */
++	for (i = 0; i < OCTTX_COPROCESSOR_CNT; i++)
++		atomic64_andnot(vf_mask[i], &octtx_vf_reset[i]);
+ 
+ 	/*make sure the other end receives it*/
+ 	mb();
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pki.h b/drivers/net/ethernet/cavium/octeontx-83xx/pki.h
+index 02e56ce546ba..c03beeca32c9 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pki.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pki.h
+@@ -492,7 +492,7 @@ struct pki_t {
+ };
+ 
+ struct pki_com_s {
+-	int (*create_domain)(u32, u16, struct octeontx_master_com_t *, void *,
++	u64 (*create_domain)(u32, u16, struct octeontx_master_com_t *, void *,
+ 			     struct kobject *kobj);
+ 	int (*destroy_domain)(u32, u16, struct kobject *kobj);
+ 	int (*reset_domain)(u32, u16);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pki_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/pki_main.c
+index b6ea1dbbcd69..5495c0f3ae98 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pki_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pki_main.c
+@@ -448,7 +448,7 @@ static int pki_destroy_domain(u32 id, u16 domain_id, struct kobject *kobj)
+ 	return 0;
+ }
+ 
+-static int pki_create_domain(u32 id, u16 domain_id,
++static u64 pki_create_domain(u32 id, u16 domain_id,
+ 			     struct octeontx_master_com_t *master_com,
+ 			     void *data, struct kobject *kobj)
+ {
+@@ -457,11 +457,12 @@ static int pki_create_domain(u32 id, u16 domain_id,
+ 	struct pci_dev *virtfn;
+ 	struct pki_t *curr;
+ 	int i, ret = 0, vf_idx = 0;
++	unsigned long pki_mask = 0;
+ 	u8 stream;
+ 	u64 cfg;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 
+ 	mutex_lock(&octeontx_pki_devices_lock);
+ 	list_for_each_entry(curr, &octeontx_pki_devices, list) {
+@@ -471,10 +472,8 @@ static int pki_create_domain(u32 id, u16 domain_id,
+ 		}
+ 	}
+ 
+-	if (!pki) {
+-		ret = -ENODEV;
++	if (!pki)
+ 		goto err_unlock;
+-	}
+ 
+ 	for (i = 0; i < PKI_MAX_VF; i++) {
+ 		if (pki->vf[i].domain.in_use) {/* pki port config */
+@@ -510,32 +509,28 @@ static int pki_create_domain(u32 id, u16 domain_id,
+ 			vf_start = PKI_VF_BASE(i);
+ 			pki->vf[i].domain.reg_base = ioremap(vf_start,
+ 							     PKI_VF_SIZE);
+-			if (!pki->vf[i].domain.reg_base) {
+-				ret = -ENOMEM;
++			if (!pki->vf[i].domain.reg_base)
+ 				goto err_unlock;
+-			}
+ 
+ 			identify(&pki->vf[i], pki->vf[i].domain.domain_id,
+ 				 pki->vf[i].domain.subdomain_id);
+ 			vf_idx++;
++			set_bit(i, &pki_mask);
+ 			break;
+ 		}
+ 	}
+ 
+-	if (!vf_idx) {
+-		ret = -ENODEV;
++	if (!vf_idx)
+ 		goto err_unlock;
+-	}
+ 
+ 	pki->vfs_in_use += vf_idx;
+ 	mutex_unlock(&octeontx_pki_devices_lock);
+-	return ret;
++	return pki_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_pki_devices_lock);
+ 	pki_destroy_domain(id, domain_id, kobj);
+-	return ret;
+-	return ret;
++	return 0;
+ }
+ 
+ static int pki_receive_message(u32 id, u16 domain_id,
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pko.h b/drivers/net/ethernet/cavium/octeontx-83xx/pko.h
+index 08266d1c8495..80e9f5dc8f78 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pko.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pko.h
+@@ -320,7 +320,7 @@ struct pkopf {
+ };
+ 
+ struct pkopf_com_s {
+-	int (*create_domain)(u32 id, u16 domain_id, u32 pko_vf_count,
++	u64 (*create_domain)(u32 id, u16 domain_id, u32 pko_vf_count,
+ 			     struct octtx_bgx_port *bgx_port, int bgx_count,
+ 			     struct octtx_lbk_port *lbk_port, int lbk_count,
+ 			     struct octtx_sdp_port *sdp_port, int sdp_count,
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+index 2cadcb64316c..27f3534793c9 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/pkopf_main.c
+@@ -359,7 +359,7 @@ static void pko_pf_gmctl_init(struct pkopf *pf, int vf, u16 gmid)
+ 	reg = pko_reg_read(pf, PKO_PF_VFX_GMCTL(vf));
+ }
+ 
+-static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
++static u64 pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 				struct octtx_bgx_port *bgx_port, int bgx_count,
+ 				struct octtx_lbk_port *lbk_port, int lbk_count,
+ 				struct octtx_sdp_port *sdp_port, int sdp_count,
+@@ -374,9 +374,10 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 	int vf_idx = 0, port_idx = 0;
+ 	int mac_num, mac_mode, chan, ret = 0;
+ 	const u32 max_frame = 0xffff;
++	unsigned long pko_mask = 0;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 
+ 	if (sdp_count)
+ 		pko_mac = PKO_MAC_HOST;
+@@ -394,7 +395,6 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 	}
+ 
+ 	if (!pko) {
+-		ret = -ENODEV;
+ 		goto err_unlock;
+ 	}
+ 
+@@ -491,6 +491,7 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 
+ 			pko_pstree_setup(pko, i, max_frame,
+ 					 mac_num, mac_mode, chan);
++			set_bit(i, &pko_mask);
+ 			vf_idx++;
+ 			if (vf_idx == pko_vf_count) {
+ 				pko->vfs_in_use += pko_vf_count;
+@@ -499,18 +500,16 @@ static int pko_pf_create_domain(u32 id, u16 domain_id, u32 pko_vf_count,
+ 		}
+ 	}
+ 
+-	if (vf_idx != pko_vf_count) {
+-		ret = -ENODEV;
++	if (vf_idx != pko_vf_count)
+ 		goto err_unlock;
+-	}
+ 
+ 	mutex_unlock(&octeontx_pko_devices_lock);
+-	return ret;
++	return pko_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_pko_devices_lock);
+ 	pko_pf_destroy_domain(id, domain_id, kobj);
+-	return ret;
++	return 0;
+ }
+ 
+ /*caller is responsible for locks
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/sso.h b/drivers/net/ethernet/cavium/octeontx-83xx/sso.h
+index 237a218e9b99..163c5141b3e2 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/sso.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/sso.h
+@@ -284,7 +284,7 @@ struct ssowpf {
+ };
+ 
+ struct ssowpf_com_s {
+-	int (*create_domain)(u32, u16, u32, void *, void *,
++	u64 (*create_domain)(u32, u16, u32, void *, void *,
+ 			     struct kobject *kobj);
+ 	int (*destroy_domain)(u32, u16, struct kobject *kobj);
+ 	int (*reset_domain)(u32, u16, u64);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/ssowpf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/ssowpf_main.c
+index 426998c4ba10..15889f0f45b1 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/ssowpf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/ssowpf_main.c
+@@ -84,7 +84,7 @@ static int ssow_pf_destroy_domain(u32 id, u16 domain_id, struct kobject *kobj)
+ 	return ret;
+ }
+ 
+-static int ssow_pf_create_domain(u32 id, u16 domain_id, u32 vf_count,
++static u64 ssow_pf_create_domain(u32 id, u16 domain_id, u32 vf_count,
+ 				 void *master, void *master_data,
+ 				 struct kobject *kobj)
+ {
+@@ -94,9 +94,10 @@ static int ssow_pf_create_domain(u32 id, u16 domain_id, u32 vf_count,
+ 	resource_size_t vf_start;
+ 	u64 i, reg;
+ 	int vf_idx = 0, ret = 0;
++	unsigned long ssow_mask = 0;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 
+ 	mutex_lock(&octeontx_ssow_devices_lock);
+ 	list_for_each_entry(curr, &octeontx_ssow_devices, list) {
+@@ -107,7 +108,7 @@ static int ssow_pf_create_domain(u32 id, u16 domain_id, u32 vf_count,
+ 	}
+ 	if (!ssow) {
+ 		mutex_unlock(&octeontx_ssow_devices_lock);
+-		return -ENODEV;
++		return 0;
+ 	}
+ 
+ 	for (i = 0; i < ssow->total_vfs; i++) {
+@@ -163,6 +164,7 @@ static int ssow_pf_create_domain(u32 id, u16 domain_id, u32 vf_count,
+ 
+ 			identify(&ssow->vf[i], domain_id, vf_idx);
+ 			vf_idx++;
++			set_bit(i, &ssow_mask);
+ 			if (vf_idx == vf_count) {
+ 				ssow->vfs_in_use += vf_count;
+ 				break;
+@@ -173,12 +175,12 @@ static int ssow_pf_create_domain(u32 id, u16 domain_id, u32 vf_count,
+ 		goto err_unlock;
+ 
+ 	mutex_unlock(&octeontx_ssow_devices_lock);
+-	return 0;
++	return ssow_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_ssow_devices_lock);
+ 	ssow_pf_destroy_domain(id, domain_id, kobj);
+-	return -ENODEV;
++	return 0;
+ }
+ 
+ static int ssow_pf_get_ram_mbox_addr(u32 node, u16 domain_id,
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/tim.h b/drivers/net/ethernet/cavium/octeontx-83xx/tim.h
+index 350f035bd662..dfecbb1a5f54 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/tim.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/tim.h
+@@ -14,7 +14,7 @@
+ #include "octeontx.h"
+ 
+ struct timpf_com_s {
+-	int (*create_domain)(u32 id, u16 domain_id, u32 num_vfs,
++	u64 (*create_domain)(u32 id, u16 domain_id, u32 num_vfs,
+ 			     struct octeontx_master_com_t *com, void *domain,
+ 			     struct kobject *kobj);
+ 	int (*destroy_domain)(u32 id, u16 domain_id, struct kobject *kobj);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/timpf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/timpf_main.c
+index c86e25b1a252..2de524db1e02 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/timpf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/timpf_main.c
+@@ -338,7 +338,7 @@ static int tim_pf_destroy_domain(u32 id, u16 domain_id, struct kobject *kobj)
+ 	return ret;
+ }
+ 
+-static int tim_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
++static u64 tim_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 				struct octeontx_master_com_t *com, void *domain,
+ 				struct kobject *kobj)
+ {
+@@ -349,9 +349,10 @@ static int tim_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 	resource_size_t ba;
+ 	u64 reg = 0, gmid;
+ 	int i, vf_idx = 0, ret = 0;
++	unsigned long tim_mask = 0;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 	gmid = get_gmid(domain_id);
+ 
+ 	mutex_lock(&octeontx_tim_dev_lock);
+@@ -362,7 +363,6 @@ static int tim_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 		}
+ 	}
+ 	if (!tim) {
+-		ret = -ENODEV;
+ 		goto err_unlock;
+ 	}
+ 	for (i = 0; i < tim->total_vfs; i++) {
+@@ -395,23 +395,23 @@ static int tim_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 		tim_reg_write(tim, TIM_RING_GMCTL(i), reg);
+ 
+ 		identify(vf, domain_id, vf_idx);
++		set_bit(i, &tim_mask);
+ 		vf_idx++;
+ 		if (vf_idx == num_vfs) {
+ 			tim->vfs_in_use += num_vfs;
+ 			break;
+ 		}
+ 	}
+-	if (vf_idx != num_vfs) {
+-		ret = -ENODEV;
++	if (vf_idx != num_vfs)
+ 		goto err_unlock;
+-	}
++
+ 	mutex_unlock(&octeontx_tim_dev_lock);
+-	return ret;
++	return tim_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_tim_dev_lock);
+ 	tim_pf_destroy_domain(id, domain_id, kobj);
+-	return ret;
++	return 0;
+ }
+ 
+ static int tim_ring_reset(struct timpf *tim, int ring)
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/zip.h b/drivers/net/ethernet/cavium/octeontx-83xx/zip.h
+index 7fe1b8182d3d..3bcc989de503 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/zip.h
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/zip.h
+@@ -77,7 +77,7 @@ struct zippf {
+ };
+ 
+ struct zippf_com_s {
+-	int (*create_domain)(u32 id, u16 domain_id, u32 num_vfs,
++	u64 (*create_domain)(u32 id, u16 domain_id, u32 num_vfs,
+ 			     void *master, void *master_data,
+ 			     struct kobject *kobj);
+ 	int (*destroy_domain)(u32 id, u16 domain_id, struct kobject *kobj);
+diff --git a/drivers/net/ethernet/cavium/octeontx-83xx/zippf_main.c b/drivers/net/ethernet/cavium/octeontx-83xx/zippf_main.c
+index 8d628a66fae4..9d1895be9126 100644
+--- a/drivers/net/ethernet/cavium/octeontx-83xx/zippf_main.c
++++ b/drivers/net/ethernet/cavium/octeontx-83xx/zippf_main.c
+@@ -93,7 +93,7 @@ static int zip_pf_destroy_domain(u32 id, u16 domain_id, struct kobject *kobj)
+ 	return 0;
+ }
+ 
+-static int zip_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
++static u64 zip_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 				void *master, void *master_data,
+ 				struct kobject *kobj)
+ {
+@@ -103,12 +103,13 @@ static int zip_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 	u64 reg;
+ 	int i, vf_idx = 0, ret = 0;
+ 	struct pci_dev *virtfn;
++	unsigned long zip_mask = 0;
+ 
+ 	union zip_quex_sbuf_ctl		quex_sbuf_ctl;
+ 	union zip_quex_map		quex_map;
+ 
+ 	if (!kobj)
+-		return -EINVAL;
++		return 0;
+ 
+ 	mutex_lock(&octeontx_zip_devices_lock);
+ 	list_for_each_entry(curr, &octeontx_zip_devices, list) {
+@@ -118,10 +119,8 @@ static int zip_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 		}
+ 	}
+ 
+-	if (!zip) {
+-		ret = -ENODEV;
++	if (!zip)
+ 		goto err_unlock;
+-	}
+ 
+ 	for (i = 0; i < zip->total_vfs; i++) {
+ 		if (zip->vf[i].domain.in_use) {
+@@ -195,6 +194,7 @@ static int zip_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 				zip->vf[i].domain.subdomain_id,
+ 				zip->vf[i].domain.gmid, vf_idx);
+ 
++			set_bit(i, &zip_mask);
+ 			vf_idx++;
+ 			if (vf_idx == num_vfs) {
+ 				zip->vfs_in_use += num_vfs;
+@@ -205,14 +205,14 @@ static int zip_pf_create_domain(u32 id, u16 domain_id, u32 num_vfs,
+ 
+ 	mutex_unlock(&octeontx_zip_devices_lock);
+ 	if (vf_idx != num_vfs) {
+-		ret = -ENODEV;
++		zip_mask = 0;
+ 		zip_pf_destroy_domain(id, domain_id, kobj);
+ 	}
+-	return ret;
++	return zip_mask;
+ 
+ err_unlock:
+ 	mutex_unlock(&octeontx_zip_devices_lock);
+-	return ret;
++	return 0;
+ }
+ 
+ static void zip_vfx_reset(struct zippf *zip, int vf)
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 5b15853b26e2..c4c2ce0bae45 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -3784,51 +3784,101 @@ static int reset_chelsio_generic_dev(struct pci_dev *dev, int probe)
+ #define PCI_DEVICE_ID_INTEL_IVB_M2_VGA     0x0166
+ 
+ #define PCI_DEVICE_ID_OCTEONTX_SSO_VF	0xA04B
++#define PCI_DEVICE_ID_OCTEONTX_SSOW_VF	0xA04D
++#define PCI_DEVICE_ID_OCTEONTX_FPA_VF	0xA053
++#define PCI_DEVICE_ID_OCTEONTX_PKI_VF	0xA0DD
++#define PCI_DEVICE_ID_OCTEONTX_PKO_VF	0xA049
++#define PCI_DEVICE_ID_OCTEONTX_TIM_VF	0xA051
++#define PCI_DEVICE_ID_OCTEONTX_CPT_VF	0xA041
++#define PCI_DEVICE_ID_OCTEONTX_DPI_VF	0xA058
++#define PCI_DEVICE_ID_OCTEONTX_ZIP_VF	0xA037
+ #define SSO_VF_VHGRPX_PF_MBOXX(x, y)	(0x200ULL | ((x) << 20) | ((y) << 3))
+ #define MBOX_TRIGGER_OOB_RESET	0x01 /* OOB reset request */
+ #define MBOX_TRIGGER_OOB_RES	0x80 /* OOB response mask */
+ #define MBOX_OPERATION_TIMEOUT	1000 /* set timeout 1 second */
+ 
+-atomic_t octtx_sso_reset[64] = ATOMIC_INIT(0);
+-EXPORT_SYMBOL(octtx_sso_reset);
+-#define SSO_VF_ID(x) (((x) >> 20) & 0x3f)
++enum octtx_coprocessor {
++	OCTTX_SSO,
++	OCTTX_SSOW,
++	OCTTX_FPA,
++	OCTTX_PKI,
++	OCTTX_PKO,
++	OCTTX_TIM,
++	OCTTX_CPT,
++	OCTTX_DPI,
++	OCTTX_ZIP,
++	OCTTX_COPROCESSOR_CNT
++};
++
++atomic64_t octtx_vf_reset[OCTTX_COPROCESSOR_CNT] = ATOMIC64_INIT(0);
++EXPORT_SYMBOL(octtx_vf_reset);
++
+ /*
+- * Device-specific reset method for Cavium OcteonTx SSO
+- * It will notify the PF that VF had reset. PF in turn will reset the OcteonTX
+- * domain.
++ * Device-specific reset method for Cavium OcteonTx VF devices.
++ * It will trigger a reset of the OcteonTX domain.
+  */
+ static int reset_cavium_octeon_vf(struct pci_dev *pdev, int probe)
+ {
+ 	u64 val;
+-	u64 addr;
+ 	int vf_id;
+ 	int count = 2000;
++	enum octtx_coprocessor cop;
+ 
+-	dev_dbg(&pdev->dev, "reset_cavium_octeon_vf() called probe=%d\n",
+-			probe);
++	switch (pdev->device) {
++	case PCI_DEVICE_ID_OCTEONTX_SSO_VF:
++		cop = OCTTX_SSO;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_SSOW_VF:
++		cop = OCTTX_SSOW;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_FPA_VF:
++		cop = OCTTX_FPA;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_PKI_VF:
++		cop = OCTTX_PKI;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_PKO_VF:
++		cop = OCTTX_PKO;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_TIM_VF:
++		cop = OCTTX_TIM;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_CPT_VF:
++		cop = OCTTX_CPT;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_DPI_VF:
++		cop = OCTTX_DPI;
++		break;
++	case PCI_DEVICE_ID_OCTEONTX_ZIP_VF:
++		cop = OCTTX_ZIP;
++		break;
++	default:
++		return -ENOTTY;
++	}
+ 
+ 	if (probe)
+ 		return 0;
+ 
+-	addr = pci_resource_start(pdev, 0);
+-	vf_id = SSO_VF_ID(addr);
+-	atomic_set(&octtx_sso_reset[vf_id], 1);
++	vf_id = pdev->devfn - 1;
++	dev_dbg(&pdev->dev, "setting 0x%p bit %d\n",
++		&octtx_vf_reset[cop], vf_id);
++	atomic64_fetch_or(1 << vf_id, &octtx_vf_reset[cop]);
+ 	/* make sure other party reads it*/
+ 	mb();
+ 
+ 	while (count) {
+ 		usleep_range(1000, 2000);
+-		val = atomic_read(&octtx_sso_reset[vf_id]);
+-		if (!val)
++		val = atomic_read(&octtx_vf_reset[cop]);
++		if ((val & (1 << vf_id)) == 0)
+ 			goto exit;
+ 		count--;
+ 	}
+-	dev_err(&pdev->dev, "reset_cavium_octeon_vf() reset timeout\n");
++	dev_err(&pdev->dev, "%s() reset timeout, vf_id %d, cop %u\n", __func__,
++		vf_id, cop);
+ exit:
+ 	return 0;
+ }
+ 
+-
+ static const struct pci_dev_reset_methods pci_dev_reset_methods[] = {
+ 	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82599_SFP_VF,
+ 		 reset_intel_82599_sfp_virtfn },
+@@ -3838,7 +3888,23 @@ static const struct pci_dev_reset_methods pci_dev_reset_methods[] = {
+ 		reset_ivb_igd },
+ 	{ PCI_VENDOR_ID_CHELSIO, PCI_ANY_ID,
+ 		reset_chelsio_generic_dev },
+-	{ PCI_VENDOR_ID_CAVIUM, PCI_DEVICE_ID_OCTEONTX_SSO_VF,
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_SSO_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_SSOW_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_FPA_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_PKI_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_PKO_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_TIM_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_CPT_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_DPI_VF,
++		reset_cavium_octeon_vf },
++	{ PCI_VENDOR_ID_CAVIUM,	PCI_DEVICE_ID_OCTEONTX_ZIP_VF,
+ 		reset_cavium_octeon_vf },
+ 	{ 0 }
+ };
+-- 
+2.17.1
+

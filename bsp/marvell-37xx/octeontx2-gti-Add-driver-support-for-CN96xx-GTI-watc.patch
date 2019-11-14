@@ -1,0 +1,481 @@
+From b5277cb7281a623d3f6bd7a71e7d00c64e7c8699 Mon Sep 17 00:00:00 2001
+From: Ashish Kalra <akalra@marvell.com>
+Date: Fri, 17 May 2019 07:13:07 +0530
+Subject: [PATCH 237/386] octeontx2-gti: Add driver support for CN96xx GTI
+ watchdog
+
+Linux kernel driver and platform specific support for NMI
+Watchdog. Uses the GTI system timer device to setup per-core
+watchdog timers which are programmed in "interrupt + del3t +
+reset mode" and del3t traps are not enabled. 1st timer
+expiration causes secure interrupt handler to execute in el3
+which simulates an exception return to a registered nmi kernel
+callback which in turn dumps register/context state on all
+cpu's. 3rd timer expiration will trigger a system-wide core
+reset.
+
+The kernel nmi callback is registered with ATF by addition
+of a new service as part of ARM Trusted Firmware Marvell
+SMC interface.
+
+Signed-off-by: Ashish Kalra <akalra@marvell.com>
+
+Change-Id: I69e2759473817223338b7addf9a2c9b0cede5e8b
+Reviewed-on: https://sj1git1.cavium.com/9127
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ arch/arm64/kernel/entry.S              |  29 +++
+ drivers/soc/marvell/Kconfig            |  11 ++
+ drivers/soc/marvell/Makefile           |   1 +
+ drivers/soc/marvell/gti/Makefile       |   8 +
+ drivers/soc/marvell/gti/gti.c          |  74 ++++++++
+ drivers/soc/marvell/gti/gti.h          |  17 ++
+ drivers/soc/marvell/gti/gti_watchdog.c | 235 +++++++++++++++++++++++++
+ 7 files changed, 375 insertions(+)
+ create mode 100644 drivers/soc/marvell/gti/Makefile
+ create mode 100644 drivers/soc/marvell/gti/gti.c
+ create mode 100644 drivers/soc/marvell/gti/gti.h
+ create mode 100644 drivers/soc/marvell/gti/gti_watchdog.c
+
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index 6a7d53134da6..634df447a875 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -202,8 +202,25 @@ alternative_cb_end
+ 	str	x20, [tsk, #TSK_TI_ADDR_LIMIT]
+ 	/* No need to reset PSTATE.UAO, hardware's already set it to 0 for us */
+ 	.endif /* \el == 0 */
++
++#ifdef CONFIG_GTI_WATCHDOG
++	.if	\el == 3
++	/*
++	 * load elr, spsr in case of simulated exception return from
++	 * elr_el12, spsr_el12 which are used as scratch registers
++	 * to store interrupted register context by nmi handler in el3,
++	 * as elr_el2 & spsr_el2 will be used for simulated return to
++	 * el1/el2 by el3 nmi handler.
++	 */
++	mrs	x22, S3_5_C4_C0_1
++	mrs	x23, S3_5_C4_C0_0
++	.else
++#endif
+ 	mrs	x22, elr_el1
+ 	mrs	x23, spsr_el1
++#ifdef CONFIG_GTI_WATCHDOG
++	.endif	/* \el == 3 */
++#endif
+ 	stp	lr, x21, [sp, #S_LR]
+ 
+ 	/*
+@@ -896,6 +913,18 @@ el0_error_naked:
+ 	b	ret_to_user
+ ENDPROC(el0_error)
+ 
++#ifdef CONFIG_GTI_WATCHDOG
++.globl el1_nmi_callback
++el1_nmi_callback:
++       /*
++        * Simulate an exception return at same ELx, for example,
++        * exception entry and pstate are loaded from ELR_ELx and SPSR_ELx.
++        */
++       sub     sp, sp, #S_FRAME_SIZE
++       kernel_entry 3
++       mov     x0, sp
++       bl      nmi_kernel_callback
++#endif
+ 
+ /*
+  * This is the fast syscall return path.  We do as little as possible here,
+diff --git a/drivers/soc/marvell/Kconfig b/drivers/soc/marvell/Kconfig
+index d96cbc842071..bf4cb573b8ca 100644
+--- a/drivers/soc/marvell/Kconfig
++++ b/drivers/soc/marvell/Kconfig
+@@ -75,4 +75,15 @@ config OCTEONTX2_DPI_PF
+ 	  DPI (DMA packet interface) provides DMA support for MAC.
+ 	  This driver intializes dpi PF device and enables VF's for supporting
+ 	  different types of DMA transfers.
++
++config GTI_WATCHDOG
++       tristate "GTI Watchdog driver"
++	depends on ARM64 && ARM64_VHE
++	---help---
++	GTI Watchdog driver, provides ioctl's for applications to
++	setup and disable the NMI Watchdog and also provides an
++	mmap() interface to map GTI device memory into process
++	address space for the application to directly poke the
++	GTI watchdog without any kernel support and entry.
++
+ endmenu
+diff --git a/drivers/soc/marvell/Makefile b/drivers/soc/marvell/Makefile
+index 1d90ab9270ba..bd583b508669 100644
+--- a/drivers/soc/marvell/Makefile
++++ b/drivers/soc/marvell/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-y		+= octeontx2-rm/
+ obj-y		+= octeontx2-dpi/
++obj-y		+= gti/
+diff --git a/drivers/soc/marvell/gti/Makefile b/drivers/soc/marvell/gti/Makefile
+new file mode 100644
+index 000000000000..51ee43c541a3
+--- /dev/null
++++ b/drivers/soc/marvell/gti/Makefile
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for Marvell's GTI Watchdog driver
++#
++
++obj-$(CONFIG_GTI_WATCHDOG) += gti_wdog.o
++
++gti_wdog-y := gti_watchdog.o gti.o
+diff --git a/drivers/soc/marvell/gti/gti.c b/drivers/soc/marvell/gti/gti.c
+new file mode 100644
+index 000000000000..5980f793d006
+--- /dev/null
++++ b/drivers/soc/marvell/gti/gti.c
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell GTI Watchdog driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/kernel.h>
++#include <linux/arm-smccc.h>
++#include <linux/cpu.h>
++#include <linux/nmi.h>
++#include <linux/module.h>
++#include <linux/irq.h>
++#include <linux/sched/debug.h>
++
++#include "gti.h"
++
++#define GTI_CWD_WDOG_POKE(a) (0x50000ll + 8ll * ((a) & 0x3f))
++
++/* Kernel exception simulation wrapper for the NMI callback */
++void nmi_kernel_callback_other_cpus(void *unused)
++{
++	struct pt_regs *regs = get_irq_regs();
++
++	pr_emerg("Watchdog CPU:%d\n", raw_smp_processor_id());
++
++	if (regs)
++		show_regs(regs);
++	else
++		dump_stack();
++}
++
++void nmi_kernel_callback(struct pt_regs *regs)
++{
++	int c;
++
++	pr_emerg("Watchdog CPU:%d Hard LOCKUP\n", raw_smp_processor_id());
++
++	if (regs)
++		show_regs(regs);
++	else
++		dump_stack();
++
++	for_each_online_cpu(c) {
++		if (c == raw_smp_processor_id())
++			continue;
++		/*
++		 * We are making a synchronous call to other cores and
++		 * waiting for those cores to dump their state/context,
++		 * if one of the cores is hanged or unable to respond
++		 * to interrupts, we can wait here forever, currently
++		 * depending on our NMI timer to trigger a system-wide
++		 * warm reset to break out of such deadlocks.
++		 */
++		smp_call_function_single(c,
++			 nmi_kernel_callback_other_cpus, NULL, 1);
++	}
++
++	/*
++	 * FIXME: Add a new SMC interface to clear a per-core watchdog.
++	 * Also, importantly add support for recovery here and return to the
++	 * interrupted state via el3.
++	 */
++	for (;;) {
++		/* Poke the Watchdog */
++		if (g_gti_devmem) {
++			writeq(0, g_gti_devmem +
++				GTI_CWD_WDOG_POKE(raw_smp_processor_id()));
++		}
++	}
++}
+diff --git a/drivers/soc/marvell/gti/gti.h b/drivers/soc/marvell/gti/gti.h
+new file mode 100644
+index 000000000000..18ac17cd783b
+--- /dev/null
++++ b/drivers/soc/marvell/gti/gti.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Marvell GTI Watchdog driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#define OCTEONTX_INSTALL_WDOG           0xc2000c01
++#define OCTEONTX_REMOVE_WDOG            0xc2000c02
++
++/* Kernel exception simulation wrapper for the NMI callback */
++extern void el1_nmi_callback(void);
++void nmi_kernel_callback(struct pt_regs *regs);
++extern void __iomem *g_gti_devmem;
+diff --git a/drivers/soc/marvell/gti/gti_watchdog.c b/drivers/soc/marvell/gti/gti_watchdog.c
+new file mode 100644
+index 000000000000..eadee0a6949b
+--- /dev/null
++++ b/drivers/soc/marvell/gti/gti_watchdog.c
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell GTI Watchdog driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/platform_device.h>
++#include <linux/arm-smccc.h>
++#include <linux/cpu.h>
++#include <linux/io.h>
++#include <linux/fs.h>
++#include <linux/miscdevice.h>
++#include <linux/ioctl.h>
++#include <linux/uaccess.h>
++#include <linux/pci.h>
++
++#include "gti.h"
++
++#define DRV_NAME        "gti-watchdog"
++#define DRV_VERSION     "1.0"
++
++MODULE_AUTHOR("Marvell International Ltd.");
++MODULE_DESCRIPTION("Marvell GTI Watchdog Driver");
++MODULE_LICENSE("GPL v2");
++MODULE_VERSION(DRV_VERSION);
++
++#define GTI_WDOG_MAGIC			'G'
++#define SET_WATCHDOG			0x01
++#define CLEAR_WATCHDOG			0x02
++#define GTI_SET_WATCHDOG		_IOW(GTI_WDOG_MAGIC,	\
++						SET_WATCHDOG, void *)
++#define GTI_CLEAR_WATCHDOG		_IOW(GTI_WDOG_MAGIC,	\
++						CLEAR_WATCHDOG, void *)
++
++struct set_watchdog_args {
++	uint64_t	watchdog_timeout_ms;
++	uint64_t	core_mask;
++};
++
++static unsigned long g_mmio_base;
++void __iomem *g_gti_devmem;
++
++static void cleanup_gti_watchdog(void)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_REMOVE_WDOG, 0, 0, 0, 0, 0, 0, 0, &res);
++
++	if (!res.a0)
++		pr_warn("Failed to remove/clear watchdog handler: %ld\n",
++			 res.a0);
++}
++
++static int gti_wdog_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static int gti_wdog_close(struct inode *inode, struct file *file)
++{
++	cleanup_gti_watchdog();
++	return 0;
++}
++
++void install_gti_cwd_wdog_secondary_cores(void *arg)
++{
++	struct set_watchdog_args *watchdog_args =
++		(struct set_watchdog_args *)arg;
++	struct arm_smccc_res res;
++
++	pr_info("Installing GTI CWD on CPU %d\n", raw_smp_processor_id());
++
++	arm_smccc_smc(OCTEONTX_INSTALL_WDOG, (uintptr_t)&el1_nmi_callback,
++		smp_processor_id(), watchdog_args->watchdog_timeout_ms,
++		watchdog_args->core_mask, 0, 0, 0, &res);
++
++	if (!res.a0)
++		pr_warn("Failed to install watchdog handler on core %d : %ld\n",
++				raw_smp_processor_id(), res.a0);
++}
++
++void install_gti_cwd_wdog_all_cores(struct set_watchdog_args *watchdog_args)
++{
++	struct arm_smccc_res res;
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++
++		if (!(watchdog_args->core_mask & (1 << cpu)))
++			continue;
++
++		smp_call_function_single(cpu,
++				install_gti_cwd_wdog_secondary_cores,
++				(void *)watchdog_args, 1);
++	}
++
++	/*
++	 * The last call actually sets up the wdog timers and
++	 * enables the interrupts.
++	 */
++
++	pr_info("Setting and enable wdog timer on core %d\n", nr_cpu_ids);
++
++	arm_smccc_smc(OCTEONTX_INSTALL_WDOG, (uintptr_t)&el1_nmi_callback,
++		nr_cpu_ids, watchdog_args->watchdog_timeout_ms,
++		watchdog_args->core_mask, 0, 0, 0, &res);
++
++	if (!res.a0)
++		pr_warn("Failed to install watchdog handler on core %d : %ld\n",
++				nr_cpu_ids, res.a0);
++}
++
++static long gti_wdog_ioctl(struct file *file, unsigned int cmd,
++	unsigned long arg)
++{
++	struct set_watchdog_args watchdog_args;
++
++	if (cmd == GTI_SET_WATCHDOG) {
++		pr_info("OCTEONTX_INSTALL_WDOG\n");
++
++		if (copy_from_user(&watchdog_args, (char *)arg,
++			sizeof(struct set_watchdog_args)))
++			return -EFAULT;
++
++		pr_info("timeout = %lld, core_mask = 0x%llx\n",
++			watchdog_args.watchdog_timeout_ms,
++			watchdog_args.core_mask);
++
++		install_gti_cwd_wdog_all_cores(&watchdog_args);
++
++	} else if (cmd == GTI_CLEAR_WATCHDOG) {
++		pr_info("OCTEONTX_CLEAR_WDOG\n");
++
++		cleanup_gti_watchdog();
++	} else {
++		return -ENOTTY;
++	}
++	return 0;
++}
++
++static int gti_wdog_mmap(struct file *filp, struct vm_area_struct *vma)
++{
++	unsigned long size = vma->vm_end - vma->vm_start;
++	int ret;
++
++	pr_info("%s invoked, size = %ld\n", __func__, size);
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++
++	ret = io_remap_pfn_range(vma, vma->vm_start,
++				g_mmio_base >> PAGE_SHIFT,
++				size, vma->vm_page_prot);
++	if (ret) {
++		pr_info("%s failed, ret = %d\n", __func__, ret);
++		return -EAGAIN;
++	}
++
++	return 0;
++}
++
++static const struct file_operations gti_wdog_fops = {
++	.owner = THIS_MODULE,
++	.open = gti_wdog_open,
++	.release = gti_wdog_close,
++	.unlocked_ioctl = gti_wdog_ioctl,
++	.mmap  = gti_wdog_mmap,
++};
++
++static struct miscdevice gti_wdog_miscdevice = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "gti_watchdog",
++	.fops = &gti_wdog_fops,
++};
++
++static int __init gti_wdog_probe(struct platform_device *pdev)
++{
++	struct resource *r;
++	int ret_val;
++
++	pr_info("gti wdog platform driver init\n");
++
++	/* get our first memory resource from the device tree */
++	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!r) {
++		pr_err("IORESOURCE_MEM, 0 does not exist\n");
++		return -EINVAL;
++	}
++	pr_info("r->start = 0x%08lx\n", (unsigned long int)r->start);
++	pr_info("r->end = 0x%08lx\n", (unsigned long int)r->end);
++	g_mmio_base = r->start;
++
++	g_gti_devmem = devm_ioremap_resource(&pdev->dev, r);
++	if (IS_ERR(g_gti_devmem))
++		pr_warn("Could not ioremap gti device memory\n");
++
++	ret_val = misc_register(&gti_wdog_miscdevice);
++	if (ret_val != 0) {
++		if (g_gti_devmem)
++			devm_iounmap(&pdev->dev, g_gti_devmem);
++		pr_warn("Could not register gti wdog misc device\n");
++	}
++
++	return 0;
++}
++
++static int __exit gti_wdog_remove(struct platform_device *pdev)
++{
++	pr_info("gti wdog platform driver exit\n");
++	if (g_gti_devmem)
++		devm_iounmap(&pdev->dev, g_gti_devmem);
++	misc_deregister(&gti_wdog_miscdevice);
++	return 0;
++}
++
++static const struct of_device_id gti_wdog_of_ids[] = {
++	{ .compatible = "arm,armv8-timer"},
++	{},
++};
++
++static struct platform_driver gti_wdog_driver = {
++	.probe = gti_wdog_probe,
++	.remove = gti_wdog_remove,
++	.driver = {
++		.name = "gti_watchdog",
++		.of_match_table = gti_wdog_of_ids,
++		.owner = THIS_MODULE,
++	},
++};
++
++module_platform_driver(gti_wdog_driver);
+-- 
+2.17.1
+

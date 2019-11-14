@@ -1,0 +1,120 @@
+From b9d314562ff2430d57d726d62897b90e8b145fb4 Mon Sep 17 00:00:00 2001
+From: Peter Swain <pswain@cavium.com>
+Date: Wed, 13 Feb 2019 00:32:14 -0800
+Subject: [PATCH 007/386] mmc: cavium: fix swiotlb buffer is full
+
+When using iommu.passthrough=1, the maximum dma size is
+limited by swiotlb size.  OcteonTX platforms do not need
+swiotlb, but iommu-passthru (a useful development option)
+forces it.  So adapt the size cap from Yoshihiro Shimoda's
+commit e90e8da72ad6 ("mmc: tmio: fix swiotlb buffer is full").
+
+Passthru reduces peak i/o rate on large requests, but could
+improve random filesystem performance slightly on some loads
+(hdparm -t down ~5%, mke2fs up ~15%)
+
+To get back some of that performance loss, the irqs are
+specified as non-threaded, as the persistent state is all
+contained in host->current_req, so no thread context needed.
+
+Signed-off-by: Peter Swain <pswain@marvell.com>
+
+Change-Id: I256729f8ff0ef194e6c57dda000c7341cac446f4
+Reviewed-on: https://sj1git1.cavium.com/3944
+Tested-by: sa_ip-sw-jenkins
+Reviewed-by: Chandrakala Chavva <Chandrakala.Chavva@cavium.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ drivers/mmc/host/cavium-octeon.c   |  8 ++++----
+ drivers/mmc/host/cavium-thunderx.c |  4 ++--
+ drivers/mmc/host/cavium.c          | 17 +++++++++++++++++
+ 3 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/mmc/host/cavium-octeon.c b/drivers/mmc/host/cavium-octeon.c
+index d7d70798cb7c..302c052b8d93 100644
+--- a/drivers/mmc/host/cavium-octeon.c
++++ b/drivers/mmc/host/cavium-octeon.c
+@@ -247,8 +247,8 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 		/* Only CMD_DONE, DMA_DONE, CMD_ERR, DMA_ERR */
+ 		for (i = 1; i <= 4; i++) {
+ 			ret = devm_request_irq(&pdev->dev, mmc_irq[i],
+-					       cvm_mmc_interrupt,
+-					       0, cvm_mmc_irq_names[i], host);
++				cvm_mmc_interrupt, IRQF_NO_THREAD,
++				cvm_mmc_irq_names[i], host);
+ 			if (ret < 0) {
+ 				dev_err(&pdev->dev, "Error: devm_request_irq %d\n",
+ 					mmc_irq[i]);
+@@ -257,8 +257,8 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 		}
+ 	} else {
+ 		ret = devm_request_irq(&pdev->dev, mmc_irq[0],
+-				       cvm_mmc_interrupt, 0, KBUILD_MODNAME,
+-				       host);
++				cvm_mmc_interrupt, IRQF_NO_THREAD,
++				KBUILD_MODNAME, host);
+ 		if (ret < 0) {
+ 			dev_err(&pdev->dev, "Error: devm_request_irq %d\n",
+ 				mmc_irq[0]);
+diff --git a/drivers/mmc/host/cavium-thunderx.c b/drivers/mmc/host/cavium-thunderx.c
+index 94812e67320f..4a16f22626c3 100644
+--- a/drivers/mmc/host/cavium-thunderx.c
++++ b/drivers/mmc/host/cavium-thunderx.c
+@@ -46,8 +46,8 @@ static int thunder_mmc_register_interrupts(struct cvm_mmc_host *host,
+ 	/* register interrupts */
+ 	for (i = 0; i < nvec; i++) {
+ 		ret = devm_request_irq(&pdev->dev, pci_irq_vector(pdev, i),
+-				       cvm_mmc_interrupt,
+-				       0, cvm_mmc_irq_names[i], host);
++				       cvm_mmc_interrupt, IRQF_NO_THREAD,
++				       cvm_mmc_irq_names[i], host);
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/mmc/host/cavium.c b/drivers/mmc/host/cavium.c
+index 834d56f1fd29..5fee4d2624e9 100644
+--- a/drivers/mmc/host/cavium.c
++++ b/drivers/mmc/host/cavium.c
+@@ -25,6 +25,8 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/scatterlist.h>
+ #include <linux/time.h>
++#include <linux/iommu.h>
++#include <linux/swiotlb.h>
+ 
+ #include "cavium.h"
+ 
+@@ -1551,6 +1553,7 @@ int cvm_mmc_of_slot_probe(struct device *dev, struct cvm_mmc_host *host)
+ {
+ 	struct cvm_mmc_slot *slot;
+ 	struct mmc_host *mmc;
++	struct iommu_domain *dom;
+ 	int ret, id;
+ 
+ 	mmc = mmc_alloc_host(sizeof(struct cvm_mmc_slot), dev);
+@@ -1594,6 +1597,20 @@ int cvm_mmc_of_slot_probe(struct device *dev, struct cvm_mmc_host *host)
+ 	mmc->max_blk_size = 512;
+ 	/* DMA block count field is 15 bits */
+ 	mmc->max_blk_count = 32767;
++
++	dom = iommu_get_domain_for_dev(dev->parent);
++	if (dom && dom->type == IOMMU_DOMAIN_IDENTITY) {
++		unsigned int max_size = (1 << IO_TLB_SHIFT) * IO_TLB_SEGSIZE;
++
++		if (mmc->max_seg_size > max_size)
++			mmc->max_seg_size = max_size;
++
++		max_size *= mmc->max_segs;
++
++		if (mmc->max_req_size > max_size)
++			mmc->max_req_size = max_size;
++	}
++
+ 	mmc_can_retune(mmc);
+ 
+ 	slot->clock = mmc->f_min;
+-- 
+2.17.1
+

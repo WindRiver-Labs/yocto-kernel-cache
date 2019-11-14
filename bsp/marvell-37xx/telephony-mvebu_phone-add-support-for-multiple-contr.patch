@@ -1,0 +1,1369 @@
+From 78188163d176fc84c13a62049e22ba5cc13bf42c Mon Sep 17 00:00:00 2001
+From: Marcin Wojtas <mw@semihalf.com>
+Date: Thu, 25 Jul 2019 00:42:43 +0200
+Subject: [PATCH 355/386] telephony: mvebu_phone: add support for multiple
+ controllers
+
+CN913x SoC family can hold multiple TDM controllers. In order
+to support all of them simultaneously the mvebu_phone and
+the TAL (Telephony Adaptation Layer) required modifications.
+
+After the preparation commits, this patch introduces remaining
+changes, allowing to pass the controllers device structure
+throughout entire API. It had to be done in a single commit in order
+not to break the compilation of the kernel.
+
+Main modifications:
+* Remove 'struct mv_phone_dev *priv' and attach it to controller's
+  struct device via dev_set_drvdata in probe. It can be later retrieved
+  via dev_get_drvdata helper routine.
+* Remove global 'struct tdmmc_dev *tdmmc' - allocate it for each used
+  instance and pass to low-level tdmmc routines.
+* Due to TAL API change, the example tal_dev interface was updated
+  accordingly:
+  - initialize and register /dev/talX miscdevice for each controller, using
+    a new TAL callback tal_dev_init(). This, together with modified
+    tal_set_if routine allow to connect TDM controller with other drivers.
+    tal_dev.c is a ready-to-use example of it, but can be replaced with
+    other implementations, depending on the architecture.
+  - remove all global variables and keep them in the
+    new 'struct tal_device'
+  - miscdevice file private_data and the 'struct tal_device'
+  - tal_dev.c is now not independently initialized module, but fully TAL
+    dependent API
+
+As a result of this patch all TDM interfaces of CN913x (maximum 3)
+can work at the same time, using unique data passed via updated
+TAL layer.
+
+Change-Id: I25bc44bfd7bb8a4700175d01f03ecd96d3fc23bd
+Signed-off-by: Marcin Wojtas <mw@semihalf.com>
+Reviewed-on: https://sj1git1.cavium.com/12963
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+[RH: Original patch taken from marvell 88F3720 board support SDK 10.0-PR2003]
+Signed-off-by: Ruiqiang Hao <Ruiqiang.Hao@windriver.com>
+---
+ drivers/telephony/mvebu_phone/mv_phone.h     |  11 +-
+ drivers/telephony/mvebu_phone/mv_phone_dev.c | 144 +++++++++++------
+ drivers/telephony/mvebu_phone/tal/tal.c      |  43 +++--
+ drivers/telephony/mvebu_phone/tal/tal.h      |  50 ++++--
+ drivers/telephony/mvebu_phone/tal/tal_dev.c  | 160 ++++++++++---------
+ drivers/telephony/mvebu_phone/tdmmc/tdmmc.c  |  67 ++++----
+ drivers/telephony/mvebu_phone/tdmmc/tdmmc.h  |  18 +--
+ 7 files changed, 293 insertions(+), 200 deletions(-)
+
+diff --git a/drivers/telephony/mvebu_phone/mv_phone.h b/drivers/telephony/mvebu_phone/mv_phone.h
+index 0172362b63f2..4047d15e9b85 100644
+--- a/drivers/telephony/mvebu_phone/mv_phone.h
++++ b/drivers/telephony/mvebu_phone/mv_phone.h
+@@ -15,6 +15,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+ #include <linux/mbus.h>
++#include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+@@ -142,6 +143,7 @@ struct mv_phone_dev {
+ 	u32 tdm_misc_reg;
+ 
+ 	struct device *dev;
++	struct miscdevice miscdev;
+ 
+ 	/* Transmit buffers */
+ 	u8 *rx_buff;
+@@ -174,6 +176,9 @@ struct mv_phone_dev {
+ 	/* TDMMC silicon revision */
+ 	enum tdmmc_ip_version tdmmc_ip_ver;
+ 
++	/* TDMMC low-level data */
++	struct tdmmc_dev *tdmmc;
++
+ 	/* Tasklets */
+ 	struct tasklet_struct tdm_if_rx_tasklet;
+ 	struct tasklet_struct tdm_if_tx_tasklet;
+@@ -234,10 +239,12 @@ int tdm2c_intr_low(struct mv_phone_intr_info *tdm_intr_info);
+ void tdm2c_ext_stats_get(struct mv_phone_extended_stats *tdm_ext_stats);
+ 
+ /* TDMMC */
+-int tdmmc_init(void __iomem *base, struct device *dev,
++int tdmmc_init(struct tdmmc_dev *tdmmc,
++	       void __iomem *base, struct device *dev,
+ 	       struct mv_phone_params *tdm_params,
+ 	       enum mv_phone_frame_ts frame_ts,
+ 	       enum tdmmc_ip_version tdmmc_ip_ver);
+-int tdmmc_intr_low(struct mv_phone_intr_info *tdm_intr_info);
++int tdmmc_intr_low(struct tdmmc_dev *tdmmc,
++		   struct mv_phone_intr_info *tdm_intr_info);
+ 
+ #endif /* _MV_PHONE_H_ */
+diff --git a/drivers/telephony/mvebu_phone/mv_phone_dev.c b/drivers/telephony/mvebu_phone/mv_phone_dev.c
+index c5588ed4994d..7f493f648951 100644
+--- a/drivers/telephony/mvebu_phone/mv_phone_dev.c
++++ b/drivers/telephony/mvebu_phone/mv_phone_dev.c
+@@ -18,12 +18,10 @@
+ 
+ #define DRV_NAME "mvebu_phone"
+ 
+-/* Globals */
+-static struct mv_phone_dev *priv;
+-
+ /* Statistic printout in userspace via /proc/tdm */
+ static int mv_phone_status_show(struct seq_file *m, void *v)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)m->private;
+ 	struct mv_phone_extended_stats tdm_ext_stats;
+ 
+ 	seq_printf(m, "tdm_init:	%u\n", priv->tdm_init);
+@@ -70,8 +68,9 @@ static const struct file_operations mv_phone_operations = {
+ /* TAL callbacks */
+ 
+ /* PCM start */
+-static void tdm2c_if_pcm_start(void)
++static void tdm2c_if_pcm_start(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	unsigned long flags;
+ 	u32 max_poll = 0;
+ 
+@@ -124,8 +123,9 @@ static void tdm2c_if_pcm_start(void)
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+-static void tdmmc_if_pcm_start(void)
++static void tdmmc_if_pcm_start(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+@@ -138,14 +138,15 @@ static void tdmmc_if_pcm_start(void)
+ 	priv->pcm_enable = true;
+ 	priv->rx_buff = NULL;
+ 	priv->tx_buff = NULL;
+-	tdmmc_pcm_start();
++	tdmmc_pcm_start(priv->tdmmc);
+ 
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+ /* PCM stop */
+-static void tdm2c_if_pcm_stop(void)
++static void tdm2c_if_pcm_stop(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+@@ -168,8 +169,9 @@ static void tdm2c_if_pcm_stop(void)
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+-static void tdmmc_if_pcm_stop(void)
++static void tdmmc_if_pcm_stop(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+@@ -180,14 +182,15 @@ static void tdmmc_if_pcm_stop(void)
+ 	}
+ 
+ 	priv->pcm_enable = false;
+-	tdmmc_pcm_stop();
++	tdmmc_pcm_stop(priv->tdmmc);
+ 
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+ /* TDM low-level initialization */
+-static int tdm_hw_init(struct mv_phone_params *tdm_params)
++static int tdm_hw_init(struct mv_phone_params *tdm_params, struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	enum mv_phone_frame_ts frame_ts;
+ 	int ret;
+ 
+@@ -217,14 +220,26 @@ static int tdm_hw_init(struct mv_phone_params *tdm_params)
+ 
+ 		break;
+ 	case MV_TDM_UNIT_TDMMC:
+-		ret = tdmmc_init(priv->tdm_base, priv->dev, tdm_params,
++		/* Allocate or reset the main tdmmc structure */
++		if (!priv->tdmmc) {
++			priv->tdmmc = devm_kzalloc(dev,
++						   sizeof(struct tdmmc_dev),
++						   GFP_KERNEL);
++			if (!priv->tdmmc)
++				return -ENOMEM;
++		} else {
++			memset(priv->tdmmc, 0,  sizeof(struct tdmmc_dev));
++		}
++
++		/* Initialize tdmmc HW */
++		ret = tdmmc_init(priv->tdmmc, priv->tdm_base, dev, tdm_params,
+ 				 frame_ts, priv->tdmmc_ip_ver);
+ 
+ 		/* Issue SLIC reset */
+-		ret |= tdmmc_reset_slic();
++		ret |= tdmmc_reset_slic(priv->tdmmc);
+ 
+ 		/* WA to stop the MCDMA gracefully after tdmmc initialization */
+-		tdmmc_if_pcm_stop();
++		tdmmc_if_pcm_stop(dev);
+ 
+ 		break;
+ 	default:
+@@ -243,6 +258,7 @@ static int tdm_hw_init(struct mv_phone_params *tdm_params)
+ /* Common interrupt top-half handler */
+ static irqreturn_t tdm_if_isr(int irq, void *dev_id)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)dev_id;
+ 	struct mv_phone_intr_info tdm_int_info;
+ 	u32 int_type;
+ 	int ret = 0;
+@@ -253,7 +269,7 @@ static irqreturn_t tdm_if_isr(int irq, void *dev_id)
+ 		ret = tdm2c_intr_low(&tdm_int_info);
+ 		break;
+ 	case MV_TDM_UNIT_TDMMC:
+-		tdmmc_intr_low(&tdm_int_info);
++		tdmmc_intr_low(priv->tdmmc, &tdm_int_info);
+ 		break;
+ 	default:
+ 		dev_err(&priv->parent->dev,
+@@ -283,7 +299,7 @@ static irqreturn_t tdm_if_isr(int irq, void *dev_id)
+ 		 */
+ 		if (!priv->rx_buff && !priv->tx_buff) {
+ 			dev_dbg(priv->dev, "Stopping the TDM\n");
+-			tdm2c_if_pcm_stop();
++			tdm2c_if_pcm_stop(priv->dev);
+ 			priv->pcm_stop_flag = false;
+ 			tasklet_hi_schedule(&priv->tdm2c_if_reset_tasklet);
+ 		} else {
+@@ -360,6 +376,7 @@ static irqreturn_t tdm_if_isr(int irq, void *dev_id)
+ /* Rx tasklets */
+ static void tdm2c_if_pcm_rx_process(unsigned long arg)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)arg;
+ 	unsigned long flags;
+ 
+ 	if (priv->pcm_enable) {
+@@ -372,7 +389,7 @@ static void tdm2c_if_pcm_rx_process(unsigned long arg)
+ 		/* Fill TDM Rx aggregated buffer */
+ 		if (tdm2c_rx(priv->rx_buff) == 0)
+ 			/* Dispatch Rx handler */
+-			tal_mmp_rx(priv->rx_buff, priv->buff_size);
++			tal_mmp_rx(priv->dev, priv->rx_buff, priv->buff_size);
+ 		else
+ 			dev_warn(priv->dev, "%s: Could not fill Rx buffer\n",
+ 				 __func__);
+@@ -385,7 +402,7 @@ static void tdm2c_if_pcm_rx_process(unsigned long arg)
+ 
+ 	if (priv->pcm_stop_flag && !priv->tx_buff) {
+ 		dev_dbg(priv->dev, "Stopping TDM from Rx tasklet\n");
+-		tdm2c_if_pcm_stop();
++		tdm2c_if_pcm_stop(priv->dev);
+ 		spin_lock_irqsave(&priv->lock, flags);
+ 		priv->pcm_stop_flag = false;
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+@@ -395,6 +412,7 @@ static void tdm2c_if_pcm_rx_process(unsigned long arg)
+ 
+ static void tdmmc_if_pcm_rx_process(unsigned long arg)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)arg;
+ 	unsigned long flags;
+ 
+ 	if (priv->pcm_enable) {
+@@ -404,9 +422,9 @@ static void tdmmc_if_pcm_rx_process(unsigned long arg)
+ 			return;
+ 		}
+ 
+-		if (tdmmc_rx(priv->rx_buff) == 0)
++		if (tdmmc_rx(priv->tdmmc, priv->rx_buff) == 0)
+ 			/* Dispatch Rx handler */
+-			tal_mmp_rx(priv->rx_buff, priv->buff_size);
++			tal_mmp_rx(priv->dev, priv->rx_buff, priv->buff_size);
+ 		else
+ 			dev_warn(priv->dev, "%s: could not fill Rx buffer\n",
+ 				 __func__);
+@@ -421,6 +439,7 @@ static void tdmmc_if_pcm_rx_process(unsigned long arg)
+ /* Tx tasklets */
+ static void tdm2c_if_pcm_tx_process(unsigned long arg)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)arg;
+ 	unsigned long flags;
+ 
+ 	if (priv->pcm_enable) {
+@@ -431,7 +450,7 @@ static void tdm2c_if_pcm_tx_process(unsigned long arg)
+ 		}
+ 
+ 		/* Dispatch Tx handler */
+-		tal_mmp_tx(priv->tx_buff, priv->buff_size);
++		tal_mmp_tx(priv->dev, priv->tx_buff, priv->buff_size);
+ 
+ 		if (!priv->test_enable) {
+ 			/* Fill Tx aggregated buffer */
+@@ -449,7 +468,7 @@ static void tdm2c_if_pcm_tx_process(unsigned long arg)
+ 
+ 	if (priv->pcm_stop_flag && !priv->rx_buff) {
+ 		dev_dbg(priv->dev, "Stopping TDM from Tx tasklet\n");
+-		tdm2c_if_pcm_stop();
++		tdm2c_if_pcm_stop(priv->dev);
+ 		spin_lock_irqsave(&priv->lock, flags);
+ 		priv->pcm_stop_flag = false;
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+@@ -459,6 +478,7 @@ static void tdm2c_if_pcm_tx_process(unsigned long arg)
+ 
+ static void tdmmc_if_pcm_tx_process(unsigned long arg)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)arg;
+ 	unsigned long flags;
+ 
+ 	if (priv->pcm_enable) {
+@@ -469,10 +489,10 @@ static void tdmmc_if_pcm_tx_process(unsigned long arg)
+ 		}
+ 
+ 		/* Dispatch Tx handler */
+-		tal_mmp_tx(priv->tx_buff, priv->buff_size);
++		tal_mmp_tx(priv->dev, priv->tx_buff, priv->buff_size);
+ 
+ 		if (!priv->test_enable) {
+-			if (tdmmc_tx(priv->tx_buff) != 0)
++			if (tdmmc_tx(priv->tdmmc, priv->tx_buff) != 0)
+ 				dev_warn(priv->dev,
+ 					 "%s: Could not fill Tx buffer\n",
+ 					 __func__);
+@@ -488,6 +508,7 @@ static void tdmmc_if_pcm_tx_process(unsigned long arg)
+ /* TDM2C restart channel callback */
+ static void tdm2c_if_reset_channels(unsigned long arg)
+ {
++	struct mv_phone_dev *priv = (struct mv_phone_dev *)arg;
+ 	u32 max_poll = 0;
+ 	unsigned long flags;
+ 
+@@ -515,12 +536,13 @@ static void tdm2c_if_reset_channels(unsigned long arg)
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ 
+ 	/* Restart channels */
+-	tdm2c_if_pcm_start();
++	tdm2c_if_pcm_start(priv->dev);
+ }
+ 
+ /* Main TDM initialization routine */
+-int tdm_if_init(struct tal_params *tal_params)
++int tdm_if_init(struct device *dev, struct tal_params *tal_params)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	struct mv_phone_params tdm_params;
+ 	int i, irqs_requested, ret;
+ 
+@@ -555,7 +577,7 @@ int tdm_if_init(struct tal_params *tal_params)
+ 	memcpy(&tdm_params, tal_params, sizeof(struct mv_phone_params));
+ 
+ 	/* TDM hardware initialization */
+-	ret = tdm_hw_init(&tdm_params);
++	ret = tdm_hw_init(&tdm_params, priv->dev);
+ 	if (ret) {
+ 		dev_err(priv->dev, "%s: TDM initialization failed\n", __func__);
+ 		return ret;
+@@ -595,11 +617,12 @@ int tdm_if_init(struct tal_params *tal_params)
+ }
+ 
+ /* Disable TDM2C PCM */
+-void tdm2c_pcm_disable(void)
++void tdm2c_pcm_disable(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	u32 max_poll = 0;
+ 
+-	tdm2c_if_pcm_stop();
++	tdm2c_if_pcm_stop(priv->dev);
+ 
+ 	while (priv->pcm_is_stopping && (max_poll <
+ 	       MV_TDM_STOP_POLLING_TIMEOUT)) {
+@@ -614,8 +637,9 @@ void tdm2c_pcm_disable(void)
+ }
+ 
+ /* Main TDM deinitialization routine */
+-void tdm_if_exit(void)
++void tdm_if_exit(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	int i;
+ 
+ 	/* Check if already stopped */
+@@ -626,10 +650,10 @@ void tdm_if_exit(void)
+ 	if (priv->pcm_enable) {
+ 		switch (priv->tdm_type) {
+ 		case MV_TDM_UNIT_TDM2C:
+-			tdm2c_pcm_disable();
++			tdm2c_pcm_disable(dev);
+ 			break;
+ 		case MV_TDM_UNIT_TDMMC:
+-			tdmmc_if_pcm_stop();
++			tdmmc_if_pcm_stop(dev);
+ 			break;
+ 		default:
+ 			dev_err(&priv->parent->dev, "%s: undefined TDM type\n",
+@@ -644,7 +668,7 @@ void tdm_if_exit(void)
+ 			tdm2c_release();
+ 			break;
+ 		case MV_TDM_UNIT_TDMMC:
+-			tdmmc_release();
++			tdmmc_release(priv->tdmmc);
+ 			break;
+ 		default:
+ 			dev_err(&priv->parent->dev, "%s: undefined TDM type\n",
+@@ -665,6 +689,9 @@ void tdm_if_exit(void)
+ 
+ static int tdm_if_control(int cmd, void *arg)
+ {
++	struct device *dev = (struct device *)arg;
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
++
+ 	switch (cmd) {
+ 	case TDM_DEV_TDM_TEST_MODE_ENABLE:
+ 		priv->test_enable = true;
+@@ -681,24 +708,30 @@ static int tdm_if_control(int cmd, void *arg)
+ 	return 0;
+ }
+ 
+-static int tdm2c_if_write(u8 *buffer, int size)
++static int tdm2c_if_write(struct device *dev, u8 *buffer, int size)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
++
+ 	if (priv->test_enable)
+ 		return tdm2c_tx(buffer);
+ 
+ 	return 0;
+ }
+ 
+-static int tdmmc_if_write(u8 *buffer, int size)
++static int tdmmc_if_write(struct device *dev, u8 *buffer, int size)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
++
+ 	if (priv->test_enable)
+-		return tdmmc_tx(buffer);
++		return tdmmc_tx(priv->tdmmc, buffer);
+ 
+ 	return 0;
+ }
+ 
+-static void tdm_if_stats_get(struct tal_stats *tdm_if_stats)
++static void tdm_if_stats_get(struct device *dev, struct tal_stats *tdm_if_stats)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
++
+ 	if (!priv->tdm_init)
+ 		return;
+ 
+@@ -755,7 +788,8 @@ u32 mv_phone_get_slic_board_type(void)
+ }
+ 
+ /* Configure PLL to 24MHz */
+-static int mv_phone_tdm_clk_pll_config(struct platform_device *pdev)
++static int mv_phone_tdm_clk_pll_config(struct platform_device *pdev,
++				       struct mv_phone_dev *priv)
+ {
+ 	struct resource *mem;
+ 	u32 reg_val;
+@@ -812,7 +846,7 @@ static int mv_phone_tdm_clk_pll_config(struct platform_device *pdev)
+ 
+ /* Set DCO post divider in respect of 24MHz PLL output */
+ static int mv_phone_dco_post_div_config(struct platform_device *pdev,
+-					u32 pclk_freq_mhz)
++					struct mv_phone_dev *priv)
+ {
+ 	struct resource *mem;
+ 	u32 reg_val, pcm_clk_ratio;
+@@ -825,7 +859,7 @@ static int mv_phone_dco_post_div_config(struct platform_device *pdev,
+ 			return -ENOMEM;
+ 	}
+ 
+-	switch (pclk_freq_mhz) {
++	switch (priv->pclk_freq_mhz) {
+ 	case 8:
+ 		pcm_clk_ratio = DCO_CLK_DIV_RATIO_8M;
+ 		break;
+@@ -872,6 +906,7 @@ static int mv_phone_dco_post_div_config(struct platform_device *pdev,
+ static int mvebu_phone_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
++	struct mv_phone_dev *priv;
+ 	struct resource *mem;
+ 	int err, i;
+ 
+@@ -924,8 +959,8 @@ static int mvebu_phone_probe(struct platform_device *pdev)
+ 
+ 	if (of_device_is_compatible(np, "marvell,armada-380-tdm")) {
+ 		priv->tdm_type = MV_TDM_UNIT_TDM2C;
+-		err = mv_phone_tdm_clk_pll_config(pdev);
+-		err |= mv_phone_dco_post_div_config(pdev, priv->pclk_freq_mhz);
++		err = mv_phone_tdm_clk_pll_config(pdev, priv);
++		err |= mv_phone_dco_post_div_config(pdev, priv);
+ 		err |= tdm2c_set_mbus_windows(&pdev->dev, priv->tdm_base,
+ 					      mv_mbus_dram_info());
+ 		if (err < 0)
+@@ -933,7 +968,10 @@ static int mvebu_phone_probe(struct platform_device *pdev)
+ 
+ 		priv->irq_count = 1;
+ 
+-		tal_set_if(&tdm2c_if);
++		err = tal_set_if(&tdm2c_if, &pdev->dev, priv->id,
++				 &priv->miscdev, true);
++		if (err)
++			goto err_axi_clk;
+ 	}
+ 
+ 	if (of_device_is_compatible(priv->np, "marvell,armada-xp-tdm")) {
+@@ -945,7 +983,10 @@ static int mvebu_phone_probe(struct platform_device *pdev)
+ 		priv->irq_count = 1;
+ 		priv->tdmmc_ip_ver = TDMMC_REV1;
+ 
+-		tal_set_if(&tdmmc_if);
++		err = tal_set_if(&tdmmc_if, &pdev->dev, priv->id,
++				 &priv->miscdev, true);
++		if (err)
++			goto err_axi_clk;
+ 	}
+ 
+ 	if (of_device_is_compatible(priv->np, "marvell,armada-a8k-tdm")) {
+@@ -955,7 +996,10 @@ static int mvebu_phone_probe(struct platform_device *pdev)
+ 		priv->irq_count = 3;
+ 		priv->tdmmc_ip_ver = TDMMC_REV1;
+ 
+-		tal_set_if(&tdmmc_if);
++		err = tal_set_if(&tdmmc_if, &pdev->dev, priv->id,
++				 &priv->miscdev, true);
++		if (err)
++			goto err_axi_clk;
+ 	}
+ 
+ 	/* Obtain IRQ numbers */
+@@ -1003,6 +1047,8 @@ static int mvebu_phone_probe(struct platform_device *pdev)
+ 	spin_lock_init(&priv->lock);
+ 	priv->dev = &pdev->dev;
+ 
++	dev_set_drvdata(&pdev->dev, priv);
++
+ 	return 0;
+ 
+ err_core_clk:
+@@ -1015,7 +1061,9 @@ static int mvebu_phone_probe(struct platform_device *pdev)
+ 
+ static int mvebu_phone_remove(struct platform_device *pdev)
+ {
+-	tal_set_if(NULL);
++	struct mv_phone_dev *priv = dev_get_drvdata(&pdev->dev);
++
++	tal_set_if(NULL, priv->dev, priv->id, &priv->miscdev, true);
+ 
+ 	clk_disable_unprepare(priv->clk);
+ 	clk_disable_unprepare(priv->axi_clk);
+@@ -1026,6 +1074,7 @@ static int mvebu_phone_remove(struct platform_device *pdev)
+ #ifdef CONFIG_PM_SLEEP
+ static int mvebu_phone_suspend(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	int i;
+ 
+ 	for (i = 0; i < TDM_CTRL_REGS_NUM; i++)
+@@ -1044,6 +1093,7 @@ static int mvebu_phone_suspend(struct device *dev)
+ 
+ static int mvebu_phone_resume(struct device *dev)
+ {
++	struct mv_phone_dev *priv = dev_get_drvdata(dev);
+ 	struct platform_device *pdev = priv->parent;
+ 	int err, i;
+ 
+@@ -1053,8 +1103,8 @@ static int mvebu_phone_resume(struct device *dev)
+ 		return err;
+ 
+ 	if (of_device_is_compatible(priv->np, "marvell,armada-380-tdm")) {
+-		err = mv_phone_tdm_clk_pll_config(pdev);
+-		err |= mv_phone_dco_post_div_config(pdev, priv->pclk_freq_mhz);
++		err = mv_phone_tdm_clk_pll_config(pdev, priv);
++		err |= mv_phone_dco_post_div_config(pdev, priv);
+ 		if (err < 0)
+ 			return err;
+ 	}
+diff --git a/drivers/telephony/mvebu_phone/tal/tal.c b/drivers/telephony/mvebu_phone/tal/tal.c
+index f0f3b1ac3cc0..50ff23435072 100644
+--- a/drivers/telephony/mvebu_phone/tal/tal.c
++++ b/drivers/telephony/mvebu_phone/tal/tal.c
+@@ -11,7 +11,7 @@
+ static struct tal_if *tal_if;
+ static struct tal_mmp_ops *tal_mmp;
+ 
+-enum tal_status tal_init(struct tal_params *tal_params,
++enum tal_status tal_init(struct device *dev, struct tal_params *tal_params,
+ 			 struct tal_mmp_ops *mmp_ops)
+ {
+ 	if (!tal_params || !mmp_ops) {
+@@ -26,33 +26,33 @@ enum tal_status tal_init(struct tal_params *tal_params,
+ 
+ 	tal_mmp = mmp_ops;
+ 	if (tal_if && tal_if->init)
+-		if (tal_if->init(tal_params) != 0)
++		if (tal_if->init(dev, tal_params) != 0)
+ 			return TAL_STAT_INIT_ERROR;
+ 
+ 	return TAL_STAT_OK;
+ }
+ EXPORT_SYMBOL(tal_init);
+ 
+-void tal_exit(void)
++void tal_exit(struct device *dev)
+ {
+ 	if (tal_if && tal_if->exit)
+-		tal_if->exit();
++		tal_if->exit(dev);
+ 
+ 	tal_mmp = NULL;
+ }
+ EXPORT_SYMBOL(tal_exit);
+ 
+-void tal_pcm_start(void)
++void tal_pcm_start(struct device *dev)
+ {
+ 	if (tal_if && tal_if->pcm_start)
+-		tal_if->pcm_start();
++		tal_if->pcm_start(dev);
+ }
+ EXPORT_SYMBOL(tal_pcm_start);
+ 
+-void tal_pcm_stop(void)
++void tal_pcm_stop(struct device *dev)
+ {
+ 	if (tal_if && tal_if->pcm_stop)
+-		tal_if->pcm_stop();
++		tal_if->pcm_stop(dev);
+ }
+ EXPORT_SYMBOL(tal_pcm_stop);
+ 
+@@ -65,20 +65,20 @@ int tal_control(int cmd, void *data)
+ }
+ EXPORT_SYMBOL(tal_control);
+ 
+-enum tal_status tal_write(u8 *buffer, int size)
++enum tal_status tal_write(struct device *dev, u8 *buffer, int size)
+ {
+ 	if (tal_if && tal_if->write)
+-		if (tal_if->write(buffer, size) != 0)
++		if (tal_if->write(dev, buffer, size) != 0)
+ 			return TAL_STAT_BAD_PARAM;
+ 
+ 	return TAL_STAT_OK;
+ }
+ EXPORT_SYMBOL(tal_write);
+ 
+-enum tal_status tal_stats_get(struct tal_stats *tal_stats)
++enum tal_status tal_stats_get(struct device *dev, struct tal_stats *tal_stats)
+ {
+ 	if (tal_stats && tal_if && tal_if->stats_get) {
+-		tal_if->stats_get(tal_stats);
++		tal_if->stats_get(dev, tal_stats);
+ 		return TAL_STAT_OK;
+ 	}
+ 
+@@ -86,7 +86,9 @@ enum tal_status tal_stats_get(struct tal_stats *tal_stats)
+ }
+ EXPORT_SYMBOL(tal_stats_get);
+ 
+-enum tal_status tal_set_if(struct tal_if *interface)
++enum tal_status tal_set_if(struct tal_if *interface, struct device *dev,
++			   u32 tdm_index, struct miscdevice *miscdev,
++			   bool create_tal_dev)
+ {
+ 	if (interface && (!interface->init || !interface->exit ||
+ 			  !interface->pcm_start || !interface->pcm_stop)) {
+@@ -96,14 +98,21 @@ enum tal_status tal_set_if(struct tal_if *interface)
+ 
+ 	tal_if = interface;
+ 
++	if (create_tal_dev) {
++		if (tal_if != NULL)
++			return tal_dev_init(dev, tdm_index, miscdev);
++
++		tal_dev_exit(miscdev);
++	}
++
+ 	return TAL_STAT_OK;
+ }
+ EXPORT_SYMBOL(tal_set_if);
+ 
+-enum tal_status tal_mmp_rx(u8 *buffer, int size)
++enum tal_status tal_mmp_rx(struct device *dev, u8 *buffer, int size)
+ {
+ 	if (tal_mmp && tal_mmp->tal_mmp_rx_callback) {
+-		tal_mmp->tal_mmp_rx_callback(buffer, size);
++		tal_mmp->tal_mmp_rx_callback(dev, buffer, size);
+ 		return TAL_STAT_OK;
+ 	}
+ 
+@@ -111,10 +120,10 @@ enum tal_status tal_mmp_rx(u8 *buffer, int size)
+ }
+ EXPORT_SYMBOL(tal_mmp_rx);
+ 
+-enum tal_status tal_mmp_tx(u8 *buffer, int size)
++enum tal_status tal_mmp_tx(struct device *dev, u8 *buffer, int size)
+ {
+ 	if (tal_mmp && tal_mmp->tal_mmp_tx_callback) {
+-		tal_mmp->tal_mmp_tx_callback(buffer, size);
++		tal_mmp->tal_mmp_tx_callback(dev, buffer, size);
+ 		return TAL_STAT_OK;
+ 	}
+ 
+diff --git a/drivers/telephony/mvebu_phone/tal/tal.h b/drivers/telephony/mvebu_phone/tal/tal.h
+index fadb1980750d..98aa7fc3c43e 100644
+--- a/drivers/telephony/mvebu_phone/tal/tal.h
++++ b/drivers/telephony/mvebu_phone/tal/tal.h
+@@ -46,36 +46,52 @@ struct tal_stats {
+ 	struct mv_phone_extended_stats tdm_ext_stats;
+ };
+ 
++struct tal_device {
++	struct device *dev;
++	wait_queue_head_t wait;
++	spinlock_t lock;
++	unsigned char *rx_buff_p;
++	size_t rx_buff_size;
++	unsigned char *tx_buff_p;
++	size_t tx_buff_size;
++	struct tal_params params;
++};
++
+ struct tal_mmp_ops {
+-	void (*tal_mmp_rx_callback)(u8 *rx_buff, int size);
+-	void (*tal_mmp_tx_callback)(u8 *tx_buff, int size);
++	void (*tal_mmp_rx_callback)(struct device *dev, u8 *rx_buff, int size);
++	void (*tal_mmp_tx_callback)(struct device *dev, u8 *tx_buff, int size);
+ };
+ 
+ struct tal_if {
+-	int (*init)(struct tal_params *tal_params);
+-	void (*exit)(void);
+-	void (*pcm_start)(void);
+-	void (*pcm_stop)(void);
++	int (*init)(struct device *dev, struct tal_params *tal_params);
++	void (*exit)(struct device *dev);
++	void (*pcm_start)(struct device *dev);
++	void (*pcm_stop)(struct device *dev);
+ 	int (*control)(int cmd, void *data);
+-	int (*write)(u8 *buffer, int size);
+-	void (*stats_get)(struct tal_stats *tal_stats);
++	int (*write)(struct device *dev, u8 *buffer, int size);
++	void (*stats_get)(struct device *dev, struct tal_stats *tal_stats);
+ 	void (*intr_enable)(void);
+ 	void (*intr_disable)(void);
+ };
+ 
+ /* API */
+-enum tal_status tal_init(struct tal_params *tal_params,
++enum tal_status tal_init(struct device *dev, struct tal_params *tal_params,
+ 			 struct tal_mmp_ops *mmp_ops);
+-enum tal_status tal_stats_get(struct tal_stats *tal_stats);
+-void tal_exit(void);
+-void tal_pcm_start(void);
+-void tal_pcm_stop(void);
++enum tal_status tal_stats_get(struct device *dev, struct tal_stats *tal_stats);
++void tal_exit(struct device *dev);
++void tal_pcm_start(struct device *dev);
++void tal_pcm_stop(struct device *dev);
+ int tal_control(int cmd, void *data);
+ 
+-enum tal_status tal_set_if(struct tal_if *interface);
+-enum tal_status tal_mmp_rx(u8 *buffer, int size);
+-enum tal_status tal_mmp_tx(u8 *buffer, int size);
+-enum tal_status tal_write(u8 *buffer, int size);
++enum tal_status tal_set_if(struct tal_if *interface, struct device *dev,
++			   u32 tdm_index, struct miscdevice *miscdev,
++			   bool create_tal_dev);
++enum tal_status tal_mmp_rx(struct device *dev, u8 *buffer, int size);
++enum tal_status tal_mmp_tx(struct device *dev, u8 *buffer, int size);
++enum tal_status tal_write(struct device *dev, u8 *buffer, int size);
++enum tal_status tal_dev_init(struct device *dev, u32 tdm_index,
++			     struct miscdevice *miscdev);
++void tal_dev_exit(struct miscdevice *miscdev);
+ void tal_intr_enable(void);
+ void tal_intr_disable(void);
+ 
+diff --git a/drivers/telephony/mvebu_phone/tal/tal_dev.c b/drivers/telephony/mvebu_phone/tal/tal_dev.c
+index c9c1c5736fcb..8ba3d1835ed4 100644
+--- a/drivers/telephony/mvebu_phone/tal/tal_dev.c
++++ b/drivers/telephony/mvebu_phone/tal/tal_dev.c
+@@ -15,40 +15,36 @@
+ #include "tal.h"
+ #include "tal_dev.h"
+ 
+-#define	TALDEV_NAME	"tal"
+-
+-static DECLARE_WAIT_QUEUE_HEAD(tal_dev_wait);
+-static DEFINE_SPINLOCK(tal_dev_lock);
+-static unsigned char *rx_buff_p, *tx_buff_p;
+-static size_t rx_buff_size, tx_buff_size;
+-
+-static void tal_dev_rx_callback(unsigned char *rx_buff, int size)
++static void tal_dev_rx_callback(struct device *dev, unsigned char *rx_buff,
++				int size)
+ {
++	struct tal_device *tal_dev = dev->platform_data;
+ 	unsigned long flags;
+ 
+ 	/* Save buffer */
+-	spin_lock_irqsave(&tal_dev_lock, flags);
+-	rx_buff_p = rx_buff;
+-	rx_buff_size = size;
+-	spin_unlock_irqrestore(&tal_dev_lock, flags);
++	spin_lock_irqsave(&tal_dev->lock, flags);
++	tal_dev->rx_buff_p = rx_buff;
++	tal_dev->rx_buff_size = size;
++	spin_unlock_irqrestore(&tal_dev->lock, flags);
+ 
+-	wake_up_interruptible(&tal_dev_wait);
++	wake_up_interruptible(&tal_dev->wait);
+ }
+ 
+-static void tal_dev_tx_callback(unsigned char *tx_buff, int size)
++static void tal_dev_tx_callback(struct device *dev, unsigned char *tx_buff,
++				int size)
+ {
++	struct tal_device *tal_dev = dev->platform_data;
+ 	unsigned long flags;
+ 
+ 	/* Save buffer */
+-	spin_lock_irqsave(&tal_dev_lock, flags);
+-	tx_buff_p = tx_buff;
+-	tx_buff_size = size;
+-	spin_unlock_irqrestore(&tal_dev_lock, flags);
++	spin_lock_irqsave(&tal_dev->lock, flags);
++	tal_dev->tx_buff_p = tx_buff;
++	tal_dev->tx_buff_size = size;
++	spin_unlock_irqrestore(&tal_dev->lock, flags);
+ 
+-	wake_up_interruptible(&tal_dev_wait);
++	wake_up_interruptible(&tal_dev->wait);
+ }
+ 
+-static struct tal_params tal_params;
+ static struct tal_mmp_ops tal_mmp_ops = {
+ 	.tal_mmp_rx_callback	= tal_dev_rx_callback,
+ 	.tal_mmp_tx_callback	= tal_dev_tx_callback,
+@@ -57,15 +53,16 @@ static struct tal_mmp_ops tal_mmp_ops = {
+ static ssize_t tal_dev_read(struct file *file_p, char __user *buf,
+ 			    size_t size, loff_t *ppos)
+ {
++	struct tal_device *tal_dev = file_p->private_data;
+ 	unsigned long flags;
+ 	unsigned char *rx_buff;
+ 
+ 	/* Check if we have got the buffer */
+-	spin_lock_irqsave(&tal_dev_lock, flags);
+-	rx_buff = rx_buff_p;
+-	rx_buff_p = NULL;
+-	size = min(rx_buff_size, size);
+-	spin_unlock_irqrestore(&tal_dev_lock, flags);
++	spin_lock_irqsave(&tal_dev->lock, flags);
++	rx_buff = tal_dev->rx_buff_p;
++	tal_dev->rx_buff_p = NULL;
++	size = min(tal_dev->rx_buff_size, size);
++	spin_unlock_irqrestore(&tal_dev->lock, flags);
+ 
+ 	if (!rx_buff)
+ 		return 0;
+@@ -80,15 +77,16 @@ static ssize_t tal_dev_read(struct file *file_p, char __user *buf,
+ static ssize_t tal_dev_write(struct file *file_p, const char __user *buf,
+ 			     size_t size, loff_t *ppos)
+ {
++	struct tal_device *tal_dev = file_p->private_data;
+ 	unsigned long flags;
+ 	unsigned char *tx_buff;
+ 
+ 	/* Check if we have got the buffer */
+-	spin_lock_irqsave(&tal_dev_lock, flags);
+-	tx_buff = tx_buff_p;
+-	tx_buff_p = NULL;
+-	size = min(tx_buff_size, size);
+-	spin_unlock_irqrestore(&tal_dev_lock, flags);
++	spin_lock_irqsave(&tal_dev->lock, flags);
++	tx_buff = tal_dev->tx_buff_p;
++	tal_dev->tx_buff_p = NULL;
++	size = min(tal_dev->tx_buff_size, size);
++	spin_unlock_irqrestore(&tal_dev->lock, flags);
+ 
+ 	if (!tx_buff)
+ 		return 0;
+@@ -98,7 +96,7 @@ static ssize_t tal_dev_write(struct file *file_p, const char __user *buf,
+ 		size = -EFAULT;
+ 
+ 	/* Pass the buffer to TAL */
+-	if (tal_write(tx_buff, size) != TAL_STAT_OK)
++	if (tal_write(tal_dev->dev, tx_buff, size) != TAL_STAT_OK)
+ 		return -EIO;
+ 
+ 	return size;
+@@ -106,29 +104,35 @@ static ssize_t tal_dev_write(struct file *file_p, const char __user *buf,
+ 
+ static int tal_dev_open(struct inode *inode_p, struct file *file_p)
+ {
+-	try_module_get(THIS_MODULE);
++	struct device *dev;
++
++	/* Replace the file's private data with a pointer to 'tal_dev' */
++	dev = ((struct miscdevice *)file_p->private_data)->parent;
++
++	file_p->private_data = dev->platform_data;
++
+ 	return 0;
+ }
+ 
+ static int tal_dev_release(struct inode *inode_p, struct file *file_p)
+ {
+-	module_put(THIS_MODULE);
+ 	return 0;
+ }
+ 
+ static unsigned int tal_dev_poll(struct file *file_p, poll_table *poll_table_p)
+ {
++	struct tal_device *tal_dev = file_p->private_data;
+ 	unsigned long flags;
+ 	int mask = 0;
+ 
+-	poll_wait(file_p, &tal_dev_wait, poll_table_p);
++	poll_wait(file_p, &tal_dev->wait, poll_table_p);
+ 
+-	spin_lock_irqsave(&tal_dev_lock, flags);
+-	if (rx_buff_p)
++	spin_lock_irqsave(&tal_dev->lock, flags);
++	if (tal_dev->rx_buff_p)
+ 		mask |= POLLIN | POLLRDNORM;
+-	if (tx_buff_p)
++	if (tal_dev->tx_buff_p)
+ 		mask |= POLLOUT | POLLWRNORM;
+-	spin_unlock_irqrestore(&tal_dev_lock, flags);
++	spin_unlock_irqrestore(&tal_dev->lock, flags);
+ 
+ 	return mask;
+ }
+@@ -136,6 +140,7 @@ static unsigned int tal_dev_poll(struct file *file_p, poll_table *poll_table_p)
+ static long tal_dev_ioctl(struct file *file_p, unsigned int cmd,
+ 							unsigned long arg)
+ {
++	struct tal_device *tal_dev = file_p->private_data;
+ 	struct tal_dev_params tal_dev_params;
+ 	char buffer[16];
+ 	long ret = 0;
+@@ -143,7 +148,7 @@ static long tal_dev_ioctl(struct file *file_p, unsigned int cmd,
+ 
+ 	/* Argument checking */
+ 	if (_IOC_TYPE(cmd) != TAL_DEV_IOCTL_MAGIC) {
+-		pr_err("%s: invalid TAL DEV Magic Num %i %i\n",
++		dev_err(tal_dev->dev, "%s: invalid TAL DEV Magic Num %i %i\n",
+ 		       __func__, _IOC_TYPE(cmd), TAL_DEV_IOCTL_MAGIC);
+ 		return -ENOTTY;
+ 	}
+@@ -157,7 +162,7 @@ static long tal_dev_ioctl(struct file *file_p, unsigned int cmd,
+ 				 _IOC_SIZE(cmd));
+ 
+ 	if (ret) {
+-		pr_err("%s: invalid TAL DEV access type %i from cmd %i\n",
++		dev_err(tal_dev->dev, "%s: wrong TAL access type %i (cmd %i)\n",
+ 		       __func__, _IOC_DIR(cmd), cmd);
+ 		return -EFAULT;
+ 	}
+@@ -168,32 +173,33 @@ static long tal_dev_ioctl(struct file *file_p, unsigned int cmd,
+ 		    (void *)arg, sizeof(tal_dev_params)))
+ 			return -EFAULT;
+ 
+-		tal_params.pcm_format = tal_dev_params.pcm_format;
+-		tal_params.sampling_period = 10; /* ms */
+-		tal_params.total_lines = tal_dev_params.total_lines;
+-		tal_params.enable_internal_loopback =
++		tal_dev->params.pcm_format = tal_dev_params.pcm_format;
++		tal_dev->params.sampling_period = 10; /* ms */
++		tal_dev->params.total_lines = tal_dev_params.total_lines;
++		tal_dev->params.enable_internal_loopback =
+ 					tal_dev_params.enable_internal_loopback;
+ 		for (i = 0; i < TAL_MAX_PHONE_LINES; i++)
+-			tal_params.pcm_slot[i] =
++			tal_dev->params.pcm_slot[i] =
+ 					    (i + 1) * tal_dev_params.pcm_format;
+ 
+-		if (tal_init(&tal_params, &tal_mmp_ops) != TAL_STAT_OK)
++		if (tal_init(tal_dev->dev, &tal_dev->params, &tal_mmp_ops) !=
++		    TAL_STAT_OK)
+ 			return -EIO;
+ 
+ 		break;
+ 
+ 	case TAL_DEV_EXIT:
+-		tal_exit();
++		tal_exit(tal_dev->dev);
+ 		break;
+ 
+ 	case TAL_DEV_PCM_START:
+-		rx_buff_p = NULL;
+-		tx_buff_p = NULL;
+-		tal_pcm_start();
++		tal_dev->rx_buff_p = NULL;
++		tal_dev->tx_buff_p = NULL;
++		tal_pcm_start(tal_dev->dev);
+ 		break;
+ 
+ 	case TAL_DEV_PCM_STOP:
+-		tal_pcm_stop();
++		tal_pcm_stop(tal_dev->dev);
+ 		break;
+ 
+ 	default:
+@@ -205,7 +211,7 @@ static long tal_dev_ioctl(struct file *file_p, unsigned int cmd,
+ 			if (copy_from_user(buffer, (void *)arg, _IOC_SIZE(cmd)))
+ 				return -EFAULT;
+ 
+-		ret = tal_control(cmd, buffer);
++		ret = tal_control(cmd, tal_dev->dev);
+ 
+ 		if (_IOC_DIR(cmd) & _IOC_READ)
+ 			if (copy_to_user((void *)arg, buffer, _IOC_SIZE(cmd)))
+@@ -227,33 +233,43 @@ static const struct file_operations tal_dev_fops = {
+ 	.release	= tal_dev_release,
+ };
+ 
+-static struct miscdevice tal_dev = {
+-	.minor	= TALDEV_MINOR,
+-	.name	= TALDEV_NAME,
+-	.fops	= &tal_dev_fops,
+-};
+-
+-static int __init tal_dev_init(void)
++enum tal_status tal_dev_init(struct device *dev, u32 tdm_index,
++			     struct miscdevice *miscdev)
+ {
++	struct tal_device *tal_dev;
++	char name[10];
+ 	int status;
+ 
+-	status = misc_register(&tal_dev);
++	/* Initialize TAL device */
++	tal_dev = devm_kzalloc(dev, sizeof(*tal_dev), GFP_KERNEL);
++	if (!tal_dev)
++		return TAL_STAT_INIT_ERROR;
++
++	tal_dev->dev = dev;
++	init_waitqueue_head(&tal_dev->wait);
++	spin_lock_init(&tal_dev->lock);
++	dev->platform_data = tal_dev;
++
++	/* Configure and register MISC device */
++	snprintf(name, sizeof(name), "tal%d", tdm_index);
++
++	miscdev->name = name;
++	miscdev->minor = TALDEV_MINOR + tdm_index;
++	miscdev->fops = &tal_dev_fops;
++	miscdev->parent = dev;
++
++	status = misc_register(miscdev);
+ 	if (status < 0) {
+-		pr_err("Failed to register TAL device!\n");
+-		return status;
++		dev_err(dev, "Failed to register %s device!\n", name);
++		return TAL_STAT_INIT_ERROR;
+ 	}
+ 
+-	return 0;
++	dev_info(dev, "register /dev/%s\n", name);
++
++	return TAL_STAT_OK;
+ }
+ 
+-static void __exit tal_dev_exit(void)
++void tal_dev_exit(struct miscdevice *miscdev)
+ {
+-	misc_deregister(&tal_dev);
++	misc_deregister(miscdev);
+ }
+-
+-/* Module stuff */
+-module_init(tal_dev_init);
+-module_exit(tal_dev_exit);
+-MODULE_DESCRIPTION("Marvell TAL Device Interface");
+-MODULE_AUTHOR("Piotr Ziecik <kosmo@angel.net.pl>");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/telephony/mvebu_phone/tdmmc/tdmmc.c b/drivers/telephony/mvebu_phone/tdmmc/tdmmc.c
+index 17ca95e3d2f4..d0feb9488f72 100644
+--- a/drivers/telephony/mvebu_phone/tdmmc/tdmmc.c
++++ b/drivers/telephony/mvebu_phone/tdmmc/tdmmc.c
+@@ -10,9 +10,9 @@
+ /* Globals */
+ static struct tdmmc_dram_entry def_dpram_entry = {
+ 					0, 0, 0x1, 0x1, 0, 0, 0x1, 0, 0, 0, 0 };
+-static struct tdmmc_dev *tdmmc;
+ 
+-static void tdmmc_desc_init(u32 chan, u32 index, u32 buff_size)
++static void tdmmc_desc_init(struct tdmmc_dev *tdmmc, u32 chan, u32 index,
++			    u32 buff_size)
+ {
+ 	/* Associate data buffers to descriptors physBuffPtr */
+ 	((struct tdmmc_mcdma_rx_desc *)
+@@ -54,7 +54,7 @@ static void tdmmc_desc_init(u32 chan, u32 index, u32 buff_size)
+ 						 (CONFIG_MCDMA_DESC_CMD_STATUS);
+ }
+ 
+-static void tdmmc_desc_chain_build(void)
++static void tdmmc_desc_chain_build(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 chan, index, buff_size;
+ 
+@@ -65,16 +65,16 @@ static void tdmmc_desc_chain_build(void)
+ 	/* Initialize descriptors fields */
+ 	for (chan = 0; chan < tdmmc->total_channels; chan++) {
+ 		for (index = 0; index < TOTAL_CHAINS; index++)
+-			tdmmc_desc_init(chan, index, buff_size);
++			tdmmc_desc_init(tdmmc, chan, index, buff_size);
+ 	}
+ }
+ 
+-static void tdmmc_mcdma_mcsc_start(void)
++static void tdmmc_mcdma_mcsc_start(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 chan;
+ 	dma_addr_t rx_desc_phys_addr, tx_desc_phys_addr;
+ 
+-	tdmmc_desc_chain_build();
++	tdmmc_desc_chain_build(tdmmc);
+ 
+ 	/* Set current Rx/Tx descriptors  */
+ 	for (chan = 0; chan < tdmmc->total_channels; chan++) {
+@@ -150,7 +150,7 @@ static void tdmmc_mcdma_mcsc_start(void)
+ 	udelay(200);
+ }
+ 
+-static void tdmmc_mcdma_mcsc_abort(void)
++static void tdmmc_mcdma_mcsc_abort(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 chan;
+ 
+@@ -174,7 +174,8 @@ static void tdmmc_mcdma_mcsc_abort(void)
+ 	}
+ }
+ 
+-static void tdmmc_mcdma_clear_rx_desc(u32 next_rx_buff, u32 chan)
++static void tdmmc_mcdma_clear_rx_desc(struct tdmmc_dev *tdmmc,
++				      u32 next_rx_buff, u32 chan)
+ {
+ 	((struct tdmmc_mcdma_rx_desc *)
+ 	 (tdmmc->rx_desc_virt[next_rx_buff] + chan))->phys_next_desc_ptr = 0;
+@@ -183,7 +184,8 @@ static void tdmmc_mcdma_clear_rx_desc(u32 next_rx_buff, u32 chan)
+ 							  (LAST_BIT | OWNER);
+ }
+ 
+-static void tdmmc_mcdma_clear_tx_desc(u32 next_tx_buff, u32 chan)
++static void tdmmc_mcdma_clear_tx_desc(struct tdmmc_dev *tdmmc,
++				      u32 next_tx_buff, u32 chan)
+ {
+ 	((struct tdmmc_mcdma_tx_desc *)
+ 	 (tdmmc->tx_desc_virt[next_tx_buff] + chan))->phys_next_desc_ptr = 0;
+@@ -192,7 +194,7 @@ static void tdmmc_mcdma_clear_tx_desc(u32 next_tx_buff, u32 chan)
+ 							  (LAST_BIT | OWNER);
+ }
+ 
+-static void tdmmc_mcdma_stop(void)
++static void tdmmc_mcdma_stop(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 index, chan, max_poll;
+ 	u32 curr_rx_desc, curr_tx_desc, next_tx_buff = 0, next_rx_buff = 0;
+@@ -218,7 +220,7 @@ static void tdmmc_mcdma_stop(void)
+ 			break;
+ 		}
+ 
+-		tdmmc_mcdma_clear_rx_desc(next_rx_buff, chan);
++		tdmmc_mcdma_clear_rx_desc(tdmmc, next_rx_buff, chan);
+ 	}
+ 
+ 	for (chan = 0; chan < tdmmc->total_channels; chan++) {
+@@ -239,7 +241,7 @@ static void tdmmc_mcdma_stop(void)
+ 			return;
+ 		}
+ 
+-		tdmmc_mcdma_clear_tx_desc(next_tx_buff, chan);
++		tdmmc_mcdma_clear_tx_desc(tdmmc, next_tx_buff, chan);
+ 	}
+ 
+ 	for (chan = 0; chan < tdmmc->total_channels; chan++) {
+@@ -289,7 +291,7 @@ static void tdmmc_mcdma_stop(void)
+ 	udelay(1);
+ }
+ 
+-void tdmmc_show(void)
++void tdmmc_show(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 index;
+ 
+@@ -310,7 +312,8 @@ void tdmmc_show(void)
+ 	}
+ }
+ 
+-int tdmmc_init(void __iomem *base, struct device *dev,
++int tdmmc_init(struct tdmmc_dev *tdmmc,
++	       void __iomem *base, struct device *dev,
+ 	       struct mv_phone_params *tdm_params,
+ 	       enum mv_phone_frame_ts frame_ts,
+ 	       enum tdmmc_ip_version tdmmc_ip_ver)
+@@ -321,15 +324,6 @@ int tdmmc_init(void __iomem *base, struct device *dev,
+ 	u16 pcm_slot, index;
+ 	int ret;
+ 
+-	/* Initialize or reset main structure */
+-	if (!tdmmc) {
+-		tdmmc = devm_kzalloc(dev, sizeof(struct tdmmc_dev), GFP_KERNEL);
+-		if (!tdmmc)
+-			return -ENOMEM;
+-	} else {
+-		memset(tdmmc, 0,  sizeof(struct tdmmc_dev));
+-	}
+-
+ 	/* Initialize remaining parameters */
+ 	tdmmc->regs = base;
+ 	tdmmc->tdm_enable = false;
+@@ -666,10 +660,10 @@ int tdmmc_init(void __iomem *base, struct device *dev,
+ 	       (count & TDM_SYNC_BIT_TX_MASK),
+ 	       tdmmc->regs + TDM_OUTPUT_SYNC_BIT_COUNT_REG);
+ 
+-	tdmmc_show();
++	tdmmc_show(tdmmc);
+ 
+ 	/* Enable PCM */
+-	tdmmc_pcm_start();
++	tdmmc_pcm_start(tdmmc);
+ 
+ 	/* Mark TDM I/F as enabled */
+ 	tdmmc->tdm_enable = true;
+@@ -717,7 +711,7 @@ int tdmmc_init(void __iomem *base, struct device *dev,
+ 	return ret;
+ }
+ 
+-void tdmmc_release(void)
++void tdmmc_release(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 buff_size, total_rx_desc_size, total_tx_desc_size, index;
+ 
+@@ -726,9 +720,9 @@ void tdmmc_release(void)
+ 		/* Mark TDM I/F as disabled */
+ 		tdmmc->tdm_enable = false;
+ 
+-		tdmmc_pcm_stop();
++		tdmmc_pcm_stop(tdmmc);
+ 
+-		tdmmc_mcdma_mcsc_abort();
++		tdmmc_mcdma_mcsc_abort(tdmmc);
+ 
+ 		udelay(10);
+ 		mv_phone_reset_bit(tdmmc->regs + MCSC_GLOBAL_CONFIG_REG,
+@@ -775,7 +769,7 @@ void tdmmc_release(void)
+ 	}
+ }
+ 
+-void tdmmc_pcm_start(void)
++void tdmmc_pcm_start(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 mask_reg;
+ 
+@@ -784,7 +778,7 @@ void tdmmc_pcm_start(void)
+ 		/* Mark PCM I/F as enabled  */
+ 		tdmmc->pcm_enable = true;
+ 
+-		tdmmc_mcdma_mcsc_start();
++		tdmmc_mcdma_mcsc_start(tdmmc);
+ 
+ 		/* Clear TDM cause and mask registers */
+ 		writel(0, tdmmc->regs + COMM_UNIT_TOP_MASK_REG);
+@@ -812,7 +806,7 @@ void tdmmc_pcm_start(void)
+ 	}
+ }
+ 
+-void tdmmc_pcm_stop(void)
++void tdmmc_pcm_stop(struct tdmmc_dev *tdmmc)
+ {
+ 	u32 buff_size, index;
+ 
+@@ -833,7 +827,7 @@ void tdmmc_pcm_stop(void)
+ 		       MCSC_GLOBAL_INT_CAUSE_REG);
+ 		writel(0, tdmmc->regs + MCSC_EXTENDED_INT_CAUSE_REG);
+ 
+-		tdmmc_mcdma_stop();
++		tdmmc_mcdma_stop(tdmmc);
+ 
+ 		/* Calculate total Rx/Tx buffer size */
+ 		buff_size = (tdmmc->sample_size * MV_TDM_TOTAL_CH_SAMPLES *
+@@ -850,7 +844,7 @@ void tdmmc_pcm_stop(void)
+ 	}
+ }
+ 
+-int tdmmc_tx(u8 *tdm_tx_buff)
++int tdmmc_tx(struct tdmmc_dev *tdmmc, u8 *tdm_tx_buff)
+ {
+ 	u32 buff_size, index;
+ 	u8 tmp;
+@@ -876,7 +870,7 @@ int tdmmc_tx(u8 *tdm_tx_buff)
+ 	return 0;
+ }
+ 
+-int tdmmc_rx(u8 *tdm_rx_buff)
++int tdmmc_rx(struct tdmmc_dev *tdmmc, u8 *tdm_rx_buff)
+ {
+ 	u32 buff_size, index;
+ 	u8 tmp;
+@@ -903,7 +897,8 @@ int tdmmc_rx(u8 *tdm_rx_buff)
+ }
+ 
+ /* Low level TDM interrupt service routine */
+-int tdmmc_intr_low(struct mv_phone_intr_info *tdm_intr_info)
++int tdmmc_intr_low(struct tdmmc_dev *tdmmc,
++		   struct mv_phone_intr_info *tdm_intr_info)
+ {
+ 	u32 cause_reg, mask_reg, cause_and_mask, curr_desc, int_ack_bits = 0;
+ 	u8 index;
+@@ -989,7 +984,7 @@ int tdmmc_intr_low(struct mv_phone_intr_info *tdm_intr_info)
+ 	return 0;
+ }
+ 
+-int tdmmc_reset_slic(void)
++int tdmmc_reset_slic(struct tdmmc_dev *tdmmc)
+ {
+ 	/* Enable SLIC reset */
+ 	mv_phone_reset_bit(tdmmc->regs + TDM_CLK_AND_SYNC_CONTROL_REG,
+diff --git a/drivers/telephony/mvebu_phone/tdmmc/tdmmc.h b/drivers/telephony/mvebu_phone/tdmmc/tdmmc.h
+index baf07a029a27..7b4ee89d7b3f 100644
+--- a/drivers/telephony/mvebu_phone/tdmmc/tdmmc.h
++++ b/drivers/telephony/mvebu_phone/tdmmc/tdmmc.h
+@@ -341,15 +341,15 @@ struct tdmmc_dev {
+ };
+ 
+ /* TDMMC APIs */
+-void tdmmc_pcm_start(void);
+-void tdmmc_pcm_stop(void);
+-int tdmmc_tx(u8 *tdm_tx_buff);
+-int tdmmc_rx(u8 *tdm_rx_buff);
+-void tdmmc_show(void);
+-void tdmmc_release(void);
+-void tdmmc_intr_enable(u8 device_id);
+-void tdmmc_intr_disable(u8 device_id);
+-int tdmmc_reset_slic(void);
++void tdmmc_pcm_start(struct tdmmc_dev *tdmmc);
++void tdmmc_pcm_stop(struct tdmmc_dev *tdmmc);
++int tdmmc_tx(struct tdmmc_dev *tdmmc, u8 *tdm_tx_buff);
++int tdmmc_rx(struct tdmmc_dev *tdmmc, u8 *tdm_rx_buff);
++void tdmmc_show(struct tdmmc_dev *tdmmc);
++void tdmmc_release(struct tdmmc_dev *tdmmc);
++void tdmmc_intr_enable(struct tdmmc_dev *tdmmc, u8 device_id);
++void tdmmc_intr_disable(struct tdmmc_dev *tdmmc, u8 device_id);
++int tdmmc_reset_slic(struct tdmmc_dev *tdmmc);
+ int tdmmc_set_mbus_windows(struct device *dev, void __iomem *regs);
+ int tdmmc_set_a8k_windows(struct device *dev, void __iomem *regs);
+ 
+-- 
+2.17.1
+
