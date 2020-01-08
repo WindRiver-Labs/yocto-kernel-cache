@@ -1,0 +1,935 @@
+From 930ff64d55547e60225477e4a58ae34fdca5ef7b Mon Sep 17 00:00:00 2001
+From: Yangbo Lu <yangbo.lu@nxp.com>
+Date: Fri, 30 Aug 2019 17:21:57 +0800
+Subject: [PATCH 069/245] staging: fsl-dpaa2/rtc: update to upstream driver
+
+commit b30ce5507dd54083bb013437c1a20a431d2d4dad from
+http://source.codeaurora.org/external/qoriq/qoriq-components/linux.git
+
+Update fsl-dpaa2/rtc driver to upstream dpaa2-ptp driver, whose
+upstream commit id is,
+
+8893a84 dpaa2-ptp: add interrupt support
+
+Signed-off-by: Yangbo Lu <yangbo.lu@nxp.com>
+Signed-off-by: Zhantao Tang <zhantao.tang@windriver.com>
+---
+ drivers/staging/fsl-dpaa2/Makefile            |   1 +
+ drivers/staging/fsl-dpaa2/rtc/Makefile        |   4 +-
+ drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.c     | 239 ++++++++++
+ .../fsl-dpaa2/rtc/{rtc.h => dpaa2-ptp.h}      |   0
+ drivers/staging/fsl-dpaa2/rtc/dprtc-cmd.h     |  64 ---
+ drivers/staging/fsl-dpaa2/rtc/dprtc.c         | 407 ------------------
+ drivers/staging/fsl-dpaa2/rtc/dprtc.h         |  77 ----
+ 7 files changed, 242 insertions(+), 550 deletions(-)
+ create mode 100644 drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.c
+ rename drivers/staging/fsl-dpaa2/rtc/{rtc.h => dpaa2-ptp.h} (100%)
+
+diff --git a/drivers/staging/fsl-dpaa2/Makefile b/drivers/staging/fsl-dpaa2/Makefile
+index e805b6e1055c..06dc119978d8 100644
+--- a/drivers/staging/fsl-dpaa2/Makefile
++++ b/drivers/staging/fsl-dpaa2/Makefile
+@@ -3,6 +3,7 @@
+ #
+ 
+ obj-$(CONFIG_FSL_DPAA2_ETH)		+= ethernet/
++obj-$(CONFIG_FSL_DPAA2_PTP_CLOCK)       += rtc/
+ obj-$(CONFIG_FSL_DPAA2_MAC)	+= mac/
+ obj-$(CONFIG_FSL_DPAA2_EVB)	+= evb/
+ obj-$(CONFIG_FSL_DPAA2_ETHSW)	+= ethsw/
+diff --git a/drivers/staging/fsl-dpaa2/rtc/Makefile b/drivers/staging/fsl-dpaa2/rtc/Makefile
+index 5468da071163..8d437f997ca4 100644
+--- a/drivers/staging/fsl-dpaa2/rtc/Makefile
++++ b/drivers/staging/fsl-dpaa2/rtc/Makefile
+@@ -2,6 +2,6 @@
+ # Makefile for the Freescale DPAA2 PTP clock
+ #
+ 
+-obj-$(CONFIG_FSL_DPAA2_PTP_CLOCK) += dpaa2-rtc.o
++obj-$(CONFIG_FSL_DPAA2_PTP_CLOCK) += fsl-dpaa2-ptp.o
+ 
+-dpaa2-rtc-objs := rtc.o dprtc.o
++fsl-dpaa2-ptp-objs     := dpaa2-ptp.o dprtc.o
+diff --git a/drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.c b/drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.c
+new file mode 100644
+index 000000000000..a9503aea527f
+--- /dev/null
++++ b/drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.c
+@@ -0,0 +1,239 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2013-2016 Freescale Semiconductor Inc.
++ * Copyright 2016-2018 NXP
++ */
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/msi.h>
++#include <linux/fsl/mc.h>
++#include <linux/fsl/ptp_qoriq.h>
++
++#include "dpaa2-ptp.h"
++
++static int dpaa2_ptp_enable(struct ptp_clock_info *ptp,
++			    struct ptp_clock_request *rq, int on)
++{
++	struct ptp_qoriq *ptp_qoriq = container_of(ptp, struct ptp_qoriq, caps);
++	struct fsl_mc_device *mc_dev;
++	struct device *dev;
++	u32 mask = 0;
++	u32 bit;
++	int err;
++
++	dev = ptp_qoriq->dev;
++	mc_dev = to_fsl_mc_device(dev);
++
++	switch (rq->type) {
++	case PTP_CLK_REQ_PPS:
++		bit = DPRTC_EVENT_PPS;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	err = dprtc_get_irq_mask(mc_dev->mc_io, 0, mc_dev->mc_handle,
++				 DPRTC_IRQ_INDEX, &mask);
++	if (err < 0) {
++		dev_err(dev, "dprtc_get_irq_mask(): %d\n", err);
++		return err;
++	}
++
++	if (on)
++		mask |= bit;
++	else
++		mask &= ~bit;
++
++	err = dprtc_set_irq_mask(mc_dev->mc_io, 0, mc_dev->mc_handle,
++				 DPRTC_IRQ_INDEX, mask);
++	if (err < 0) {
++		dev_err(dev, "dprtc_set_irq_mask(): %d\n", err);
++		return err;
++	}
++
++	return 0;
++}
++
++static const struct ptp_clock_info dpaa2_ptp_caps = {
++	.owner		= THIS_MODULE,
++	.name		= "DPAA2 PTP Clock",
++	.max_adj	= 512000,
++	.n_alarm	= 2,
++	.n_ext_ts	= 2,
++	.n_per_out	= 3,
++	.n_pins		= 0,
++	.pps		= 1,
++	.adjfine	= ptp_qoriq_adjfine,
++	.adjtime	= ptp_qoriq_adjtime,
++	.gettime64	= ptp_qoriq_gettime,
++	.settime64	= ptp_qoriq_settime,
++	.enable		= dpaa2_ptp_enable,
++};
++
++static irqreturn_t dpaa2_ptp_irq_handler_thread(int irq, void *priv)
++{
++	struct ptp_qoriq *ptp_qoriq = priv;
++	struct ptp_clock_event event;
++	struct fsl_mc_device *mc_dev;
++	struct device *dev;
++	u32 status = 0;
++	int err;
++
++	dev = ptp_qoriq->dev;
++	mc_dev = to_fsl_mc_device(dev);
++
++	err = dprtc_get_irq_status(mc_dev->mc_io, 0, mc_dev->mc_handle,
++				   DPRTC_IRQ_INDEX, &status);
++	if (unlikely(err)) {
++		dev_err(dev, "dprtc_get_irq_status err %d\n", err);
++		return IRQ_NONE;
++	}
++
++	if (status & DPRTC_EVENT_PPS) {
++		event.type = PTP_CLOCK_PPS;
++		ptp_clock_event(ptp_qoriq->clock, &event);
++	}
++
++	err = dprtc_clear_irq_status(mc_dev->mc_io, 0, mc_dev->mc_handle,
++				     DPRTC_IRQ_INDEX, status);
++	if (unlikely(err)) {
++		dev_err(dev, "dprtc_clear_irq_status err %d\n", err);
++		return IRQ_NONE;
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int dpaa2_ptp_probe(struct fsl_mc_device *mc_dev)
++{
++	struct device *dev = &mc_dev->dev;
++	struct fsl_mc_device_irq *irq;
++	struct ptp_qoriq *ptp_qoriq;
++	struct device_node *node;
++	void __iomem *base;
++	int err;
++
++	ptp_qoriq = devm_kzalloc(dev, sizeof(*ptp_qoriq), GFP_KERNEL);
++	if (!ptp_qoriq)
++		return -ENOMEM;
++
++	err = fsl_mc_portal_allocate(mc_dev, 0, &mc_dev->mc_io);
++	if (err) {
++		if (err == -ENXIO)
++			err = -EPROBE_DEFER;
++		else
++			dev_err(dev, "fsl_mc_portal_allocate err %d\n", err);
++		goto err_exit;
++	}
++
++	err = dprtc_open(mc_dev->mc_io, 0, mc_dev->obj_desc.id,
++			 &mc_dev->mc_handle);
++	if (err) {
++		dev_err(dev, "dprtc_open err %d\n", err);
++		goto err_free_mcp;
++	}
++
++	ptp_qoriq->dev = dev;
++
++	node = of_find_compatible_node(NULL, NULL, "fsl,dpaa2-ptp");
++	if (!node) {
++		err = -ENODEV;
++		goto err_close;
++	}
++
++	dev->of_node = node;
++
++	base = of_iomap(node, 0);
++	if (!base) {
++		err = -ENOMEM;
++		goto err_close;
++	}
++
++	err = fsl_mc_allocate_irqs(mc_dev);
++	if (err) {
++		dev_err(dev, "MC irqs allocation failed\n");
++		goto err_unmap;
++	}
++
++	irq = mc_dev->irqs[0];
++	ptp_qoriq->irq = irq->msi_desc->irq;
++
++	err = devm_request_threaded_irq(dev, ptp_qoriq->irq, NULL,
++					dpaa2_ptp_irq_handler_thread,
++					IRQF_NO_SUSPEND | IRQF_ONESHOT,
++					dev_name(dev), ptp_qoriq);
++	if (err < 0) {
++		dev_err(dev, "devm_request_threaded_irq(): %d\n", err);
++		goto err_free_mc_irq;
++	}
++
++	err = dprtc_set_irq_enable(mc_dev->mc_io, 0, mc_dev->mc_handle,
++				   DPRTC_IRQ_INDEX, 1);
++	if (err < 0) {
++		dev_err(dev, "dprtc_set_irq_enable(): %d\n", err);
++		goto err_free_mc_irq;
++	}
++
++	err = ptp_qoriq_init(ptp_qoriq, base, &dpaa2_ptp_caps);
++	if (err)
++		goto err_free_mc_irq;
++
++	dpaa2_phc_index = ptp_qoriq->phc_index;
++	dev_set_drvdata(dev, ptp_qoriq);
++
++	return 0;
++
++err_free_mc_irq:
++	fsl_mc_free_irqs(mc_dev);
++err_unmap:
++	iounmap(base);
++err_close:
++	dprtc_close(mc_dev->mc_io, 0, mc_dev->mc_handle);
++err_free_mcp:
++	fsl_mc_portal_free(mc_dev->mc_io);
++err_exit:
++	return err;
++}
++
++static int dpaa2_ptp_remove(struct fsl_mc_device *mc_dev)
++{
++	struct device *dev = &mc_dev->dev;
++	struct ptp_qoriq *ptp_qoriq;
++
++	ptp_qoriq = dev_get_drvdata(dev);
++
++	dpaa2_phc_index = -1;
++	ptp_qoriq_free(ptp_qoriq);
++
++	fsl_mc_free_irqs(mc_dev);
++	dprtc_close(mc_dev->mc_io, 0, mc_dev->mc_handle);
++	fsl_mc_portal_free(mc_dev->mc_io);
++
++	return 0;
++}
++
++static const struct fsl_mc_device_id dpaa2_ptp_match_id_table[] = {
++	{
++		.vendor = FSL_MC_VENDOR_FREESCALE,
++		.obj_type = "dprtc",
++	},
++	{}
++};
++MODULE_DEVICE_TABLE(fslmc, dpaa2_ptp_match_id_table);
++
++static struct fsl_mc_driver dpaa2_ptp_drv = {
++	.driver = {
++		.name = KBUILD_MODNAME,
++		.owner = THIS_MODULE,
++	},
++	.probe = dpaa2_ptp_probe,
++	.remove = dpaa2_ptp_remove,
++	.match_id_table = dpaa2_ptp_match_id_table,
++};
++
++module_fsl_mc_driver(dpaa2_ptp_drv);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("DPAA2 PTP Clock Driver");
+diff --git a/drivers/staging/fsl-dpaa2/rtc/rtc.h b/drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.h
+similarity index 100%
+rename from drivers/staging/fsl-dpaa2/rtc/rtc.h
+rename to drivers/staging/fsl-dpaa2/rtc/dpaa2-ptp.h
+diff --git a/drivers/staging/fsl-dpaa2/rtc/dprtc-cmd.h b/drivers/staging/fsl-dpaa2/rtc/dprtc-cmd.h
+index db6a473430cc..a6a12a150e68 100644
+--- a/drivers/staging/fsl-dpaa2/rtc/dprtc-cmd.h
++++ b/drivers/staging/fsl-dpaa2/rtc/dprtc-cmd.h
+@@ -7,10 +7,6 @@
+ #ifndef _FSL_DPRTC_CMD_H
+ #define _FSL_DPRTC_CMD_H
+ 
+-/* DPRTC Version */
+-#define DPRTC_VER_MAJOR			2
+-#define DPRTC_VER_MINOR			0
+-
+ /* Command versioning */
+ #define DPRTC_CMD_BASE_VERSION		1
+ #define DPRTC_CMD_ID_OFFSET		4
+@@ -20,15 +16,6 @@
+ /* Command IDs */
+ #define DPRTC_CMDID_CLOSE			DPRTC_CMD(0x800)
+ #define DPRTC_CMDID_OPEN			DPRTC_CMD(0x810)
+-#define DPRTC_CMDID_CREATE			DPRTC_CMD(0x910)
+-#define DPRTC_CMDID_DESTROY			DPRTC_CMD(0x990)
+-#define DPRTC_CMDID_GET_API_VERSION		DPRTC_CMD(0xa10)
+-
+-#define DPRTC_CMDID_ENABLE			DPRTC_CMD(0x002)
+-#define DPRTC_CMDID_DISABLE			DPRTC_CMD(0x003)
+-#define DPRTC_CMDID_GET_ATTR			DPRTC_CMD(0x004)
+-#define DPRTC_CMDID_RESET			DPRTC_CMD(0x005)
+-#define DPRTC_CMDID_IS_ENABLED			DPRTC_CMD(0x006)
+ 
+ #define DPRTC_CMDID_SET_IRQ_ENABLE		DPRTC_CMD(0x012)
+ #define DPRTC_CMDID_GET_IRQ_ENABLE		DPRTC_CMD(0x013)
+@@ -37,41 +24,12 @@
+ #define DPRTC_CMDID_GET_IRQ_STATUS		DPRTC_CMD(0x016)
+ #define DPRTC_CMDID_CLEAR_IRQ_STATUS		DPRTC_CMD(0x017)
+ 
+-#define DPRTC_CMDID_SET_CLOCK_OFFSET		DPRTC_CMD(0x1d0)
+-#define DPRTC_CMDID_SET_FREQ_COMPENSATION	DPRTC_CMD(0x1d1)
+-#define DPRTC_CMDID_GET_FREQ_COMPENSATION	DPRTC_CMD(0x1d2)
+-#define DPRTC_CMDID_GET_TIME			DPRTC_CMD(0x1d3)
+-#define DPRTC_CMDID_SET_TIME			DPRTC_CMD(0x1d4)
+-#define DPRTC_CMDID_SET_ALARM			DPRTC_CMD(0x1d5)
+-#define DPRTC_CMDID_SET_PERIODIC_PULSE		DPRTC_CMD(0x1d6)
+-#define DPRTC_CMDID_CLEAR_PERIODIC_PULSE	DPRTC_CMD(0x1d7)
+-#define DPRTC_CMDID_SET_EXT_TRIGGER		DPRTC_CMD(0x1d8)
+-#define DPRTC_CMDID_CLEAR_EXT_TRIGGER		DPRTC_CMD(0x1d9)
+-#define DPRTC_CMDID_GET_EXT_TRIGGER_TIMESTAMP	DPRTC_CMD(0x1dA)
+-
+-/* Macros for accessing command fields smaller than 1byte */
+-#define DPRTC_MASK(field)        \
+-	GENMASK(DPRTC_##field##_SHIFT + DPRTC_##field##_SIZE - 1, \
+-		DPRTC_##field##_SHIFT)
+-#define dprtc_get_field(var, field)      \
+-	(((var) & DPRTC_MASK(field)) >> DPRTC_##field##_SHIFT)
+ 
+ #pragma pack(push, 1)
+ struct dprtc_cmd_open {
+ 	__le32 dprtc_id;
+ };
+ 
+-struct dprtc_cmd_destroy {
+-	__le32 object_id;
+-};
+-
+-#define DPRTC_ENABLE_SHIFT	0
+-#define DPRTC_ENABLE_SIZE	1
+-
+-struct dprtc_rsp_is_enabled {
+-	u8 en;
+-};
+-
+ struct dprtc_cmd_get_irq {
+ 	__le32 pad;
+ 	u8 irq_index;
+@@ -110,28 +68,6 @@ struct dprtc_cmd_clear_irq_status {
+ 	u8 irq_index;
+ };
+ 
+-struct dprtc_rsp_get_attributes {
+-	__le32 pad;
+-	__le32 id;
+-};
+-
+-struct dprtc_cmd_set_clock_offset {
+-	__le64 offset;
+-};
+-
+-struct dprtc_get_freq_compensation {
+-	__le32 freq_compensation;
+-};
+-
+-struct dprtc_time {
+-	__le64 time;
+-};
+-
+-struct dprtc_rsp_get_api_version {
+-	__le16 major;
+-	__le16 minor;
+-};
+-
+ #pragma pack(pop)
+ 
+ #endif /* _FSL_DPRTC_CMD_H */
+diff --git a/drivers/staging/fsl-dpaa2/rtc/dprtc.c b/drivers/staging/fsl-dpaa2/rtc/dprtc.c
+index 68ae6ffefbf5..803b6dad122c 100644
+--- a/drivers/staging/fsl-dpaa2/rtc/dprtc.c
++++ b/drivers/staging/fsl-dpaa2/rtc/dprtc.c
+@@ -73,172 +73,6 @@ int dprtc_close(struct fsl_mc_io *mc_io,
+ 	return mc_send_command(mc_io, &cmd);
+ }
+ 
+-/**
+- * dprtc_create() - Create the DPRTC object.
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @dprc_token:	Parent container token; '0' for default container
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @cfg:	Configuration structure
+- * @obj_id:	Returned object id
+- *
+- * Create the DPRTC object, allocate required resources and
+- * perform required initialization.
+- *
+- * The function accepts an authentication token of a parent
+- * container that this object should be assigned to. The token
+- * can be '0' so the object will be assigned to the default container.
+- * The newly created object can be opened with the returned
+- * object id and using the container's associated tokens and MC portals.
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_create(struct fsl_mc_io *mc_io,
+-		 u16 dprc_token,
+-		 u32 cmd_flags,
+-		 const struct dprtc_cfg *cfg,
+-		 u32 *obj_id)
+-{
+-	struct fsl_mc_command cmd = { 0 };
+-	int err;
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_CREATE,
+-					  cmd_flags,
+-					  dprc_token);
+-
+-	err = mc_send_command(mc_io, &cmd);
+-	if (err)
+-		return err;
+-
+-	*obj_id = mc_cmd_read_object_id(&cmd);
+-
+-	return 0;
+-}
+-
+-/**
+- * dprtc_destroy() - Destroy the DPRTC object and release all its resources.
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @dprc_token: Parent container token; '0' for default container
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @object_id:	The object id; it must be a valid id within the container that
+- * created this object;
+- *
+- * The function accepts the authentication token of the parent container that
+- * created the object (not the one that currently owns the object). The object
+- * is searched within parent using the provided 'object_id'.
+- * All tokens to the object must be closed before calling destroy.
+- *
+- * Return:	'0' on Success; error code otherwise.
+- */
+-int dprtc_destroy(struct fsl_mc_io *mc_io,
+-		  u16 dprc_token,
+-		  u32 cmd_flags,
+-		  u32 object_id)
+-{
+-	struct dprtc_cmd_destroy *cmd_params;
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_DESTROY,
+-					  cmd_flags,
+-					  dprc_token);
+-	cmd_params = (struct dprtc_cmd_destroy *)cmd.params;
+-	cmd_params->object_id = cpu_to_le32(object_id);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_enable() - Enable the DPRTC.
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_enable(struct fsl_mc_io *mc_io,
+-		 u32 cmd_flags,
+-		 u16 token)
+-{
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_ENABLE, cmd_flags,
+-					  token);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_disable() - Disable the DPRTC.
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_disable(struct fsl_mc_io *mc_io,
+-		  u32 cmd_flags,
+-		  u16 token)
+-{
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_DISABLE,
+-					  cmd_flags,
+-					  token);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_is_enabled() - Check if the DPRTC is enabled.
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- * @en:		Returns '1' if object is enabled; '0' otherwise
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_is_enabled(struct fsl_mc_io *mc_io,
+-		     u32 cmd_flags,
+-		     u16 token,
+-		     int *en)
+-{
+-	struct dprtc_rsp_is_enabled *rsp_params;
+-	struct fsl_mc_command cmd = { 0 };
+-	int err;
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_IS_ENABLED, cmd_flags,
+-					  token);
+-
+-	err = mc_send_command(mc_io, &cmd);
+-	if (err)
+-		return err;
+-
+-	rsp_params = (struct dprtc_rsp_is_enabled *)cmd.params;
+-	*en = dprtc_get_field(rsp_params->en, ENABLE);
+-
+-	return 0;
+-}
+-
+-/**
+- * dprtc_reset() - Reset the DPRTC, returns the object to initial state.
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_reset(struct fsl_mc_io *mc_io,
+-		u32 cmd_flags,
+-		u16 token)
+-{
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_RESET,
+-					  cmd_flags,
+-					  token);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+ /**
+  * dprtc_set_irq_enable() - Set overall interrupt state.
+  * @mc_io:	Pointer to MC portal's I/O object
+@@ -458,244 +292,3 @@ int dprtc_clear_irq_status(struct fsl_mc_io *mc_io,
+ 	return mc_send_command(mc_io, &cmd);
+ }
+ 
+-/**
+- * dprtc_get_attributes - Retrieve DPRTC attributes.
+- *
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- * @attr:	Returned object's attributes
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_get_attributes(struct fsl_mc_io *mc_io,
+-			 u32 cmd_flags,
+-			 u16 token,
+-			 struct dprtc_attr *attr)
+-{
+-	struct dprtc_rsp_get_attributes *rsp_params;
+-	struct fsl_mc_command cmd = { 0 };
+-	int err;
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_GET_ATTR,
+-					  cmd_flags,
+-					  token);
+-
+-	err = mc_send_command(mc_io, &cmd);
+-	if (err)
+-		return err;
+-
+-	rsp_params = (struct dprtc_rsp_get_attributes *)cmd.params;
+-	attr->id = le32_to_cpu(rsp_params->id);
+-
+-	return 0;
+-}
+-
+-/**
+- * dprtc_set_clock_offset() - Sets the clock's offset
+- * (usually relative to another clock).
+- *
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- * @offset:	New clock offset (in nanoseconds).
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_set_clock_offset(struct fsl_mc_io *mc_io,
+-			   u32 cmd_flags,
+-			   u16 token,
+-			   int64_t offset)
+-{
+-	struct dprtc_cmd_set_clock_offset *cmd_params;
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_SET_CLOCK_OFFSET,
+-					  cmd_flags,
+-					  token);
+-	cmd_params = (struct dprtc_cmd_set_clock_offset *)cmd.params;
+-	cmd_params->offset = cpu_to_le64(offset);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_set_freq_compensation() - Sets a new frequency compensation value.
+- *
+- * @mc_io:		Pointer to MC portal's I/O object
+- * @cmd_flags:		Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:		Token of DPRTC object
+- * @freq_compensation:	The new frequency compensation value to set.
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_set_freq_compensation(struct fsl_mc_io *mc_io,
+-				u32 cmd_flags,
+-				u16 token,
+-				u32 freq_compensation)
+-{
+-	struct dprtc_get_freq_compensation *cmd_params;
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_SET_FREQ_COMPENSATION,
+-					  cmd_flags,
+-					  token);
+-	cmd_params = (struct dprtc_get_freq_compensation *)cmd.params;
+-	cmd_params->freq_compensation = cpu_to_le32(freq_compensation);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_get_freq_compensation() - Retrieves the frequency compensation value
+- *
+- * @mc_io:		Pointer to MC portal's I/O object
+- * @cmd_flags:		Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:		Token of DPRTC object
+- * @freq_compensation:	Frequency compensation value
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_get_freq_compensation(struct fsl_mc_io *mc_io,
+-				u32 cmd_flags,
+-				u16 token,
+-				u32 *freq_compensation)
+-{
+-	struct dprtc_get_freq_compensation *rsp_params;
+-	struct fsl_mc_command cmd = { 0 };
+-	int err;
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_GET_FREQ_COMPENSATION,
+-					  cmd_flags,
+-					  token);
+-
+-	err = mc_send_command(mc_io, &cmd);
+-	if (err)
+-		return err;
+-
+-	rsp_params = (struct dprtc_get_freq_compensation *)cmd.params;
+-	*freq_compensation = le32_to_cpu(rsp_params->freq_compensation);
+-
+-	return 0;
+-}
+-
+-/**
+- * dprtc_get_time() - Returns the current RTC time.
+- *
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- * @time:	Current RTC time.
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_get_time(struct fsl_mc_io *mc_io,
+-		   u32 cmd_flags,
+-		   u16 token,
+-		   uint64_t *time)
+-{
+-	struct dprtc_time *rsp_params;
+-	struct fsl_mc_command cmd = { 0 };
+-	int err;
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_GET_TIME,
+-					  cmd_flags,
+-					  token);
+-
+-	err = mc_send_command(mc_io, &cmd);
+-	if (err)
+-		return err;
+-
+-	rsp_params = (struct dprtc_time *)cmd.params;
+-	*time = le64_to_cpu(rsp_params->time);
+-
+-	return 0;
+-}
+-
+-/**
+- * dprtc_set_time() - Updates current RTC time.
+- *
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- * @time:	New RTC time.
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_set_time(struct fsl_mc_io *mc_io,
+-		   u32 cmd_flags,
+-		   u16 token,
+-		   uint64_t time)
+-{
+-	struct dprtc_time *cmd_params;
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_SET_TIME,
+-					  cmd_flags,
+-					  token);
+-	cmd_params = (struct dprtc_time *)cmd.params;
+-	cmd_params->time = cpu_to_le64(time);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_set_alarm() - Defines and sets alarm.
+- *
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @token:	Token of DPRTC object
+- * @time:	In nanoseconds, the time when the alarm
+- *			should go off - must be a multiple of
+- *			1 microsecond
+- *
+- * Return:	'0' on Success; Error code otherwise.
+- */
+-int dprtc_set_alarm(struct fsl_mc_io *mc_io,
+-		    u32 cmd_flags,
+-		    u16 token, uint64_t time)
+-{
+-	struct dprtc_time *cmd_params;
+-	struct fsl_mc_command cmd = { 0 };
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_SET_ALARM,
+-					  cmd_flags,
+-					  token);
+-	cmd_params = (struct dprtc_time *)cmd.params;
+-	cmd_params->time = cpu_to_le64(time);
+-
+-	return mc_send_command(mc_io, &cmd);
+-}
+-
+-/**
+- * dprtc_get_api_version() - Get Data Path Real Time Counter API version
+- * @mc_io:	Pointer to MC portal's I/O object
+- * @cmd_flags:	Command flags; one or more of 'MC_CMD_FLAG_'
+- * @major_ver:	Major version of data path real time counter API
+- * @minor_ver:	Minor version of data path real time counter API
+- *
+- * Return:  '0' on Success; Error code otherwise.
+- */
+-int dprtc_get_api_version(struct fsl_mc_io *mc_io,
+-			  u32 cmd_flags,
+-			  u16 *major_ver,
+-			  u16 *minor_ver)
+-{
+-	struct dprtc_rsp_get_api_version *rsp_params;
+-	struct fsl_mc_command cmd = { 0 };
+-	int err;
+-
+-	cmd.header = mc_encode_cmd_header(DPRTC_CMDID_GET_API_VERSION,
+-					  cmd_flags,
+-					  0);
+-
+-	err = mc_send_command(mc_io, &cmd);
+-	if (err)
+-		return err;
+-
+-	rsp_params = (struct dprtc_rsp_get_api_version *)cmd.params;
+-	*major_ver = le16_to_cpu(rsp_params->major);
+-	*minor_ver = le16_to_cpu(rsp_params->minor);
+-
+-	return 0;
+-}
+diff --git a/drivers/staging/fsl-dpaa2/rtc/dprtc.h b/drivers/staging/fsl-dpaa2/rtc/dprtc.h
+index 08f7c7bebbca..0108c55e342b 100644
+--- a/drivers/staging/fsl-dpaa2/rtc/dprtc.h
++++ b/drivers/staging/fsl-dpaa2/rtc/dprtc.h
+@@ -19,17 +19,6 @@ struct fsl_mc_io;
+ #define DPRTC_MAX_IRQ_NUM			1
+ #define DPRTC_IRQ_INDEX				0
+ 
+-/**
+- * Interrupt event masks:
+- */
+-
+-/**
+- * Interrupt event mask indicating alarm event had occurred
+- */
+-#define DPRTC_EVENT_ALARM			0x40000000
+-/**
+- * Interrupt event mask indicating periodic pulse event had occurred
+- */
+ #define DPRTC_EVENT_PPS				0x08000000
+ 
+ int dprtc_open(struct fsl_mc_io *mc_io,
+@@ -41,24 +30,6 @@ int dprtc_close(struct fsl_mc_io *mc_io,
+ 		u32 cmd_flags,
+ 		u16 token);
+ 
+-/**
+- * struct dprtc_cfg - Structure representing DPRTC configuration
+- * @options:	place holder
+- */
+-struct dprtc_cfg {
+-	u32 options;
+-};
+-
+-int dprtc_create(struct fsl_mc_io *mc_io,
+-		 u16 dprc_token,
+-		 u32 cmd_flags,
+-		 const struct dprtc_cfg *cfg,
+-		 u32 *obj_id);
+-
+-int dprtc_destroy(struct fsl_mc_io *mc_io,
+-		  u16 dprc_token,
+-		  u32 cmd_flags,
+-		  u32 object_id);
+ 
+ int dprtc_enable(struct fsl_mc_io *mc_io,
+ 		 u32 cmd_flags,
+@@ -77,36 +48,6 @@ int dprtc_reset(struct fsl_mc_io *mc_io,
+ 		u32 cmd_flags,
+ 		u16 token);
+ 
+-int dprtc_set_clock_offset(struct fsl_mc_io *mc_io,
+-			   u32 cmd_flags,
+-			   u16 token,
+-			   int64_t offset);
+-
+-int dprtc_set_freq_compensation(struct fsl_mc_io *mc_io,
+-				u32 cmd_flags,
+-				u16 token,
+-				u32 freq_compensation);
+-
+-int dprtc_get_freq_compensation(struct fsl_mc_io *mc_io,
+-				u32 cmd_flags,
+-				u16 token,
+-				u32 *freq_compensation);
+-
+-int dprtc_get_time(struct fsl_mc_io *mc_io,
+-		   u32 cmd_flags,
+-		   u16 token,
+-		   uint64_t *time);
+-
+-int dprtc_set_time(struct fsl_mc_io *mc_io,
+-		   u32 cmd_flags,
+-		   u16 token,
+-		   uint64_t time);
+-
+-int dprtc_set_alarm(struct fsl_mc_io *mc_io,
+-		    u32 cmd_flags,
+-		    u16 token,
+-		    uint64_t time);
+-
+ int dprtc_set_irq_enable(struct fsl_mc_io *mc_io,
+ 			 u32 cmd_flags,
+ 			 u16 token,
+@@ -143,22 +84,4 @@ int dprtc_clear_irq_status(struct fsl_mc_io *mc_io,
+ 			   u8 irq_index,
+ 			   u32 status);
+ 
+-/**
+- * struct dprtc_attr - Structure representing DPRTC attributes
+- * @id:		DPRTC object ID
+- */
+-struct dprtc_attr {
+-	int id;
+-};
+-
+-int dprtc_get_attributes(struct fsl_mc_io *mc_io,
+-			 u32 cmd_flags,
+-			 u16 token,
+-			 struct dprtc_attr *attr);
+-
+-int dprtc_get_api_version(struct fsl_mc_io *mc_io,
+-			  u32 cmd_flags,
+-			  u16 *major_ver,
+-			  u16 *minor_ver);
+-
+ #endif /* __FSL_DPRTC_H */
+-- 
+2.17.1
+

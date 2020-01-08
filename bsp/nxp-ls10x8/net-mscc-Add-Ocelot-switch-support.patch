@@ -1,0 +1,3051 @@
+From 6af8570e93f3e82cbaa49cf11c7006886583d516 Mon Sep 17 00:00:00 2001
+From: Zhao Qiang <qiang.zhao@nxp.com>
+Date: Wed, 28 Aug 2019 18:07:59 +0800
+Subject: [PATCH 095/245] net: mscc: Add Ocelot switch support
+
+commit f9a81c9bfdf355d032cb3a303082a5a12aff8618 from
+http://source.codeaurora.org/external/qoriq/qoriq-components/linux.git
+
+Signed-off-by: Zhao Qiang <qiang.zhao@nxp.com>
+Signed-off-by: Zhantao Tang <zhantao.tang@windriver.com>
+---
+ drivers/net/ethernet/mscc/felix_board.c |  907 +++++++++++++++++
+ drivers/net/ethernet/mscc/felix_ptp.c   |  154 +++
+ drivers/net/ethernet/mscc/felix_regs.c  |  607 ++++++++++++
+ drivers/net/ethernet/mscc/ocelot_ptp.h  |   43 +
+ drivers/net/ethernet/mscc/tsn_switch.c  | 1204 +++++++++++++++++++++++
+ drivers/net/ethernet/mscc/tsn_switch.h  |   72 ++
+ 6 files changed, 2987 insertions(+)
+ create mode 100644 drivers/net/ethernet/mscc/felix_board.c
+ create mode 100644 drivers/net/ethernet/mscc/felix_ptp.c
+ create mode 100644 drivers/net/ethernet/mscc/felix_regs.c
+ create mode 100644 drivers/net/ethernet/mscc/ocelot_ptp.h
+ create mode 100644 drivers/net/ethernet/mscc/tsn_switch.c
+ create mode 100644 drivers/net/ethernet/mscc/tsn_switch.h
+
+diff --git a/drivers/net/ethernet/mscc/felix_board.c b/drivers/net/ethernet/mscc/felix_board.c
+new file mode 100644
+index 000000000000..c374bf7ff4b4
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/felix_board.c
+@@ -0,0 +1,907 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/* Felix Switch driver
++ *
++ * Copyright 2018-2019 NXP
++ */
++
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/netdevice.h>
++#include <linux/phy_fixed.h>
++#include <linux/phy.h>
++#include <linux/of_mdio.h>
++#include <linux/of_net.h>
++#include <net/sock.h>
++
++#include "ocelot.h"
++#include "tsn_switch.h"
++
++static const char felix_driver_string[] = "Felix Switch Driver";
++#define DRV_VERSION "0.3"
++static const char felix_driver_version[] = DRV_VERSION;
++
++#define FELIX_MAX_NUM_PHY_PORTS	6
++#define PORT_RES_START		(GCB + 1)
++
++#define PCI_DEVICE_ID_FELIX_PF5	0xEEF0
++
++/* Switch register block BAR */
++#define FELIX_SWITCH_BAR	4
++
++#define FELIX_INIT_TIMEOUT	50000
++
++static struct pci_device_id felix_ids[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_FREESCALE, PCI_DEVICE_ID_FELIX_PF5) },
++	{ 0, }
++};
++MODULE_DEVICE_TABLE(pci, felix_ids);
++
++#ifdef CONFIG_MSCC_FELIX_SWITCH_TSN
++const struct tsn_ops switch_tsn_ops = {
++	.qbv_set			= switch_qbv_set,
++	.qbv_get			= switch_qbv_get,
++	.qbv_get_status			= switch_qbv_get_status,
++	.qbu_set			= switch_qbu_set,
++	.qbu_get                        = switch_qbu_get,
++	.cb_streamid_set		= switch_cb_streamid_set,
++	.cb_streamid_get		= switch_cb_streamid_get,
++	.cb_streamid_counters_get	= switch_cb_streamid_counters_get,
++	.qci_sfi_set			= switch_qci_sfi_set,
++	.qci_sfi_get			= switch_qci_sfi_get,
++	.qci_sfi_counters_get		= switch_qci_sfi_counters_get,
++	.qci_sgi_set			= switch_qci_sgi_set,
++	.qci_sgi_get			= switch_qci_sgi_get,
++	.qci_sgi_status_get		= switch_qci_sgi_status_get,
++	.qci_fmi_set			= switch_qci_fmi_set,
++	.qci_fmi_get			= switch_qci_fmi_get,
++	.cbs_set			= switch_cbs_set,
++	.ct_set				= switch_cut_thru_set,
++	.cbgen_set			= switch_seq_gen_set,
++	.cbrec_set			= switch_seq_rec_set,
++	.cb_get				= switch_cb_get,
++	.pcpmap_set			= switch_pcp_map_set,
++	.dscp_set			= switch_dscp_set,
++};
++#endif
++
++/* Mimic the order of ocelot_target */
++static struct resource felix_switch_res[] = {
++	{
++		/* Nothing here */
++	},
++	{
++		.start = 0x0280000,
++		.end = 0x028ffff,
++		.name = "ana",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0090000,
++		.end = 0x00900ff,
++		.name = "ptp",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0080000,
++		.end = 0x00800ff,
++		.name = "qs",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0200000,
++		.end = 0x021ffff,
++		.name = "qsys",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0030000,
++		.end = 0x003ffff,
++		.name = "rew",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0010000,
++		.end = 0x001ffff,
++		.name = "sys",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0070000,
++		.end = 0x00701ff,
++		.name = "devcpu_gcb",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0100000,
++		.end = 0x010ffff,
++		.name = "port0",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0110000,
++		.end = 0x011ffff,
++		.name = "port1",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0120000,
++		.end = 0x012ffff,
++		.name = "port2",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0130000,
++		.end = 0x013ffff,
++		.name = "port3",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0140000,
++		.end = 0x014ffff,
++		.name = "port4",
++		.flags = IORESOURCE_MEM,
++	},
++	{
++		.start = 0x0150000,
++		.end = 0x015ffff,
++		.name = "port5",
++		.flags = IORESOURCE_MEM,
++	},
++};
++
++static void __iomem *regs;
++
++int felix_chip_init(struct ocelot *ocelot);
++
++/* Felix header bytes length */
++#define FELIX_XFH_LEN 16
++#define FELIX_MAX_MTU (VLAN_ETH_FRAME_LEN - XFH_LONG_PREFIX_LEN - VLAN_ETH_HLEN)
++
++static inline void felix_set_xfh_field(u64 *efh, u8 nth_bit, u8 w, u16 v)
++{
++	u8 i = (8 * FELIX_XFH_LEN - nth_bit) >> 6; /* MSB0 dword index */
++	u8 bit = nth_bit & GENMASK(5, 0); /* modulo: field start bit index */
++	u64 val = v & GENMASK(w - 1, 0);
++
++	efh[i] |= cpu_to_be64(val << bit);
++}
++
++static inline u32 felix_get_xfh_field(u64 *efh, u8 nth_bit, u8 w)
++{
++	u8 i = (8 * FELIX_XFH_LEN - nth_bit) >> 6; /* MSB0 dword index */
++	u8 bit = nth_bit & GENMASK(5, 0); /* modulo: field start bit index */
++
++	return (be64_to_cpu(efh[i]) >> bit) & GENMASK(w - 1, 0);
++}
++
++#define FELIX_IFH_FIELD(name, bit, w) \
++static inline void felix_set_ifh_##name(u64 *ifh, u16 v) \
++{ \
++	felix_set_xfh_field(ifh, bit, w, v); \
++}
++
++#define FELIX_EFH_FIELD(name, bit, w) \
++static inline u32 felix_get_efh_##name(u64 *efh) \
++{ \
++	return felix_get_xfh_field(efh, bit, w); \
++}
++
++/* Felix 128bit-value frame injection header:
++ *
++ * bit 127: bypass the analyzer processing
++ * bit 56-61: destination port mask
++ * bit 28-29: pop_cnt: 3 disables all rewriting of the frame
++ * bit 20-27: cpu extraction queue mask
++ */
++FELIX_IFH_FIELD(bypass, 127, 1)
++FELIX_IFH_FIELD(rew_op, 117, 9)
++FELIX_IFH_FIELD(dstp, 56, 6)
++FELIX_IFH_FIELD(srcp, 43, 4)
++FELIX_IFH_FIELD(popcnt, 28, 2)
++FELIX_IFH_FIELD(cpuq, 20, 8)
++
++#define FELIX_IFH_INJ_POP_CNT_DISABLE 3
++
++/* Felix 128bit-value frame extraction header */
++
++/* bit 85-116: rewriter val */
++/* bit 43-45: source port id */
++FELIX_EFH_FIELD(rew_val, 85, 32)
++FELIX_EFH_FIELD(srcp, 43, 4)
++
++static void felix_tx_hdr_set(struct sk_buff *skb, struct ocelot_port *port)
++{
++	u64 *ifh = skb_push(skb, FELIX_XFH_LEN);
++	struct ocelot *ocelot = port->ocelot;
++
++	/* fill frame injection header */
++	memset(ifh, 0x0, FELIX_XFH_LEN);
++	felix_set_ifh_bypass(ifh, 1);
++	felix_set_ifh_dstp(ifh, BIT(port->chip_port));
++	felix_set_ifh_srcp(ifh, ocelot->cpu_port_id);
++	felix_set_ifh_popcnt(ifh, 0);
++	felix_set_ifh_cpuq(ifh, 0x0);
++
++	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
++	    port->tx_tstamp) {
++		u8 id = (port->ocelot->tstamp_id++) % 4;
++
++		felix_set_ifh_rew_op(ifh, 0x3 | id << 3);
++	}
++}
++
++static rx_handler_result_t felix_frm_ext_handler(struct sk_buff **pskb)
++{
++	struct net_device *ndev = (*pskb)->dev;
++	struct sk_buff *skb = *pskb;
++	struct skb_shared_hwtstamps *shhwtstamps;
++	struct timespec64 ts;
++	struct ocelot_port *port = NULL;
++	struct ocelot *ocelot = NULL;
++	char *start = skb->data;
++	u64 *efh, tstamp_in_ns;
++	u32 p, tstamp_lo, tstamp_hi;
++
++	/* extraction header offset: assume eth header was consumed */
++	efh = (u64 *)(start + FELIX_XFH_LEN - ETH_HLEN);
++
++	/* decode src port */
++	p = felix_get_efh_srcp(efh);
++
++	tstamp_lo = felix_get_efh_rew_val(efh);
++
++	/* don't pass frames with unknown header format back to interface */
++	if (unlikely(p >= FELIX_MAX_NUM_PHY_PORTS)) {
++		kfree_skb(skb);
++		return RX_HANDLER_CONSUMED;
++	}
++
++	ocelot = rcu_dereference(ndev->rx_handler_data);
++	/* get the intf to fwd the frame */
++	if (ocelot && p != ocelot->cpu_port_id) {
++		port = ocelot->ports[p];
++		if (port)
++			ndev = port->dev;
++	}
++
++	/* pull the rest of extraction header */
++	skb_pull(skb, XFH_LONG_PREFIX_LEN - ETH_HLEN);
++
++	/* init with actual protocol type */
++	skb->protocol = eth_type_trans(skb, ndev);
++
++	skb_reset_transport_header(skb);
++	skb_reset_network_header(skb);
++	skb->pkt_type = PACKET_HOST;
++
++	/* remove from inet csum the extraction and eth headers */
++	skb_postpull_rcsum(skb, start, XFH_LONG_PREFIX_LEN);
++
++	/* frame for CPU */
++	if (ocelot && p == ocelot->cpu_port_id)
++		return RX_HANDLER_PASS;
++
++	if (port && port->rx_tstamp) {
++		felix_ptp_gettime(&ocelot->ptp_caps, &ts);
++		tstamp_in_ns = ktime_set(ts.tv_sec, ts.tv_nsec);
++
++		tstamp_hi = tstamp_in_ns >> 32;
++		if ((tstamp_in_ns & 0xffffffff) < tstamp_lo)
++			tstamp_hi = tstamp_hi - 1;
++
++		tstamp_in_ns = ((u64)tstamp_hi << 32) | tstamp_lo;
++
++		shhwtstamps = skb_hwtstamps(skb);
++		memset(shhwtstamps, 0, sizeof(struct skb_shared_hwtstamps));
++		shhwtstamps->hwtstamp = tstamp_in_ns;
++	}
++
++	if (ocelot->bridge_mask & BIT(p))
++		skb->offload_fwd_mark = 1;
++	netif_rx(skb);
++
++	return RX_HANDLER_CONSUMED;
++}
++
++static netdev_tx_t felix_cpu_inj_handler(struct sk_buff *skb,
++					 struct ocelot_port *port)
++{
++	struct net_device *pair_ndev = port->cpu_inj_handler_data;
++	bool do_tstamp = skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
++			 port->tx_tstamp;
++
++	if (!netif_running(pair_ndev))
++		return NETDEV_TX_BUSY;
++
++	if (do_tstamp) {
++		struct ocelot_skb *oskb =
++			devm_kzalloc(port->ocelot->dev,
++				     sizeof(struct ocelot_skb),
++				     GFP_KERNEL);
++		oskb->skb = skb_clone(skb, GFP_ATOMIC);
++		if (skb->sk)
++			skb_set_owner_w(oskb->skb, skb->sk);
++		oskb->tstamp_id = port->ocelot->tstamp_id % 4;
++		oskb->tx_port = port->chip_port;
++		list_add_tail(&oskb->head, &port->ocelot->skbs);
++
++		skb_shinfo(oskb->skb)->tx_flags |= SKBTX_IN_PROGRESS;
++	}
++
++	if (unlikely(skb_headroom(skb) < FELIX_XFH_LEN)) {
++		struct sk_buff *skb_orig = skb;
++
++		skb = skb_realloc_headroom(skb, FELIX_XFH_LEN);
++
++		/* TODO: free skb in non irq context */
++		if (!skb) {
++			dev_kfree_skb_any(skb_orig);
++			return NETDEV_TX_OK;
++		}
++
++		if (skb_orig->sk)
++			skb_set_owner_w(skb, skb_orig->sk);
++
++		skb_copy_queue_mapping(skb, skb_orig);
++		skb->priority = skb_orig->priority;
++#ifdef CONFIG_NET_SCHED
++		skb->tc_index = skb_orig->tc_index;
++#endif
++		dev_consume_skb_any(skb_orig);
++	}
++
++	/* add cpu injection header */
++	felix_tx_hdr_set(skb, port);
++
++	skb->dev = pair_ndev;
++	dev_queue_xmit(skb);
++
++	return NETDEV_TX_OK;
++}
++
++static void felix_register_rx_handler(struct ocelot *ocelot,
++				      struct net_device *pair_ndev)
++{
++	int err = -EBUSY;
++
++	/* must obtain rtnl mutex first */
++	rtnl_lock();
++	if (netif_device_present(pair_ndev) &&
++	    !netdev_is_rx_handler_busy(pair_ndev))
++		err = netdev_rx_handler_register(pair_ndev,
++						 felix_frm_ext_handler, ocelot);
++	rtnl_unlock();
++	if (err)
++		dev_err(ocelot->dev,
++			"pair ndev busy: rx_handler not registered\n");
++}
++
++static struct regmap *felix_io_init(struct ocelot *ocelot, u8 target)
++{
++	void __iomem *target_regs;
++	struct regmap_config felix_regmap_config = {
++		.reg_bits	= 32,
++		.val_bits	= 32,
++		.reg_stride	= 4,
++	};
++
++	felix_regmap_config.name = felix_switch_res[target].name;
++	target_regs = devm_ioremap_resource(ocelot->dev,
++					    &felix_switch_res[target]);
++	if (IS_ERR(target_regs))
++		return ERR_CAST(target_regs);
++
++	return devm_regmap_init_mmio(ocelot->dev, target_regs,
++				     &felix_regmap_config);
++}
++
++static void felix_release_ports(struct ocelot *ocelot)
++{
++	struct ocelot_port *ocelot_port;
++	struct net_device *pair_ndev;
++	struct phy_device *phydev;
++	struct device_node *dn;
++	int i;
++
++	for (i = 0; i < ocelot->num_phys_ports; i++) {
++		ocelot_port = ocelot->ports[i];
++		if (!ocelot_port || !ocelot_port->phy || !ocelot_port->dev)
++			continue;
++
++		phydev = ocelot_port->phy;
++#ifdef CONFIG_MSCC_FELIX_SWITCH_TSN
++		tsn_port_unregister(ocelot_port->dev);
++#endif
++		unregister_netdev(ocelot_port->dev);
++		free_netdev(ocelot_port->dev);
++
++		if (phy_is_pseudo_fixed_link(phydev)) {
++			dn = phydev->mdio.dev.of_node;
++			/* decr refcnt: of_phy_register_fixed_link */
++			of_phy_deregister_fixed_link(dn);
++		}
++		phy_device_free(phydev); /* decr refcnt: of_find_phy_device */
++
++		/* unregister cpu port rx handler */
++		if (ocelot->cpu_port_id == i) {
++			pair_ndev = ocelot_port->cpu_inj_handler_data;
++			if (pair_ndev && netif_device_present(pair_ndev)) {
++				rtnl_lock();
++				netdev_rx_handler_unregister(pair_ndev);
++				rtnl_unlock();
++			}
++		}
++	}
++}
++
++static void felix_setup_port_mac(struct ocelot_port *port)
++{
++	/* Only 1G full duplex supported for now */
++	ocelot_port_writel(port, DEV_MAC_MODE_CFG_FDX_ENA |
++			   DEV_MAC_MODE_CFG_GIGA_MODE_ENA, DEV_MAC_MODE_CFG);
++	/* Take MAC, Port, Phy (intern) and PCS (SGMII/Serdes)
++	 * clock out of reset
++	 */
++	ocelot_port_writel(port, DEV_CLOCK_CFG_LINK_SPEED(OCELOT_SPEED_1000),
++			   DEV_CLOCK_CFG);
++}
++
++static void felix_setup_port_inj(struct ocelot_port *port,
++				 struct net_device *pair_ndev)
++{
++	struct ocelot *ocelot = port->ocelot;
++	struct net_device *pdev = port->dev;
++
++	if (port->chip_port == ocelot->cpu_port_id) {
++		/* expected frame formats on NPI:
++		 * short prefix frame tag on tx and long prefix on rx
++		 */
++		ocelot_write_rix(ocelot, SYS_PORT_MODE_INCL_XTR_HDR(3) |
++				 SYS_PORT_MODE_INCL_INJ_HDR(1), SYS_PORT_MODE,
++				 port->chip_port);
++
++		/* register rx handler for decoding tagged frames from NPI */
++		felix_register_rx_handler(port->ocelot, pair_ndev);
++		/* save for cleanup */
++		port->cpu_inj_handler_data = pair_ndev;
++	} else {
++		/* set frame injection handler on non-NPI ports */
++		port->cpu_inj_handler = &felix_cpu_inj_handler;
++		port->cpu_inj_handler_data = pair_ndev;
++		/* no CPU header, only normal frames */
++		ocelot_write_rix(ocelot, 0, SYS_PORT_MODE, port->chip_port);
++	}
++
++	/* set port max MTU size */
++	pdev->max_mtu = FELIX_MAX_MTU;
++	pdev->mtu = pdev->max_mtu;
++}
++
++static void felix_get_hwtimestamp(struct ocelot *ocelot, struct timespec64 *ts)
++{
++	/* Read current PTP time to get seconds */
++	u32 val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_SAVE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++	ts->tv_sec = ocelot_read_rix(ocelot, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++
++	/* Read packet HW timestamp from FIFO */
++	val = ocelot_read(ocelot, SYS_PTP_TXSTAMP);
++	ts->tv_nsec = SYS_PTP_TXSTAMP_PTP_TXSTAMP(val);
++
++	/* Sec has incremented since the ts was registered */
++	if ((ts->tv_sec & 0x1) != !!(val & SYS_PTP_TXSTAMP_PTP_TXSTAMP_SEC))
++		ts->tv_sec--;
++}
++
++static bool felix_tx_tstamp_avail(struct ocelot *ocelot)
++{
++	return (!list_empty(&ocelot->skbs)) &&
++	       (ocelot_read(ocelot, SYS_PTP_STATUS) &
++		SYS_PTP_STATUS_PTP_MESS_VLD);
++}
++
++static void felix_tx_clean(struct ocelot *ocelot)
++{
++	do {
++		struct list_head *pos, *tmp;
++		struct ocelot_skb *entry;
++		struct sk_buff *skb = NULL;
++		struct timespec64 ts;
++		struct skb_shared_hwtstamps shhwtstamps;
++		u32 val, id, port;
++
++		val = ocelot_read(ocelot, SYS_PTP_STATUS);
++
++		id = SYS_PTP_STATUS_PTP_MESS_ID_X(val);
++		port = SYS_PTP_STATUS_PTP_MESS_TXPORT_X(val);
++
++		list_for_each_safe(pos, tmp, &ocelot->skbs) {
++			entry = list_entry(pos, struct ocelot_skb, head);
++			if (entry->tstamp_id != id ||
++			    entry->tx_port != port)
++				continue;
++			skb = entry->skb;
++
++			list_del(pos);
++			devm_kfree(ocelot->dev, entry);
++		}
++
++		if (likely(skb)) {
++			felix_get_hwtimestamp(ocelot, &ts);
++			memset(&shhwtstamps, 0, sizeof(shhwtstamps));
++			shhwtstamps.hwtstamp = ktime_set(ts.tv_sec, ts.tv_nsec);
++			skb_tstamp_tx(skb, &shhwtstamps);
++
++			dev_kfree_skb_any(skb);
++		}
++
++		/* Next tstamp */
++		ocelot_write(ocelot, SYS_PTP_NXT_PTP_NXT, SYS_PTP_NXT);
++
++	} while (ocelot_read(ocelot, SYS_PTP_STATUS) &
++		 SYS_PTP_STATUS_PTP_MESS_VLD);
++}
++
++static void felix_preempt_irq_clean(struct ocelot *ocelot)
++{
++	int port;
++	struct ocelot_port *ocelot_port;
++
++	for (port = 0; port < FELIX_MAX_NUM_PHY_PORTS; port++) {
++		ocelot_port = ocelot->ports[port];
++		ocelot_port_rmwl(
++			ocelot_port,
++		    DEV_GMII_MM_STATISTICS_MM_STATUS_PRMPT_ACTIVE_STICKY,
++		    DEV_GMII_MM_STATISTICS_MM_STATUS_PRMPT_ACTIVE_STICKY,
++		    DEV_GMII_MM_STATISTICS_MM_STATUS);
++	}
++}
++
++static void felix_irq_handle_work(struct work_struct *work)
++{
++	struct ocelot *ocelot = container_of(work, struct ocelot,
++					     irq_handle_work);
++	struct pci_dev *pdev = container_of(ocelot->dev, struct pci_dev, dev);
++
++	/* The INTB interrupt is used both for 1588 interrupt and
++	 * preemption status change interrupt on each port. So check
++	 * which interrupt it is, and clean it.
++	 */
++	if (felix_tx_tstamp_avail(ocelot))
++		felix_tx_clean(ocelot);
++	else
++		felix_preempt_irq_clean(ocelot);
++
++	enable_irq(pdev->irq);
++}
++
++static irqreturn_t felix_isr(int irq, void *data)
++{
++	struct ocelot *ocelot = (struct ocelot *)data;
++
++	disable_irq_nosync(irq);
++	queue_work(ocelot->ocelot_wq, &ocelot->irq_handle_work);
++
++	return IRQ_HANDLED;
++}
++
++static int felix_ports_init(struct pci_dev *pdev)
++{
++	struct ocelot *ocelot = pci_get_drvdata(pdev);
++	struct device_node *np = ocelot->dev->of_node;
++	struct net_device *pair_ndev = NULL;
++	struct device_node *phy_node = NULL;
++	struct device_node *portnp, *ethnp;
++	struct phy_device *phydev = NULL;
++	struct resource *felix_res;
++	void __iomem *port_regs;
++	u32 port;
++	int err;
++
++	portnp = of_find_node_with_property(np, "cpu-ethernet");
++	if (portnp) {
++		ethnp = of_parse_phandle(portnp, "cpu-ethernet", 0);
++		if (!ethnp)
++			return -EINVAL;
++		pair_ndev = of_find_net_device_by_node(ethnp);
++		if (!pair_ndev)
++			return -EPROBE_DEFER;
++		if (of_property_read_u32(portnp, "reg", &port))
++			return -EINVAL;
++
++		ocelot->cpu_port_id = port;
++		ocelot->num_cpu_ports = 1;
++	}
++
++	if (!pair_ndev)
++		ocelot->cpu_port_id = FELIX_MAX_NUM_PHY_PORTS;
++
++	ocelot->num_phys_ports = FELIX_MAX_NUM_PHY_PORTS;
++	ocelot->ports = devm_kcalloc(ocelot->dev, ocelot->num_phys_ports,
++				     sizeof(struct ocelot_port *), GFP_KERNEL);
++
++	/* alloc netdev for each port */
++	err = ocelot_init(ocelot);
++	if (err)
++		return err;
++
++	for_each_available_child_of_node(np, portnp) {
++		struct ocelot_port *ocelot_port;
++
++		if (!portnp || !portnp->name ||
++		    of_node_cmp(portnp->name, "port") ||
++		    of_property_read_u32(portnp, "reg", &port))
++			continue;
++		if (port >= FELIX_MAX_NUM_PHY_PORTS) {
++			dev_err(ocelot->dev, "invalid port num: %d\n", port);
++			continue;
++		}
++		if (ocelot->ports[port]) {
++			dev_warn(ocelot->dev, "port %d already defined\n",
++				 port);
++			continue;
++		}
++		felix_res = &felix_switch_res[PORT_RES_START + port];
++		port_regs = devm_ioremap_resource(ocelot->dev, felix_res);
++		if (IS_ERR(port_regs)) {
++			dev_err(ocelot->dev,
++				"failed to map registers for port %d\n", port);
++			continue;
++		}
++		if (phy_node) {
++			of_node_put(phy_node);
++			phy_node = NULL;
++		}
++		phy_node = of_parse_phandle(portnp, "phy-handle", 0);
++		if (!phy_node) {
++			if (!of_phy_is_fixed_link(portnp))
++				continue;
++			err = of_phy_register_fixed_link(portnp);
++			if (err < 0) {
++				dev_err(ocelot->dev,
++					"can't create fixed link for port:%d\n",
++					port);
++				continue;
++			}
++			phydev = of_phy_find_device(portnp);
++		} else {
++			phydev = of_phy_find_device(phy_node);
++		}
++		if (!phydev)
++			continue;
++
++		of_node_put(phy_node);
++		phy_node = NULL;
++
++		phy_attached_info(phydev);
++
++		err = ocelot_probe_port(ocelot, port, port_regs, phydev);
++		if (err) {
++			dev_err(ocelot->dev, "failed to probe ports\n");
++			goto release_ports;
++		}
++
++		/* apply felix config */
++		ocelot_port = ocelot->ports[port];
++
++		felix_setup_port_mac(ocelot_port);
++		if (pair_ndev)
++			felix_setup_port_inj(ocelot_port, pair_ndev);
++
++#ifdef CONFIG_MSCC_FELIX_SWITCH_TSN
++		tsn_port_register(ocelot_port->dev,
++				  (struct tsn_ops *)&switch_tsn_ops,
++				  (u16)pdev->bus->number + GROUP_OFFSET_SWITCH);
++#endif
++	}
++	/* set port for external CPU frame extraction/injection */
++	if (pair_ndev)
++		ocelot_write(ocelot, QSYS_EXT_CPU_CFG_EXT_CPUQ_MSK_M |
++			     QSYS_EXT_CPU_CFG_EXT_CPU_PORT(ocelot->cpu_port_id),
++			     QSYS_EXT_CPU_CFG);
++
++	return 0;
++
++release_ports:
++	felix_release_ports(ocelot);
++
++	return err;
++}
++
++static int felix_init_switch_core(struct ocelot *ocelot)
++{
++	int timeout = FELIX_INIT_TIMEOUT;
++	int val = 1;
++
++	/* soft-reset the switch core */
++	regmap_field_write(ocelot->regfields[GCB_SOFT_RST_SWC_RST], 1);
++	do {
++		usleep_range(10, 100);
++		regmap_field_read(ocelot->regfields[GCB_SOFT_RST_SWC_RST],
++				  &val);
++	} while (val && --timeout);
++
++	if (timeout == 0) {
++		dev_err(ocelot->dev, "timeout: switch core init\n");
++		return -ETIMEDOUT;
++	}
++	/* initialize switch mem ~40us */
++	ocelot_write(ocelot, SYS_RAM_INIT_RAM_INIT, SYS_RAM_INIT);
++	timeout = FELIX_INIT_TIMEOUT;
++	do {
++		usleep_range(40, 80);
++		val = ocelot_read(ocelot, SYS_RAM_INIT);
++	} while (val && --timeout);
++
++	if (timeout == 0) {
++		dev_err(ocelot->dev, "timeout: switch sram init\n");
++		return -ETIMEDOUT;
++	}
++
++	/* enable switch core */
++	regmap_field_write(ocelot->regfields[SYS_RESET_CFG_CORE_ENA], 1);
++
++	return 0;
++}
++
++static int felix_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	resource_size_t offset;
++	struct ocelot *ocelot;
++	size_t len;
++	int i, err;
++
++	err = pci_enable_device(pdev);
++	if (err) {
++		dev_err(&pdev->dev, "device enable failed\n");
++		return err;
++	}
++
++	/* set up for high or low dma */
++	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
++	if (err) {
++		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
++		if (err) {
++			dev_err(&pdev->dev,
++				"DMA configuration failed: 0x%x\n", err);
++			goto err_dma;
++		}
++	}
++
++	offset = pci_resource_start(pdev, FELIX_SWITCH_BAR);
++
++	pci_set_master(pdev);
++
++	ocelot = kzalloc(sizeof(*ocelot), GFP_KERNEL);
++	if (!ocelot) {
++		err = -ENOMEM;
++		goto err_alloc_ocelot;
++	}
++
++	pci_set_drvdata(pdev, ocelot);
++	ocelot->dev = &pdev->dev;
++
++	err = request_irq(pdev->irq, &felix_isr, 0, "felix-intb", ocelot);
++	if (err)
++		goto err_alloc_irq;
++
++	ocelot->ocelot_wq = alloc_workqueue("ocelot_wq", 0, 0);
++	if (!ocelot->ocelot_wq) {
++		err = -ENOMEM;
++		goto err_alloc_wq;
++	}
++
++	INIT_WORK(&ocelot->irq_handle_work, felix_irq_handle_work);
++
++	INIT_LIST_HEAD(&ocelot->skbs);
++
++	len = pci_resource_len(pdev, FELIX_SWITCH_BAR);
++	if (len == 0) {
++		err = -EINVAL;
++		goto err_resource_len;
++	}
++
++	regs = pci_iomap(pdev, FELIX_SWITCH_BAR, len);
++	if (!regs) {
++		err = -ENXIO;
++		dev_err(&pdev->dev, "ioremap() failed\n");
++		goto err_iomap;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(felix_switch_res); i++)
++		if (felix_switch_res[i].flags == IORESOURCE_MEM) {
++			felix_switch_res[i].start += offset;
++			felix_switch_res[i].end += offset;
++		}
++
++	for (i = ANA; i <= GCB; i++) {
++		struct regmap *target;
++
++		target = felix_io_init(ocelot, i);
++		if (IS_ERR(target))
++			return PTR_ERR(target);
++
++		ocelot->targets[i] = target;
++	}
++
++	err = felix_chip_init(ocelot);
++	if (err)
++		goto err_chip_init;
++
++	/* initialize switch core */
++	err = felix_init_switch_core(ocelot);
++	if (err)
++		goto err_sw_core_init;
++
++	err = felix_ptp_init(ocelot);
++	if (err)
++		goto err_ptp_init;
++
++	err = felix_ports_init(pdev);
++	if (err)
++		goto err_ports_init;
++
++	register_netdevice_notifier(&ocelot_netdevice_nb);
++
++	dev_info(&pdev->dev, "%s - version %s probed\n", felix_driver_string,
++		 felix_driver_version);
++	return 0;
++
++err_ports_init:
++	felix_ptp_remove(ocelot);
++err_ptp_init:
++err_chip_init:
++err_sw_core_init:
++	pci_iounmap(pdev, regs);
++err_iomap:
++err_resource_len:
++	destroy_workqueue(ocelot->ocelot_wq);
++err_alloc_wq:
++	free_irq(pdev->irq, ocelot);
++err_alloc_irq:
++	kfree(ocelot);
++err_alloc_ocelot:
++err_dma:
++	pci_disable_device(pdev);
++
++	return err;
++}
++
++static void felix_pci_remove(struct pci_dev *pdev)
++{
++	struct ocelot *ocelot;
++
++	ocelot = pci_get_drvdata(pdev);
++
++	/* stop workqueue thread */
++	ocelot_deinit(ocelot);
++
++	free_irq(pdev->irq, ocelot);
++
++	unregister_netdevice_notifier(&ocelot_netdevice_nb);
++
++	felix_release_ports(ocelot);
++
++	pci_iounmap(pdev, regs);
++	destroy_workqueue(ocelot->ocelot_wq);
++	kfree(ocelot);
++	pci_disable_device(pdev);
++	pr_debug("%s - version %s removed\n", felix_driver_string,
++		 felix_driver_version);
++}
++
++static struct pci_driver felix_pci_driver = {
++	.name = "mscc_felix",
++	.id_table = felix_ids,
++	.probe = felix_pci_probe,
++	.remove = felix_pci_remove,
++};
++
++module_pci_driver(felix_pci_driver);
++
++MODULE_DESCRIPTION("Felix switch driver");
++MODULE_AUTHOR("Razvan Stefanescu <razvan.stefanescu@nxp.com>");
++MODULE_LICENSE("Dual MIT/GPL");
+diff --git a/drivers/net/ethernet/mscc/felix_ptp.c b/drivers/net/ethernet/mscc/felix_ptp.c
+new file mode 100644
+index 000000000000..6b7112df3fef
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/felix_ptp.c
+@@ -0,0 +1,154 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/* Felix switch PTP clock driver
++ *
++ * Copyright 2019 NXP
++ */
++
++#include "ocelot.h"
++
++int felix_ptp_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 val, tod_ns, tod_sec_lsb, tod_sec_msb;
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_SAVE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	tod_sec_msb = ocelot_read_rix(ocelot, PTP_TOD_SEC_MSB, TOD_ACC_PIN);
++	tod_sec_lsb = ocelot_read_rix(ocelot, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++	tod_ns = ocelot_read_rix(ocelot, PTP_TOD_NSEC, TOD_ACC_PIN);
++
++	ts->tv_sec = ((u64)(tod_sec_msb & SEC_MSB_MASK) << 32) | tod_sec_lsb;
++	ts->tv_nsec = tod_ns & NSEC_MASK;
++
++	/* Deal with negative values -1 and -2 */
++	if (ts->tv_nsec == 0x3fffffff) {
++		ts->tv_sec -= 1;
++		ts->tv_nsec = 999999999;
++	} else if (ts->tv_nsec == 0x3ffffffe) {
++		ts->tv_sec -= 1;
++		ts->tv_nsec = 999999998;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(felix_ptp_gettime);
++
++static int felix_ptp_settime(struct ptp_clock_info *ptp,
++			     const struct timespec64 *ts)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 val, tod_ns, tod_sec_lsb, tod_sec_msb;
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_IDLE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	tod_ns = ts->tv_nsec & NSEC_MASK;
++	tod_sec_msb = (u32)(ts->tv_sec >> 32) & SEC_MSB_MASK;
++	tod_sec_lsb = (u32)ts->tv_sec;
++
++	ocelot_write_rix(ocelot, tod_ns, PTP_TOD_NSEC, TOD_ACC_PIN);
++	ocelot_write_rix(ocelot, tod_sec_msb, PTP_TOD_SEC_MSB, TOD_ACC_PIN);
++	ocelot_write_rix(ocelot, tod_sec_lsb, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_LOAD);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	return 0;
++}
++
++static int felix_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
++{
++	struct timespec64 ts;
++	struct timespec64 offset;
++
++	offset = ns_to_timespec64(delta);
++
++	felix_ptp_gettime(ptp, &ts);
++	ts = timespec64_add(ts, offset);
++	felix_ptp_settime(ptp, &ts);
++
++	return 0;
++}
++
++static int felix_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u64 adj;
++	u32 reg_adjfreq = 0, reg_adjcfg = PTP_CLK_ADJ_ENA;
++
++	if (!ppb)
++		goto no_adj;
++
++	if (ppb < 0) {
++		reg_adjcfg |= PTP_CLK_ADJ_DIR;
++		ppb = -ppb;
++	}
++
++	adj = PSEC_PER_SEC;
++	do_div(adj, ppb);
++
++	if (adj >= (1L << 30)) {
++		reg_adjfreq |= PTP_CLK_ADJ_UNIT_NS;
++		do_div(adj, 1000);
++	}
++
++	if (adj >= (1L << 30))
++		goto no_adj;
++
++	reg_adjfreq |= adj;
++
++	ocelot_write(ocelot, reg_adjfreq, PTP_CLK_ADJ_FRQ);
++	ocelot_write(ocelot, reg_adjcfg, PTP_CLK_ADJ_CFG);
++	return 0;
++
++no_adj:
++	ocelot_write(ocelot, 0, PTP_CLK_ADJ_CFG);
++	return 0;
++}
++
++static const struct ptp_clock_info felix_ptp_caps = {
++	.owner		= THIS_MODULE,
++	.name		= "felix ptp clock",
++	.max_adj	= 0x7fffffff,
++	.n_alarm	= 0,
++	.n_ext_ts	= 0,
++	.n_per_out	= 0,
++	.n_pins		= 0,
++	.pps		= 0,
++	.gettime64	= felix_ptp_gettime,
++	.settime64	= felix_ptp_settime,
++	.adjtime	= felix_ptp_adjtime,
++	.adjfreq	= felix_ptp_adjfreq,
++};
++
++int felix_ptp_init(struct ocelot *ocelot)
++{
++	/* Reset and enable ptp clock */
++	regmap_field_write(ocelot->regfields[PTP_MISC_CFG_ENA], 0);
++	regmap_field_write(ocelot->regfields[PTP_SYS_CLK_CFG_PER_NS],
++			   SYS_CLK_PER_NS);
++	regmap_field_write(ocelot->regfields[PTP_SYS_CLK_CFG_PER_PS100],
++			   SYS_CLK_PER_PS100);
++	regmap_field_write(ocelot->regfields[PTP_MISC_CFG_ENA], 1);
++
++	ocelot->ptp_caps = felix_ptp_caps;
++
++	ocelot->clock = ptp_clock_register(&ocelot->ptp_caps, ocelot->dev);
++	if (IS_ERR(ocelot->clock))
++		return PTR_ERR(ocelot->clock);
++
++	ocelot->phc_index = ptp_clock_index(ocelot->clock);
++	return 0;
++}
++
++void felix_ptp_remove(struct ocelot *ocelot)
++{
++	ptp_clock_unregister(ocelot->clock);
++}
+diff --git a/drivers/net/ethernet/mscc/felix_regs.c b/drivers/net/ethernet/mscc/felix_regs.c
+new file mode 100644
+index 000000000000..970637f4d272
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/felix_regs.c
+@@ -0,0 +1,607 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/* Felix Switch driver
++ *
++ * Copyright 2017 Microsemi Corporation
++ * Copyright 2018-2019 NXP
++ */
++#include <linux/phy.h>
++#include "ocelot.h"
++
++static const u32 felix_ana_regmap[] = {
++	REG(ANA_ADVLEARN,                  0x0089a0),
++	REG(ANA_VLANMASK,                  0x0089a4),
++//	REG(ANA_PORT_B_DOMAIN,             0x0089a8),
++	REG(ANA_ANAGEFIL,                  0x0089ac),
++	REG(ANA_ANEVENTS,                  0x0089b0),
++	REG(ANA_STORMLIMIT_BURST,          0x0089b4),
++	REG(ANA_STORMLIMIT_CFG,            0x0089b8),
++	REG(ANA_ISOLATED_PORTS,            0x0089c8),
++	REG(ANA_COMMUNITY_PORTS,           0x0089cc),
++	REG(ANA_AUTOAGE,                   0x0089d0),
++	REG(ANA_MACTOPTIONS,               0x0089d4),
++	REG(ANA_LEARNDISC,                 0x0089d8),
++	REG(ANA_AGENCTRL,                  0x0089dc),
++	REG(ANA_MIRRORPORTS,               0x0089e0),
++	REG(ANA_EMIRRORPORTS,              0x0089e4),
++	REG(ANA_FLOODING,                  0x0089e8),
++	REG(ANA_FLOODING_IPMC,             0x008a08),
++	REG(ANA_SFLOW_CFG,                 0x008a0c),
++	REG(ANA_PORT_MODE,                 0x008a28),
++	REG(ANA_CUT_THRU_CFG,              0x008a48),
++	REG(ANA_PGID_PGID,                 0x008400),
++	REG(ANA_TABLES_ANMOVED,            0x007f1c),
++	REG(ANA_TABLES_MACHDATA,           0x007f20),
++	REG(ANA_TABLES_MACLDATA,           0x007f24),
++	REG(ANA_TABLES_STREAMDATA,         0x007f28),
++	REG(ANA_TABLES_MACACCESS,          0x007f2c),
++	REG(ANA_TABLES_MACTINDX,           0x007f30),
++	REG(ANA_TABLES_VLANACCESS,         0x007f34),
++	REG(ANA_TABLES_VLANTIDX,           0x007f38),
++	REG(ANA_TABLES_ISDXACCESS,         0x007f3c),
++	REG(ANA_TABLES_ISDXTIDX,           0x007f40),
++	REG(ANA_TABLES_ENTRYLIM,           0x007f00),
++	REG(ANA_TABLES_PTP_ID_HIGH,        0x007f44),
++	REG(ANA_TABLES_PTP_ID_LOW,         0x007f48),
++	REG(ANA_TABLES_STREAMACCESS,       0x007f4c),
++	REG(ANA_TABLES_STREAMTIDX,         0x007f50),
++	REG(ANA_TABLES_SEQ_HISTORY,        0x007f54),
++	REG(ANA_TABLES_SEQ_MASK,           0x007f58),
++	REG(ANA_TABLES_SFID_MASK,          0x007f5c),
++	REG(ANA_TABLES_SFIDACCESS,         0x007f60),
++	REG(ANA_TABLES_SFIDTIDX,           0x007f64),
++	REG(ANA_MSTI_STATE,                0x008600),
++	REG(ANA_OAM_UPM_LM_CNT,            0x008000),
++	REG(ANA_SG_ACCESS_CTRL,            0x008a64),
++	REG(ANA_SG_CONFIG_REG_1,           0x007fb0),
++	REG(ANA_SG_CONFIG_REG_2,           0x007fb4),
++	REG(ANA_SG_CONFIG_REG_3,           0x007fb8),
++	REG(ANA_SG_CONFIG_REG_4,           0x007fbc),
++	REG(ANA_SG_CONFIG_REG_5,           0x007fc0),
++	REG(ANA_SG_GCL_GS_CONFIG,          0x007f80),
++	REG(ANA_SG_GCL_TI_CONFIG,          0x007f90),
++	REG(ANA_SG_STATUS_REG_1,           0x008980),
++	REG(ANA_SG_STATUS_REG_2,           0x008984),
++	REG(ANA_SG_STATUS_REG_3,           0x008988),
++	REG(ANA_PORT_VLAN_CFG,             0x007800),
++	REG(ANA_PORT_DROP_CFG,             0x007804),
++	REG(ANA_PORT_QOS_CFG,              0x007808),
++	REG(ANA_PORT_VCAP_CFG,             0x00780c),
++	REG(ANA_PORT_VCAP_S1_KEY_CFG,      0x007810),
++	REG(ANA_PORT_VCAP_S2_CFG,          0x00781c),
++	REG(ANA_PORT_PCP_DEI_MAP,          0x007820),
++	REG(ANA_PORT_CPU_FWD_CFG,          0x007860),
++	REG(ANA_PORT_CPU_FWD_BPDU_CFG,     0x007864),
++	REG(ANA_PORT_CPU_FWD_GARP_CFG,     0x007868),
++	REG(ANA_PORT_CPU_FWD_CCM_CFG,      0x00786c),
++	REG(ANA_PORT_PORT_CFG,             0x007870),
++	REG(ANA_PORT_POL_CFG,              0x007874),
++	REG(ANA_PORT_PTP_CFG,              0x007878),
++	REG(ANA_PORT_PTP_DLY1_CFG,         0x00787c),
++	REG(ANA_PORT_PTP_DLY2_CFG,         0x007880),
++	REG(ANA_PORT_SFID_CFG,             0x007884),
++	REG(ANA_PFC_PFC_CFG,               0x008800),
++//	REG(ANA_PFC_PFC_TIMER,             0x008804),
++//	REG(ANA_IPT_OAM_MEP_CFG,           0x007000),
++//	REG(ANA_IPT_IPT,                   0x007004),
++//	REG(ANA_PPT_PPT,                   0x007fd0),
++//	REG(ANA_FID_MAP_FID_MAP,           0x000000),
++	REG(ANA_AGGR_CFG,                  0x008a68),
++	REG(ANA_CPUQ_CFG,                  0x008a6c),
++//	REG(ANA_CPUQ_CFG2,                 0x008a70),
++	REG(ANA_CPUQ_8021_CFG,             0x008a74),
++	REG(ANA_DSCP_CFG,                  0x008ab4),
++	REG(ANA_DSCP_REWR_CFG,             0x008bb4),
++	REG(ANA_VCAP_RNG_TYPE_CFG,         0x008bf4),
++	REG(ANA_VCAP_RNG_VAL_CFG,          0x008c14),
++//	REG(ANA_VRAP_CFG,                  0x008c34),
++//	REG(ANA_VRAP_HDR_DATA,             0x008c38),
++//	REG(ANA_VRAP_HDR_MASK,             0x008c3c),
++	REG(ANA_DISCARD_CFG,               0x008c40),
++	REG(ANA_FID_CFG,                   0x008c44),
++	REG(ANA_POL_PIR_CFG,               0x004000),
++	REG(ANA_POL_CIR_CFG,               0x004004),
++	REG(ANA_POL_MODE_CFG,              0x004008),
++	REG(ANA_POL_PIR_STATE,             0x00400c),
++	REG(ANA_POL_CIR_STATE,             0x004010),
++//	REG(ANA_POL_STATE,                 0x004014),
++	REG(ANA_POL_FLOWC,                 0x008c48),
++	REG(ANA_POL_HYST,                  0x008cb4),
++//	REG(ANA_POL_MISC_CFG,              0x008c94),
++};
++
++static const u32 felix_ptp_regmap[] = {
++	REG(PTP_MISC_CFG,                  0x0000a0),
++	REG(PTP_CLK_ADJ_CFG,               0x0000a4),
++	REG(PTP_CLK_ADJ_FRQ,               0x0000a8),
++	REG(PTP_PIN_INTR,                  0x0000ac),
++	REG(PTP_PIN_INTR_ENA,              0x0000b0),
++	REG(PTP_INTR_IDENT,                0x0000b4),
++	REG(PTP_SYS_CLK_CFG,               0x0000b8),
++	REG(PTP_CUR_NSF,                   0x0000bc),
++	REG(PTP_CUR_NSEC,                  0x0000c0),
++	REG(PTP_CUR_SEC_LSB,               0x0000c4),
++	REG(PTP_CUR_SEC_MSB,               0x0000c8),
++	REG(PTP_PIN_CFG,                   0x000000),
++	REG(PTP_TOD_SEC_MSB,               0x000004),
++	REG(PTP_TOD_SEC_LSB,               0x000008),
++	REG(PTP_TOD_NSEC,                  0x00000c),
++	REG(PTP_NSF,                       0x000010),
++	REG(PTP_PIN_WF_HIGH_PERIOD,        0x000014),
++	REG(PTP_PIN_WF_LOW_PERIOD,         0x000018),
++};
++
++static const u32 felix_qs_regmap[] = {
++	REG(QS_XTR_GRP_CFG,                0x000000),
++	REG(QS_XTR_RD,                     0x000008),
++	REG(QS_XTR_FRM_PRUNING,            0x000010),
++	REG(QS_XTR_FLUSH,                  0x000018),
++	REG(QS_XTR_DATA_PRESENT,           0x00001c),
++	REG(QS_XTR_CFG,                    0x000020),
++	REG(QS_INJ_GRP_CFG,                0x000024),
++	REG(QS_INJ_WR,                     0x00002c),
++	REG(QS_INJ_CTRL,                   0x000034),
++	REG(QS_INJ_STATUS,                 0x00003c),
++	REG(QS_INJ_ERR,                    0x000040),
++//	REG(QS_INH_DBG,                    0x000048),
++};
++
++static const u32 felix_qsys_regmap[] = {
++	REG(QSYS_PORT_MODE,                0x00f460),
++	REG(QSYS_SWITCH_PORT_MODE,         0x00f480),
++	REG(QSYS_STAT_CNT_CFG,             0x00f49c),
++	REG(QSYS_EEE_CFG,                  0x00f4a0),
++	REG(QSYS_EEE_THRES,                0x00f4b8),
++	REG(QSYS_IGR_NO_SHARING,           0x00f4bc),
++	REG(QSYS_EGR_NO_SHARING,           0x00f4c0),
++	REG(QSYS_SW_STATUS,                0x00f4c4),
++	REG(QSYS_EXT_CPU_CFG,              0x00f4e0),
++//	REG(QSYS_PAD_CFG,                  0x00f4e4),
++	REG(QSYS_CPU_GROUP_MAP,            0x00f4e8),
++//	REG(QSYS_QMAP,                     0x00f4ec),
++//	REG(QSYS_ISDX_SGRP,                0x00f000),
++//	REG(QSYS_TIMED_FRAME_ENTRY,        0x00e000),
++	REG(QSYS_TFRM_MISC,                0x00f50c),
++	REG(QSYS_TFRM_PORT_DLY,            0x00f510),
++	REG(QSYS_TFRM_TIMER_CFG_1,         0x00f514),
++	REG(QSYS_TFRM_TIMER_CFG_2,         0x00f518),
++	REG(QSYS_TFRM_TIMER_CFG_3,         0x00f51c),
++	REG(QSYS_TFRM_TIMER_CFG_4,         0x00f520),
++	REG(QSYS_TFRM_TIMER_CFG_5,         0x00f524),
++	REG(QSYS_TFRM_TIMER_CFG_6,         0x00f528),
++	REG(QSYS_TFRM_TIMER_CFG_7,         0x00f52c),
++	REG(QSYS_TFRM_TIMER_CFG_8,         0x00f530),
++	REG(QSYS_RED_PROFILE,              0x00f534),
++	REG(QSYS_RES_QOS_MODE,             0x00f574),
++	REG(QSYS_RES_CFG,                  0x00c000),
++	REG(QSYS_RES_STAT,                 0x00c004),
++	REG(QSYS_EGR_DROP_MODE,            0x00f578),
++	REG(QSYS_EQ_CTRL,                  0x00f57c),
++//	REG(QSYS_EVENTS_CORE,              0x00f580),
++	REG(QSYS_QMAXSDU_CFG_0,            0x00f584),
++	REG(QSYS_QMAXSDU_CFG_1,            0x00f5a0),
++	REG(QSYS_QMAXSDU_CFG_2,            0x00f5bc),
++	REG(QSYS_QMAXSDU_CFG_3,            0x00f5d8),
++	REG(QSYS_QMAXSDU_CFG_4,            0x00f5f4),
++	REG(QSYS_QMAXSDU_CFG_5,            0x00f610),
++	REG(QSYS_QMAXSDU_CFG_6,            0x00f62c),
++	REG(QSYS_QMAXSDU_CFG_7,            0x00f648),
++	REG(QSYS_PREEMPTION_CFG,           0x00f664),
++	REG(QSYS_CIR_CFG,                  0x000000),
++	REG(QSYS_EIR_CFG,                  0x000004),
++	REG(QSYS_SE_CFG,                   0x000008),
++	REG(QSYS_SE_DWRR_CFG,              0x00000c),
++//	REG(QSYS_SE_CONNECT,               0x00003c),
++	REG(QSYS_SE_DLB_SENSE,             0x000040),
++	REG(QSYS_CIR_STATE,                0x000044),
++	REG(QSYS_EIR_STATE,                0x000048),
++//	REG(QSYS_SE_STATE,                 0x00004c),
++	REG(QSYS_HSCH_MISC_CFG,            0x00f67c),
++	REG(QSYS_TAG_CONFIG,               0x00f680),
++	REG(QSYS_TAS_PARAM_CFG_CTRL,       0x00f698),
++	REG(QSYS_PORT_MAX_SDU,             0x00f69c),
++	REG(QSYS_PARAM_CFG_REG_1,          0x00f440),
++	REG(QSYS_PARAM_CFG_REG_2,          0x00f444),
++	REG(QSYS_PARAM_CFG_REG_3,          0x00f448),
++	REG(QSYS_PARAM_CFG_REG_4,          0x00f44c),
++	REG(QSYS_PARAM_CFG_REG_5,          0x00f450),
++	REG(QSYS_GCL_CFG_REG_1,            0x00f454),
++	REG(QSYS_GCL_CFG_REG_2,            0x00f458),
++	REG(QSYS_PARAM_STATUS_REG_1,       0x00f400),
++	REG(QSYS_PARAM_STATUS_REG_2,       0x00f404),
++	REG(QSYS_PARAM_STATUS_REG_3,       0x00f408),
++	REG(QSYS_PARAM_STATUS_REG_4,       0x00f40c),
++	REG(QSYS_PARAM_STATUS_REG_5,       0x00f410),
++	REG(QSYS_PARAM_STATUS_REG_6,       0x00f414),
++	REG(QSYS_PARAM_STATUS_REG_7,       0x00f418),
++	REG(QSYS_PARAM_STATUS_REG_8,       0x00f41c),
++	REG(QSYS_PARAM_STATUS_REG_9,       0x00f420),
++	REG(QSYS_GCL_STATUS_REG_1,         0x00f424),
++	REG(QSYS_GCL_STATUS_REG_2,         0x00f428),
++};
++
++static const u32 felix_rew_regmap[] = {
++	REG(REW_PORT_VLAN_CFG,             0x000000),
++	REG(REW_TAG_CFG,                   0x000004),
++	REG(REW_PORT_CFG,                  0x000008),
++	REG(REW_DSCP_CFG,                  0x00000c),
++	REG(REW_PCP_DEI_QOS_MAP_CFG,       0x000010),
++	REG(REW_PTP_CFG,                   0x000050),
++	REG(REW_PTP_DLY1_CFG,              0x000054),
++	REG(REW_RED_TAG_CFG,               0x000058),
++	REG(REW_DSCP_REMAP_DP1_CFG,        0x000410),
++	REG(REW_DSCP_REMAP_CFG,            0x000510),
++//	REG(REW_STAT_CFG,                  0x000610),
++//	REG(REW_REW_STICKY,                0x000614),
++//	REG(REW_PPT,                       0x000400),
++};
++
++static const u32 felix_sys_regmap[] = {
++	REG(SYS_COUNT_RX_OCTETS,	   0x000000),
++	REG(SYS_COUNT_RX_MULTICAST,	   0x000008),
++	REG(SYS_COUNT_RX_SHORTS,	   0x000010),
++	REG(SYS_COUNT_RX_FRAGMENTS,	   0x000014),
++	REG(SYS_COUNT_RX_JABBERS,	   0x000018),
++	REG(SYS_COUNT_RX_64,		   0x000024),
++	REG(SYS_COUNT_RX_65_127,	   0x000028),
++	REG(SYS_COUNT_RX_128_255,	   0x00002c),
++	REG(SYS_COUNT_RX_256_1023,	   0x000030),
++	REG(SYS_COUNT_RX_1024_1526,	   0x000034),
++	REG(SYS_COUNT_RX_1527_MAX,	   0x000038),
++	REG(SYS_COUNT_RX_LONGS,		   0x000044),
++	REG(SYS_COUNT_TX_OCTETS,	   0x000200),
++	REG(SYS_COUNT_TX_COLLISION,	   0x000210),
++	REG(SYS_COUNT_TX_DROPS,		   0x000214),
++	REG(SYS_COUNT_TX_64,		   0x00021c),
++	REG(SYS_COUNT_TX_65_127,	   0x000220),
++	REG(SYS_COUNT_TX_128_511,	   0x000224),
++	REG(SYS_COUNT_TX_512_1023,	   0x000228),
++	REG(SYS_COUNT_TX_1024_1526,	   0x00022c),
++	REG(SYS_COUNT_TX_1527_MAX,	   0x000230),
++	REG(SYS_COUNT_TX_AGING,		   0x000278),
++	REG(SYS_RESET_CFG,                 0x000e00),
++	REG(SYS_SR_ETYPE_CFG,              0x000e04),
++	REG(SYS_VLAN_ETYPE_CFG,            0x000e08),
++	REG(SYS_PORT_MODE,                 0x000e0c),
++	REG(SYS_FRONT_PORT_MODE,           0x000e2c),
++	REG(SYS_FRM_AGING,                 0x000e44),
++	REG(SYS_STAT_CFG,                  0x000e48),
++	REG(SYS_SW_STATUS,                 0x000e4c),
++//	REG(SYS_MISC_CFG,                  0x000e68),
++	REG(SYS_REW_MAC_HIGH_CFG,          0x000e6c),
++	REG(SYS_REW_MAC_LOW_CFG,           0x000e84),
++	REG(SYS_TIMESTAMP_OFFSET,          0x000e9c),
++	REG(SYS_PAUSE_CFG,                 0x000ea0),
++	REG(SYS_PAUSE_TOT_CFG,             0x000ebc),
++	REG(SYS_ATOP,                      0x000ec0),
++	REG(SYS_ATOP_TOT_CFG,              0x000edc),
++	REG(SYS_MAC_FC_CFG,                0x000ee0),
++	REG(SYS_MMGT,                      0x000ef8),
++//	REG(SYS_MMGT_FAST,                 0x000efc),
++//	REG(SYS_EVENTS_DIF,                0x000f00),
++//	REG(SYS_EVENTS_CORE,               0x000f10),
++	REG(SYS_CNT,                       0x000000),
++	REG(SYS_PTP_STATUS,                0x000f14),
++	REG(SYS_PTP_TXSTAMP,               0x000f18),
++	REG(SYS_PTP_NXT,                   0x000f1c),
++	REG(SYS_PTP_CFG,                   0x000f20),
++	REG(SYS_RAM_INIT,                  0x000f24),
++//	REG(SYS_CM_ADDR,                   0x000f28),
++//	REG(SYS_CM_DATA_WR,                0x000f2c),
++//	REG(SYS_CM_DATA_RD,                0x000f30),
++//	REG(SYS_CM_OP,                     0x000f34),
++};
++
++static const u32 felix_gcb_regmap[] = {
++	REG(GCB_SOFT_RST,		   0x000004),
++};
++
++static const u32 *felix_regmap[] = {
++	[ANA] = felix_ana_regmap,
++	[QS] = felix_qs_regmap,
++	[QSYS] = felix_qsys_regmap,
++	[REW] = felix_rew_regmap,
++	[SYS] = felix_sys_regmap,
++	[PTP] = felix_ptp_regmap,
++	[GCB] = felix_gcb_regmap,
++};
++
++static const struct reg_field felix_regfields[] = {
++	[ANA_ADVLEARN_VLAN_CHK] = REG_FIELD(ANA_ADVLEARN, 6, 6),
++	[ANA_ADVLEARN_LEARN_MIRROR] = REG_FIELD(ANA_ADVLEARN, 0, 5),
++	[ANA_ANEVENTS_FLOOD_DISCARD] = REG_FIELD(ANA_ANEVENTS, 30, 30),
++	[ANA_ANEVENTS_AUTOAGE] = REG_FIELD(ANA_ANEVENTS, 26, 26),
++	[ANA_ANEVENTS_STORM_DROP] = REG_FIELD(ANA_ANEVENTS, 24, 24),
++	[ANA_ANEVENTS_LEARN_DROP] = REG_FIELD(ANA_ANEVENTS, 23, 23),
++	[ANA_ANEVENTS_AGED_ENTRY] = REG_FIELD(ANA_ANEVENTS, 22, 22),
++	[ANA_ANEVENTS_CPU_LEARN_FAILED] = REG_FIELD(ANA_ANEVENTS, 21, 21),
++	[ANA_ANEVENTS_AUTO_LEARN_FAILED] = REG_FIELD(ANA_ANEVENTS, 20, 20),
++	[ANA_ANEVENTS_LEARN_REMOVE] = REG_FIELD(ANA_ANEVENTS, 19, 19),
++	[ANA_ANEVENTS_AUTO_LEARNED] = REG_FIELD(ANA_ANEVENTS, 18, 18),
++	[ANA_ANEVENTS_AUTO_MOVED] = REG_FIELD(ANA_ANEVENTS, 17, 17),
++	[ANA_ANEVENTS_CLASSIFIED_DROP] = REG_FIELD(ANA_ANEVENTS, 15, 15),
++	[ANA_ANEVENTS_CLASSIFIED_COPY] = REG_FIELD(ANA_ANEVENTS, 14, 14),
++	[ANA_ANEVENTS_VLAN_DISCARD] = REG_FIELD(ANA_ANEVENTS, 13, 13),
++	[ANA_ANEVENTS_FWD_DISCARD] = REG_FIELD(ANA_ANEVENTS, 12, 12),
++	[ANA_ANEVENTS_MULTICAST_FLOOD] = REG_FIELD(ANA_ANEVENTS, 11, 11),
++	[ANA_ANEVENTS_UNICAST_FLOOD] = REG_FIELD(ANA_ANEVENTS, 10, 10),
++	[ANA_ANEVENTS_DEST_KNOWN] = REG_FIELD(ANA_ANEVENTS, 9, 9),
++	[ANA_ANEVENTS_BUCKET3_MATCH] = REG_FIELD(ANA_ANEVENTS, 8, 8),
++	[ANA_ANEVENTS_BUCKET2_MATCH] = REG_FIELD(ANA_ANEVENTS, 7, 7),
++	[ANA_ANEVENTS_BUCKET1_MATCH] = REG_FIELD(ANA_ANEVENTS, 6, 6),
++	[ANA_ANEVENTS_BUCKET0_MATCH] = REG_FIELD(ANA_ANEVENTS, 5, 5),
++	[ANA_ANEVENTS_CPU_OPERATION] = REG_FIELD(ANA_ANEVENTS, 4, 4),
++	[ANA_ANEVENTS_DMAC_LOOKUP] = REG_FIELD(ANA_ANEVENTS, 3, 3),
++	[ANA_ANEVENTS_SMAC_LOOKUP] = REG_FIELD(ANA_ANEVENTS, 2, 2),
++	[ANA_ANEVENTS_SEQ_GEN_ERR_0] = REG_FIELD(ANA_ANEVENTS, 1, 1),
++	[ANA_ANEVENTS_SEQ_GEN_ERR_1] = REG_FIELD(ANA_ANEVENTS, 0, 0),
++	[ANA_TABLES_MACACCESS_B_DOM] = REG_FIELD(ANA_TABLES_MACACCESS, 16, 16),
++	[ANA_TABLES_MACTINDX_BUCKET] = REG_FIELD(ANA_TABLES_MACTINDX, 11, 12),
++	[ANA_TABLES_MACTINDX_M_INDEX] = REG_FIELD(ANA_TABLES_MACTINDX, 0, 10),
++	[PTP_MISC_CFG_ENA] = REG_FIELD(PTP_MISC_CFG, 2, 2),
++	[PTP_SYS_CLK_CFG_PER_NS] = REG_FIELD(PTP_SYS_CLK_CFG, 4, 8),
++	[PTP_SYS_CLK_CFG_PER_PS100] = REG_FIELD(PTP_SYS_CLK_CFG, 0, 3),
++	[QSYS_TIMED_FRAME_ENTRY_TFRM_VLD] =
++		REG_FIELD(QSYS_TIMED_FRAME_ENTRY, 19, 19),
++	[QSYS_TIMED_FRAME_ENTRY_TFRM_FP] =
++		REG_FIELD(QSYS_TIMED_FRAME_ENTRY, 7, 18),
++	[QSYS_TIMED_FRAME_ENTRY_TFRM_PORTNO] =
++		REG_FIELD(QSYS_TIMED_FRAME_ENTRY, 4, 6),
++	[QSYS_TIMED_FRAME_ENTRY_TFRM_TM_SEL] =
++		REG_FIELD(QSYS_TIMED_FRAME_ENTRY, 1, 3),
++	[QSYS_TIMED_FRAME_ENTRY_TFRM_TM_T] =
++		REG_FIELD(QSYS_TIMED_FRAME_ENTRY, 0, 0),
++	[SYS_RESET_CFG_CORE_ENA] = REG_FIELD(SYS_RESET_CFG, 0, 0),
++	[SYS_RESET_CFG_MEM_ENA] = REG_FIELD(SYS_RESET_CFG, 1, 1),
++	[SYS_RESET_CFG_MEM_INIT] = REG_FIELD(SYS_RESET_CFG, 0, 0),
++	[ANA_TABLES_STREAMDATA_SFID_0] =
++		REG_FIELD(ANA_TABLES_STREAMDATA, 0, 7),
++	[ANA_TABLES_STREAMDATA_SFID_VALID_0] =
++		REG_FIELD(ANA_TABLES_STREAMDATA, 8, 8),
++	[ANA_TABLES_SFIDTIDX_SFID_INDEX_0] =
++		REG_FIELD(ANA_TABLES_SFIDTIDX, 0, 7),
++	[ANA_SG_ACCESS_CTRL_CONFIG_CHANGE_0] =
++		REG_FIELD(ANA_SG_ACCESS_CTRL, 28, 28),
++	[ANA_SG_ACCESS_CTRL_SGID_0] =
++		REG_FIELD(ANA_SG_ACCESS_CTRL, 0, 7),
++	[ANA_SG_CONFIG_REG_3_GATE_ENABLE_0] =
++		REG_FIELD(ANA_SG_CONFIG_REG_3, 20, 20),
++	[QSYS_TAS_PARAM_CFG_CTRL_PORT_NUM_0] =
++		REG_FIELD(QSYS_TAS_PARAM_CFG_CTRL, 0, 7),
++	[QSYS_GCL_STATUS_REG_1_GCL_ENTRY_NUM_0] =
++		REG_FIELD(QSYS_GCL_STATUS_REG_1, 0, 5),
++	[QSYS_GCL_CFG_REG_1_GATE_STATE_0] =
++		REG_FIELD(QSYS_GCL_CFG_REG_1, 8, 15),
++	[QSYS_GCL_CFG_REG_1_GCL_ENTRY_NUM_0] =
++		REG_FIELD(QSYS_GCL_CFG_REG_1, 0, 5),
++	[QSYS_TAS_PARAM_CFG_CTRL_CONFIG_CHANGE_0] =
++		REG_FIELD(QSYS_TAS_PARAM_CFG_CTRL, 16, 16),
++	[QSYS_TAG_CONFIG_ENABLE_0] = REG_FIELD(QSYS_TAG_CONFIG, 0, 0),
++	[SYS_STAT_CFG_STAT_VIEW_0] = REG_FIELD(SYS_STAT_CFG, 0, 9),
++	[GCB_SOFT_RST_SWC_RST] = REG_FIELD(GCB_SOFT_RST, 0, 0),
++};
++
++static const struct ocelot_stat_layout felix_stats_layout[] = {
++	{ .name = "rx_octets", .offset = 0x00, },
++	{ .name = "rx_unicast", .offset = 0x01, },
++	{ .name = "rx_multicast", .offset = 0x02, },
++	{ .name = "rx_broadcast", .offset = 0x03, },
++	{ .name = "rx_shorts", .offset = 0x04, },
++	{ .name = "rx_fragments", .offset = 0x05, },
++	{ .name = "rx_jabbers", .offset = 0x06, },
++	{ .name = "rx_crc_align_errs", .offset = 0x07, },
++	{ .name = "rx_sym_errs", .offset = 0x08, },
++	{ .name = "rx_frames_below_65_octets", .offset = 0x09, },
++	{ .name = "rx_frames_65_to_127_octets", .offset = 0x0A, },
++	{ .name = "rx_frames_128_to_255_octets", .offset = 0x0B, },
++	{ .name = "rx_frames_256_to_511_octets", .offset = 0x0C, },
++	{ .name = "rx_frames_512_to_1023_octets", .offset = 0x0D, },
++	{ .name = "rx_frames_1024_to_1526_octets", .offset = 0x0E, },
++	{ .name = "rx_frames_over_1526_octets", .offset = 0x0F, },
++	{ .name = "rx_pause", .offset = 0x10, },
++	{ .name = "rx_control", .offset = 0x11, },
++	{ .name = "rx_longs", .offset = 0x12, },
++	{ .name = "rx_classified_drops", .offset = 0x13, },
++	{ .name = "rx_red_prio_0", .offset = 0x14, },
++	{ .name = "rx_red_prio_1", .offset = 0x15, },
++	{ .name = "rx_red_prio_2", .offset = 0x16, },
++	{ .name = "rx_red_prio_3", .offset = 0x17, },
++	{ .name = "rx_red_prio_4", .offset = 0x18, },
++	{ .name = "rx_red_prio_5", .offset = 0x19, },
++	{ .name = "rx_red_prio_6", .offset = 0x1A, },
++	{ .name = "rx_red_prio_7", .offset = 0x1B, },
++	{ .name = "rx_yellow_prio_0", .offset = 0x1C, },
++	{ .name = "rx_yellow_prio_1", .offset = 0x1D, },
++	{ .name = "rx_yellow_prio_2", .offset = 0x1E, },
++	{ .name = "rx_yellow_prio_3", .offset = 0x1F, },
++	{ .name = "rx_yellow_prio_4", .offset = 0x20, },
++	{ .name = "rx_yellow_prio_5", .offset = 0x21, },
++	{ .name = "rx_yellow_prio_6", .offset = 0x22, },
++	{ .name = "rx_yellow_prio_7", .offset = 0x23, },
++	{ .name = "rx_green_prio_0", .offset = 0x24, },
++	{ .name = "rx_green_prio_1", .offset = 0x25, },
++	{ .name = "rx_green_prio_2", .offset = 0x26, },
++	{ .name = "rx_green_prio_3", .offset = 0x27, },
++	{ .name = "rx_green_prio_4", .offset = 0x28, },
++	{ .name = "rx_green_prio_5", .offset = 0x29, },
++	{ .name = "rx_green_prio_6", .offset = 0x2A, },
++	{ .name = "rx_green_prio_7", .offset = 0x2B, },
++	{ .name = "tx_octets", .offset = 0x80, },
++	{ .name = "tx_unicast", .offset = 0x81, },
++	{ .name = "tx_multicast", .offset = 0x82, },
++	{ .name = "tx_broadcast", .offset = 0x83, },
++	{ .name = "tx_collision", .offset = 0x84, },
++	{ .name = "tx_drops", .offset = 0x85, },
++	{ .name = "tx_pause", .offset = 0x86, },
++	{ .name = "tx_frames_below_65_octets", .offset = 0x87, },
++	{ .name = "tx_frames_65_to_127_octets", .offset = 0x88, },
++	{ .name = "tx_frames_128_255_octets", .offset = 0x89, },
++	{ .name = "tx_frames_256_511_octets", .offset = 0x8A, },
++	{ .name = "tx_frames_512_1023_octets", .offset = 0x8B, },
++	{ .name = "tx_frames_1024_1526_octets", .offset = 0x8C, },
++	{ .name = "tx_frames_over_1526_octets", .offset = 0x8D, },
++	{ .name = "tx_yellow_prio_0", .offset = 0x8E, },
++	{ .name = "tx_yellow_prio_1", .offset = 0x8F, },
++	{ .name = "tx_yellow_prio_2", .offset = 0x90, },
++	{ .name = "tx_yellow_prio_3", .offset = 0x91, },
++	{ .name = "tx_yellow_prio_4", .offset = 0x92, },
++	{ .name = "tx_yellow_prio_5", .offset = 0x93, },
++	{ .name = "tx_yellow_prio_6", .offset = 0x94, },
++	{ .name = "tx_yellow_prio_7", .offset = 0x95, },
++	{ .name = "tx_green_prio_0", .offset = 0x96, },
++	{ .name = "tx_green_prio_1", .offset = 0x97, },
++	{ .name = "tx_green_prio_2", .offset = 0x98, },
++	{ .name = "tx_green_prio_3", .offset = 0x99, },
++	{ .name = "tx_green_prio_4", .offset = 0x9A, },
++	{ .name = "tx_green_prio_5", .offset = 0x9B, },
++	{ .name = "tx_green_prio_6", .offset = 0x9C, },
++	{ .name = "tx_green_prio_7", .offset = 0x9D, },
++	{ .name = "tx_aged", .offset = 0x9E, },
++	{ .name = "drop_local", .offset = 0x100, },
++	{ .name = "drop_tail", .offset = 0x101, },
++	{ .name = "drop_yellow_prio_0", .offset = 0x102, },
++	{ .name = "drop_yellow_prio_1", .offset = 0x103, },
++	{ .name = "drop_yellow_prio_2", .offset = 0x104, },
++	{ .name = "drop_yellow_prio_3", .offset = 0x105, },
++	{ .name = "drop_yellow_prio_4", .offset = 0x106, },
++	{ .name = "drop_yellow_prio_5", .offset = 0x107, },
++	{ .name = "drop_yellow_prio_6", .offset = 0x108, },
++	{ .name = "drop_yellow_prio_7", .offset = 0x109, },
++	{ .name = "drop_green_prio_0", .offset = 0x10A, },
++	{ .name = "drop_green_prio_1", .offset = 0x10B, },
++	{ .name = "drop_green_prio_2", .offset = 0x10C, },
++	{ .name = "drop_green_prio_3", .offset = 0x10D, },
++	{ .name = "drop_green_prio_4", .offset = 0x10E, },
++	{ .name = "drop_green_prio_5", .offset = 0x10F, },
++	{ .name = "drop_green_prio_6", .offset = 0x110, },
++	{ .name = "drop_green_prio_7", .offset = 0x111, },
++};
++
++/* FIXME this is duplicated */
++/* Watermark encode
++ * Bit 8:   Unit; 0:1, 1:16
++ * Bit 7-0: Value to be multiplied with unit
++ */
++static u16 ocelot_wm_enc(u16 value)
++{
++	if (value >= BIT(8))
++		return BIT(8) | (value / 16);
++
++	return value;
++}
++
++void felix_port_adjust_link(struct net_device *dev)
++{
++	struct ocelot_port *port = netdev_priv(dev);
++	struct ocelot *ocelot = port->ocelot;
++	u8 p = port->chip_port;
++	int speed, atop_wm;
++
++	switch (dev->phydev->speed) {
++	case SPEED_10:
++		speed = OCELOT_SPEED_10;
++		break;
++	case SPEED_100:
++		speed = OCELOT_SPEED_100;
++		break;
++	case SPEED_1000:
++		speed = OCELOT_SPEED_1000;
++		break;
++	case SPEED_2500:
++		speed = OCELOT_SPEED_2500;
++		break;
++	default:
++		netdev_err(dev, "Unsupported PHY speed: %d\n",
++			   dev->phydev->speed);
++		return;
++	}
++
++	phy_print_status(dev->phydev);
++
++	if (!dev->phydev->link)
++		return;
++
++	/* Set MAC IFG Gaps
++	 * FDX: TX_IFG = 5, RX_IFG1 = RX_IFG2 = 0
++	 * !FDX: TX_IFG = 5, RX_IFG1 = RX_IFG2 = 5
++	 */
++	ocelot_port_writel(port, DEV_MAC_IFG_CFG_TX_IFG(5), DEV_MAC_IFG_CFG);
++
++	/* Load seed (0) and set MAC HDX late collision  */
++	ocelot_port_writel(port, DEV_MAC_HDX_CFG_LATE_COL_POS(67) |
++			   DEV_MAC_HDX_CFG_SEED_LOAD,
++			   DEV_MAC_HDX_CFG);
++	mdelay(1);
++	ocelot_port_writel(port, DEV_MAC_HDX_CFG_LATE_COL_POS(67),
++			   DEV_MAC_HDX_CFG);
++
++	/* Set Max Length and maximum tags allowed */
++	ocelot_port_writel(port, VLAN_ETH_FRAME_LEN, DEV_MAC_MAXLEN_CFG);
++	ocelot_port_writel(port, DEV_MAC_TAGS_CFG_TAG_ID(ETH_P_8021AD) |
++			   DEV_MAC_TAGS_CFG_VLAN_AWR_ENA |
++			   DEV_MAC_TAGS_CFG_VLAN_LEN_AWR_ENA,
++			   DEV_MAC_TAGS_CFG);
++
++	/* Enable MAC module */
++	ocelot_port_writel(port, DEV_MAC_ENA_CFG_RX_ENA |
++			   DEV_MAC_ENA_CFG_TX_ENA, DEV_MAC_ENA_CFG);
++
++	/* Set SMAC of Pause frame (00:00:00:00:00:00) */
++	ocelot_port_writel(port, 0, DEV_MAC_FC_MAC_HIGH_CFG);
++	ocelot_port_writel(port, 0, DEV_MAC_FC_MAC_LOW_CFG);
++
++	/* No PFC */
++	ocelot_write_gix(ocelot, ANA_PFC_PFC_CFG_FC_LINK_SPEED(speed),
++			 ANA_PFC_PFC_CFG, p);
++
++	/* Set Pause WM hysteresis
++	 * 152 = 6 * VLAN_ETH_FRAME_LEN / OCELOT_BUFFER_CELL_SZ
++	 * 101 = 4 * VLAN_ETH_FRAME_LEN / OCELOT_BUFFER_CELL_SZ
++	 */
++	ocelot_write_rix(ocelot, SYS_PAUSE_CFG_PAUSE_ENA |
++			 SYS_PAUSE_CFG_PAUSE_STOP(101) |
++			 SYS_PAUSE_CFG_PAUSE_START(152), SYS_PAUSE_CFG, p);
++
++	/* Core: Enable port for frame transfer */
++	ocelot_write_rix(ocelot, QSYS_SWITCH_PORT_MODE_INGRESS_DROP_MODE |
++			 QSYS_SWITCH_PORT_MODE_SCH_NEXT_CFG(1) |
++			 QSYS_SWITCH_PORT_MODE_PORT_ENA,
++			 QSYS_SWITCH_PORT_MODE, p);
++
++	/* Flow control */
++	ocelot_write_rix(ocelot, SYS_MAC_FC_CFG_PAUSE_VAL_CFG(0xffff) |
++			 SYS_MAC_FC_CFG_RX_FC_ENA | SYS_MAC_FC_CFG_TX_FC_ENA |
++			 SYS_MAC_FC_CFG_ZERO_PAUSE_ENA |
++			 SYS_MAC_FC_CFG_FC_LATENCY_CFG(0x7) |
++			 SYS_MAC_FC_CFG_FC_LINK_SPEED(speed),
++			 SYS_MAC_FC_CFG, p);
++	ocelot_write_rix(ocelot, 0, ANA_POL_FLOWC, p);
++
++	/* Tail dropping watermark */
++	atop_wm = ocelot->shared_queue_sz - 9 * VLAN_ETH_FRAME_LEN;
++	atop_wm /= OCELOT_BUFFER_CELL_SZ;
++	ocelot_write_rix(ocelot, ocelot_wm_enc(9 * VLAN_ETH_FRAME_LEN),
++			 SYS_ATOP, p);
++	ocelot_write(ocelot, ocelot_wm_enc(atop_wm), SYS_ATOP_TOT_CFG);
++}
++
++int felix_chip_init(struct ocelot *ocelot)
++{
++	int ret;
++
++	ocelot->map = felix_regmap;
++	ocelot->stats_layout = felix_stats_layout;
++	ocelot->num_stats = ARRAY_SIZE(felix_stats_layout);
++	ocelot->shared_queue_sz = 128 * 1024;
++	ocelot->port_adjust_link = &felix_port_adjust_link;
++
++	ret = ocelot_regfields_init(ocelot, felix_regfields);
++	if (ret) {
++		dev_err(ocelot->dev, "failed to init reg fields map\n");
++		return ret;
++	}
++
++	eth_random_addr(ocelot->base_mac);
++	ocelot->base_mac[5] &= 0xf0;
++	return 0;
++}
++EXPORT_SYMBOL(felix_chip_init);
+diff --git a/drivers/net/ethernet/mscc/ocelot_ptp.h b/drivers/net/ethernet/mscc/ocelot_ptp.h
+new file mode 100644
+index 000000000000..d3c7f35e7ae6
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/ocelot_ptp.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: (GPL-2.0 OR MIT) */
++/* Copyright (c) 2017 Microsemi Corporation
++ * Copyright 2019 NXP
++ */
++
++#ifndef _MSCC_OCELOT_PTP_H_
++#define _MSCC_OCELOT_PTP_H_
++
++#define PTP_PIN_CFG_RSZ			0x20
++#define PTP_TOD_SEC_MSB_RSZ		PTP_PIN_CFG_RSZ
++#define PTP_TOD_SEC_LSB_RSZ		PTP_PIN_CFG_RSZ
++#define PTP_TOD_NSEC_RSZ		PTP_PIN_CFG_RSZ
++#define PTP_NSF_RSZ			PTP_PIN_CFG_RSZ
++#define PTP_PIN_WF_HIGH_PERIOD_RSZ	PTP_PIN_CFG_RSZ
++#define PTP_PIN_WF_LOW_PERIOD_RSZ	PTP_PIN_CFG_RSZ
++
++#define PTP_PIN_CFG_DOM			BIT(0)
++#define PTP_PIN_CFG_SYNC		BIT(2)
++#define PTP_PIN_CFG_ACTION(x)		((x) << 3)
++#define PTP_PIN_CFG_ACTION_MASK		PTP_PIN_CFG_ACTION(0x7)
++
++#define PTP_CLK_ADJ_DIR			BIT(1)
++#define PTP_CLK_ADJ_ENA			BIT(0)
++
++#define PTP_CLK_ADJ_UNIT_NS		BIT(30)
++
++enum {
++	PTP_PIN_ACTION_IDLE = 0,
++	PTP_PIN_ACTION_LOAD,
++	PTP_PIN_ACTION_SAVE,
++	PTP_PIN_ACTION_CLOCK,
++	PTP_PIN_ACTION_DELTA,
++};
++
++#define SEC_MSB_MASK           0x0000ffff
++#define NSEC_MASK              0x3fffffff
++
++// System clock period 6.4 ns (Frequency 156.25MHz)
++#define SYS_CLK_PER_NS		0x6
++#define SYS_CLK_PER_PS100	0x4
++
++#define PSEC_PER_SEC		1000000000000LL
++#endif
+diff --git a/drivers/net/ethernet/mscc/tsn_switch.c b/drivers/net/ethernet/mscc/tsn_switch.c
+new file mode 100644
+index 000000000000..d904e7b49a5e
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/tsn_switch.c
+@@ -0,0 +1,1204 @@
++/* SPDX-License-Identifier: (GPL-2.0 OR MIT)
++ *
++ * TSN_SWITCH driver
++ *
++ * Copyright 2018-2019 NXP
++ */
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/sys_soc.h>
++#include <linux/clk.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/phy.h>
++#include "ocelot.h"
++#include "tsn_switch.h"
++
++/* Round x divided by y to nearest higher integer. x and y are integers */
++#define MSCC_DIV_ROUND_UP(x, y) (((x) + (y) - 1) / (y))
++#define SE_IX_PORT 64
++#define MSCC_QOS_DSCP_MAX 63
++#define MSCC_QOS_DP_MAX 1
++#ifndef MIN
++#define MIN(x, y) ((x) < (y) ? (x) : (y))
++#endif
++#ifndef MAX
++#define MAX(x, y) ((x) > (y) ? (x) : (y))
++#endif
++
++static int qos_port_tas_gcl_set(struct net_device *ndev,
++				struct ocelot *ocelot, const u8 gcl_ix,
++				struct tsn_qbv_entry *control_list,
++				const bool dry_run)
++{
++	netdev_dbg(ndev, "%s: gcl_ix %u gate_state 0x%02x time_interval %u dry_run %d\n",
++		   __func__, gcl_ix, control_list->gate_state,
++		   control_list->time_interval, dry_run);
++	if (gcl_ix > (SWITCH_TAS_GCL_MAX - 1)) {
++		netdev_info(ndev, "Invalid gcl ix %u\n", gcl_ix);
++		return -EINVAL;
++	}
++	if (!control_list->time_interval ||
++	    (control_list->time_interval > 1000000000)) {
++		netdev_info(ndev, "Invalid time_interval %u\n",
++			    control_list->time_interval);
++		return -EINVAL;
++	}
++	if (dry_run)
++		return 0;
++
++	ocelot_write(ocelot,
++		     QSYS_GCL_CFG_REG_1_GCL_ENTRY_NUM(gcl_ix) |
++		     QSYS_GCL_CFG_REG_1_GATE_STATE(control_list->gate_state),
++		     QSYS_GCL_CFG_REG_1);
++
++	ocelot_write(ocelot,
++		     control_list->time_interval,
++		     QSYS_GCL_CFG_REG_2);
++
++	return 0;
++}
++
++int switch_qbv_set(struct net_device *ndev, struct tsn_qbv_conf *shaper_config)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	int  i, count;
++	struct tsn_qbv_basic *admin_basic = &shaper_config->admin;
++	struct tsn_qbv_entry *control_list = admin_basic->control_list;
++	u32 base_time_nsec = admin_basic->base_time -
++		admin_basic->base_time / 1000000000 * 1000000000;
++	u64 base_time_sec = admin_basic->base_time / 1000000000;
++	u64 cur_time;
++	u32 val;
++
++	shaper_config->config_change = 1;
++	netdev_dbg(ndev, "%s: gate_enabled %d admin_gate_states 0x%02x admin_control_list_length %u admin_cycle_time %u admin_cycle_time_extension %u admin_base_time %llu config_change %d ",
++		   __func__, shaper_config->gate_enabled,
++		   admin_basic->gate_states,
++		   admin_basic->control_list_length,
++		   admin_basic->cycle_time,
++		   admin_basic->cycle_time_extension,
++		   admin_basic->base_time, shaper_config->config_change);
++
++	if (admin_basic->control_list_length > SWITCH_TAS_GCL_MAX) {
++		netdev_info(ndev, "Invalid admin_control_list_length %u\n",
++			    admin_basic->control_list_length);
++		return -EINVAL;
++	}
++
++	if (((admin_basic->cycle_time < SWITCH_TAS_CT_MIN) ||
++	    (admin_basic->cycle_time > SWITCH_TAS_CT_MAX)) &&
++	    shaper_config->gate_enabled) {
++		netdev_info(ndev, "Invalid admin_cycle_time %u ns\n",
++			    admin_basic->cycle_time);
++		return -EINVAL;
++	}
++	if (admin_basic->cycle_time_extension > SWITCH_TAS_CTE_MAX) {
++		netdev_info(ndev, "Invalid admin_cycle_time_extension %u\n",
++			    admin_basic->cycle_time_extension);
++		return -EINVAL;
++	}
++	if (base_time_nsec > 999999999) {
++		netdev_info(ndev, "Invalid admin_base_time.tv_nsec %u\n",
++			    base_time_nsec);
++		return -EINVAL;
++	}
++
++	cur_time = ocelot_read(ocelot, PTP_CUR_SEC_MSB);
++	cur_time = cur_time << 32;
++	cur_time += ocelot_read(ocelot, PTP_CUR_SEC_LSB);
++
++	if (base_time_sec < cur_time) {
++		base_time_sec = cur_time;
++		base_time_nsec = ocelot_read(ocelot, PTP_CUR_NSEC);
++	}
++
++	/* Select port */
++	ocelot_rmw(ocelot,
++		   QSYS_TAS_PARAM_CFG_CTRL_PORT_NUM(port->chip_port),
++		   QSYS_TAS_PARAM_CFG_CTRL_PORT_NUM_M,
++		   QSYS_TAS_PARAM_CFG_CTRL);
++
++	val = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_8);
++	if (val & QSYS_PARAM_STATUS_REG_8_CONFIG_PENDING) {
++		ocelot_rmw_rix(ocelot, 0, QSYS_TAG_CONFIG_ENABLE,
++			       QSYS_TAG_CONFIG, port->chip_port);
++	}
++
++	ocelot_rmw_rix(ocelot,
++		    (shaper_config->gate_enabled ? QSYS_TAG_CONFIG_ENABLE : 0) |
++		    QSYS_TAG_CONFIG_INIT_GATE_STATE(admin_basic->gate_states) |
++		    QSYS_TAG_CONFIG_SCH_TRAFFIC_QUEUES(0xff) |
++		    QSYS_TAG_CONFIG_LINK_SPEED(0x1),
++		    QSYS_TAG_CONFIG_ENABLE |
++		    QSYS_TAG_CONFIG_INIT_GATE_STATE_M |
++		    QSYS_TAG_CONFIG_SCH_TRAFFIC_QUEUES_M |
++		    QSYS_TAG_CONFIG_LINK_SPEED_M,
++		    QSYS_TAG_CONFIG,
++		    port->chip_port);
++
++	ocelot_write_rix(ocelot, shaper_config->maxsdu,
++			  QSYS_PORT_MAX_SDU, port->chip_port);
++	/* TODO: add queue max SDU set */
++
++	if (shaper_config->gate_enabled && shaper_config->config_change) {
++		ocelot_write(ocelot, base_time_nsec,
++			     QSYS_PARAM_CFG_REG_1);
++
++		ocelot_write(ocelot, base_time_sec & GENMASK(31, 0),
++			     QSYS_PARAM_CFG_REG_2);
++
++		ocelot_write(ocelot,
++			     QSYS_PARAM_CFG_REG_3_BASE_TIME_SEC_MSB(base_time_sec >> 32) |
++			     QSYS_PARAM_CFG_REG_3_LIST_LENGTH(admin_basic->control_list_length),
++			     QSYS_PARAM_CFG_REG_3);
++		ocelot_write(ocelot, admin_basic->cycle_time,
++			     QSYS_PARAM_CFG_REG_4);
++
++		ocelot_write(ocelot,
++			     admin_basic->cycle_time_extension,
++			     QSYS_PARAM_CFG_REG_5);
++
++		for (i = 0; i < admin_basic->control_list_length; i++) {
++			qos_port_tas_gcl_set(ndev, ocelot, i,
++					     control_list, 0);
++			control_list++;
++		}
++
++		/* Start configuration change */
++		ocelot_rmw(ocelot,
++			   QSYS_TAS_PARAM_CFG_CTRL_CONFIG_CHANGE,
++			   QSYS_TAS_PARAM_CFG_CTRL_CONFIG_CHANGE,
++			   QSYS_TAS_PARAM_CFG_CTRL);
++
++		count = 0;
++		do { /* Wait until configuration change is complete */
++			msleep(20);
++			count++;
++			if (count == 100) {
++				netdev_err(ndev, "Config change timeout on chip_port %u\n", port->chip_port);
++				return -ETIMEDOUT;
++			}
++		} while (ocelot_read(ocelot, QSYS_TAS_PARAM_CFG_CTRL) &
++			 QSYS_TAS_PARAM_CFG_CTRL_CONFIG_CHANGE);
++	}
++	return 0;
++}
++
++int switch_qbv_get(struct net_device *ndev, struct tsn_qbv_conf *shaper_config)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 val, reg;
++	int i;
++	u8 p_num = port->chip_port;
++	u32 base_timel;
++	u32 base_timeh;
++	struct tsn_qbv_basic *admin = &shaper_config->admin;
++	struct tsn_qbv_entry *list;
++
++	ocelot_field_write(ocelot,
++			   QSYS_TAS_PARAM_CFG_CTRL_PORT_NUM_0, p_num);
++
++	val = ocelot_read(ocelot, QSYS_TAG_CONFIG);
++	if (val & QSYS_TAG_CONFIG_ENABLE)
++		shaper_config->gate_enabled = TRUE;
++	else
++		shaper_config->gate_enabled = FALSE;
++
++	admin->gate_states = QSYS_TAG_CONFIG_INIT_GATE_STATE_X(val);
++
++	base_timel = ocelot_read(ocelot, QSYS_PARAM_CFG_REG_1);
++	base_timeh = ocelot_read(ocelot, QSYS_PARAM_CFG_REG_2);
++	reg = ocelot_read(ocelot, QSYS_PARAM_CFG_REG_3);
++	admin->base_time = base_timeh | (((u64)QSYS_PARAM_CFG_REG_3_BASE_TIME_SEC_MSB(reg)) << 32);
++	admin->base_time = (admin->base_time << 32) | base_timel;
++
++	admin->control_list_length = QSYS_PARAM_CFG_REG_3_LIST_LENGTH_X(reg);
++
++	admin->cycle_time = ocelot_read(ocelot, QSYS_PARAM_CFG_REG_4);
++	admin->cycle_time_extension = ocelot_read(ocelot, QSYS_PARAM_CFG_REG_5);
++
++	list = (struct tsn_qbv_entry *)kmalloc(admin->control_list_length *
++			sizeof(struct tsn_qbv_entry), GFP_KERNEL);
++	admin->control_list = list;
++
++	for (i = 0; i < admin->control_list_length; i++) {
++		ocelot_field_write(ocelot,
++				   QSYS_GCL_CFG_REG_1_GCL_ENTRY_NUM_0, i);
++		list->time_interval = ocelot_read(ocelot, QSYS_GCL_CFG_REG_2);
++		reg = ocelot_read(ocelot, QSYS_GCL_CFG_REG_1);
++		list->gate_state = QSYS_GCL_CFG_REG_1_GATE_STATE_X(reg);
++
++		list++;
++	}
++
++	return 0;
++}
++
++void get_operparam(struct ocelot *ocelot, struct tsn_qbv_basic *oper)
++{
++	u32 base_timel;
++	u32 base_timeh;
++	u32 val;
++	struct tsn_qbv_entry *glist;
++	int i;
++
++	base_timel = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_1);
++	base_timeh = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_2);
++	val = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_3);
++	oper->base_time = base_timeh;
++	oper->base_time += ((u64)QSYS_PARAM_STATUS_REG_3_BASE_TIME_SEC_MSB(val)) << 32;
++	oper->base_time = (oper->base_time << 32) | base_timel;
++
++	oper->control_list_length = QSYS_PARAM_STATUS_REG_3_LIST_LENGTH_X(val);
++	oper->cycle_time = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_4);
++	oper->cycle_time_extension = ocelot_read(ocelot,
++						 QSYS_PARAM_STATUS_REG_5);
++
++	val = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_8);
++	oper->gate_states = QSYS_PARAM_STATUS_REG_8_OPER_GATE_STATE_X(val);
++
++	glist = (struct tsn_qbv_entry *)kmalloc(oper->control_list_length *
++		sizeof(struct tsn_qbv_entry), GFP_KERNEL);
++
++	oper->control_list = glist;
++
++	for (i = 0; i < oper->control_list_length; i++) {
++		ocelot_field_write(ocelot,
++				   QSYS_GCL_STATUS_REG_1_GCL_ENTRY_NUM_0, i);
++		val = ocelot_read(ocelot, QSYS_GCL_STATUS_REG_2);
++		oper->control_list->time_interval = val;
++		val = ocelot_read(ocelot, QSYS_GCL_STATUS_REG_1);
++		glist->gate_state = QSYS_GCL_STATUS_REG_1_GATE_STATE_X(val);
++
++		glist++;
++	}
++}
++
++int switch_qbv_get_status(struct net_device *ndev,
++			  struct tsn_qbv_status *qbvstatus)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	struct tsn_qbv_basic *oper = &qbvstatus->oper;
++	u8 p_num = port->chip_port;
++	u32 val;
++	ptptime_t cur_time;
++
++	ocelot_field_write(ocelot, QSYS_TAS_PARAM_CFG_CTRL_PORT_NUM_0, p_num);
++
++	qbvstatus->supported_list_max = 64;
++
++	val = ocelot_read(ocelot, QSYS_PARAM_STATUS_REG_8);
++	if (val & QSYS_PARAM_STATUS_REG_8_CONFIG_PENDING)
++		qbvstatus->config_pending = TRUE;
++	else
++		qbvstatus->config_pending = FALSE;
++
++	qbvstatus->config_change_time = ocelot_read(ocelot,
++						    QSYS_PARAM_STATUS_REG_7);
++	qbvstatus->config_change_time += ((u64)QSYS_PARAM_STATUS_REG_8_CFG_CHG_TIME_SEC_MSB(val)) << 32;
++	qbvstatus->config_change_time = (qbvstatus->config_change_time << 32) |
++					ocelot_read(ocelot,
++						    QSYS_PARAM_STATUS_REG_6);
++
++	qbvstatus->config_change_error = ocelot_read(ocelot,
++						     QSYS_PARAM_STATUS_REG_9);
++
++	cur_time = ocelot_read(ocelot, PTP_CUR_SEC_MSB);
++	cur_time = cur_time << 32;
++	cur_time += ocelot_read(ocelot, PTP_CUR_SEC_LSB);
++	cur_time = (cur_time << 32) | ocelot_read(ocelot, PTP_CUR_NSEC);
++	qbvstatus->current_time = cur_time;
++	get_operparam(ocelot, oper);
++
++	return 0;
++}
++
++int switch_cut_thru_set(struct net_device *ndev, u8 cut_thru)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++	ocelot_write_rix(ocelot, cut_thru, ANA_CUT_THRU_CFG,
++			 ocelot_port->chip_port);
++
++	return 0;
++}
++
++
++int qos_shaper_conf_set(struct net_device *ndev, u32 port_ix, u8 percent)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++	u32 cbs = 0;
++	u32 cir = 0;
++
++	switch (ndev->phydev->speed) {
++	case SPEED_10:
++		cir = 10000;
++		break;
++	case SPEED_100:
++		cir = 100000;
++		break;
++	case SPEED_1000:
++		cir = 1000000;
++		break;
++	case SPEED_2500:
++		cir = 2500000;
++		break;
++	}
++
++	cir = cir * percent / 100;
++	cir = MSCC_DIV_ROUND_UP(cir, 100);  /* Rate unit is 100 kbps */
++	cir = (cir ? cir : 1);                    /* Avoid using zero rate */
++	cbs = MSCC_DIV_ROUND_UP(cbs, 4096); /* Burst unit is 4kB */
++	cbs = (cbs ? cbs : 1);                    /* Avoid using zero burst size */
++	cir = MIN(GENMASK(15, 0), cir);
++	cbs = MIN(GENMASK(6, 0), cbs);
++	ocelot_write_gix(ocelot,
++			 QSYS_CIR_CFG_CIR_RATE(cir) |
++			 QSYS_CIR_CFG_CIR_BURST(cbs),
++			 QSYS_CIR_CFG,
++			 port_ix);
++
++	return 0;
++}
++
++int switch_cbs_set(struct net_device *ndev, u8 tc, u8 bw)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++
++	qos_shaper_conf_set(ndev, ocelot_port->chip_port * 8 + tc, bw);
++
++	ocelot_rmw_gix(ocelot,
++		       QSYS_SE_CFG_SE_AVB_ENA,
++		       QSYS_SE_CFG_SE_AVB_ENA,
++		       QSYS_SE_CFG,
++		       ocelot_port->chip_port * 8 + tc);
++
++	return 0;
++
++}
++
++int switch_port_shaper_set(struct net_device *ndev, u8 tc, u8 bw)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++	u8 *weight = ocelot_port->cbs_weight;
++	int i;
++	int percent = 100;
++	u8 w_min = 100;
++	u32 c_max = 1 << 5;
++
++	qos_shaper_conf_set(ndev, SE_IX_PORT + ocelot_port->chip_port,
++			    percent);
++
++	ocelot_rmw_gix(ocelot,
++		       QSYS_SE_CFG_SE_DWRR_CNT(7) |
++		       QSYS_SE_CFG_SE_AVB_ENA,
++		       QSYS_SE_CFG_SE_DWRR_CNT_M |
++		       QSYS_SE_CFG_SE_AVB_ENA,
++		       QSYS_SE_CFG,
++		       SE_IX_PORT + ocelot_port->chip_port);
++
++	weight[tc] = bw;
++	for (i = 0; i < NUM_MSCC_QOS_PRIO; i++) {
++		if (weight[i])
++			/* Find the lowest weight */
++			w_min = MIN(w_min, weight[i]);
++	}
++	for (i = 0; i < NUM_MSCC_QOS_PRIO; i++) {
++		if (weight[i]) {
++			u32 c = (((c_max << 4) * w_min / weight[i]) + 8) >> 4;
++			c = MAX(1, c) - 1;
++			ocelot_write_ix(ocelot, c,
++					QSYS_SE_DWRR_CFG,
++					SE_IX_PORT + ocelot_port->chip_port,
++					i);
++		} else {
++			ocelot_write_ix(ocelot, 0,
++					QSYS_SE_DWRR_CFG,
++					SE_IX_PORT + ocelot_port->chip_port,
++					i);
++		}
++	}
++
++	return 0;
++}
++
++int switch_qbu_set(struct net_device *ndev, u8 preemptable)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++
++	ocelot_port_rmwl(ocelot_port,
++		   DEV_GMII_MM_CONFIG_ENABLE_CONFIG_MM_RX_ENA |
++		   DEV_GMII_MM_CONFIG_ENABLE_CONFIG_MM_TX_ENA,
++		   DEV_GMII_MM_CONFIG_ENABLE_CONFIG_MM_RX_ENA |
++		   DEV_GMII_MM_CONFIG_ENABLE_CONFIG_MM_TX_ENA,
++		   DEV_GMII_MM_CONFIG_ENABLE_CONFIG);
++
++	ocelot_rmw_rix(ocelot,
++		       QSYS_PREEMPTION_CFG_P_QUEUES(preemptable),
++		       QSYS_PREEMPTION_CFG_P_QUEUES_M,
++		       QSYS_PREEMPTION_CFG,
++		       ocelot_port->chip_port);
++
++	return 0;
++}
++
++int switch_qbu_get(struct net_device *ndev, struct tsn_preempt_status *c)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++	u32 val;
++
++	val = ocelot_read_rix(ocelot,
++			      QSYS_PREEMPTION_CFG,
++			      ocelot_port->chip_port);
++
++	c->admin_state = QSYS_PREEMPTION_CFG_P_QUEUES(val);
++	c->hold_advance = QSYS_PREEMPTION_CFG_HOLD_ADVANCE_X(val);
++
++	val = ocelot_port_readl(ocelot_port,
++				DEV_GMII_MM_STATISTICS_MM_STATUS);
++	c->preemption_active =
++		DEV_GMII_MM_STATISTICS_MM_STATUS_PRMPT_ACTIVE_STATUS & val;
++
++	return 0;
++}
++
++/* Qci */
++int switch_cb_streamid_get(struct net_device *ndev, u32 index,
++			   struct tsn_cb_streamid *streamid)
++{
++	struct ocelot_port *ocelot_port = netdev_priv(ndev);
++	struct ocelot *ocelot = ocelot_port->ocelot;
++
++	u32 m_index = index / 4;
++	u32 bucket =  index % 4;
++	u32 val, dst, reg;
++	u64 dmac;
++	u32 ldmac, hdmac;
++
++	streamid->type = 1;
++	regmap_field_write(ocelot->regfields[ANA_TABLES_MACTINDX_BUCKET],
++			   bucket);
++	regmap_field_write(ocelot->regfields[ANA_TABLES_MACTINDX_M_INDEX],
++			   m_index);
++
++	/*READ command MACACCESS.VALID(11 bit) must be 0 */
++	ocelot_write(ocelot,
++		     ANA_TABLES_MACACCESS_MAC_TABLE_CMD(
++			    MACACCESS_CMD_READ),
++		     ANA_TABLES_MACACCESS);
++
++	val = ocelot_read(ocelot, ANA_TABLES_MACACCESS);
++	dst = (val & ANA_TABLES_MACACCESS_DEST_IDX_M) >> 3;
++	reg = ocelot_read_rix(ocelot, ANA_PGID_PGID, dst);
++	streamid->ofac_oport = ANA_PGID_PGID_PGID(reg);
++
++	/*Get the entry's MAC address and VLAN id*/
++	ldmac = ocelot_read(ocelot, ANA_TABLES_MACLDATA);
++	val = ocelot_read(ocelot, ANA_TABLES_MACHDATA);
++	val &= 0x1fffffff;
++	hdmac = val & 0xffff;
++	dmac = hdmac;
++	dmac = (dmac << 32) | ldmac;
++	streamid->para.nid.dmac = dmac;
++
++	streamid->para.nid.vid = ANA_TABLES_MACHDATA_VID_X(val);
++
++	val = ocelot_read(ocelot, ANA_TABLES_STREAMDATA);
++	if (!(val & ANA_TABLES_STREAMDATA_SFID_VALID))
++		return -EINVAL;
++
++	streamid->handle = ANA_TABLES_STREAMDATA_SSID_X(val);
++
++	return 0;
++}
++u32 lookup_pgid(u32 mask, struct ocelot *ocelot)
++{
++	int i;
++	u32 val, port_mask;
++
++	for (i = 0; i < PGID_AGGR; i++) {
++		val = ocelot_read_rix(ocelot, ANA_PGID_PGID, i);
++		port_mask = ANA_PGID_PGID_PGID(val);
++		if (mask == port_mask)
++			return i;
++	}
++	if (i == PGID_AGGR)
++		return PGID_UC;
++
++	return 0;
++}
++int switch_cb_streamid_set(struct net_device *ndev, u32 index, bool enable,
++			   struct tsn_cb_streamid *streamid)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 macl, mach;
++	u16 vid;
++	u64 mac;
++	u32 dst_idx;
++	int sfid, ssid;
++	u32 m_index = index / 4;
++	u32 bucket =  index % 4;
++
++	regmap_field_write(ocelot->regfields[ANA_TABLES_MACTINDX_BUCKET],
++			   bucket);
++	regmap_field_write(ocelot->regfields[ANA_TABLES_MACTINDX_M_INDEX],
++			   m_index);
++	if (streamid->type != 1)
++		return -EINVAL;
++
++	if (enable) {
++		netdev_dbg(ndev, "index=%d mac=0x%llx vid=0x%x sfid=%d dst=%d\n",
++			   index, streamid->para.nid.dmac,
++			   streamid->para.nid.vid,
++			   streamid->handle,
++			   port->chip_port);
++
++		mac = streamid->para.nid.dmac;
++		macl = mac & 0xffffffff;
++		mach = (mac >> 32) & 0xffff;
++		vid = streamid->para.nid.vid;
++		ocelot_write(ocelot, macl, ANA_TABLES_MACLDATA);
++		ocelot_write(ocelot, ANA_TABLES_MACHDATA_VID(vid) |
++			     ANA_TABLES_MACHDATA_MACHDATA(mach),
++			     ANA_TABLES_MACHDATA);
++
++		sfid = streamid->handle * 2;
++		ssid = streamid->handle;
++		ocelot_write(ocelot,
++			     ANA_TABLES_STREAMDATA_SFID_VALID |
++			     ANA_TABLES_STREAMDATA_SFID(sfid) |
++			     ANA_TABLES_STREAMDATA_SSID_VALID |
++			     ANA_TABLES_STREAMDATA_SSID(ssid),
++			     ANA_TABLES_STREAMDATA);
++
++		dst_idx = port->chip_port;
++		ocelot_write(ocelot, ANA_TABLES_MACACCESS_VALID |
++			     ANA_TABLES_MACACCESS_ENTRYTYPE(1) |
++			     ANA_TABLES_MACACCESS_DEST_IDX(dst_idx) |
++			     ANA_TABLES_MACACCESS_MAC_TABLE_CMD(
++				    MACACCESS_CMD_WRITE),
++			     ANA_TABLES_MACACCESS);
++
++		ocelot_write(ocelot, ANA_TABLES_MACACCESS_VALID |
++			     ANA_TABLES_MACACCESS_ENTRYTYPE(1) |
++			     ANA_TABLES_MACACCESS_DEST_IDX(dst_idx) |
++			     ANA_TABLES_MACACCESS_MAC_TABLE_CMD(
++				    MACACCESS_CMD_LEARN),
++			     ANA_TABLES_MACACCESS);
++	} else {
++		netdev_info(ndev, "disable stream set\n");
++		mac = streamid->para.nid.dmac;
++		macl = mac & 0xffffffff;
++		mach = (mac >> 32) & 0xffff;
++		vid = streamid->para.nid.vid;
++		ocelot_write(ocelot, macl, ANA_TABLES_MACLDATA);
++		ocelot_write(ocelot, ANA_TABLES_MACHDATA_VID(vid) |
++			     ANA_TABLES_MACHDATA_MACHDATA(mach),
++			     ANA_TABLES_MACHDATA);
++
++		ocelot_write(ocelot,
++			     ANA_TABLES_MACACCESS_MAC_TABLE_CMD(
++				    MACACCESS_CMD_FORGET),
++			     ANA_TABLES_MACACCESS);
++	}
++
++	return 0;
++}
++
++int switch_qci_sfi_get(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_sfi_conf *sfi)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 val, reg, fmeter_id, max_sdu;
++
++	ocelot_field_write(ocelot, ANA_TABLES_SFIDTIDX_SFID_INDEX_0, index);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_SFIDACCESS_SFID_TBL_CMD(SFIDACCESS_CMD_READ),
++		     ANA_TABLES_SFIDACCESS);
++
++	val = ocelot_read(ocelot, ANA_TABLES_SFIDTIDX);
++	if (!(val & ANA_TABLES_SFIDTIDX_SGID_VALID))
++		return -EINVAL;
++
++	sfi->stream_gate_instance_id = ANA_TABLES_SFIDTIDX_SGID_X(val);
++	fmeter_id = ANA_TABLES_SFIDTIDX_POL_IDX_X(val);
++	sfi->stream_filter.flow_meter_instance_id = fmeter_id;
++
++	reg = ocelot_read(ocelot, ANA_TABLES_SFIDACCESS);
++	max_sdu = ANA_TABLES_SFIDACCESS_MAX_SDU_LEN_X(reg);
++	sfi->stream_filter.maximum_sdu_size  = max_sdu;
++
++	if (reg & ANA_TABLES_SFIDACCESS_IGR_PRIO_MATCH_ENA)
++		sfi->priority_spec = ANA_TABLES_SFIDACCESS_IGR_PRIO_X(reg);
++	else
++		netdev_info(ndev, "priority not enable\n");
++
++	return 0;
++}
++
++int switch_qci_sfi_set(struct net_device *ndev, u32 index, bool enable,
++		       struct tsn_qci_psfp_sfi_conf *sfi)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	int igr_prio = sfi->priority_spec;
++	u16 sgid  = sfi->stream_gate_instance_id;
++	u16 pol_idx = sfi->stream_filter.flow_meter_instance_id;
++	u16 max_sdu_len = sfi->stream_filter.maximum_sdu_size;
++	int sfid = index * 2;
++
++	netdev_dbg(ndev, "sfid=%d prio=%d sgid=%d pol_idx=%d\n",
++		   index, igr_prio, sgid, pol_idx);
++
++	ocelot_write(ocelot, ANA_TABLES_SFIDTIDX_SGID_VALID |
++		     ANA_TABLES_SFIDTIDX_SGID(sgid) |
++		     ANA_TABLES_SFIDTIDX_POL_ENA |
++		     ANA_TABLES_SFIDTIDX_POL_IDX(pol_idx) |
++		     ANA_TABLES_SFIDTIDX_SFID_INDEX(sfid),
++		     ANA_TABLES_SFIDTIDX);
++
++	ocelot_write(ocelot,
++		     ((igr_prio >= 0) ? ANA_TABLES_SFIDACCESS_IGR_PRIO_MATCH_ENA : 0) |
++		     ANA_TABLES_SFIDACCESS_IGR_PRIO(igr_prio) |
++		     ANA_TABLES_SFIDACCESS_MAX_SDU_LEN(max_sdu_len) |
++		     ANA_TABLES_SFIDACCESS_SFID_TBL_CMD(SFIDACCESS_CMD_WRITE),
++		     ANA_TABLES_SFIDACCESS);
++
++	return 0;
++}
++
++int switch_cb_streamid_counters_get(struct net_device *ndev, u32 index,
++				    struct tsn_cb_streamid_counters *s_counters)
++{
++	return 0;
++}
++
++int switch_qci_sfi_counters_get(struct net_device *ndev, u32 index,
++				struct tsn_qci_psfp_sfi_counters *sfi_counters)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 sfid = index;
++	u32 match, not_pass, not_pass_sdu, red;
++
++	ocelot_field_write(ocelot, SYS_STAT_CFG_STAT_VIEW_0, sfid);
++	match = ocelot_read_gix(ocelot, SYS_CNT, 0x200);
++	not_pass = ocelot_read_gix(ocelot, SYS_CNT, 0x201);
++	not_pass_sdu = ocelot_read_gix(ocelot, SYS_CNT, 0x202);
++	red = ocelot_read_gix(ocelot, SYS_CNT, 0x203);
++
++	sfi_counters->matching_frames_count = match;
++	sfi_counters->not_passing_frames_count = not_pass;
++	sfi_counters->not_passing_sdu_count = not_pass_sdu;
++	sfi_counters->red_frames_count  =  red;
++
++	sfi_counters->passing_frames_count = match - not_pass;
++	sfi_counters->passing_sdu_count = match - not_pass - not_pass_sdu;
++
++	return 0;
++}
++
++void write_list(struct ocelot *ocelot,
++		struct tsn_qci_psfp_gcl *gcl, uint32_t num)
++{
++	int i;
++	u32 time_sum = 0;
++
++	for (i = 0; i < num; i++) {
++		ocelot_write_rix(ocelot,
++				 ANA_SG_GCL_GS_CONFIG_IPS((gcl->ipv < 0) ? 0 : gcl->ipv + 8) |
++				 (gcl->gate_state ? ANA_SG_GCL_GS_CONFIG_GATE_STATE : 0),
++				 ANA_SG_GCL_GS_CONFIG, i);
++
++		time_sum += gcl->time_interval;
++		ocelot_write_rix(ocelot, time_sum, ANA_SG_GCL_TI_CONFIG, i);
++
++		gcl++;
++	}
++}
++
++int switch_qci_sgi_set(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_sgi_conf *sgi_conf)
++{
++	int count;
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	struct tsn_qci_sg_control *admin_list = &sgi_conf->admin;
++	u32 sgid = index;
++	u32 list_length = sgi_conf->admin.control_list_length;
++	u32 cycle_time = sgi_conf->admin.cycle_time;
++	u32 cycle_time_ex = sgi_conf->admin.cycle_time_extension;
++	u32 l_basetime = sgi_conf->admin.base_time -
++		sgi_conf->admin.base_time / 1000000000 * 1000000000;
++	u64 h_basetime = sgi_conf->admin.base_time / 1000000000;
++	u64 cur_time;
++
++	/*configure SGID*/
++	ocelot_field_write(ocelot, ANA_SG_ACCESS_CTRL_SGID_0, sgid);
++
++	netdev_info(ndev, "sgid=%d ate_enabled=%d control_list_length=%d cycle_time=0x%x l_basetime=0x%x initipv=%d\n",
++		    sgid, sgi_conf->gate_enabled,
++		    sgi_conf->admin.control_list_length,
++		    cycle_time, l_basetime,
++		    sgi_conf->admin.init_ipv);
++
++	/*Enable SG*/
++	if (sgi_conf->gate_enabled == FALSE) {
++		ocelot_field_write(ocelot,
++				   ANA_SG_CONFIG_REG_3_GATE_ENABLE_0, 0);
++		return 0;
++	}
++	/*admin parameters*/
++	cur_time = ocelot_read(ocelot, PTP_CUR_SEC_MSB);
++	cur_time = cur_time << 32;
++	cur_time += ocelot_read(ocelot, PTP_CUR_SEC_LSB);
++	if (h_basetime < cur_time) {
++		h_basetime = cur_time;
++		l_basetime = ocelot_read(ocelot, PTP_CUR_NSEC);
++	}
++
++	ocelot_write(ocelot, l_basetime, ANA_SG_CONFIG_REG_1);
++	ocelot_write(ocelot, h_basetime, ANA_SG_CONFIG_REG_2);
++	if (sgi_conf->admin.init_ipv >= 0)
++		ocelot_write(ocelot, ANA_SG_CONFIG_REG_3_IPV_VALID |
++			     ANA_SG_CONFIG_REG_3_INIT_IPV(sgi_conf->admin.init_ipv) |
++			     ANA_SG_CONFIG_REG_3_GATE_ENABLE |
++			     ANA_SG_CONFIG_REG_3_LIST_LENGTH(list_length) |
++			     sgi_conf->admin.gate_states << 28 |
++			     ANA_SG_CONFIG_REG_3_BASE_TIME_SEC_MSB(h_basetime >> 32),
++			     ANA_SG_CONFIG_REG_3);
++	else
++		ocelot_write(ocelot, ANA_SG_CONFIG_REG_3_IPV_INVALID(0) |
++			     ANA_SG_CONFIG_REG_3_INIT_IPV(sgi_conf->admin.init_ipv) |
++			     ANA_SG_CONFIG_REG_3_GATE_ENABLE |
++			     ANA_SG_CONFIG_REG_3_LIST_LENGTH(list_length) |
++			     sgi_conf->admin.gate_states << 28 |
++			     ANA_SG_CONFIG_REG_3_BASE_TIME_SEC_MSB(h_basetime >> 32),
++			     ANA_SG_CONFIG_REG_3);
++
++	ocelot_write(ocelot, cycle_time, ANA_SG_CONFIG_REG_4);
++	ocelot_write(ocelot, cycle_time_ex, ANA_SG_CONFIG_REG_5);
++
++	write_list(ocelot, admin_list->gcl, list_length);
++
++	/*CONG_CHANGE TO 1*/
++	ocelot_field_write(ocelot, ANA_SG_ACCESS_CTRL_CONFIG_CHANGE_0, 1);
++
++	count = 0;
++	do { /* Wait until configuration change is complete */
++		msleep(20);
++		count++;
++		if (count == 100) {
++			netdev_err(ndev, "SGI Config change timeout\n");
++			return -ETIMEDOUT;
++		}
++	} while (ocelot_read(ocelot, ANA_SG_ACCESS_CTRL) &
++		 ANA_SG_ACCESS_CTRL_CONFIG_CHANGE);
++
++	return SUCCESS;
++}
++
++void get_list(struct ocelot *ocelot, struct tsn_qci_psfp_gcl *gcl, uint32_t num)
++{
++	int i;
++	u16 val;
++	u32 time = 0;
++	u32 reg;
++
++	for (i = 0; i < num; i++) {
++		val = ocelot_read_rix(ocelot, ANA_SG_GCL_GS_CONFIG, i);
++		if (val & ANA_SG_GCL_GS_CONFIG_GATE_STATE)
++			gcl->gate_state = TRUE;
++		else
++			gcl->gate_state = FALSE;
++
++		if (val & ANA_SG_GCL_GS_CONFIG_IPV_VALID)
++			gcl->ipv = ANA_SG_GCL_GS_CONFIG_IPV(val);
++		else
++			gcl->ipv = 0;
++
++		reg = ocelot_read_rix(ocelot, ANA_SG_GCL_TI_CONFIG, i);
++		gcl->time_interval = (reg - time);
++		time = reg;
++
++		gcl++;
++	}
++}
++
++int switch_qci_sgi_get(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_sgi_conf *sgi_conf)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	struct tsn_qci_sg_control *admin  = &sgi_conf->admin;
++	struct tsn_qci_psfp_gcl *glist;
++
++	u32 val, reg;
++	u32 list_num;
++
++	val = ocelot_read(ocelot, ANA_SG_CONFIG_REG_1);
++	reg = ocelot_read(ocelot, ANA_SG_CONFIG_REG_2);
++	admin->base_time = reg;
++	admin->base_time = (admin->base_time << 32) | val;
++
++	admin->cycle_time = ocelot_read(ocelot,  ANA_SG_CONFIG_REG_4);
++	admin->cycle_time_extension = ocelot_read(ocelot, ANA_SG_CONFIG_REG_5);
++
++	val = ocelot_read(ocelot, ANA_SG_CONFIG_REG_3);
++
++	if (val & ANA_SG_CONFIG_REG_3_IPV_VALID)
++		admin->init_ipv = ANA_SG_CONFIG_REG_3_INIT_IPV_X(val);
++	else
++		netdev_info(ndev, "IPV specified  in bits [0:2] is not used or invalid");
++
++	admin->control_list_length = ANA_SG_CONFIG_REG_3_LIST_LENGTH_X(val);
++	list_num = admin->control_list_length;
++
++	glist = (struct tsn_qci_psfp_gcl *)kmalloc(list_num *
++			sizeof(struct tsn_qci_psfp_gcl), GFP_KERNEL);
++	admin->gcl = glist;
++
++	get_list(ocelot, glist, list_num);
++
++	return 0;
++}
++
++int switch_qci_sgi_status_get(struct net_device *ndev, u16 index,
++			      struct tsn_psfp_sgi_status *sgi_status)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 val, reg;
++
++	/*SET SGID*/
++	ocelot_field_write(ocelot, ANA_SG_ACCESS_CTRL_SGID_0, index);
++
++	val = ocelot_read(ocelot, ANA_SG_STATUS_REG_1);
++	reg = ocelot_read(ocelot, ANA_SG_STATUS_REG_2);
++	sgi_status->config_change_time = reg;
++	sgi_status->config_change_time = sgi_status->config_change_time << 32 |
++					 val;
++
++	val = ocelot_read(ocelot, ANA_SG_STATUS_REG_3);
++	if (val & ANA_SG_STATUS_REG_3_CONFIG_PENDING)
++		sgi_status->config_pending  = TRUE;
++	else
++		sgi_status->config_pending = FALSE;
++
++	if (val & ANA_SG_STATUS_REG_3_GATE_STATE)
++		sgi_status->oper.gate_states  =  TRUE;
++	else
++		sgi_status->oper.gate_states  =  FALSE;
++	/*bit 3 encoding 0:IPV [0:2]is invalid . 1:IPV[0:2] is valid*/
++	if (val & ANA_SG_STATUS_REG_3_IPV_VALID)
++		sgi_status->oper.init_ipv  = ANA_SG_STATUS_REG_3_IPV_X(val);
++	else
++		sgi_status->oper.init_ipv = 0;
++
++	return 0;
++}
++
++int switch_qci_fmi_set(struct net_device *ndev, u32 index,
++		       bool enable, struct tsn_qci_psfp_fmi *fmi)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 cir = 0, cbs = 0, pir = 0, pbs = 0;
++	u32 cir_ena = 0;
++	u32 pbs_max = 0, cbs_max = 0;
++	bool cir_discard = 0, pir_discard = 0;
++
++	pir = fmi->eir;
++	pbs = fmi->ebs;
++
++	if (!fmi->drop_on_yellow) {
++		cir_ena = 1;
++	}
++
++	if (cir_ena) {
++		cir = fmi->cir;
++		cbs = fmi->cbs;
++		if (cir == 0 && cbs == 0) {
++			cir_discard = 1;
++		} else {
++			cir = MSCC_DIV_ROUND_UP(cir, 100);
++			cir *= 3;  /* Rate unit is 33 1/3 kbps */
++			cbs = MSCC_DIV_ROUND_UP(cbs, 4096);
++			cbs = (cbs ? cbs : 1);
++			cbs_max = 60;
++			if (fmi->cf)
++				pir += fmi->cir;
++		}
++	}
++	if (pir == 0 && pbs == 0) {
++		pir_discard = 1;
++	} else {
++		pir = MSCC_DIV_ROUND_UP(pir, 100);
++		pir *= 3;  /* Rate unit is 33 1/3 kbps */
++		pbs = MSCC_DIV_ROUND_UP(pbs, 4096);
++		pbs = (pbs ? pbs : 1);
++		pbs_max = 60;
++	}
++	pir = MIN(GENMASK(15, 0), pir);
++	cir = MIN(GENMASK(15, 0), cir);
++	pbs = MIN(pbs_max, pbs);
++	cbs = MIN(cbs_max, cbs);
++
++	ocelot_write_gix(ocelot, (ANA_POL_MODE_CFG_IPG_SIZE(20) |
++			 ANA_POL_MODE_CFG_FRM_MODE(1) |
++			 (fmi->cf ? ANA_POL_MODE_CFG_DLB_COUPLED : 0) |
++			 (cir_ena ? ANA_POL_MODE_CFG_CIR_ENA : 0) |
++			 ANA_POL_MODE_CFG_OVERSHOOT_ENA),
++			 ANA_POL_MODE_CFG, index);
++
++	ocelot_write_gix(ocelot, ANA_POL_PIR_CFG_PIR_RATE(pir) |
++			 ANA_POL_PIR_CFG_PIR_BURST(pbs),
++			 ANA_POL_PIR_CFG, index);
++
++	ocelot_write_gix(ocelot,
++			 (pir_discard ? GENMASK(22, 0) : 0),
++			 ANA_POL_PIR_STATE, index);
++
++	ocelot_write_gix(ocelot, ANA_POL_CIR_CFG_CIR_RATE(cir) |
++			 ANA_POL_CIR_CFG_CIR_BURST(cbs),
++			 ANA_POL_CIR_CFG, index);
++
++	ocelot_write_gix(ocelot,
++			 (cir_discard ? GENMASK(22, 0) : 0),
++			 ANA_POL_CIR_STATE, index);
++
++	return 0;
++}
++
++int switch_qci_fmi_get(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_fmi *fmi,
++			   struct tsn_qci_psfp_fmi_counters *counters)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 val, reg;
++
++	if (index <= 64)
++		index += 64;
++
++	val = ocelot_read_gix(ocelot, ANA_POL_PIR_CFG, index);
++	reg = ocelot_read_gix(ocelot, ANA_POL_CIR_CFG, index);
++
++	fmi->eir = ANA_POL_PIR_CFG_PIR_RATE_X(val);
++	fmi->ebs = ANA_POL_PIR_CFG_PIR_BURST(val);
++	fmi->cir = ANA_POL_CIR_CFG_CIR_RATE_X(reg);
++	fmi->cbs = ANA_POL_CIR_CFG_CIR_BURST(reg);
++	if (!(fmi->eir | fmi->ebs | fmi->cir | fmi->cbs))
++		fmi->mark_red = TRUE;
++	else
++		fmi->mark_red = FALSE;
++
++	val = ocelot_read_gix(ocelot, ANA_POL_MODE_CFG, index);
++	if (val & ANA_POL_MODE_CFG_DLB_COUPLED)
++		fmi->cf = TRUE;
++	else
++		fmi->cf = FALSE;
++	if (val & ANA_POL_MODE_CFG_CIR_ENA)
++		fmi->drop_on_yellow = FALSE;
++	else
++		fmi->drop_on_yellow = TRUE;
++
++	return 0;
++}
++
++int switch_seq_gen_set(struct net_device *ndev, u32 index,
++		  struct tsn_seq_gen_conf *sg_conf)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u8 iport_mask = sg_conf->iport_mask;
++	u8 split_mask = sg_conf->split_mask;
++	u8 seq_len = sg_conf->seq_len;
++	u32 seq_num = sg_conf->seq_num;
++
++	netdev_dbg(ndev, "iport_mask=0x%x split_mask=0x%x seq_len=%d seq_num=%d\n",
++		   sg_conf->iport_mask, sg_conf->split_mask,
++		   sg_conf->seq_len, sg_conf->seq_num);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_SEQ_MASK_SPLIT_MASK(split_mask) |
++		     ANA_TABLES_SEQ_MASK_INPUT_PORT_MASK(iport_mask),
++		     ANA_TABLES_SEQ_MASK);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_STREAMTIDX_S_INDEX(index) |
++		     ANA_TABLES_STREAMTIDX_STREAM_SPLIT |
++		     ANA_TABLES_STREAMTIDX_SEQ_SPACE_LOG2(seq_len),
++		     ANA_TABLES_STREAMTIDX);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_STREAMACCESS_GEN_REC_SEQ_NUM(seq_num) |
++		     ANA_TABLES_STREAMACCESS_SEQ_GEN_REC_ENA |
++		     ANA_TABLES_STREAMACCESS_STREAM_TBL_CMD(
++			    SFIDACCESS_CMD_WRITE),
++		     ANA_TABLES_STREAMACCESS);
++
++	return 0;
++}
++
++int switch_seq_rec_set(struct net_device *ndev, u32 index,
++		  struct tsn_seq_rec_conf *sr_conf)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u8 seq_len = sr_conf->seq_len;
++	u8 hislen = sr_conf->his_len;
++
++	netdev_dbg(ndev, "seq_len=%d hislen=%d rtag_pop_en=%d\n",
++		   sr_conf->seq_len, sr_conf->his_len,
++		   sr_conf->rtag_pop_en);
++
++	ocelot_rmw_rix(ocelot, ANA_PORT_MODE_REDTAG_PARSE_CFG,
++		       ANA_PORT_MODE_REDTAG_PARSE_CFG,
++		       ANA_PORT_MODE, port->chip_port);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_STREAMTIDX_S_INDEX(index) |
++		     ANA_TABLES_STREAMTIDX_FORCE_SF_BEHAVIOUR |
++		     ANA_TABLES_STREAMTIDX_SEQ_HISTORY_LEN(hislen) |
++		     ANA_TABLES_STREAMTIDX_RESET_ON_ROGUE |
++		     (sr_conf->rtag_pop_en ?
++		      ANA_TABLES_STREAMTIDX_REDTAG_POP : 0) |
++		     ANA_TABLES_STREAMTIDX_SEQ_SPACE_LOG2(seq_len),
++		     ANA_TABLES_STREAMTIDX);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_STREAMACCESS_SEQ_GEN_REC_ENA |
++		     ANA_TABLES_STREAMACCESS_GEN_REC_TYPE |
++		     ANA_TABLES_STREAMACCESS_STREAM_TBL_CMD(
++			    SFIDACCESS_CMD_WRITE),
++		     ANA_TABLES_STREAMACCESS);
++
++	return 0;
++}
++
++int switch_cb_get(struct net_device *ndev, u32 index, struct tsn_cb_status *c)
++{
++	u32 val;
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_STREAMTIDX_S_INDEX(index),
++		     ANA_TABLES_STREAMTIDX);
++
++	ocelot_write(ocelot,
++		     ANA_TABLES_STREAMACCESS_STREAM_TBL_CMD(
++			    SFIDACCESS_CMD_READ),
++		     ANA_TABLES_STREAMACCESS);
++
++	val = ocelot_read(ocelot, ANA_TABLES_STREAMACCESS);
++	c->gen_rec = (ANA_TABLES_STREAMACCESS_GEN_REC_TYPE & val) >> 2;
++	c->seq_num = ANA_TABLES_STREAMACCESS_GEN_REC_SEQ_NUM_X(val);
++
++	val = ocelot_read(ocelot, ANA_TABLES_STREAMTIDX);
++	c->err = ANA_TABLES_STREAMTIDX_SEQ_GEN_ERR_STATUS_X(val);
++	c->his_len = ANA_TABLES_STREAMTIDX_SEQ_HISTORY_LEN_X(val);
++	c->seq_len = ANA_TABLES_STREAMTIDX_SEQ_SPACE_LOG2(val);
++
++	val = ocelot_read(ocelot, ANA_TABLES_SEQ_MASK);
++	c->split_mask = ANA_TABLES_SEQ_MASK_SPLIT_MASK_X(val);
++	c->iport_mask = ANA_TABLES_SEQ_MASK_INPUT_PORT_MASK(val);
++
++	c->seq_his = ocelot_read(ocelot, ANA_TABLES_SEQ_HISTORY);
++
++	return 0;
++}
++
++int switch_pcp_map_set(struct net_device *ndev, bool enable)
++{
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	int i;
++
++	ocelot_rmw_gix(ocelot,
++		       (enable ? ANA_PORT_QOS_CFG_QOS_PCP_ENA : 0),
++		       ANA_PORT_QOS_CFG_QOS_PCP_ENA,
++		       ANA_PORT_QOS_CFG,
++		       port->chip_port);
++
++	for (i = 0; i < NUM_MSCC_QOS_PRIO * 2; i++) {
++		ocelot_rmw_ix(ocelot,
++			      (ANA_PORT_PCP_DEI_MAP_DP_PCP_DEI_VAL & i) |
++			      ANA_PORT_PCP_DEI_MAP_QOS_PCP_DEI_VAL(i),
++			      ANA_PORT_PCP_DEI_MAP_DP_PCP_DEI_VAL |
++			      ANA_PORT_PCP_DEI_MAP_QOS_PCP_DEI_VAL_M,
++			      ANA_PORT_PCP_DEI_MAP,
++			      port->chip_port, i);
++	}
++
++	return 0;
++}
++
++int switch_dscp_set(struct net_device *ndev,
++		    bool enable,
++		    const u8 dscp_ix,
++		    struct tsn_qos_switch_dscp_conf *c)
++{
++
++	struct ocelot_port *port = netdev_priv(ndev);
++	struct ocelot *ocelot = port->ocelot;
++	u32 val, ri = dscp_ix;
++
++	c->dscp = 0;
++	c->trust = 1;
++	c->remark = 0;
++
++	if (dscp_ix > MSCC_QOS_DSCP_MAX) {
++		netdev_info(ndev, "%s: Invalid dscp_ix %u\n",
++			    __func__, dscp_ix);
++		return -EINVAL;
++	}
++	if (c->cos > MSCC_QOS_PRIO_MAX) {
++		netdev_info(ndev, "%s: Invalid cos %d\n",
++			    __func__, c->cos);
++		return -EINVAL;
++	}
++	if (c->dpl > MSCC_QOS_DP_MAX) {
++		netdev_info(ndev, "%s: Invalid dpl %d\n",
++			    __func__, c->dpl);
++		return -EINVAL;
++	}
++	if (c->dscp > MSCC_QOS_DSCP_MAX) {
++		netdev_info(ndev, "%s: Invalid dscp %d\n",
++			    __func__, c->dscp);
++		return -EINVAL;
++	}
++
++	ocelot_rmw_gix(ocelot,
++		       (enable ? ANA_PORT_QOS_CFG_QOS_DSCP_ENA : 0) |
++		       (c->dscp ? ANA_PORT_QOS_CFG_DSCP_TRANSLATE_ENA : 0),
++		       ANA_PORT_QOS_CFG_QOS_DSCP_ENA |
++		       ANA_PORT_QOS_CFG_DSCP_TRANSLATE_ENA,
++		       ANA_PORT_QOS_CFG,
++		       port->chip_port);
++
++	val = (c->dpl ? ANA_DSCP_CFG_DP_DSCP_VAL : 0) |
++	       ANA_DSCP_CFG_QOS_DSCP_VAL(c->cos) |
++	       ANA_DSCP_CFG_DSCP_TRANSLATE_VAL(c->dscp) |
++	       (c->trust ? ANA_DSCP_CFG_DSCP_TRUST_ENA : 0) |
++	       (c->remark ? ANA_DSCP_CFG_DSCP_REWR_ENA : 0);
++
++	ocelot_write_rix(ocelot, val, ANA_DSCP_CFG, ri);
++	return 0;
++}
+diff --git a/drivers/net/ethernet/mscc/tsn_switch.h b/drivers/net/ethernet/mscc/tsn_switch.h
+new file mode 100644
+index 000000000000..0902f5d743c4
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/tsn_switch.h
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: (GPL-2.0 OR MIT)
++ *
++ * TSN_SWITCH driver
++ *
++ * Copyright 2018-2019 NXP
++ */
++
++#ifndef _MSCC_FELIX_SWITCH_TSN_H_
++#define _MSCC_FELIX_SWITCH_TSN_H_
++#include <net/tsn.h>
++
++#define TRUE 1
++#define FALSE 0
++#define SUCCESS 1
++#define FAILED 0
++
++#define SWITCH_TAS_GCL_MAX 64
++#define SWITCH_TAS_CT_MAX 1000000000
++#define SWITCH_TAS_CT_MIN 100
++#define SWITCH_TAS_CTE_MAX 999999999
++
++int switch_qbv_set(struct net_device *ndev,
++		   struct tsn_qbv_conf *shaper_config);
++int switch_qbv_get(struct net_device *ndev,
++		   struct tsn_qbv_conf *shaper_config);
++int switch_qbv_get_status(struct net_device *ndev,
++			  struct tsn_qbv_status *qbvstatus);
++int switch_cut_thru_set(struct net_device *ndev, u8 cut_thru);
++int switch_cbs_set(struct net_device *ndev, u8 tc, u8 bw);
++int switch_qbu_set(struct net_device *ndev, u8 preemptable);
++int switch_qbu_get(struct net_device *ndev, struct tsn_preempt_status *c);
++int switch_cb_streamid_get(struct net_device *ndev, u32 index,
++			   struct tsn_cb_streamid *streamid);
++int switch_cb_streamid_set(struct net_device *ndev, u32 index,
++			   bool enable, struct tsn_cb_streamid *streamid);
++int switch_qci_sfi_get(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_sfi_conf *sfi);
++int switch_qci_sfi_set(struct net_device *ndev, u32 index,
++		       bool enable, struct tsn_qci_psfp_sfi_conf *sfi);
++int switch_cb_streamid_counters_get(struct net_device *ndev, u32 index,
++				    struct tsn_cb_streamid_counters *s_counters);
++int switch_qci_sfi_counters_get(struct net_device *ndev, u32 index,
++				struct tsn_qci_psfp_sfi_counters *sfi_counters);
++int switch_qci_sgi_set(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_sgi_conf *sgi_conf);
++int switch_qci_sgi_get(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_sgi_conf *sgi_conf);
++int switch_qci_sgi_status_get(struct net_device *ndev, u16 index,
++			      struct tsn_psfp_sgi_status *sgi_status);
++int switch_qci_fmi_set(struct net_device *ndev, u32 index,
++		       bool enable, struct tsn_qci_psfp_fmi *fmi);
++int switch_qci_fmi_get(struct net_device *ndev, u32 index,
++		       struct tsn_qci_psfp_fmi *fmi,
++			   struct tsn_qci_psfp_fmi_counters *counters);
++int switch_seq_gen_set(struct net_device *ndev, u32 index,
++		       struct tsn_seq_gen_conf *sg_conf);
++int switch_seq_rec_set(struct net_device *ndev, u32 index,
++		       struct tsn_seq_rec_conf *sr_conf);
++int switch_cb_get(struct net_device *ndev, u32 index,
++		  struct tsn_cb_status  *c);
++int switch_pcp_map_set(struct net_device *ndev, bool enable);
++int switch_dscp_set(struct net_device *ndev, bool enable, const u8 dscp_ix,
++		    struct tsn_qos_switch_dscp_conf *c);
++
++static inline void ocelot_port_rmwl(struct ocelot_port *port, u32 val,
++				    u32 mask, u32 reg)
++{
++	u32 cur = ocelot_port_readl(port, reg);
++
++	ocelot_port_writel(port, (cur & (~mask)) | val, reg);
++}
++#endif
+-- 
+2.17.1
+
