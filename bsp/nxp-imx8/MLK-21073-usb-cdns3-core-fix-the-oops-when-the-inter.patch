@@ -1,0 +1,133 @@
+From 9ecd59f25ad83c52a1019a18ba11baac1ca85451 Mon Sep 17 00:00:00 2001
+From: Peter Chen <peter.chen@nxp.com>
+Date: Fri, 22 Feb 2019 17:12:52 +0800
+Subject: [PATCH 1/4] MLK-21073 usb: cdns3: core: fix the oops when the
+ interrupt occurs during suspend
+
+commit d26aa9a5399873c8136b210d8b5866cf4d5544c4 from
+https://source.codeaurora.org/external/imx/linux-imx.git
+
+When the interrupt occurs during the USB is entering suspend, the
+cdns->lpm flag may not be updated well, the below oops may occur.
+We treat above interrupt as wakeup interrupt, it should be handled
+after lpm flag is set.
+
+irq 120: nobody cared (try booting with the "irqpoll" option)
+CPU: 0 PID: 107 Comm: kworker/0:1 Tainted: G           O    4.14.78 #1
+Hardware name: Freescale i.MX8QM MEK (DT)
+Workqueue: pm pm_runtime_work
+Call trace:
+[<ffff000008083230>] el1_irq+0xb0/0x124
+[<ffff000009028fcc>] _raw_spin_unlock_irqrestore+0x18/0x48
+[<ffff000008147a6c>] __irq_put_desc_unlock+0x1c/0x44
+[<ffff000008149e4c>] enable_irq+0x54/0x90
+[<ffff0000089cb08c>] cdns3_enter_suspend+0x30c/0x3ac
+[<ffff0000089cb274>] cdns3_runtime_suspend+0x40/0x78
+[<ffff000008796cd8>] pm_generic_runtime_suspend+0x28/0x48
+[<ffff0000087a7400>] genpd_runtime_suspend+0x90/0x21c
+[<ffff00000879a14c>] __rpm_callback+0x130/0x264
+[<ffff00000879a2a4>] rpm_callback+0x24/0x78
+[<ffff000008798ec8>] rpm_suspend+0x10c/0x668
+[<ffff0000087996b4>] rpm_idle+0x1c0/0x390
+[<ffff00000879aa6c>] pm_runtime_work+0x94/0xe0
+[<ffff0000080fac88>] process_one_work+0x140/0x3f8
+[<ffff0000080fb078>] worker_thread+0x138/0x3e4
+[<ffff0000081014e0>] kthread+0x104/0x130
+[<ffff00000808552c>] ret_from_fork+0x10/0x18
+
+Signed-off-by: Peter Chen <peter.chen@nxp.com>
+Signed-off-by: Arulpandiyan Vadivel <arulpandiyan_vadivel@mentor.com>
+Signed-off-by: Shrikant Bobade <Shrikant_Bobade@mentor.com>
+(cherry picked from commit e9f0c22de405d2e7f9698e67fbebde1e5aa37fdc)
+Signed-off-by: Xulin Sun <xulin.sun@windriver.com>
+---
+ drivers/usb/cdns3/core.c | 40 +++++++++++++++++++++-------------------
+ 1 file changed, 21 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/usb/cdns3/core.c b/drivers/usb/cdns3/core.c
+index db20506bb3dd..b8a183f03af7 100644
+--- a/drivers/usb/cdns3/core.c
++++ b/drivers/usb/cdns3/core.c
+@@ -704,10 +704,18 @@ static void cdns3_enter_suspend(struct cdns3 *cdns, bool suspend, bool wakeup)
+ 	u32 value;
+ 	int timeout_us = 100000;
+ 
+-	if (cdns->role != CDNS3_ROLE_HOST)
++	if (cdns->role == CDNS3_ROLE_GADGET) {
++		if (suspend) {
++			/* When at device mode, set controller at reset mode */
++			value = readl(cdns->none_core_regs + USB3_CORE_CTRL1);
++			value |= ALL_SW_RESET;
++			writel(value, cdns->none_core_regs + USB3_CORE_CTRL1);
++		}
++		return;
++	} else if (cdns->role == CDNS3_ROLE_END) {
+ 		return;
++	}
+ 
+-	disable_irq(cdns->irq);
+ 	if (suspend) {
+ 		if (cdns3_role(cdns)->suspend)
+ 			cdns3_role(cdns)->suspend(cdns, wakeup);
+@@ -823,6 +831,14 @@ static void cdns3_enter_suspend(struct cdns3 *cdns, bool suspend, bool wakeup)
+ 		if (timeout_us <= 0)
+ 			dev_err(cdns->dev, "wait xhci_power_on_ready timeout\n");
+ 	}
++}
++
++static void cdns3_controller_suspend(struct cdns3 *cdns, bool wakeup)
++{
++	disable_irq(cdns->irq);
++	cdns3_enter_suspend(cdns, true, wakeup);
++	usb_phy_set_suspend(cdns->usbphy, 1);
++	cdns->in_lpm = true;
+ 	enable_irq(cdns->irq);
+ }
+ 
+@@ -831,29 +847,17 @@ static int cdns3_suspend(struct device *dev)
+ {
+ 	struct cdns3 *cdns = dev_get_drvdata(dev);
+ 	bool wakeup = device_may_wakeup(dev);
+-	u32 value;
+ 
+ 	dev_dbg(dev, "at %s\n", __func__);
+ 
+ 	if (pm_runtime_status_suspended(dev))
+ 		pm_runtime_resume(dev);
+ 
+-	if (cdns->role == CDNS3_ROLE_HOST)
+-		cdns3_enter_suspend(cdns, true, wakeup);
+-	else if (cdns->role == CDNS3_ROLE_GADGET) {
+-		/* When at device mode, always set controller at reset mode */
+-		value = readl(cdns->none_core_regs + USB3_CORE_CTRL1);
+-		value |= ALL_SW_RESET;
+-		writel(value, cdns->none_core_regs + USB3_CORE_CTRL1);
+-	}
+-
++	cdns3_controller_suspend(cdns, wakeup);
++	cdns3_disable_unprepare_clks(dev);
+ 	if (wakeup)
+ 		enable_irq_wake(cdns->irq);
+ 
+-	usb_phy_set_suspend(cdns->usbphy, 1);
+-	cdns3_disable_unprepare_clks(dev);
+-	cdns->in_lpm = true;
+-
+ 	return 0;
+ }
+ 
+@@ -929,10 +933,8 @@ static int cdns3_runtime_suspend(struct device *dev)
+ 		return 0;
+ 	}
+ 
+-	cdns3_enter_suspend(cdns, true, true);
+-	usb_phy_set_suspend(cdns->usbphy, 1);
++	cdns3_controller_suspend(cdns, true);
+ 	cdns3_disable_unprepare_clks(dev);
+-	cdns->in_lpm = true;
+ 
+ 	dev_dbg(dev, "at the end of %s\n", __func__);
+ 
+-- 
+2.17.1
+
