@@ -1,0 +1,211 @@
+From 160207ffebbfd40442101c2285b238c46d6c4669 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Fri, 20 Dec 2019 12:46:38 +0530
+Subject: [PATCH 08/25] octeontx2-pf: Allocate receive buffers of MTU size
+
+commit 5e3ec7229b120001681a9d9ea8f7ce7e9cf1320a from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Due to SMQ length configuration we are anyway reinitializing
+the interface upon MTU change. So better allocate receive
+buffers of size MTU so that pkt always fits into a single
+buffer.
+
+A follow up patch will cleanup the multi segment processing
+code in Rx napi handler.
+
+Change-Id: I0a84ab11650ae507dd03da3076b2fefa8c8cfcbe
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/21018
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 12 +++++----
+ .../marvell/octeontx2/nic/otx2_common.h       |  2 ++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  4 +++
+ .../marvell/octeontx2/nic/otx2_txrx.c         |  8 +++---
+ .../marvell/octeontx2/nic/otx2_txrx.h         | 26 ++++++++++++-------
+ 5 files changed, 33 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 88e08480efd2..1d19eb808d32 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -363,7 +363,8 @@ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 	otx2_get_page(pool);
+ 
+ 	/* Allocate a new page */
+-	pool->page = alloc_pages(gfp | __GFP_COMP | __GFP_NOWARN, 0);
++	pool->page = alloc_pages(gfp | __GFP_COMP | __GFP_NOWARN,
++				 pool->rbpage_order);
+ 	if (unlikely(!pool->page))
+ 		return -ENOMEM;
+ 
+@@ -374,7 +375,7 @@ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 				      DMA_ATTR_SKIP_CPU_SYNC);
+ 	if (!iova) {
+ 		if (!pool->page_offset)
+-			__free_pages(pool->page, 0);
++			__free_pages(pool->page, pool->rbpage_order);
+ 		pool->page = NULL;
+ 		return -ENOMEM;
+ 	}
+@@ -584,7 +585,7 @@ static int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx, u16 lpb_aura)
+ 	aq->rq.ena = 1;
+ 	aq->rq.pb_caching = 1;
+ 	aq->rq.lpb_aura = lpb_aura; /* Use large packet buffer aura */
+-	aq->rq.lpb_sizem1 = (DMA_BUFFER_LEN / 8) - 1;
++	aq->rq.lpb_sizem1 = (DMA_BUFFER_LEN(pfvf->rbsize) / 8) - 1;
+ 	aq->rq.xqe_imm_size = 0; /* Copying of packet to CQE not needed */
+ 	aq->rq.flow_tagw = 32; /* Copy full 32bit flow_tag to CQE header */
+ 	aq->rq.qint_idx = 0;
+@@ -916,7 +917,7 @@ void otx2_free_aura_ptr(struct otx2_nic *pfvf, int type)
+ 	if (type == AURA_NIX_RQ) {
+ 		pool_start = otx2_get_pool_idx(pfvf, type, 0);
+ 		pool_end = pfvf->hw.rqpool_cnt;
+-		size = RCV_FRAG_LEN;
++		size = pfvf->rbsize;
+ 	}
+ 
+ 	/* Free SQB and RQB pointers from the aura pool */
+@@ -1025,6 +1026,7 @@ static int otx2_pool_init(struct otx2_nic *pfvf, u16 pool_id,
+ 		return err;
+ 
+ 	pool->rbsize = buf_size;
++	pool->rbpage_order = get_order(buf_size);
+ 
+ 	/* Initialize this pool's context via AF */
+ 	aq = otx2_mbox_alloc_msg_npa_aq_enq(&pfvf->mbox);
+@@ -1150,7 +1152,7 @@ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf)
+ 	}
+ 	for (pool_id = 0; pool_id < hw->rqpool_cnt; pool_id++) {
+ 		err = otx2_pool_init(pfvf, pool_id, stack_pages,
+-				     num_ptrs, RCV_FRAG_LEN);
++				     num_ptrs, pfvf->rbsize);
+ 		if (err)
+ 			goto fail;
+ 	}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index fda30b7040dc..dade789f2029 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -255,6 +255,7 @@ struct otx2_nic {
+ 	u16			iommu_domain_type;
+ 	u16			xtra_hdr;
+ 	u16			max_frs;
++	u16			rbsize; /* Receive buffer size */
+ 
+ #define OTX2_FLAG_RX_TSTAMP_ENABLED		BIT_ULL(0)
+ #define OTX2_FLAG_TX_TSTAMP_ENABLED		BIT_ULL(1)
+@@ -314,6 +315,7 @@ struct otx2_nic {
+ 	 */
+ #define OTX2_EDSA_HDR_LEN			16
+ #define OTX2_HIGIG2_HDR_LEN			16
++#define OTX2_HW_TIMESTAMP_LEN			8
+ 	u32			addl_mtu;
+ 	/* Block address of NIX either BLKADDR_NIX0 or BLKADDR_NIX1 */
+ 	int			nix_blkaddr;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index c50b6341da7f..f133c8e49912 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1319,6 +1319,10 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	hw->sqpool_cnt = hw->tx_queues;
+ 	hw->pool_cnt = hw->rqpool_cnt + hw->sqpool_cnt;
+ 
++	/* Get the size of receive buffers to allocate */
++	pf->rbsize = RCV_FRAG_LEN(OTX2_HW_TIMESTAMP_LEN + pf->netdev->mtu +
++				  pf->addl_mtu + pf->xtra_hdr);
++
+ 	otx2_mbox_lock(mbox);
+ 	/* NPA init */
+ 	err = otx2_config_npa(pf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 6864fa315900..f96e1755cd00 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -206,16 +206,16 @@ static void otx2_skb_add_frag(struct otx2_nic *pfvf, struct sk_buff *skb,
+ 		 */
+ 		if (parse->laptr) {
+ 			otx2_set_rxtstamp(pfvf, skb, va);
+-			off = 8;
++			off = OTX2_HW_TIMESTAMP_LEN;
+ 		}
+ 		off += pfvf->xtra_hdr;
+ 	}
+ 
+ 	page = virt_to_page(va);
+ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+-			va - page_address(page) + off, len - off, RCV_FRAG_LEN);
++			va - page_address(page) + off, len - off, pfvf->rbsize);
+ 
+-	otx2_dma_unmap_page(pfvf, iova - OTX2_HEAD_ROOM, RCV_FRAG_LEN,
++	otx2_dma_unmap_page(pfvf, iova - OTX2_HEAD_ROOM, pfvf->rbsize,
+ 			    DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+ }
+ 
+@@ -984,7 +984,7 @@ void otx2_cleanup_rx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq)
+ 				pa = otx2_iova_to_phys(pfvf->iommu_domain,
+ 						       *iova);
+ 				otx2_dma_unmap_page(pfvf, *iova,
+-						    RCV_FRAG_LEN,
++						    pfvf->rbsize,
+ 						    DMA_FROM_DEVICE,
+ 						    DMA_ATTR_SKIP_CPU_SYNC);
+ 				put_page(virt_to_page(phys_to_virt(pa)));
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index b898693ac08d..de37d57a5ba3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -19,17 +19,7 @@
+ #define SDP_CHAN_BASE	0x700
+ #define CGX_CHAN_BASE	0x800
+ 
+-#define DMA_BUFFER_LEN	1536 /* In multiples of 128bytes */
+ #define OTX2_DATA_ALIGN(X)	ALIGN(X, OTX2_ALIGN)
+-#define RCV_FRAG_LEN1		\
+-	((OTX2_DATA_ALIGN(DMA_BUFFER_LEN + NET_SKB_PAD)) + \
+-	(OTX2_DATA_ALIGN(sizeof(struct skb_shared_info))))
+-
+-/* Prefer 2048 byte buffers for better last level cache
+- * utilization or data distribution across regions.
+- */
+-#define RCV_FRAG_LEN		((RCV_FRAG_LEN1 < 2048) ? 2048 : RCV_FRAG_LEN1)
+-
+ #define OTX2_HEAD_ROOM		OTX2_ALIGN
+ 
+ #define	OTX2_ETH_HLEN		(VLAN_ETH_HLEN + VLAN_HLEN)
+@@ -39,6 +29,21 @@
+ #define OTX2_MAX_GSO_SEGS	255
+ #define OTX2_MAX_FRAGS_IN_SQE	9
+ 
++/* Rx buffer size should be in multiples of 128bytes */
++#define RCV_FRAG_LEN1(x)				\
++		((OTX2_HEAD_ROOM + OTX2_DATA_ALIGN(x)) + \
++		OTX2_DATA_ALIGN(sizeof(struct skb_shared_info)))
++
++/* Prefer 2048 byte buffers for better last level cache
++ * utilization or data distribution across regions.
++ */
++#define RCV_FRAG_LEN(x)	\
++		((RCV_FRAG_LEN1(x) < 2048) ? 2048 : RCV_FRAG_LEN1(x))
++
++#define DMA_BUFFER_LEN(x)		\
++		((x) - OTX2_HEAD_ROOM - \
++		OTX2_DATA_ALIGN(sizeof(struct skb_shared_info)))
++
+ /* IRQ triggered when NIX_LF_CINTX_CNT[ECOUNT]
+  * is equal to this value.
+  */
+@@ -105,6 +110,7 @@ struct otx2_cq_poll {
+ struct otx2_pool {
+ 	struct qmem		*stack;
+ 	struct qmem		*fc_addr;
++	u8			rbpage_order;
+ 	u16			rbsize;
+ 	u32			page_offset;
+ 	u16			pageref;
+-- 
+2.17.1
+
