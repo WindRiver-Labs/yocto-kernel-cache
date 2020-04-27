@@ -1,0 +1,117 @@
+From c6a788b35c9ffdbd2d5b93ee6fd200253d87b29b Mon Sep 17 00:00:00 2001
+From: Alex Marginean <alexandru.marginean@nxp.com>
+Date: Fri, 13 Sep 2019 19:03:06 +0300
+Subject: [PATCH 665/741] enetc: Fix hang with MDIO WA
+
+commit 825be02cf20e835c3a0575a4ef778e46522acb9f from
+http://source.codeaurora.org/external/qoriq/qoriq-components/linux
+
+The ENETC Tx clean-up flow ends up calling kmem_cache_free_bulk which
+cannot be called with IRQs off.  The previous version of the MDIO WA
+was keeping IRQs off over this call, this is now fixed.
+Use a single lock in the enetc MSI handler and disable interrupts before
+disabling preemption in MDIO accessors, following the model in the generic
+code.
+
+Fixes: 6907d6d1d1cc ("enetc: WA for MDIO register access issue")
+
+Signed-off-by: Alex Marginean <alexandru.marginean@nxp.com>
+Signed-off-by: Zhantao Tang <zhantao.tang@windriver.com>
+---
+ drivers/net/ethernet/freescale/enetc/enetc.c  | 22 ++++++++++++++-----
+ .../net/ethernet/freescale/enetc/enetc_hw.h   |  4 ++--
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc.c b/drivers/net/ethernet/freescale/enetc/enetc.c
+index 750633ec95bf..0fe28445a0b3 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc.c
++++ b/drivers/net/ethernet/freescale/enetc/enetc.c
+@@ -260,13 +260,21 @@ static int enetc_map_tx_buffs(struct enetc_bdr *tx_ring, struct sk_buff *skb,
+ static irqreturn_t enetc_msix(int irq, void *data)
+ {
+ 	struct enetc_int_vector	*v = data;
++	unsigned long flags;
++	/* pointer to per-cpu ENETC lock for register access issue WA */
++	spinlock_t *lock;
+ 	int i;
+ 
++	lock = this_cpu_ptr(&enetc_gregs);
++	spin_lock_irqsave(lock, flags);
++
+ 	/* disable interrupts */
+-	enetc_wr_reg(v->rbier, 0);
++	enetc_wr_reg_hot(v->rbier, 0);
+ 
+ 	for_each_set_bit(i, &v->tx_rings_map, v->count_tx_rings)
+-		enetc_wr_reg(v->tbier_base + ENETC_BDR_OFF(i), 0);
++		enetc_wr_reg_hot(v->tbier_base + ENETC_BDR_OFF(i), 0);
++
++	spin_unlock_irqrestore(lock, flags);
+ 
+ 	napi_schedule_irqoff(&v->napi);
+ 
+@@ -361,11 +369,13 @@ static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ 	spinlock_t *lock;
+ 
+ 	lock = this_cpu_ptr(&enetc_gregs);
+-	spin_lock_irqsave(lock, flags);
+ 
+ 	i = tx_ring->next_to_clean;
+ 	tx_swbd = &tx_ring->tx_swbd[i];
++
++	spin_lock_irqsave(lock, flags);
+ 	bds_to_clean = enetc_bd_ready_count(tx_ring, i);
++	spin_unlock_irqrestore(lock, flags);
+ 
+ 	do_tstamp = false;
+ 
+@@ -411,6 +421,8 @@ static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ 			tx_swbd = tx_ring->tx_swbd;
+ 		}
+ 
++		spin_lock_irqsave(lock, flags);
++
+ 		/* BD iteration loop end */
+ 		if (is_eof) {
+ 			tx_frm_cnt++;
+@@ -421,9 +433,9 @@ static bool enetc_clean_tx_ring(struct enetc_bdr *tx_ring, int napi_budget)
+ 
+ 		if (unlikely(!bds_to_clean))
+ 			bds_to_clean = enetc_bd_ready_count(tx_ring, i);
+-	}
+ 
+-	spin_unlock_irqrestore(lock, flags);
++		spin_unlock_irqrestore(lock, flags);
++	}
+ 
+ 	tx_ring->next_to_clean = i;
+ 	tx_ring->stats.packets += tx_frm_cnt;
+diff --git a/drivers/net/ethernet/freescale/enetc/enetc_hw.h b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+index fa8b2050ad58..c54764b3671c 100644
+--- a/drivers/net/ethernet/freescale/enetc/enetc_hw.h
++++ b/drivers/net/ethernet/freescale/enetc/enetc_hw.h
+@@ -403,9 +403,9 @@ static inline u32 enetc_rd_reg_wa_single(void *reg)
+ 	spinlock_t *lock[ENETC_NR_CPU_LOCKS];
+ 	unsigned long flags;
+ 
++	local_irq_save(flags);
+ 	preempt_disable();
+ 
+-	local_irq_save(flags);
+ 	for_each_online_cpu(cpu) {
+ 		lock[cpu] = per_cpu_ptr(&enetc_gregs, cpu);
+ 		spin_lock(lock[cpu]);
+@@ -429,9 +429,9 @@ static inline void enetc_wr_reg_wa_single(void *reg, u32 val)
+ 	spinlock_t *lock[ENETC_NR_CPU_LOCKS];
+ 	unsigned long flags;
+ 
++	local_irq_save(flags);
+ 	preempt_disable();
+ 
+-	local_irq_save(flags);
+ 	for_each_online_cpu(cpu) {
+ 		lock[cpu] = per_cpu_ptr(&enetc_gregs, cpu);
+ 		spin_lock(lock[cpu]);
+-- 
+2.17.1
+

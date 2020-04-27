@@ -1,0 +1,234 @@
+From 7ec8a26aa764c3813419b5e138e0aa20f9901197 Mon Sep 17 00:00:00 2001
+From: Ioana Radulescu <ruxandra.radulescu@nxp.com>
+Date: Wed, 3 May 2017 17:29:18 +0300
+Subject: [PATCH 074/741] dpaa2-eth: Add pause frame support
+
+commit 8b819c5f4ddbd87d5dcabf7df7a507e030855f0d from
+http://source.codeaurora.org/external/qoriq/qoriq-components/linux
+
+Add L2 flow control support, configurable via ethtool.
+
+The hardware can automatically sends pause frames when the number
+of buffers in the pool goes below a predefined threshold.
+
+Due to this, flow control is incompatible with Rx frame queue
+taildrop (both mechanisms target the case when processing of
+ingress frames can't keep up with the Rx rate, and a low enough
+taildrop threshold means the number of buffers in the pool won't
+get below the value needed to trigger pause frames, effectively
+disabling flow control).
+
+So activating flow control also has the side effect of disabling
+Rx FQ taildrop, and viceversa. Also, the maximum number of
+buffers in the pool is reduced when flow control is enabled, for
+better latency times.
+
+Configuring pause frame autonegotiation is not supported for now
+due to an MC limitation, so advertise it based on general port
+autoneg and report a warning that it can't be changed when
+requested to.
+
+By default, flow control is enabled.
+
+Signed-off-by: Bogdan Purcareata <bogdan.purcareata@nxp.com>
+Signed-off-by: Ioana Radulescu <ruxandra.radulescu@nxp.com>
+Signed-off-by: Zhantao Tang <zhantao.tang@windriver.com>
+---
+ .../net/ethernet/freescale/dpaa2/dpaa2-eth.c  | 46 +++++++++---
+ .../net/ethernet/freescale/dpaa2/dpaa2-eth.h  |  1 +
+ .../ethernet/freescale/dpaa2/dpaa2-ethtool.c  | 75 +++++++++++++++++++
+ 3 files changed, 112 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+index 296245fef96a..86538666ba92 100644
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+@@ -2391,6 +2391,7 @@ static int setup_dpni(struct fsl_mc_device *ls_dev)
+ 	struct device *dev = &ls_dev->dev;
+ 	struct dpaa2_eth_priv *priv;
+ 	struct net_device *net_dev;
++	struct dpni_link_cfg cfg = {0};
+ 	int err;
+ 
+ 	net_dev = dev_get_drvdata(dev);
+@@ -2445,6 +2446,14 @@ static int setup_dpni(struct fsl_mc_device *ls_dev)
+ 	if (!priv->cls_rules)
+ 		goto close;
+ 
++	/* Enable flow control */
++	cfg.options = DPNI_LINK_OPT_AUTONEG | DPNI_LINK_OPT_PAUSE;
++	err = dpni_set_link_cfg(priv->mc_io, 0, priv->mc_token, &cfg);
++	if (err) {
++		dev_err(dev, "dpni_set_link_cfg() failed\n");
++		goto close;
++	}
++
+ 	return 0;
+ 
+ close:
+@@ -2471,7 +2480,6 @@ static int setup_rx_flow(struct dpaa2_eth_priv *priv,
+ 	struct device *dev = priv->net_dev->dev.parent;
+ 	struct dpni_queue queue;
+ 	struct dpni_queue_id qid;
+-	struct dpni_taildrop td;
+ 	int err;
+ 
+ 	err = dpni_get_queue(priv->mc_io, 0, priv->mc_token,
+@@ -2501,15 +2509,6 @@ static int setup_rx_flow(struct dpaa2_eth_priv *priv,
+ 		return err;
+ 	}
+ 
+-	td.enable = 1;
+-	td.threshold = DPAA2_ETH_TAILDROP_THRESH;
+-	err = dpni_set_taildrop(priv->mc_io, 0, priv->mc_token, DPNI_CP_QUEUE,
+-				DPNI_QUEUE_RX, 0, fq->flowid, &td);
+-	if (err) {
+-		dev_err(dev, "dpni_set_threshold() failed\n");
+-		return err;
+-	}
+-
+ 	if (fq->tc > 0)
+ 		return 0;
+ 
+@@ -2531,6 +2530,33 @@ static int setup_rx_flow(struct dpaa2_eth_priv *priv,
+ 	return 0;
+ }
+ 
++/* Enable/disable Rx FQ taildrop
++ *
++ * Rx FQ taildrop is mutually exclusive with flow control and it only gets
++ * disabled when FC is active.
++ */
++int set_rx_taildrop(struct dpaa2_eth_priv *priv, bool enable)
++{
++        struct dpni_taildrop td = {0};
++        int i, err;
++
++        td.enable = enable;
++        td.threshold = DPAA2_ETH_TAILDROP_THRESH;
++
++        for (i = 0; i < priv->num_fqs; i++) {
++                if (priv->fq[i].type != DPAA2_RX_FQ)
++                        continue;
++                err = dpni_set_taildrop(priv->mc_io, 0, priv->mc_token,
++                                        DPNI_CP_QUEUE, DPNI_QUEUE_RX, 0,
++                                        priv->fq[i].flowid, &td);
++                if (err)
++                        return err;
++        }
++
++	return 0;
++
++}
++
+ static int setup_tx_flow(struct dpaa2_eth_priv *priv,
+ 			 struct dpaa2_eth_fq *fq)
+ {
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h
+index e180d5a68c98..0ba9c941a0fc 100644
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.h
+@@ -506,6 +506,7 @@ int dpaa2_eth_set_hash(struct net_device *net_dev, u64 flags);
+ int dpaa2_eth_set_cls(struct net_device *net_dev, u64 key);
+ int dpaa2_eth_cls_key_size(u64 key);
+ int dpaa2_eth_cls_fld_off(int prot, int field);
++int set_rx_taildrop(struct dpaa2_eth_priv *priv, bool enable);
+ void dpaa2_eth_cls_trim_rule(void *key_mem, u64 fields);
+ 
+ #endif	/* __DPAA2_H */
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-ethtool.c b/drivers/net/ethernet/freescale/dpaa2/dpaa2-ethtool.c
+index 7b182f4b263c..6b7f90765cf7 100644
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-ethtool.c
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-ethtool.c
+@@ -145,6 +145,79 @@ dpaa2_eth_set_link_ksettings(struct net_device *net_dev,
+ 	return err;
+ }
+ 
++static void dpaa2_eth_get_pauseparam(struct net_device *net_dev,
++				     struct ethtool_pauseparam *pause)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++	struct dpni_link_state state = {0};
++	int err;
++
++	err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token, &state);
++	if (err)
++		netdev_dbg(net_dev, "Error getting link state\n");
++
++	/* Report general port autonegotiation status */
++	pause->autoneg = !!(state.options & DPNI_LINK_OPT_AUTONEG);
++	pause->rx_pause = !!(state.options & DPNI_LINK_OPT_PAUSE);
++	pause->tx_pause = pause->rx_pause ^
++			  !!(state.options & DPNI_LINK_OPT_ASYM_PAUSE);
++}
++
++static int dpaa2_eth_set_pauseparam(struct net_device *net_dev,
++				    struct ethtool_pauseparam *pause)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++	struct dpni_link_state state = {0};
++	struct dpni_link_cfg cfg = {0};
++	u32 current_tx_pause;
++	int err = 0;
++
++	err = dpni_get_link_state(priv->mc_io, 0, priv->mc_token, &state);
++	if (err) {
++		netdev_dbg(net_dev, "Error getting link state\n");
++		goto out;
++	}
++
++	cfg.rate = state.rate;
++	cfg.options = state.options;
++	current_tx_pause = !!(cfg.options & DPNI_LINK_OPT_PAUSE) ^
++			   !!(cfg.options & DPNI_LINK_OPT_ASYM_PAUSE);
++
++	/* We don't support changing pause frame autonegotiation separately
++	 * from general port autoneg
++	 */
++	if (pause->autoneg != !!(state.options & DPNI_LINK_OPT_AUTONEG))
++		netdev_warn(net_dev,
++			    "Cannot change pause frame autoneg separately\n");
++
++	if (pause->rx_pause)
++		cfg.options |= DPNI_LINK_OPT_PAUSE;
++	else
++		cfg.options &= ~DPNI_LINK_OPT_PAUSE;
++
++	if (pause->rx_pause ^ pause->tx_pause)
++		cfg.options |= DPNI_LINK_OPT_ASYM_PAUSE;
++	else
++		cfg.options &= ~DPNI_LINK_OPT_ASYM_PAUSE;
++
++	err = dpni_set_link_cfg(priv->mc_io, 0, priv->mc_token, &cfg);
++	if (err) {
++		netdev_dbg(net_dev, "Error setting link\n");
++		goto out;
++	}
++
++	/* Enable/disable Rx FQ taildrop if Tx pause frames have changed */
++	if (current_tx_pause == pause->tx_pause)
++		goto out;
++
++	err = set_rx_taildrop(priv, !pause->tx_pause);
++	if (err)
++		netdev_dbg(net_dev, "Error configuring taildrop\n");
++
++out:
++	return err;
++}
++
+ static void dpaa2_eth_get_strings(struct net_device *netdev, u32 stringset,
+ 				  u8 *data)
+ {
+@@ -722,6 +795,8 @@ const struct ethtool_ops dpaa2_ethtool_ops = {
+ 	.get_link = ethtool_op_get_link,
+ 	.get_link_ksettings = dpaa2_eth_get_link_ksettings,
+ 	.set_link_ksettings = dpaa2_eth_set_link_ksettings,
++	.get_pauseparam = dpaa2_eth_get_pauseparam,
++	.set_pauseparam = dpaa2_eth_set_pauseparam,
+ 	.get_sset_count = dpaa2_eth_get_sset_count,
+ 	.get_ethtool_stats = dpaa2_eth_get_ethtool_stats,
+ 	.get_strings = dpaa2_eth_get_strings,
+-- 
+2.17.1
+

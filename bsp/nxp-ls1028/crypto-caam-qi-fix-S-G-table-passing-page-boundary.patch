@@ -1,0 +1,90 @@
+From 4641d8254314f9a64d04039785a91c0f9bac41c7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Horia=20Geant=C4=83?= <horia.geanta@nxp.com>
+Date: Thu, 29 Nov 2018 21:27:52 +0200
+Subject: [PATCH 432/741] crypto: caam/qi - fix S/G table passing page boundary
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit c8b85c3f68a627df82581df78a398d6192e29b22 from
+http://source.codeaurora.org/external/qoriq/qoriq-components/linux
+
+According to CAAM RM:
+-crypto engine reads 4 S/G entries at a time, even if the S/G table
+has fewer entries
+-it's the responsibility of the user / programmer to make sure
+this HW behaviour has no side effect
+
+The driver does not take care of this currently, leading to IOMMU faults
+when the S/G table ends close to a page boundary - since only one page
+is DMA mapped, while CAAM's DMA engine accesses two pages.
+
+Fix this by rounding up the number of allocted S/G table entries
+to a multiple of 4.
+
+Signed-off-by: Horia Geantă <horia.geanta@nxp.com>
+Signed-off-by: Zhantao Tang <zhantao.tang@windriver.com>
+---
+ drivers/crypto/caam/caamalg_qi.c | 38 +++++++++++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/crypto/caam/caamalg_qi.c b/drivers/crypto/caam/caamalg_qi.c
+index 1d9323c7c67e..47f919b492d1 100644
+--- a/drivers/crypto/caam/caamalg_qi.c
++++ b/drivers/crypto/caam/caamalg_qi.c
+@@ -1215,9 +1215,24 @@ static struct aead_edesc *aead_edesc_alloc(struct aead_request *req,
+ 	/*
+ 	 * Create S/G table: req->assoclen, [IV,] req->src [, req->dst].
+ 	 * Input is not contiguous.
++	 * HW reads 4 S/G entries at a time; make sure the reads don't go beyond
++	 * the end of the table by allocating more S/G entries. Logic:
++	 * if (src != dst && output S/G)
++	 *      pad output S/G, if needed
++	 * else if (src == dst && S/G)
++	 *      overlapping S/Gs; pad one of them
++	 * else if (input S/G) ...
++	 *      pad input S/G, if needed
+ 	 */
+-	qm_sg_ents = 1 + !!ivsize + mapped_src_nents +
+-		     (mapped_dst_nents > 1 ? mapped_dst_nents : 0);
++	qm_sg_ents = 1 + !!ivsize + mapped_src_nents;
++	if (mapped_dst_nents > 1)
++		qm_sg_ents += ALIGN(mapped_dst_nents, 4);
++	else if ((req->src == req->dst) && (mapped_src_nents > 1))
++		qm_sg_ents = max(ALIGN(qm_sg_ents, 4),
++				 1 + !!ivsize + ALIGN(mapped_src_nents, 4));
++	else
++		qm_sg_ents = ALIGN(qm_sg_ents, 4);
++
+ 	sg_table = &edesc->sgt[0];
+ 	qm_sg_bytes = qm_sg_ents * sizeof(*sg_table);
+ 	if (unlikely(offsetof(struct aead_edesc, sgt) + qm_sg_bytes + ivsize >
+@@ -1709,7 +1724,24 @@ static struct skcipher_edesc *skcipher_edesc_alloc(struct skcipher_request *req,
+ 	qm_sg_ents = 1 + mapped_src_nents;
+ 	dst_sg_idx = qm_sg_ents;
+ 
+-	qm_sg_ents += mapped_dst_nents > 1 ? mapped_dst_nents : 0;
++	/*
++	 * HW reads 4 S/G entries at a time; make sure the reads don't go beyond
++	 * the end of the table by allocating more S/G entries. Logic:
++	 * if (src != dst && output S/G)
++	 *      pad output S/G, if needed
++	 * else if (src == dst && S/G)
++	 *      overlapping S/Gs; pad one of them
++	 * else if (input S/G) ...
++	 *      pad input S/G, if needed
++	 */
++	if (mapped_dst_nents > 1)
++		qm_sg_ents += ALIGN(mapped_dst_nents, 4);
++	else if ((req->src == req->dst) && (mapped_src_nents > 1))
++		qm_sg_ents = max(ALIGN(qm_sg_ents, 4),
++				 1 + ALIGN(mapped_src_nents, 4));
++	else
++		qm_sg_ents = ALIGN(qm_sg_ents, 4);
++
+ 	qm_sg_bytes = qm_sg_ents * sizeof(struct qm_sg_entry);
+ 	if (unlikely(offsetof(struct skcipher_edesc, sgt) + qm_sg_bytes +
+ 		     ivsize > CAAM_QI_MEMCACHE_SIZE)) {
+-- 
+2.17.1
+

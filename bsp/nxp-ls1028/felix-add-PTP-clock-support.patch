@@ -1,0 +1,316 @@
+From 1d144478e1139ba1af19ec4aea3a7bcbd55ad60d Mon Sep 17 00:00:00 2001
+From: Yangbo Lu <yangbo.lu@nxp.com>
+Date: Wed, 17 Jul 2019 17:43:23 +0800
+Subject: [PATCH 615/741] felix: add PTP clock support
+
+commit 3ff61b32f13d13646dbc48b58040b12ed37fc5a2 from
+http://source.codeaurora.org/external/qoriq/qoriq-components/linux
+
+This patch is to add PTP clock support for Felix switch device.
+
+Signed-off-by: Yangbo Lu <yangbo.lu@nxp.com>
+Signed-off-by: Zhantao Tang <zhantao.tang@windriver.com>
+---
+ drivers/net/ethernet/mscc/Kconfig       |  11 ++
+ drivers/net/ethernet/mscc/Makefile      |   4 +
+ drivers/net/ethernet/mscc/felix_board.c |   6 +
+ drivers/net/ethernet/mscc/felix_ptp.c   | 171 ++++++++++++++++++++++++
+ drivers/net/ethernet/mscc/ocelot.h      |  20 +++
+ 5 files changed, 212 insertions(+)
+ create mode 100644 drivers/net/ethernet/mscc/felix_ptp.c
+
+diff --git a/drivers/net/ethernet/mscc/Kconfig b/drivers/net/ethernet/mscc/Kconfig
+index e5a7fa69307e..d4ad724bdd3b 100644
+--- a/drivers/net/ethernet/mscc/Kconfig
++++ b/drivers/net/ethernet/mscc/Kconfig
+@@ -37,4 +37,15 @@ config MSCC_FELIX_SWITCH
+ 	  This driver supports the Felix network switch device, connected as a
+ 	  PCI device.
+ 
++config MSCC_FELIX_SWITCH_PTP_CLOCK
++	bool "Felix switch PTP clock driver"
++	depends on MSCC_FELIX_SWITCH
++	imply PTP_1588_CLOCK
++	default y
++	help
++	  This driver supports the PTP clock on Felix network switch
++	  device. This clock is only useful if your PTP programs are
++	  getting hardware time stamps on the PTP Ethernet packets
++	  using the SO_TIMESTAMPING API.
++
+ endif # NET_VENDOR_MICROSEMI
+diff --git a/drivers/net/ethernet/mscc/Makefile b/drivers/net/ethernet/mscc/Makefile
+index c81fef470882..252a46743e6e 100644
+--- a/drivers/net/ethernet/mscc/Makefile
++++ b/drivers/net/ethernet/mscc/Makefile
+@@ -6,3 +6,7 @@ mscc_ocelot-$(CONFIG_MSCC_OCELOT_SWITCH_OCELOT) := ocelot_regs.o ocelot_board.o
+ 
+ obj-$(CONFIG_MSCC_FELIX_SWITCH) += mscc_felix.o
+ mscc_felix-$(CONFIG_MSCC_FELIX_SWITCH) := felix_regs.o felix_board.o
++
++ifeq ($(CONFIG_MSCC_FELIX_SWITCH_PTP_CLOCK),y)
++	mscc_felix-$(CONFIG_MSCC_FELIX_SWITCH) += felix_ptp.o
++endif
+diff --git a/drivers/net/ethernet/mscc/felix_board.c b/drivers/net/ethernet/mscc/felix_board.c
+index 7f37e07a87e1..409946c3a2de 100644
+--- a/drivers/net/ethernet/mscc/felix_board.c
++++ b/drivers/net/ethernet/mscc/felix_board.c
+@@ -605,6 +605,10 @@ static int felix_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_sw_core_init;
+ 
++	err = felix_ptp_init(ocelot);
++	if (err)
++		goto err_ptp_init;
++
+ 	err = felix_ports_init(pdev);
+ 	if (err)
+ 		goto err_ports_init;
+@@ -617,6 +621,7 @@ static int felix_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return 0;
+ 
+ err_ports_init:
++err_ptp_init:
+ err_chip_init:
+ err_sw_core_init:
+ 	pci_iounmap(pdev, regs);
+@@ -642,6 +647,7 @@ static void felix_pci_remove(struct pci_dev *pdev)
+ 	unregister_netdevice_notifier(&ocelot_netdevice_nb);
+ 
+ 	felix_release_ports(ocelot);
++	felix_ptp_remove(ocelot);
+ 
+ 	pci_iounmap(pdev, regs);
+ 	pci_disable_device(pdev);
+diff --git a/drivers/net/ethernet/mscc/felix_ptp.c b/drivers/net/ethernet/mscc/felix_ptp.c
+new file mode 100644
+index 000000000000..cfa972d412e3
+--- /dev/null
++++ b/drivers/net/ethernet/mscc/felix_ptp.c
+@@ -0,0 +1,171 @@
++// SPDX-License-Identifier: (GPL-2.0 OR MIT)
++/* Felix switch PTP clock driver
++ *
++ * Copyright 2019 NXP
++ */
++
++#include "ocelot.h"
++
++static int felix_ptp_gettime(struct ptp_clock_info *ptp, struct timespec64 *ts)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 val, ns, sec_lsb, sec_msb;
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_SAVE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	sec_msb = ocelot_read_rix(ocelot, PTP_TOD_SEC_MSB, TOD_ACC_PIN);
++	sec_lsb = ocelot_read_rix(ocelot, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++	ns = ocelot_read_rix(ocelot, PTP_TOD_NSEC, TOD_ACC_PIN);
++
++	ts->tv_sec = ((u64)sec_msb << 32) | sec_lsb;
++	ts->tv_nsec = ns;
++
++	/* Deal with negative values -1 and -2 */
++	if (ts->tv_nsec == 0x3fffffff) {
++		ts->tv_sec -= 1;
++		ts->tv_nsec = 999999999;
++	} else if (ts->tv_nsec == 0x3ffffffe) {
++		ts->tv_sec -= 1;
++		ts->tv_nsec = 999999998;
++	}
++
++	return 0;
++}
++
++static int felix_ptp_settime(struct ptp_clock_info *ptp,
++			     const struct timespec64 *ts)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 val, ns, sec_lsb, sec_msb;
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_IDLE);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	ns = ts->tv_nsec & NSEC_MASK;
++	sec_msb = (u32)(ts->tv_sec >> 32) & SEC_MSB_MASK;
++	sec_lsb = (u32)ts->tv_sec;
++
++	ocelot_write_rix(ocelot, ns, PTP_TOD_NSEC, TOD_ACC_PIN);
++	ocelot_write_rix(ocelot, sec_msb, PTP_TOD_SEC_MSB, TOD_ACC_PIN);
++	ocelot_write_rix(ocelot, sec_lsb, PTP_TOD_SEC_LSB, TOD_ACC_PIN);
++
++	val = ocelot_read_rix(ocelot, PTP_PIN_CFG, TOD_ACC_PIN);
++	val &= ~(PTP_PIN_CFG_SYNC | PTP_PIN_CFG_ACTION_MASK | PTP_PIN_CFG_DOM);
++	val |= PTP_PIN_CFG_ACTION(PTP_PIN_ACTION_LOAD);
++	ocelot_write_rix(ocelot, val, PTP_PIN_CFG, TOD_ACC_PIN);
++
++	return 0;
++}
++
++static int felix_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
++{
++	struct timespec64 ts;
++	struct timespec64 offset;
++
++	offset = ns_to_timespec64(delta);
++
++	felix_ptp_gettime(ptp, &ts);
++	ts = timespec64_add(ts, offset);
++	felix_ptp_settime(ptp, &ts);
++
++	return 0;
++}
++
++static int felix_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
++{
++	struct ocelot *ocelot = container_of(ptp, struct ocelot, ptp_caps);
++	u32 adjfreq = 0, adjcfg = PTP_CLK_ADJ_CFG_ENA;
++	u64 adj;
++
++	if (!ppb)
++		goto no_adj;
++
++	if (ppb < 0) {
++		adjcfg |= PTP_CLK_ADJ_CFG_DIR;
++		ppb = -ppb;
++	}
++
++	/* Calculate PSEC value. For every PSEC time, adjust 1ns. */
++	adj = PSEC_PER_SEC;
++	do_div(adj, ppb);
++
++	if (adj >= (1L << 30)) {
++		adjfreq |= PTP_CLK_ADJ_FRQ_UNIT;
++		do_div(adj, 1000);
++	}
++
++	if (adj >= (1L << 30))
++		goto no_adj;
++
++	adjfreq |= adj;
++
++	ocelot_write(ocelot, adjfreq, PTP_CLK_ADJ_FRQ);
++	ocelot_write(ocelot, adjcfg, PTP_CLK_ADJ_CFG);
++	return 0;
++
++no_adj:
++	ocelot_write(ocelot, 0, PTP_CLK_ADJ_CFG);
++	return 0;
++}
++
++static const struct ptp_clock_info felix_ptp_caps = {
++	.owner		= THIS_MODULE,
++	.name		= "felix ptp clock",
++	.max_adj	= 0x3fffffff,
++	.n_alarm	= 0,
++	.n_ext_ts	= 0,
++	.n_per_out	= 0,
++	.n_pins		= 0,
++	.pps		= 0,
++	.gettime64	= felix_ptp_gettime,
++	.settime64	= felix_ptp_settime,
++	.adjtime	= felix_ptp_adjtime,
++	.adjfreq	= felix_ptp_adjfreq,
++};
++
++int felix_ptp_init(struct ocelot *ocelot)
++{
++	u32 val;
++	int ret;
++
++	/* Reset PTP_MISC_CFG to disable the counter */
++	ocelot_write(ocelot, 0, PTP_MISC_CFG);
++
++	/* Reset PTP_CLK_ADJ_CFG to disable frequency adjustment */
++	ocelot_write(ocelot, 0, PTP_CLK_ADJ_CFG);
++
++	/* Reset PTP_SYS_CLK_CFG for default configuration */
++	val = PTP_SYS_CLK_CFG_PER_NS_DEFAULT << PTP_SYS_CLK_CFG_PER_NS_SHIFT |
++	      PTP_SYS_CLK_CFG_PER_PS100_DEFAULT;
++	ocelot_write(ocelot, val, PTP_SYS_CLK_CFG);
++
++	/* Enable the counter */
++	ocelot_write(ocelot, PTP_MISC_CFG_PTP_ENA, PTP_MISC_CFG);
++
++	ocelot->ptp_caps = felix_ptp_caps;
++	ocelot->clock = ptp_clock_register(&ocelot->ptp_caps, ocelot->dev);
++	ret = IS_ERR(ocelot->clock);
++	if (ret) {
++		ocelot->clock = NULL;
++		ocelot->phc_index = -1;
++		memset(&ocelot->ptp_caps, 0,
++		       sizeof(struct ptp_clock_info));
++		return ret;
++	}
++	ocelot->phc_index = ptp_clock_index(ocelot->clock);
++
++	return 0;
++}
++
++void felix_ptp_remove(struct ocelot *ocelot)
++{
++	ptp_clock_unregister(ocelot->clock);
++	ocelot->clock = NULL;
++	ocelot->phc_index = -1;
++	memset(&ocelot->ptp_caps, 0, sizeof(struct ptp_clock_info));
++}
+diff --git a/drivers/net/ethernet/mscc/ocelot.h b/drivers/net/ethernet/mscc/ocelot.h
+index 5b4e81429fcc..9f28990be97e 100644
+--- a/drivers/net/ethernet/mscc/ocelot.h
++++ b/drivers/net/ethernet/mscc/ocelot.h
+@@ -15,6 +15,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
++#include <linux/ptp_clock_kernel.h>
+ 
+ #include "ocelot_ana.h"
+ #include "ocelot_dev.h"
+@@ -422,6 +423,13 @@ struct ocelot_multicast {
+ 
+ struct ocelot_port;
+ 
++enum ocelot_ptp_pins {
++	ALT_PPS_PIN	= 1,
++	EXT_CLK_PIN,
++	ALT_LDST_PIN,
++	TOD_ACC_PIN
++};
++
+ struct ocelot_stat_layout {
+ 	u32 offset;
+ 	char name[ETH_GSTRING_LEN];
+@@ -465,6 +473,10 @@ struct ocelot {
+ 	struct workqueue_struct *stats_queue;
+ 
+ 	void (*port_pcs_init)(struct ocelot_port *port);
++
++	struct ptp_clock_info ptp_caps;
++	struct ptp_clock *clock;
++	int phc_index;
+ };
+ 
+ struct ocelot_port {
+@@ -530,6 +542,14 @@ int ocelot_probe_port(struct ocelot *ocelot, u8 port,
+ 		      void __iomem *regs,
+ 		      struct phy_device *phy);
+ 
++#ifdef CONFIG_MSCC_FELIX_SWITCH_PTP_CLOCK
++int felix_ptp_init(struct ocelot *ocelot);
++void felix_ptp_remove(struct ocelot *ocelot);
++#else
++static inline int felix_ptp_init(struct ocelot *ocelot) { return 0; }
++static inline void felix_ptp_remove(struct ocelot *ocelot) { }
++#endif
++
+ extern struct notifier_block ocelot_netdevice_nb;
+ extern struct notifier_block ocelot_switchdev_nb;
+ extern struct notifier_block ocelot_switchdev_blocking_nb;
+-- 
+2.17.1
+
