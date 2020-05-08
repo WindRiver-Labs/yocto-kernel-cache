@@ -1,0 +1,165 @@
+From 09b25e0f2ed05802ff5d7ee9ec9b2fabb520ef22 Mon Sep 17 00:00:00 2001
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Date: Wed, 3 Jul 2019 20:51:26 -0300
+Subject: [PATCH 78/87] cpuidle: add poll_limit_ns to cpuidle_device structure
+
+commit 36fcb4292473cb9c9ce7706d038bcf0eda5cabeb upstream
+
+Add a poll_limit_ns variable to cpuidle_device structure.
+
+Calculate and configure it in the new cpuidle_poll_time
+function, in case its zero.
+
+Individual governors are allowed to override this value.
+
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Jun Miao <jun.miao@windriver.com>
+---
+ drivers/cpuidle/cpuidle.c    | 30 ++++++++++++++++++++++++++++++
+ drivers/cpuidle/poll_state.c | 11 ++---------
+ drivers/cpuidle/sysfs.c      |  7 +++++++
+ include/linux/cpuidle.h      |  6 ++++++
+ 4 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/cpuidle/cpuidle.c b/drivers/cpuidle/cpuidle.c
+index 0f4b7c45df3e..0895b988fa92 100644
+--- a/drivers/cpuidle/cpuidle.c
++++ b/drivers/cpuidle/cpuidle.c
+@@ -361,6 +361,36 @@ void cpuidle_reflect(struct cpuidle_device *dev, int index)
+ 		cpuidle_curr_governor->reflect(dev, index);
+ }
+ 
++/**
++ * cpuidle_poll_time - return amount of time to poll for,
++ * governors can override dev->poll_limit_ns if necessary
++ *
++ * @drv:   the cpuidle driver tied with the cpu
++ * @dev:   the cpuidle device
++ *
++ */
++u64 cpuidle_poll_time(struct cpuidle_driver *drv,
++		      struct cpuidle_device *dev)
++{
++	int i;
++	u64 limit_ns;
++
++	if (dev->poll_limit_ns)
++		return dev->poll_limit_ns;
++
++	limit_ns = TICK_NSEC;
++	for (i = 1; i < drv->state_count; i++) {
++		if (drv->states[i].disabled || dev->states_usage[i].disable)
++			continue;
++
++		limit_ns = (u64)drv->states[i].target_residency * NSEC_PER_USEC;
++	}
++
++	dev->poll_limit_ns = limit_ns;
++
++	return dev->poll_limit_ns;
++}
++
+ /**
+  * cpuidle_install_idle_handler - installs the cpuidle idle loop handler
+  */
+diff --git a/drivers/cpuidle/poll_state.c b/drivers/cpuidle/poll_state.c
+index 02b9315a9e96..c8fa5f41dfc4 100644
+--- a/drivers/cpuidle/poll_state.c
++++ b/drivers/cpuidle/poll_state.c
+@@ -20,16 +20,9 @@ static int __cpuidle poll_idle(struct cpuidle_device *dev,
+ 	local_irq_enable();
+ 	if (!current_set_polling_and_test()) {
+ 		unsigned int loop_count = 0;
+-		u64 limit = TICK_NSEC;
+-		int i;
++		u64 limit;
+ 
+-		for (i = 1; i < drv->state_count; i++) {
+-			if (drv->states[i].disabled || dev->states_usage[i].disable)
+-				continue;
+-
+-			limit = (u64)drv->states[i].target_residency * NSEC_PER_USEC;
+-			break;
+-		}
++		limit = cpuidle_poll_time(drv, dev);
+ 
+ 		while (!need_resched()) {
+ 			cpu_relax();
+diff --git a/drivers/cpuidle/sysfs.c b/drivers/cpuidle/sysfs.c
+index eb20adb5de23..2bb2683b493c 100644
+--- a/drivers/cpuidle/sysfs.c
++++ b/drivers/cpuidle/sysfs.c
+@@ -334,6 +334,7 @@ struct cpuidle_state_kobj {
+ 	struct cpuidle_state_usage *state_usage;
+ 	struct completion kobj_unregister;
+ 	struct kobject kobj;
++	struct cpuidle_device *device;
+ };
+ 
+ #ifdef CONFIG_SUSPEND
+@@ -391,6 +392,7 @@ static inline void cpuidle_remove_s2idle_attr_group(struct cpuidle_state_kobj *k
+ #define kobj_to_state_obj(k) container_of(k, struct cpuidle_state_kobj, kobj)
+ #define kobj_to_state(k) (kobj_to_state_obj(k)->state)
+ #define kobj_to_state_usage(k) (kobj_to_state_obj(k)->state_usage)
++#define kobj_to_device(k) (kobj_to_state_obj(k)->device)
+ #define attr_to_stateattr(a) container_of(a, struct cpuidle_state_attr, attr)
+ 
+ static ssize_t cpuidle_state_show(struct kobject *kobj, struct attribute *attr,
+@@ -414,10 +416,14 @@ static ssize_t cpuidle_state_store(struct kobject *kobj, struct attribute *attr,
+ 	struct cpuidle_state *state = kobj_to_state(kobj);
+ 	struct cpuidle_state_usage *state_usage = kobj_to_state_usage(kobj);
+ 	struct cpuidle_state_attr *cattr = attr_to_stateattr(attr);
++	struct cpuidle_device *dev = kobj_to_device(kobj);
+ 
+ 	if (cattr->store)
+ 		ret = cattr->store(state, state_usage, buf, size);
+ 
++	/* reset poll time cache */
++	dev->poll_limit_ns = 0;
++
+ 	return ret;
+ }
+ 
+@@ -468,6 +474,7 @@ static int cpuidle_add_state_sysfs(struct cpuidle_device *device)
+ 		}
+ 		kobj->state = &drv->states[i];
+ 		kobj->state_usage = &device->states_usage[i];
++		kobj->device = device;
+ 		init_completion(&kobj->kobj_unregister);
+ 
+ 		ret = kobject_init_and_add(&kobj->kobj, &ktype_state_cpuidle,
+diff --git a/include/linux/cpuidle.h b/include/linux/cpuidle.h
+index bb9a0db89f1a..b484dd69ec21 100644
+--- a/include/linux/cpuidle.h
++++ b/include/linux/cpuidle.h
+@@ -86,6 +86,7 @@ struct cpuidle_device {
+ 	ktime_t			next_hrtimer;
+ 
+ 	int			last_residency;
++	u64			poll_limit_ns;
+ 	struct cpuidle_state_usage	states_usage[CPUIDLE_STATE_MAX];
+ 	struct cpuidle_state_kobj *kobjs[CPUIDLE_STATE_MAX];
+ 	struct cpuidle_driver_kobj *kobj_driver;
+@@ -132,6 +133,8 @@ extern int cpuidle_select(struct cpuidle_driver *drv,
+ extern int cpuidle_enter(struct cpuidle_driver *drv,
+ 			 struct cpuidle_device *dev, int index);
+ extern void cpuidle_reflect(struct cpuidle_device *dev, int index);
++extern u64 cpuidle_poll_time(struct cpuidle_driver *drv,
++			     struct cpuidle_device *dev);
+ 
+ extern int cpuidle_register_driver(struct cpuidle_driver *drv);
+ extern struct cpuidle_driver *cpuidle_get_driver(void);
+@@ -166,6 +169,9 @@ static inline int cpuidle_enter(struct cpuidle_driver *drv,
+ 				struct cpuidle_device *dev, int index)
+ {return -ENODEV; }
+ static inline void cpuidle_reflect(struct cpuidle_device *dev, int index) { }
++extern u64 cpuidle_poll_time(struct cpuidle_driver *drv,
++			     struct cpuidle_device *dev)
++{return 0; }
+ static inline int cpuidle_register_driver(struct cpuidle_driver *drv)
+ {return -ENODEV; }
+ static inline struct cpuidle_driver *cpuidle_get_driver(void) {return NULL; }
+-- 
+2.17.1
+
