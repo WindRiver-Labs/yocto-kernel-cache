@@ -1,0 +1,118 @@
+From 63793afc7c8f9f89faf17eae9a3cd7b05294b670 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Mon, 9 Dec 2019 18:59:16 +0530
+Subject: [PATCH 16/37] octeontx2-af: Map NIX block from CGX connection
+
+commit d0f8f194eaff4b950fdd1a31ebc40d80c37dd6fc from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Firmware configures NIX block mapping for all CGXs to achieve maximum
+throughput. This patch reads the configuration and create mapping between
+RVU PF and NIX blocks which can later be used for allocating NIX
+resources to PFs accordingly.
+
+Change-Id: I4a92b7c538f483185d36168b446db96113aa877d
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/27436
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/octeontx2/af/cgx.c   | 10 ++++++++++
+ drivers/net/ethernet/marvell/octeontx2/af/cgx.h   |  6 ++++++
+ drivers/net/ethernet/marvell/octeontx2/af/rvu.h   |  2 ++
+ .../net/ethernet/marvell/octeontx2/af/rvu_cgx.c   | 15 +++++++++++++++
+ 4 files changed, 33 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index 71eddbbef5a3..0c6e0e703b1d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -154,6 +154,16 @@ int cgx_get_cgxid(void *cgxd)
+ 	return cgx->cgx_id;
+ }
+ 
++u8 cgx_lmac_get_p2x(int cgx_id, int lmac_id)
++{
++	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	u64 cfg;
++
++	cfg = cgx_read(cgx_dev, lmac_id, CGXX_CMRX_CFG);
++
++	return (cfg & CMR_P2X_SEL_MASK) >> CMR_P2X_SEL_SHIFT;
++}
++
+ /* Ensure the required lock for event queue(where asynchronous events are
+  * posted) is acquired before calling this API. Else an asynchronous event(with
+  * latest link status) can reach the destination before this function returns
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+index 1aaa4a4f8727..e196a0a8730f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+@@ -28,6 +28,10 @@
+ 
+ /* Registers */
+ #define CGXX_CMRX_CFG			0x00
++#define CMR_P2X_SEL_MASK		GENMASK_ULL(61, 59)
++#define CMR_P2X_SEL_SHIFT		59ULL
++#define CMR_P2X_SEL_NIX0		1ULL
++#define CMR_P2X_SEL_NIX1		2ULL
+ #define CMR_EN				BIT_ULL(55)
+ #define DATA_PKT_TX_EN			BIT_ULL(53)
+ #define DATA_PKT_RX_EN			BIT_ULL(54)
+@@ -173,4 +177,6 @@ int cgx_get_phy_fec_stats(void *cgxd, int lmac_id);
+ void cgx_lmac_enadis_higig2(void *cgxd, int lmac_id, bool enable);
+ bool is_higig2_enabled(void *cgxd, int lmac_id);
+ int cgx_get_pkind(void *cgxd, u8 lmac_id, int *pkind);
++u8 cgx_lmac_get_p2x(int cgx_id, int lmac_id);
++
+ #endif /* CGX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index a0a885d06f75..781c20d3b800 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -298,6 +298,8 @@ struct rvu_pfvf {
+ 
+ 	bool	cgx_in_use; /* this PF/VF using CGX? */
+ 	int	cgx_users;  /* number of cgx users - used only by PFs */
++
++	u8	nix_blkaddr; /* BLKADDR_NIX0/1 assigned to this PF */
+ };
+ 
+ struct nix_txsch {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+index a153f8f2bcde..3b0d2ea12c89 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+@@ -72,6 +72,20 @@ void *rvu_cgx_pdata(u8 cgx_id, struct rvu *rvu)
+ 	return rvu->cgx_idmap[cgx_id];
+ }
+ 
++/* Based on P2X connectivity find mapped NIX block for a PF */
++static void rvu_map_cgx_nix_block(struct rvu *rvu, int pf,
++				  int cgx_id, int lmac_id)
++{
++	struct rvu_pfvf *pfvf = &rvu->pf[pf];
++	u8 p2x;
++
++	p2x = cgx_lmac_get_p2x(cgx_id, lmac_id);
++	/* Firmware sets P2X_SELECT as either NIX0 or NIX1 */
++	pfvf->nix_blkaddr = BLKADDR_NIX0;
++	if (p2x == CMR_P2X_SEL_NIX1)
++		pfvf->nix_blkaddr = BLKADDR_NIX1;
++}
++
+ static int rvu_map_cgx_lmac_pf(struct rvu *rvu)
+ {
+ 	struct npc_pkind *pkind = &rvu->hw->pkind;
+@@ -115,6 +129,7 @@ static int rvu_map_cgx_lmac_pf(struct rvu *rvu)
+ 			rvu->cgxlmac2pf_map[CGX_OFFSET(cgx) + lmac] = 1 << pf;
+ 			free_pkind = rvu_alloc_rsrc(&pkind->rsrc);
+ 			pkind->pfchan_map[free_pkind] = ((pf) & 0x3F) << 16;
++			rvu_map_cgx_nix_block(rvu, pf, cgx, lmac);
+ 			rvu->cgx_mapped_pfs++;
+ 		}
+ 	}
+-- 
+2.17.1
+

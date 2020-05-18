@@ -1,0 +1,99 @@
+From 9d545b4781c4f2d0fe6b1cc2bafda36683dcd8ee Mon Sep 17 00:00:00 2001
+From: Kevin Hao <kexin.hao@windriver.com>
+Date: Sat, 16 May 2020 19:36:36 +0800
+Subject: [PATCH 37/37] octeontx2-af: Fix deadlock between tx_stall->txsch_lock
+ and rvu->rsrc_lock
+
+The patch ("octeontx2-af: wait for tx link idle for credits change")
+introduces a ABBA deadlock:
+  kworker/u49:1/257 is trying to acquire lock:
+  000000009c4ce30c (&tx_stall->txsch_lock){+.+.}, at: rvu_nix_update_link_credits+0x50/0x78
+
+  but task is already holding lock:
+  00000000dd73fbc7 (&rvu->rsrc_lock){+.+.}, at: rvu_mbox_handler_nix_set_hw_frs+0x3e8/0x648
+
+  which lock already depends on the new lock.
+
+  the existing dependency chain (in reverse order) is:
+
+  -> #1 (&rvu->rsrc_lock){+.+.}:
+         __mutex_lock+0x94/0x830
+         mutex_lock_nested+0x3c/0x50
+         is_valid_txschq+0x94/0x108
+         rvu_mbox_handler_nix_txschq_cfg+0x16c/0x628
+         __rvu_mbox_handler+0x1bcc/0x27d8
+         rvu_afvf_mbox_handler+0x10/0x18
+         process_one_work+0x29c/0x6d8
+         worker_thread+0x50/0x418
+         kthread+0x108/0x138
+         ret_from_fork+0x10/0x18
+
+  -> #0 (&tx_stall->txsch_lock){+.+.}:
+         lock_acquire+0xfc/0x288
+         __mutex_lock+0x94/0x830
+         mutex_lock_nested+0x3c/0x50
+         rvu_nix_update_link_credits+0x50/0x78
+         rvu_mbox_handler_nix_set_hw_frs+0x5b4/0x648
+         __rvu_mbox_handler+0x1fec/0x27d8
+         rvu_afpf_mbox_handler+0x10/0x18
+         process_one_work+0x29c/0x6d8
+         worker_thread+0x50/0x418
+         kthread+0x108/0x138
+         ret_from_fork+0x10/0x18
+
+  other info that might help us debug this:
+
+   Possible unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(&rvu->rsrc_lock);
+                                 lock(&tx_stall->txsch_lock);
+                                 lock(&rvu->rsrc_lock);
+    lock(&tx_stall->txsch_lock);
+
+Adjust the lock sequence in nix_config_link_credits() to fix this.
+
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c | 2 --
+ drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c   | 2 ++
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c
+index 909abb2d358e..0c556c3be666 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c
+@@ -122,9 +122,7 @@ void rvu_nix_update_link_credits(struct rvu *rvu, int blkaddr,
+ 	if (!tx_stall)
+ 		return;
+ 
+-	rvu_nix_txsch_lock(nix_hw);
+ 	tx_stall->nlink_credits[link] = ncredits;
+-	rvu_nix_txsch_unlock(nix_hw);
+ }
+ 
+ void rvu_nix_update_sq_smq_mapping(struct rvu *rvu, int blkaddr, int nixlf,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 2866ef702252..8fa751cdbb88 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -3404,6 +3404,7 @@ nix_config_link_credits(struct rvu *rvu, int blkaddr, int link,
+ 						    lmac_id, true);
+ 	}
+ 
++	rvu_nix_txsch_lock(nix_hw);
+ 	mutex_lock(&rvu->rsrc_lock);
+ 	/* Disable new traffic to link */
+ 	if (hw->cap.nix_shaping) {
+@@ -3444,6 +3445,7 @@ nix_config_link_credits(struct rvu *rvu, int blkaddr, int link,
+ 		cgx_lmac_tx_enable(rvu_cgx_pdata(cgx_id, rvu), lmac_id, false);
+ 
+ 	mutex_unlock(&rvu->rsrc_lock);
++	rvu_nix_txsch_unlock(nix_hw);
+ 	return rc;
+ }
+ 
+-- 
+2.17.1
+

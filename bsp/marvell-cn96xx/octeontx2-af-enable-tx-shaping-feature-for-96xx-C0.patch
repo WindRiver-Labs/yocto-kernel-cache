@@ -1,0 +1,295 @@
+From 0ee50932069e38326789c7f4913e9f7c32bc3a3d Mon Sep 17 00:00:00 2001
+From: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Date: Sat, 18 Jan 2020 17:59:50 +0530
+Subject: [PATCH 01/37] octeontx2-af: enable tx shaping feature for 96xx C0
+
+commit a477553bb04b25fbd61a3ddf91544992d3e7ff08 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Enable shaping for 96xx C0. Along with enabling shaping
+feature, add support to poll or wait everytime shaping
+configuration is toggled from enabled to disable and
+vice versa.
+
+This patch also fixes level used in resetting link config
+register by using NIX_AF_PSE_CHANNEL_LEVEL config.
+
+Change-Id: I6ffee2f3637dd67cf6066e98674f5b7c2619fb67
+Signed-off-by: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/24953
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |   5 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   1 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 136 +++++++++++++++++-
+ .../ethernet/marvell/octeontx2/af/rvu_reg.c   |   4 +-
+ 4 files changed, 136 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 33de5da3d4ce..40f0c17e347b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -70,9 +70,10 @@ static void rvu_setup_hw_capabilities(struct rvu *rvu)
+ 	hw->cap.nix_shaping = true;
+ 	hw->cap.nix_tx_link_bp = true;
+ 	hw->cap.nix_rx_multicast = true;
++	hw->cap.nix_shaper_toggle_wait = false;
+ 
+ 	if (is_rvu_96xx_B0(rvu) || is_rvu_95xx_A0(rvu) ||
+-	    is_rvu_post_96xx_C0(rvu) || is_rvu_95xx_B0(rvu)) {
++	    is_rvu_95xx_B0(rvu)) {
+ 		hw->cap.nix_fixed_txschq_mapping = true;
+ 		hw->cap.nix_txsch_per_cgx_lmac = 4;
+ 		hw->cap.nix_txsch_per_lbk_lmac = 132;
+@@ -82,6 +83,8 @@ static void rvu_setup_hw_capabilities(struct rvu *rvu)
+ 		if (is_rvu_96xx_A0(rvu) || is_rvu_95xx_A0(rvu))
+ 			hw->cap.nix_rx_multicast = false;
+ 	}
++	if (is_rvu_post_96xx_C0(rvu))
++		hw->cap.nix_shaper_toggle_wait = true;
+ }
+ 
+ /* Poll a RVU block's register 'offset', for a 'zero'
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index a66da9254029..fd20e48a52c9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -360,6 +360,7 @@ struct hw_cap {
+ 	u16	nix_txsch_per_sdp_lmac; /* Max Q's transmitting to SDP LMAC */
+ 	bool	nix_fixed_txschq_mapping; /* Schq mapping fixed or flexible */
+ 	bool	nix_shaping;		 /* Is shaping and coloring supported */
++	bool    nix_shaper_toggle_wait; /* Shaping toggle needs poll/wait */
+ 	bool	nix_tx_link_bp;		 /* Can link backpressure TL queues ? */
+ 	bool	nix_rx_multicast;	 /* Rx packet replication support */
+ };
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index eb36ad0439e6..0c45daf8a077 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -1290,12 +1290,104 @@ int rvu_mbox_handler_nix_mark_format_cfg(struct rvu *rvu,
+ 	return 0;
+ }
+ 
++/* Handle shaper update specially for few revisions */
++static bool
++handle_txschq_shaper_update(struct rvu *rvu, int blkaddr, int nixlf,
++			    int lvl, u64 reg, u64 regval)
++{
++	u64 regbase, oldval, sw_xoff = 0;
++	u64 dbgval, md_debug0 = 0;
++	unsigned long poll_tmo;
++	bool rate_reg = 0;
++	u16 schq;
++
++	regbase = reg & 0xFFFF;
++	schq = TXSCHQ_IDX(reg, TXSCHQ_IDX_SHIFT);
++
++	/* Check for rate register */
++	switch (lvl) {
++	case NIX_TXSCH_LVL_TL1:
++		md_debug0 = NIX_AF_TL1X_MD_DEBUG0(schq);
++		sw_xoff = NIX_AF_TL1X_SW_XOFF(schq);
++
++		rate_reg = !!(regbase == NIX_AF_TL1X_CIR(0));
++		break;
++	case NIX_TXSCH_LVL_TL2:
++		md_debug0 = NIX_AF_TL2X_MD_DEBUG0(schq);
++		sw_xoff = NIX_AF_TL2X_SW_XOFF(schq);
++
++		rate_reg = (regbase == NIX_AF_TL2X_CIR(0) ||
++			    regbase == NIX_AF_TL2X_PIR(0));
++		break;
++	case NIX_TXSCH_LVL_TL3:
++		md_debug0 = NIX_AF_TL3X_MD_DEBUG0(schq);
++		sw_xoff = NIX_AF_TL3X_SW_XOFF(schq);
++
++		rate_reg = (regbase == NIX_AF_TL3X_CIR(0) ||
++			    regbase == NIX_AF_TL3X_PIR(0));
++		break;
++	case NIX_TXSCH_LVL_TL4:
++		md_debug0 = NIX_AF_TL4X_MD_DEBUG0(schq);
++		sw_xoff = NIX_AF_TL4X_SW_XOFF(schq);
++
++		rate_reg = (regbase == NIX_AF_TL4X_CIR(0) ||
++			    regbase == NIX_AF_TL4X_PIR(0));
++		break;
++	case NIX_TXSCH_LVL_MDQ:
++		sw_xoff = NIX_AF_MDQX_SW_XOFF(schq);
++		rate_reg = (regbase == NIX_AF_MDQX_CIR(0) ||
++			    regbase == NIX_AF_MDQX_PIR(0));
++		break;
++	}
++
++	if (!rate_reg)
++		return false;
++
++	/* Nothing special to do when state is not toggled */
++	oldval = rvu_read64(rvu, blkaddr, reg);
++	if ((oldval & 0x1) == (regval & 0x1)) {
++		rvu_write64(rvu, blkaddr, reg, regval);
++		return true;
++	}
++
++	/* PIR/CIR disable */
++	if (!(regval & 0x1)) {
++		rvu_write64(rvu, blkaddr, sw_xoff, 1);
++		rvu_write64(rvu, blkaddr, reg, 0);
++		udelay(4);
++		rvu_write64(rvu, blkaddr, sw_xoff, 0);
++		return true;
++	}
++
++	/* PIR/CIR enable */
++	rvu_write64(rvu, blkaddr, sw_xoff, 1);
++	if (md_debug0) {
++		poll_tmo = jiffies + usecs_to_jiffies(10000);
++		/* Wait until VLD(bit32) == 1 or C_CON(bit48) == 0 */
++		do {
++			if (time_after(jiffies, poll_tmo)) {
++				dev_err(rvu->dev,
++					"NIXLF%d: TLX%u(lvl %u) CIR/PIR enable failed\n",
++					nixlf, schq, lvl);
++				goto exit;
++			}
++			usleep_range(1, 5);
++			dbgval = rvu_read64(rvu, blkaddr, md_debug0);
++		} while (!(dbgval & BIT_ULL(32)) && (dbgval & BIT_ULL(48)));
++	}
++	rvu_write64(rvu, blkaddr, reg, regval);
++exit:
++	rvu_write64(rvu, blkaddr, sw_xoff, 0);
++	return true;
++}
++
+ /* Disable shaping of pkts by a scheduler queue
+  * at a given scheduler level.
+  */
+ static void nix_reset_tx_shaping(struct rvu *rvu, int blkaddr,
+-				 int lvl, int schq)
++				 int nixlf, int lvl, int schq)
+ {
++	struct rvu_hwinfo *hw = rvu->hw;
+ 	u64  cir_reg = 0, pir_reg = 0;
+ 	u64  cfg;
+ 
+@@ -1316,6 +1408,21 @@ static void nix_reset_tx_shaping(struct rvu *rvu, int blkaddr,
+ 		cir_reg = NIX_AF_TL4X_CIR(schq);
+ 		pir_reg = NIX_AF_TL4X_PIR(schq);
+ 		break;
++	case NIX_TXSCH_LVL_MDQ:
++		cir_reg = NIX_AF_MDQX_CIR(schq);
++		pir_reg = NIX_AF_MDQX_PIR(schq);
++		break;
++	}
++
++	/* Shaper state toggle needs wait/poll */
++	if (hw->cap.nix_shaper_toggle_wait) {
++		if (cir_reg)
++			handle_txschq_shaper_update(rvu, blkaddr, nixlf,
++						    lvl, cir_reg, 0);
++		if (pir_reg)
++			handle_txschq_shaper_update(rvu, blkaddr, nixlf,
++						    lvl, pir_reg, 0);
++		return;
+ 	}
+ 
+ 	if (!cir_reg)
+@@ -1333,6 +1440,7 @@ static void nix_reset_tx_linkcfg(struct rvu *rvu, int blkaddr,
+ 				 int lvl, int schq)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
++	int link_level;
+ 	int link;
+ 
+ 	if (lvl >= hw->cap.nix_tx_aggr_lvl)
+@@ -1342,7 +1450,9 @@ static void nix_reset_tx_linkcfg(struct rvu *rvu, int blkaddr,
+ 	if (lvl == NIX_TXSCH_LVL_TL4)
+ 		rvu_write64(rvu, blkaddr, NIX_AF_TL4X_SDP_LINK_CFG(schq), 0x00);
+ 
+-	if (lvl != NIX_TXSCH_LVL_TL2)
++	link_level = rvu_read64(rvu, blkaddr, NIX_AF_PSE_CHANNEL_LEVEL) & 0x01 ?
++			NIX_TXSCH_LVL_TL3 : NIX_TXSCH_LVL_TL2;
++	if (lvl != link_level)
+ 		return;
+ 
+ 	/* Reset TL2's CGX or LBK link config */
+@@ -1531,12 +1641,13 @@ int rvu_mbox_handler_nix_txsch_alloc(struct rvu *rvu,
+ 	struct rvu_pfvf *pfvf;
+ 	struct nix_hw *nix_hw;
+ 	u32 *pfvf_map;
++	int nixlf;
+ 	u16 schq;
+ 
+ 	pfvf = rvu_get_pfvf(rvu, pcifunc);
+-	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
+-	if (!pfvf->nixlf || blkaddr < 0)
+-		return NIX_AF_ERR_AF_LF_INVALID;
++	rc = nix_get_nixlf(rvu, pcifunc, &nixlf, &blkaddr);
++	if (rc)
++		return rc;
+ 
+ 	nix_hw = get_nix_hw(rvu->hw, blkaddr);
+ 	if (!nix_hw)
+@@ -1593,7 +1704,7 @@ int rvu_mbox_handler_nix_txsch_alloc(struct rvu *rvu,
+ 			    NIX_TXSCHQ_CFG_DONE))
+ 				pfvf_map[schq] = TXSCH_MAP(pcifunc, 0);
+ 			nix_reset_tx_linkcfg(rvu, blkaddr, lvl, schq);
+-			nix_reset_tx_shaping(rvu, blkaddr, lvl, schq);
++			nix_reset_tx_shaping(rvu, blkaddr, nixlf, lvl, schq);
+ 		}
+ 
+ 		for (idx = 0; idx < req->schq[lvl]; idx++) {
+@@ -1602,7 +1713,7 @@ int rvu_mbox_handler_nix_txsch_alloc(struct rvu *rvu,
+ 			    NIX_TXSCHQ_CFG_DONE))
+ 				pfvf_map[schq] = TXSCH_MAP(pcifunc, 0);
+ 			nix_reset_tx_linkcfg(rvu, blkaddr, lvl, schq);
+-			nix_reset_tx_shaping(rvu, blkaddr, lvl, schq);
++			nix_reset_tx_shaping(rvu, blkaddr, nixlf, lvl, schq);
+ 		}
+ 	}
+ 
+@@ -1857,6 +1968,11 @@ static bool is_txschq_shaping_valid(struct rvu_hwinfo *hw, int lvl, u64 reg)
+ 		    regbase == NIX_AF_TL4X_PIR(0))
+ 			return false;
+ 		break;
++	case NIX_TXSCH_LVL_MDQ:
++		if (regbase == NIX_AF_MDQX_CIR(0) ||
++		    regbase == NIX_AF_MDQX_PIR(0))
++			return false;
++		break;
+ 	}
+ 	return true;
+ }
+@@ -1965,6 +2081,12 @@ int rvu_mbox_handler_nix_txschq_cfg(struct rvu *rvu,
+ 		val = rvu_read64(rvu, blkaddr, reg);
+ 		regval = (val & val_mask) | (regval & ~val_mask);
+ 
++		/* Handle shaping state toggle specially */
++		if (hw->cap.nix_shaper_toggle_wait &&
++		    handle_txschq_shaper_update(rvu, blkaddr, nixlf,
++						req->lvl, reg, regval))
++			continue;
++
+ 		/* Replace PF/VF visible NIXLF slot with HW NIXLF id */
+ 		if (schq_regbase == NIX_AF_SMQX_CFG(0)) {
+ 			nixlf = rvu_get_lf(rvu, &hw->block[blkaddr],
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.c
+index 9d7c135c7965..33c2e9457cc4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.c
+@@ -33,8 +33,8 @@ static struct hw_reg_map txsch_reg_map[NIX_TXSCH_LVL_CNT] = {
+ 	{NIX_TXSCH_LVL_SMQ, 2, 0xFFFF, {{0x0700, 0x0708}, {0x1400, 0x14C8} } },
+ 	{NIX_TXSCH_LVL_TL4, 3, 0xFFFF, {{0x0B00, 0x0B08}, {0x0B10, 0x0B18},
+ 			      {0x1200, 0x12E0} } },
+-	{NIX_TXSCH_LVL_TL3, 3, 0xFFFF, {{0x1000, 0x10E0}, {0x1600, 0x1608},
+-			      {0x1610, 0x1618} } },
++	{NIX_TXSCH_LVL_TL3, 4, 0xFFFF, {{0x1000, 0x10E0}, {0x1600, 0x1608},
++			      {0x1610, 0x1618}, {0x1700, 0x1768} } },
+ 	{NIX_TXSCH_LVL_TL2, 2, 0xFFFF, {{0x0E00, 0x0EE0}, {0x1700, 0x1768} } },
+ 	{NIX_TXSCH_LVL_TL1, 1, 0xFFFF, {{0x0C00, 0x0D98} } },
+ };
+-- 
+2.17.1
+
