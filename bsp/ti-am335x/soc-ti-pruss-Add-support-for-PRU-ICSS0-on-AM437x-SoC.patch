@@ -1,0 +1,155 @@
+From 87b700b304224d80ed5570598d9a014ab09fc608 Mon Sep 17 00:00:00 2001
+From: Suman Anna <s-anna@ti.com>
+Date: Fri, 15 Feb 2019 12:20:35 -0600
+Subject: [PATCH 36/51] soc: ti: pruss: Add support for PRU-ICSS0 on AM437x
+ SoCs
+
+commit 08f9362d3d428d39d41f4c224d6feb3e8164676a from
+https://git.ti.com/cgit/processor-sdk/processor-sdk-linux/?h=processor-sdk-linux-01.00.00
+
+The AM437x SoCs have a second smaller PRU-ICSS subsystem (PRUSS0)
+in addition to the primary PRUSS1 instance. The PRUSS0 is another
+instantiation of the IP, but is not identical to PRUSS1. It is
+essentially a cut-down version of the IP, with less DRAM per PRU,
+no Shared DRAM etc. It also does not have direct access to L3 bus
+regions, there is a single interface to L3 for both PRUSS0 and
+PRUSS1, and it would have to go through the PRUSS1's interface.
+The PRUSS_SYSCFG register is reserved on PRUSS0, so any external
+access requires the programming the corresponding PRUSS_SYSCFG
+register in PRUSS1. It does have its own dedicated I/O lines
+though. Note that this instance does not support any PRU Ethernet
+related usecases.
+
+The PRUSS remoteproc drivers have been enhanced to support this
+smaller PRUSS0 instance using instance-specific data. The adaptation
+uses a newly introduced pruss_match_private_data structure and the
+pruss_get_private_data() function to retrieve a PRUSS instance
+specific data using a device-name based lookup logic. The reset
+and the L3 external access are managed by the common PRUSS SoC bus
+driver so that PRUSS1 and PRUSS0 can be independently supported.
+The initial names for the firmware images for each PRU core are
+retrieved from DT nodes, and can be adjusted through sysfs if
+required.
+
+Signed-off-by: Andrew F. Davis <afd@ti.com>
+Signed-off-by: Suman Anna <s-anna@ti.com>
+Signed-off-by: Xiaolei Wang <xiaolei.wang@windriver.com>
+---
+ drivers/soc/ti/pruss.c | 71 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/ti/pruss.c b/drivers/soc/ti/pruss.c
+index 86805a3328be..b88c1d596a93 100644
+--- a/drivers/soc/ti/pruss.c
++++ b/drivers/soc/ti/pruss.c
+@@ -15,6 +15,41 @@
+ #include <linux/of_device.h>
+ #include <linux/pruss_driver.h>
+ 
++/**
++ * struct pruss_private_data - PRUSS driver private data
++ * @has_no_sharedram: flag to indicate the absence of PRUSS Shared Data RAM
++ */
++struct pruss_private_data {
++	bool has_no_sharedram;
++};
++
++/**
++ * struct pruss_match_private_data - private data to handle multiple instances
++ * @device_name: device name of the PRUSS instance
++ * @priv_data: PRUSS driver private data for this PRUSS instance
++ */
++struct pruss_match_private_data {
++	const char *device_name;
++	const struct pruss_private_data *priv_data;
++};
++
++static const
++struct pruss_private_data *pruss_get_private_data(struct platform_device *pdev)
++{
++	const struct pruss_match_private_data *data;
++
++	if (!of_device_is_compatible(pdev->dev.of_node, "ti,am4376-pruss"))
++		return NULL;
++
++	data = of_device_get_match_data(&pdev->dev);
++	for (; data && data->device_name; data++) {
++		if (!strcmp(dev_name(&pdev->dev), data->device_name))
++			return data->priv_data;
++	}
++
++	return ERR_PTR(-ENODEV);
++}
++
+ static int pruss_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -23,6 +58,7 @@ static int pruss_probe(struct platform_device *pdev)
+ 	struct pruss *pruss;
+ 	struct resource res;
+ 	int ret, i, index;
++	const struct pruss_private_data *data;
+ 	const char *mem_names[PRUSS_MEM_MAX] = { "dram0", "dram1", "shrdram2" };
+ 
+ 	if (!node) {
+@@ -30,6 +66,12 @@ static int pruss_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
++	data = pruss_get_private_data(pdev);
++	if (IS_ERR(data)) {
++		dev_err(dev, "missing private data\n");
++		return -ENODEV;
++	}
++
+ 	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+ 	if (ret) {
+ 		dev_err(dev, "dma_set_coherent_mask: %d\n", ret);
+@@ -82,6 +124,10 @@ static int pruss_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(mem_names); i++) {
++		if (data && data->has_no_sharedram &&
++		    !strcmp(mem_names[i], "shrdram2"))
++			continue;
++
+ 		index = of_property_match_string(np, "reg-names", mem_names[i]);
+ 		if (index < 0) {
+ 			of_node_put(np);
+@@ -130,9 +176,32 @@ static int pruss_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++/* instance-specific driver private data */
++static const struct pruss_private_data am437x_pruss1_priv_data = {
++	.has_no_sharedram = false,
++};
++
++static const struct pruss_private_data am437x_pruss0_priv_data = {
++	.has_no_sharedram = true,
++};
++
++static const struct pruss_match_private_data am437x_match_data[] = {
++	{
++		.device_name	= "54400000.pruss",
++		.priv_data	= &am437x_pruss1_priv_data,
++	},
++	{
++		.device_name	= "54440000.pruss",
++		.priv_data	= &am437x_pruss0_priv_data,
++	},
++	{
++		/* sentinel */
++	},
++};
++
+ static const struct of_device_id pruss_of_match[] = {
+ 	{ .compatible = "ti,am3356-pruss", .data = NULL, },
+-	{ .compatible = "ti,am4376-pruss", .data = NULL, },
++	{ .compatible = "ti,am4376-pruss", .data = &am437x_match_data, },
+ 	{ /* sentinel */ },
+ };
+ MODULE_DEVICE_TABLE(of, pruss_of_match);
+-- 
+2.17.1
+
