@@ -1,0 +1,156 @@
+From b4ba673fa471a813897550b68d2bd713b37dbf47 Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Wed, 26 Jun 2019 15:38:45 -0700
+Subject: [PATCH 4/9] platform/x86: ISST: Add IOCTL to Translate Linux logical
+ CPU to PUNIT CPU number
+
+commit fb5b36a413b9f30fba573fc2a596ab7142dfaf12 upstream
+
+Add processing for IOCTL command ISST_IF_GET_PHY_ID. This converts from the
+Linux logical CPU to PUNIT CPU numbering scheme.
+
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Jun Miao <jun.miao@windriver.com>
+---
+ .../intel_speed_select_if/isst_if_common.c    | 74 +++++++++++++++++++
+ include/uapi/linux/isst_if.h                  | 28 +++++++
+ 2 files changed, 102 insertions(+)
+
+diff --git a/drivers/platform/x86/intel_speed_select_if/isst_if_common.c b/drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+index 0e16cbf685d0..72e74d72724b 100644
+--- a/drivers/platform/x86/intel_speed_select_if/isst_if_common.c
++++ b/drivers/platform/x86/intel_speed_select_if/isst_if_common.c
+@@ -134,16 +134,90 @@ static void isst_if_cpu_info_exit(void)
+ 	kfree(isst_cpu_info);
+ };
+ 
++static long isst_if_proc_phyid_req(u8 *cmd_ptr, int *write_only, int resume)
++{
++	struct isst_if_cpu_map *cpu_map;
++
++	cpu_map = (struct isst_if_cpu_map *)cmd_ptr;
++	if (cpu_map->logical_cpu >= nr_cpu_ids ||
++	    cpu_map->logical_cpu >= num_possible_cpus())
++		return -EINVAL;
++
++	*write_only = 0;
++	cpu_map->physical_cpu = isst_cpu_info[cpu_map->logical_cpu].punit_cpu_id;
++
++	return 0;
++}
++
++static long isst_if_exec_multi_cmd(void __user *argp, struct isst_if_cmd_cb *cb)
++{
++	unsigned char __user *ptr;
++	u32 cmd_count;
++	u8 *cmd_ptr;
++	long ret;
++	int i;
++
++	/* Each multi command has u32 command count as the first field */
++	if (copy_from_user(&cmd_count, argp, sizeof(cmd_count)))
++		return -EFAULT;
++
++	if (!cmd_count || cmd_count > ISST_IF_CMD_LIMIT)
++		return -EINVAL;
++
++	cmd_ptr = kmalloc(cb->cmd_size, GFP_KERNEL);
++	if (!cmd_ptr)
++		return -ENOMEM;
++
++	/* cb->offset points to start of the command after the command count */
++	ptr = argp + cb->offset;
++
++	for (i = 0; i < cmd_count; ++i) {
++		int wr_only;
++
++		if (signal_pending(current)) {
++			ret = -EINTR;
++			break;
++		}
++
++		if (copy_from_user(cmd_ptr, ptr, cb->cmd_size)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ret = cb->cmd_callback(cmd_ptr, &wr_only, 0);
++		if (ret)
++			break;
++
++		if (!wr_only && copy_to_user(ptr, cmd_ptr, cb->cmd_size)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		ptr += cb->cmd_size;
++	}
++
++	kfree(cmd_ptr);
++
++	return i ? i : ret;
++}
++
+ static long isst_if_def_ioctl(struct file *file, unsigned int cmd,
+ 			      unsigned long arg)
+ {
+ 	void __user *argp = (void __user *)arg;
++	struct isst_if_cmd_cb cmd_cb;
+ 	long ret = -ENOTTY;
+ 
+ 	switch (cmd) {
+ 	case ISST_IF_GET_PLATFORM_INFO:
+ 		ret = isst_if_get_platform_info(argp);
+ 		break;
++	case ISST_IF_GET_PHY_ID:
++		cmd_cb.cmd_size = sizeof(struct isst_if_cpu_map);
++		cmd_cb.offset = offsetof(struct isst_if_cpu_maps, cpu_map);
++		cmd_cb.cmd_callback = isst_if_proc_phyid_req;
++		ret = isst_if_exec_multi_cmd(argp, &cmd_cb);
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/include/uapi/linux/isst_if.h b/include/uapi/linux/isst_if.h
+index fa94480b5f74..15d1f286a830 100644
+--- a/include/uapi/linux/isst_if.h
++++ b/include/uapi/linux/isst_if.h
+@@ -36,6 +36,34 @@ struct isst_if_platform_info {
+ 	__u8 mmio_supported;
+ };
+ 
++/**
++ * struct isst_if_cpu_map - CPU mapping between logical and physical CPU
++ * @logical_cpu:	Linux logical CPU number
++ * @physical_cpu:	PUNIT CPU number
++ *
++ * Used to convert from Linux logical CPU to PUNIT CPU numbering scheme.
++ * The PUNIT CPU number is different than APIC ID based CPU numbering.
++ */
++struct isst_if_cpu_map {
++	__u32 logical_cpu;
++	__u32 physical_cpu;
++};
++
++/**
++ * struct isst_if_cpu_maps - structure for CPU map IOCTL
++ * @cmd_count:	Number of CPU mapping command in cpu_map[]
++ * @cpu_map[]:	Holds one or more CPU map data structure
++ *
++ * This structure used with ioctl ISST_IF_GET_PHY_ID to send
++ * one or more CPU mapping commands. Here IOCTL return value indicates
++ * number of commands sent or error number if no commands have been sent.
++ */
++struct isst_if_cpu_maps {
++	__u32 cmd_count;
++	struct isst_if_cpu_map cpu_map[1];
++};
++
+ #define ISST_IF_MAGIC			0xFE
+ #define ISST_IF_GET_PLATFORM_INFO	_IOR(ISST_IF_MAGIC, 0, struct isst_if_platform_info *)
++#define ISST_IF_GET_PHY_ID		_IOWR(ISST_IF_MAGIC, 1, struct isst_if_cpu_map *)
+ #endif
+-- 
+2.17.1
+
