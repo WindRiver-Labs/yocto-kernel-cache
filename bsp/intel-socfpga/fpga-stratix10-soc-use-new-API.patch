@@ -1,0 +1,235 @@
+From 7adc8cf0c52f6fe58f66c665652bf460d9fb038e Mon Sep 17 00:00:00 2001
+From: Alan Tull <atull@kernel.org>
+Date: Tue, 14 Aug 2018 16:47:55 -0500
+Subject: [PATCH 08/18] fpga: stratix10-soc: use new API
+
+commit  2dc1d02ce4ac9bd0f575092c025f5aacd4c046ae from
+https://github.com/altera-opensource/linux-socfpga.git
+
+Changes to use new fpga_mgr_create/register/unregister API.
+
+Signed-off-by: Alan Tull <atull@kernel.org>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/fpga/fpga-mgr.c       | 78 +++++++++++++++++++++++------------
+ drivers/fpga/stratix10-soc.c  | 18 ++++++--
+ include/linux/fpga/fpga-mgr.h | 10 +++--
+ 3 files changed, 72 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/fpga/fpga-mgr.c b/drivers/fpga/fpga-mgr.c
+index 2f4df3a22a35..ee1fb44f680a 100644
+--- a/drivers/fpga/fpga-mgr.c
++++ b/drivers/fpga/fpga-mgr.c
+@@ -452,17 +452,17 @@ void fpga_mgr_put(struct fpga_manager *mgr)
+ EXPORT_SYMBOL_GPL(fpga_mgr_put);
+ 
+ /**
+- * fpga_mgr_register - register a low level fpga manager driver
++ * fpga_mgr_create - create and initialize a FPGA manager struct
+  * @dev:	fpga manager device from pdev
+  * @name:	fpga manager name
+  * @mops:	pointer to structure of fpga manager ops
+  * @priv:	fpga manager private data
+  *
+- * Return: 0 on success, negative error code otherwise.
++ * Return: pointer to struct fpga_manager or NULL
+  */
+-int fpga_mgr_register(struct device *dev, const char *name,
+-		      const struct fpga_manager_ops *mops,
+-		      void *priv)
++struct fpga_manager *fpga_mgr_create(struct device *dev, const char *name,
++				     const struct fpga_manager_ops *mops,
++				     void *priv)
+ {
+ 	struct fpga_manager *mgr;
+ 	int id, ret;
+@@ -471,17 +471,17 @@ int fpga_mgr_register(struct device *dev, const char *name,
+ 	    !mops->write_init || (!mops->write && !mops->write_sg) ||
+ 	    (mops->write && mops->write_sg)) {
+ 		dev_err(dev, "Attempt to register without fpga_manager_ops\n");
+-		return -EINVAL;
++		return NULL;
+ 	}
+ 
+ 	if (!name || !strlen(name)) {
+ 		dev_err(dev, "Attempt to register with no name!\n");
+-		return -EINVAL;
++		return NULL;
+ 	}
+ 
+ 	mgr = kzalloc(sizeof(*mgr), GFP_KERNEL);
+ 	if (!mgr)
+-		return -ENOMEM;
++		return NULL;
+ 
+ 	id = ida_simple_get(&fpga_mgr_ida, 0, 0, GFP_KERNEL);
+ 	if (id < 0) {
+@@ -495,24 +495,55 @@ int fpga_mgr_register(struct device *dev, const char *name,
+ 	mgr->mops = mops;
+ 	mgr->priv = priv;
+ 
+-	/*
+-	 * Initialize framework state by requesting low level driver read state
+-	 * from device.  FPGA may be in reset mode or may have been programmed
+-	 * by bootloader or EEPROM.
+-	 */
+-	mgr->state = mgr->mops->state(mgr);
+-
+ 	device_initialize(&mgr->dev);
+ 	mgr->dev.class = fpga_mgr_class;
+ 	mgr->dev.parent = dev;
+ 	mgr->dev.of_node = dev->of_node;
+ 	mgr->dev.id = id;
+-	dev_set_drvdata(dev, mgr);
+ 
+ 	ret = dev_set_name(&mgr->dev, "fpga%d", id);
+ 	if (ret)
+ 		goto error_device;
+ 
++	return mgr;
++
++error_device:
++	ida_simple_remove(&fpga_mgr_ida, id);
++error_kfree:
++	kfree(mgr);
++
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(fpga_mgr_create);
++
++/**
++ * fpga_mgr_free - deallocate a FPGA manager
++ * @mgr:	fpga manager struct created by fpga_mgr_create
++ */
++void fpga_mgr_free(struct fpga_manager *mgr)
++{
++	ida_simple_remove(&fpga_mgr_ida, mgr->dev.id);
++	kfree(mgr);
++}
++EXPORT_SYMBOL_GPL(fpga_mgr_free);
++
++/**
++ * fpga_mgr_register - register a FPGA manager
++ * @mgr:	fpga manager struct created by fpga_mgr_create
++ *
++ * Return: 0 on success, negative error code otherwise.
++ */
++int fpga_mgr_register(struct fpga_manager *mgr)
++{
++	int ret;
++
++	/*
++	 * Initialize framework state by requesting low level driver read state
++	 * from device.  FPGA may be in reset mode or may have been programmed
++	 * by bootloader or EEPROM.
++	 */
++	mgr->state = mgr->mops->state(mgr);
++
+ 	ret = device_add(&mgr->dev);
+ 	if (ret)
+ 		goto error_device;
+@@ -524,22 +555,18 @@ int fpga_mgr_register(struct device *dev, const char *name,
+ 	return 0;
+ 
+ error_device:
+-	ida_simple_remove(&fpga_mgr_ida, id);
+-error_kfree:
+-	kfree(mgr);
++	ida_simple_remove(&fpga_mgr_ida, mgr->dev.id);
+ 
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(fpga_mgr_register);
+ 
+ /**
+- * fpga_mgr_unregister - unregister a low level fpga manager driver
+- * @dev:	fpga manager device from pdev
++ * fpga_mgr_unregister - unregister a FPGA manager
++ * @mgr:	fpga manager struct
+  */
+-void fpga_mgr_unregister(struct device *dev)
++void fpga_mgr_unregister(struct fpga_manager *mgr)
+ {
+-	struct fpga_manager *mgr = dev_get_drvdata(dev);
+-
+ 	dev_info(&mgr->dev, "%s %s\n", __func__, mgr->name);
+ 
+ 	fpga_mgr_debugfs_remove(mgr);
+@@ -559,8 +586,7 @@ static void fpga_mgr_dev_release(struct device *dev)
+ {
+ 	struct fpga_manager *mgr = to_fpga_manager(dev);
+ 
+-	ida_simple_remove(&fpga_mgr_ida, mgr->dev.id);
+-	kfree(mgr);
++	fpga_mgr_free(mgr);
+ }
+ 
+ static int __init fpga_mgr_class_init(void)
+diff --git a/drivers/fpga/stratix10-soc.c b/drivers/fpga/stratix10-soc.c
+index 257faf14178e..9112d0cd96d8 100644
+--- a/drivers/fpga/stratix10-soc.c
++++ b/drivers/fpga/stratix10-soc.c
+@@ -462,6 +462,7 @@ static const struct fpga_manager_ops s10_ops = {
+ static int s10_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct fpga_manager *mgr;
+ 	struct s10_priv *priv;
+ 	int ret;
+ 
+@@ -483,11 +484,20 @@ static int s10_probe(struct platform_device *pdev)
+ 
+ 	init_completion(&priv->status_return_completion);
+ 
+-	ret = fpga_mgr_register(dev, "Stratix10 SOC FPGA Manager",
+-				&s10_ops, priv);
++	mgr = fpga_mgr_create(dev, "Stratix10 SOC FPGA Manager",
++			      &s10_ops, priv);
++	if (!mgr) {
++		free_svc_channel(priv->chan);
++		return -ENOMEM;
++	}
+ 
+-	if (ret)
++	platform_set_drvdata(pdev, mgr);
++
++	ret = fpga_mgr_register(mgr);
++	if (ret) {
++		fpga_mgr_free(mgr);
+ 		free_svc_channel(priv->chan);
++	}
+ 
+ 	return ret;
+ }
+@@ -497,7 +507,7 @@ static int s10_remove(struct platform_device *pdev)
+ 	struct fpga_manager *mgr = platform_get_drvdata(pdev);
+ 	struct s10_priv *priv = mgr->priv;
+ 
+-	fpga_mgr_unregister(&pdev->dev);
++	fpga_mgr_unregister(mgr);
+ 	free_svc_channel(priv->chan);
+ 
+ 	return 0;
+diff --git a/include/linux/fpga/fpga-mgr.h b/include/linux/fpga/fpga-mgr.h
+index 7954896badbf..44b2bb5f94c0 100644
+--- a/include/linux/fpga/fpga-mgr.h
++++ b/include/linux/fpga/fpga-mgr.h
+@@ -152,9 +152,11 @@ struct fpga_manager *fpga_mgr_get(struct device *dev);
+ 
+ void fpga_mgr_put(struct fpga_manager *mgr);
+ 
+-int fpga_mgr_register(struct device *dev, const char *name,
+-		      const struct fpga_manager_ops *mops, void *priv);
+-
+-void fpga_mgr_unregister(struct device *dev);
++struct fpga_manager *fpga_mgr_create(struct device *dev, const char *name,
++				     const struct fpga_manager_ops *mops,
++				     void *priv);
++void fpga_mgr_free(struct fpga_manager *mgr);
++int fpga_mgr_register(struct fpga_manager *mgr);
++void fpga_mgr_unregister(struct fpga_manager *mgr);
+ 
+ #endif /*_LINUX_FPGA_MGR_H */
+-- 
+2.17.1
+
