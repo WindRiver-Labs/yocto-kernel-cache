@@ -1,0 +1,712 @@
+From 099d57d90be1604b63108b17809a98ef6e059062 Mon Sep 17 00:00:00 2001
+From: Smadar Fuks <smadarf@marvell.com>
+Date: Tue, 26 May 2020 14:45:51 -0400
+Subject: [PATCH 1/4] octeontx2-af: Introducing REE block for 98xx
+
+commit a4d454585655319d82d1e97283a91d356ba1d72d from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+CN98XX Regular Expression Engine (REE) includes a two-part regular
+expression search engine consisting of filter engine and graph-walk
+engines. Input data (job) is searched against the regular expression
+rule set by first traversing the filter engine and if matched passing
+full Thompson NFA graph walk.
+These 2 REE blocks (REE0 and REE1) are introduced in 98xx.
+REE is provisioned using RVU.
+REE has up to 36 local functions (queues)
+
+A new file rvu_ree.c is added to support the new REE block with the
+following functions:
+- Initialization
+- Free memory
+- Interrupt registration and handling
+
+The following changes were done in rvu.c for ree:
+- Added calls to ree functions init, free memory, register/unregister
+  interrupts and teardown
+- Added member struct ree_rsrc in struct rvu_pfvf to hold ree data
+- Added member struct rvu *rvu in struct rvu_block so that interrupt
+  handler will know the block address
+
+Change-Id: I33184efaed9bab2954c8604d462b8945dda892d4
+Signed-off-by: Smadar Fuks <smadarf@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/29293
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/Makefile    |   2 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |  21 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  19 +
+ .../ethernet/marvell/octeontx2/af/rvu_ree.c   | 366 ++++++++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_reg.h   |  53 ++-
+ .../marvell/octeontx2/af/rvu_struct.h         |  31 ++
+ 6 files changed, 488 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/af/rvu_ree.c
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/Makefile b/drivers/net/ethernet/marvell/octeontx2/af/Makefile
+index a64046727ede..b31751cbf91d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/Makefile
++++ b/drivers/net/ethernet/marvell/octeontx2/af/Makefile
+@@ -10,4 +10,4 @@ octeontx2_mbox-y := mbox.o
+ octeontx2_af-y := cgx.o rvu.o rvu_cgx.o rvu_npa.o rvu_nix.o \
+ 		  rvu_reg.o rvu_npc.o rvu_validation.o rvu_sso.o \
+ 		  rvu_tim.o rvu_cpt.o rvu_debugfs.o rvu_npc_fs.o \
+-		  ptp.o rvu_ptp.o rvu_fixes.o rvu_sdp.o
++		  ptp.o rvu_ptp.o rvu_fixes.o rvu_sdp.o rvu_ree.o
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index e53c336befa8..585b9f21d072 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -733,6 +733,7 @@ static void rvu_free_hw_resources(struct rvu *rvu)
+ 	rvu_npc_freemem(rvu);
+ 	rvu_nix_freemem(rvu);
+ 	rvu_sso_freemem(rvu);
++	rvu_ree_freemem(rvu);
+ 
+ 	/* Free block LF bitmaps */
+ 	for (id = 0; id < BLK_COUNT; id++) {
+@@ -859,6 +860,7 @@ static int rvu_setup_nix_hw_resource(struct rvu *rvu, int blkaddr)
+ 	block->lfcfg_reg = NIX_PRIV_LFX_CFG;
+ 	block->msixcfg_reg = NIX_PRIV_LFX_INT_CFG;
+ 	block->lfreset_reg = NIX_AF_LF_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "NIX%d", blkid);
+ 	rvu->nix_blkaddr[blkid] = blkaddr;
+ 	return rvu_alloc_bitmap(&block->lf);
+@@ -888,6 +890,7 @@ static int rvu_setup_cpt_hw_resource(struct rvu *rvu, int blkaddr)
+ 	block->lfcfg_reg = CPT_PRIV_LFX_CFG;
+ 	block->msixcfg_reg = CPT_PRIV_LFX_INT_CFG;
+ 	block->lfreset_reg = CPT_AF_LF_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "CPT%d", blkid);
+ 	return rvu_alloc_bitmap(&block->lf);
+ }
+@@ -915,6 +918,7 @@ static int rvu_setup_ree_hw_resource(struct rvu *rvu, int blkaddr, int blkid)
+ 	block->lfcfg_reg = REE_PRIV_LFX_CFG;
+ 	block->msixcfg_reg = REE_PRIV_LFX_INT_CFG;
+ 	block->lfreset_reg = REE_AF_LF_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "REE%d", blkid);
+ 	err = rvu_alloc_bitmap(&block->lf);
+ 	if (err)
+@@ -950,6 +954,7 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	block->lfcfg_reg = NPA_PRIV_LFX_CFG;
+ 	block->msixcfg_reg = NPA_PRIV_LFX_INT_CFG;
+ 	block->lfreset_reg = NPA_AF_LF_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "NPA");
+ 	err = rvu_alloc_bitmap(&block->lf);
+ 	if (err)
+@@ -979,6 +984,7 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	block->lfcfg_reg = SSO_PRIV_LFX_HWGRP_CFG;
+ 	block->msixcfg_reg = SSO_PRIV_LFX_HWGRP_INT_CFG;
+ 	block->lfreset_reg = SSO_AF_LF_HWGRP_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "SSO GROUP");
+ 	err = rvu_alloc_bitmap(&block->lf);
+ 	if (err)
+@@ -1000,6 +1006,7 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	block->lfcfg_reg = SSOW_PRIV_LFX_HWS_CFG;
+ 	block->msixcfg_reg = SSOW_PRIV_LFX_HWS_INT_CFG;
+ 	block->lfreset_reg = SSOW_AF_LF_HWS_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "SSOWS");
+ 	err = rvu_alloc_bitmap(&block->lf);
+ 	if (err)
+@@ -1022,6 +1029,7 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	block->lfcfg_reg = TIM_PRIV_LFX_CFG;
+ 	block->msixcfg_reg = TIM_PRIV_LFX_INT_CFG;
+ 	block->lfreset_reg = TIM_AF_LF_RST;
++	block->rvu = rvu;
+ 	sprintf(block->name, "TIM");
+ 	err = rvu_alloc_bitmap(&block->lf);
+ 	if (err)
+@@ -1115,6 +1123,10 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 	if (err)
+ 		goto sso_err;
+ 
++	err = rvu_ree_init(rvu);
++	if (err)
++		goto sso_err;
++
+ 	return 0;
+ 
+ sso_err:
+@@ -1656,7 +1668,7 @@ static int rvu_check_rsrc_availability(struct rvu *rvu,
+ 		if (req->reelfs > block->lf.max) {
+ 			dev_err(&rvu->pdev->dev,
+ 				"Func 0x%x: Invalid REELF req, %d > max %d\n",
+-				 pcifunc, req->cptlfs, block->lf.max);
++				 pcifunc, req->reelfs, block->lf.max);
+ 			return -EINVAL;
+ 		}
+ 		mappedlfs = rvu_get_rsrc_mapcount(pfvf, block->addr);
+@@ -2557,6 +2569,8 @@ static void __rvu_flr_handler(struct rvu *rvu, u16 pcifunc)
+ 	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_NIX1);
+ 	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_CPT0);
+ 	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_CPT1);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_REE0);
++	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_REE1);
+ 	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_TIM);
+ 	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_SSOW);
+ 	rvu_blklf_teardown(rvu, pcifunc, BLKADDR_SSO);
+@@ -2736,6 +2750,7 @@ static void rvu_unregister_interrupts(struct rvu *rvu)
+ 	rvu_nix_unregister_interrupts(rvu);
+ 	rvu_sso_unregister_interrupts(rvu);
+ 	rvu_cpt_unregister_interrupts(rvu);
++	rvu_ree_unregister_interrupts(rvu);
+ 
+ 	/* Disable the Mbox interrupt */
+ 	rvu_write64(rvu, BLKADDR_RVUM, RVU_AF_PFAF_MBOX_INT_ENA_W1C,
+@@ -2961,6 +2976,10 @@ static int rvu_register_interrupts(struct rvu *rvu)
+ 	if (ret)
+ 		goto fail;
+ 
++	ret = rvu_ree_register_interrupts(rvu);
++	if (ret)
++		goto fail;
++
+ 	return 0;
+ fail:
+ 	rvu_unregister_interrupts(rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 74b3463fe632..6b95bdf3a0b4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -102,6 +102,7 @@ struct rvu_block {
+ 	u64  msixcfg_reg;
+ 	u64  lfreset_reg;
+ 	unsigned char name[NAME_SIZE];
++	struct rvu *rvu;
+ };
+ 
+ struct nix_mcast {
+@@ -239,6 +240,17 @@ struct sso_rsrc {
+ 	struct rsrc_bmap pfvf_ident;
+ };
+ 
++struct ree_rsrc {
++	struct qmem	*graph_ctx;	/* Graph base address - used by HW */
++	struct qmem	*prefix_ctx;	/* Prefix blocks - used by HW */
++	void		**ruledb;	/* ROF file from application */
++	u8		*ruledbi;	/* Incremental checksum instructions */
++	u32		aq_head;	/* AF AQ head address */
++	u32		ruledb_len;	/* Length of ruledb */
++	u32		ruledbi_len;	/* Length of ruledbi */
++	u8		ruledb_blocks;	/* Number of blocks pointed by ruledb */
++};
++
+ /* Structure for per RVU func info ie PF/VF */
+ struct rvu_pfvf {
+ 	bool		npalf; /* Only one NPALF per RVU_FUNC */
+@@ -400,6 +412,7 @@ struct rvu_hwinfo {
+ 	struct npc_pkind pkind;
+ 	struct npc_mcam  mcam;
+ 	struct sso_rsrc  sso;
++	struct ree_rsrc *ree;
+ };
+ 
+ struct mbox_wq_info {
+@@ -737,6 +750,12 @@ int rvu_tim_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot);
+ int rvu_sdp_init(struct rvu *rvu);
+ bool is_sdp_pf(u16 pcifunc);
+ 
++/* REE APIs */
++int rvu_ree_init(struct rvu *rvu);
++void rvu_ree_freemem(struct rvu *rvu);
++int rvu_ree_register_interrupts(struct rvu *rvu);
++void rvu_ree_unregister_interrupts(struct rvu *rvu);
++
+ /* CONFIG_DEBUG_FS*/
+ #ifdef CONFIG_DEBUG_FS
+ void rvu_dbg_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_ree.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_ree.c
+new file mode 100644
+index 000000000000..e201c1fe2d98
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_ree.c
+@@ -0,0 +1,366 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 RVU Admin Function driver
++ *
++ * Copyright (C) 2020 Marvell Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include "rvu.h"
++#include "rvu_reg.h"
++
++/* Maximum number of REE blocks */
++#define MAX_REE_BLKS		2
++
++/* Administrative instruction queue size */
++#define REE_AQ_SIZE		128
++
++static void ree_reex_force_clock(struct rvu *rvu, struct rvu_block *block,
++				 bool force_on)
++{
++	u64 reg;
++
++	/* Force ON or OFF for SCLK / RXPCLK */
++	reg = rvu_read64(rvu, block->addr, REE_AF_CMD_CTL);
++	if (force_on)
++		reg = reg | REE_AF_FORCE_CCLK | REE_AF_FORCE_CSCLK;
++	else
++		reg = reg & ~(REE_AF_FORCE_CCLK | REE_AF_FORCE_CSCLK);
++	rvu_write64(rvu, block->addr, REE_AF_CMD_CTL, reg);
++}
++
++static int ree_aq_inst_alloc(struct rvu *rvu, struct admin_queue **ad_queue,
++			     int qsize, int inst_size, int res_size)
++{
++	struct admin_queue *aq;
++	int err;
++
++	*ad_queue = devm_kzalloc(rvu->dev, sizeof(*aq), GFP_KERNEL);
++	if (!*ad_queue)
++		return -ENOMEM;
++	aq = *ad_queue;
++
++	/* Allocate memory for instructions i.e AQ */
++	err = qmem_alloc(rvu->dev, &aq->inst, qsize, inst_size);
++	if (err) {
++		devm_kfree(rvu->dev, aq);
++		return err;
++	}
++
++	/* REE AF AQ does not have result and lock is not used */
++	aq->res = NULL;
++
++	return 0;
++}
++
++static irqreturn_t rvu_ree_af_ras_intr_handler(int irq, void *ptr)
++{
++	struct rvu_block *block = ptr;
++	struct rvu *rvu = block->rvu;
++	int blkaddr = block->addr;
++	u64 intr;
++
++	if (blkaddr < 0)
++		return IRQ_NONE;
++
++	intr = rvu_read64(block->rvu, blkaddr, REE_AF_RAS);
++	if (intr & REE_AF_RAS_DAT_PSN)
++		dev_err(rvu->dev, "REE: Poison received on a NCB data response\n");
++	if (intr & REE_AF_RAS_LD_CMD_PSN)
++		dev_err(rvu->dev, "REE: Poison received on a NCB instruction response\n");
++	if (intr & REE_AF_RAS_LD_REEX_PSN)
++		dev_err(rvu->dev, "REE: Poison received on a REEX response\n");
++
++	/* Clear interrupts */
++	rvu_write64(rvu, blkaddr, REE_AF_RAS, intr);
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t rvu_ree_af_rvu_intr_handler(int irq, void *ptr)
++{
++	struct rvu_block *block = ptr;
++	struct rvu *rvu = block->rvu;
++	int blkaddr = block->addr;
++	u64 intr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_REE, 0);
++	if (blkaddr < 0)
++		return IRQ_NONE;
++
++	intr = rvu_read64(rvu, blkaddr, REE_AF_RVU_INT);
++	if (intr & REE_AF_RVU_INT_UNMAPPED_SLOT)
++		dev_err(rvu->dev, "REE: Unmapped slot error\n");
++
++	/* Clear interrupts */
++	rvu_write64(rvu, blkaddr, REE_AF_RVU_INT, intr);
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t rvu_ree_af_aq_intr_handler(int irq, void *ptr)
++{
++	struct rvu_block *block = ptr;
++	struct rvu *rvu = block->rvu;
++	int blkaddr = block->addr;
++	u64 intr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_REE, 0);
++	if (blkaddr < 0)
++		return IRQ_NONE;
++
++	intr = rvu_read64(rvu, blkaddr, REE_AF_AQ_INT);
++
++	if (intr & REE_AF_AQ_INT_DOVF)
++		dev_err(rvu->dev, "REE: DOORBELL overflow\n");
++	if (intr & REE_AF_AQ_INT_IRDE)
++		dev_err(rvu->dev, "REE: Instruction NCB read response error\n");
++	if (intr & REE_AF_AQ_INT_PRDE)
++		dev_err(rvu->dev, "REE: Payload NCB read response error\n");
++	if (intr & REE_AF_AQ_INT_PLLE)
++		dev_err(rvu->dev, "REE: Payload length error\n");
++
++	/* Clear interrupts */
++	rvu_write64(rvu, blkaddr, REE_AF_AQ_INT, intr);
++	return IRQ_HANDLED;
++}
++
++void rvu_ree_unregister_interrupts_block(struct rvu *rvu, int blkaddr)
++{
++	int i, offs;
++
++	if (!is_block_implemented(rvu->hw, blkaddr))
++		return;
++
++	offs = rvu_read64(rvu, blkaddr, REE_PRIV_AF_INT_CFG) & 0x7FF;
++	if (!offs) {
++		dev_warn(rvu->dev,
++			 "Failed to get REE_AF_INT vector offsets");
++		return;
++	}
++
++	/* Disable all REE AF interrupts */
++	rvu_write64(rvu, blkaddr, REE_AF_RAS_ENA_W1C, 0x1);
++	rvu_write64(rvu, blkaddr, REE_AF_RVU_INT_ENA_W1C, 0x1);
++	rvu_write64(rvu, blkaddr, REE_AF_AQ_DONE_INT_ENA_W1C, 0x1);
++	rvu_write64(rvu, blkaddr, REE_AF_AQ_INT_ENA_W1C, 0x1);
++
++	for (i = 0; i < REE_AF_INT_VEC_CNT; i++)
++		if (rvu->irq_allocated[offs + i]) {
++			free_irq(pci_irq_vector(rvu->pdev, offs + i), rvu);
++			rvu->irq_allocated[offs + i] = false;
++		}
++}
++
++void rvu_ree_unregister_interrupts(struct rvu *rvu)
++{
++	rvu_ree_unregister_interrupts_block(rvu, BLKADDR_REE0);
++	rvu_ree_unregister_interrupts_block(rvu, BLKADDR_REE1);
++}
++
++static int rvu_ree_af_request_irq(struct rvu_block *block,
++				  int offset, irq_handler_t handler,
++				  const char *name)
++{
++	int ret = 0;
++	struct rvu *rvu = block->rvu;
++
++	WARN_ON(rvu->irq_allocated[offset]);
++	rvu->irq_allocated[offset] = false;
++	sprintf(&rvu->irq_name[offset * NAME_SIZE], name);
++	ret = request_irq(pci_irq_vector(rvu->pdev, offset), handler, 0,
++			  &rvu->irq_name[offset * NAME_SIZE], block);
++	if (ret)
++		dev_warn(block->rvu->dev, "Failed to register %s irq\n", name);
++	else
++		rvu->irq_allocated[offset] = true;
++
++	return rvu->irq_allocated[offset];
++}
++
++int rvu_ree_register_interrupts_block(struct rvu *rvu, int blkaddr)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	int offs, ret = 0;
++
++	if (!is_block_implemented(rvu->hw, blkaddr))
++		return 0;
++
++	block = &hw->block[blkaddr];
++
++	/* Read interrupt vector */
++	offs = rvu_read64(rvu, blkaddr, REE_PRIV_AF_INT_CFG) & 0x7FF;
++	if (!offs) {
++		dev_warn(rvu->dev,
++			 "Failed to get REE_AF_INT vector offsets");
++		return 0;
++	}
++
++	/* Register and enable RAS interrupt */
++	ret = rvu_ree_af_request_irq(block, offs + REE_AF_INT_VEC_RAS,
++				     rvu_ree_af_ras_intr_handler,
++				     "REEAF RAS");
++	if (!ret)
++		goto err;
++	rvu_write64(rvu, blkaddr, REE_AF_RAS_ENA_W1S, ~0ULL);
++
++	/* Register and enable RVU interrupt */
++	ret = rvu_ree_af_request_irq(block, offs + REE_AF_INT_VEC_RVU,
++				     rvu_ree_af_rvu_intr_handler,
++				     "REEAF RVU");
++	if (!ret)
++		goto err;
++	rvu_write64(rvu, blkaddr, REE_AF_RVU_INT_ENA_W1S, ~0ULL);
++
++	/* QUE DONE */
++	/* Interrupt for QUE DONE is not required, software is polling
++	 * DONE count to get indication that all instructions are completed
++	 */
++
++	/* Register and enable AQ interrupt */
++	ret = rvu_ree_af_request_irq(block, offs + REE_AF_INT_VEC_AQ,
++				     rvu_ree_af_aq_intr_handler,
++				     "REEAF RVU");
++	if (!ret)
++		goto err;
++	rvu_write64(rvu, blkaddr, REE_AF_AQ_INT_ENA_W1S, ~0ULL);
++
++	return 0;
++err:
++	rvu_ree_unregister_interrupts(rvu);
++	return ret;
++}
++
++int rvu_ree_register_interrupts(struct rvu *rvu)
++{
++	int ret;
++
++	ret = rvu_ree_register_interrupts_block(rvu, BLKADDR_REE0);
++	if (ret)
++		return ret;
++
++	return rvu_ree_register_interrupts_block(rvu, BLKADDR_REE1);
++}
++
++static int rvu_ree_init_block(struct rvu *rvu, int blkaddr)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	struct ree_rsrc *ree;
++	int err, blkid = 0;
++	u64 val;
++
++	if (!is_block_implemented(rvu->hw, blkaddr))
++		return 0;
++
++	block = &hw->block[blkaddr];
++	if (blkaddr == BLKADDR_REE1)
++		blkid = 1;
++	ree = &rvu->hw->ree[blkid];
++
++	/* Administrative instruction queue allocation */
++	err = ree_aq_inst_alloc(rvu, &block->aq,
++				REE_AQ_SIZE,
++				sizeof(struct ree_af_aq_inst_s),
++				0);
++	if (err)
++		return err;
++
++	/* Administrative instruction queue address */
++	rvu_write64(rvu, block->addr, REE_AF_AQ_SBUF_ADDR,
++		    (u64)block->aq->inst->iova);
++
++	/* Move head to start only when a new AQ is allocated and configured.
++	 * Otherwise head is wrap around
++	 */
++	ree->aq_head = 0;
++
++	/* Administrative queue instruction buffer size, in units of 128B
++	 * (8 * REE_AF_AQ_INST_S)
++	 */
++	val = REE_AQ_SIZE >> 3;
++	rvu_write64(rvu, block->addr, REE_AF_AQ_SBUF_CTL,
++		    (val << REE_AF_AQ_SBUF_CTL_SIZE_SHIFT));
++
++	/* Enable instruction queue */
++	rvu_write64(rvu, block->addr, REE_AF_AQ_ENA, 0x1);
++
++	/* Force Clock ON
++	 * Force bits should be set throughout the REEX Initialization
++	 */
++	ree_reex_force_clock(rvu, block, true);
++
++	/* REEX MAIN_CSR configuration */
++	rvu_write64(rvu, block->addr, REE_AF_REEXM_MAX_MATCH,
++		    REE_AF_REEXM_MAX_MATCH_MAX);
++	rvu_write64(rvu, block->addr, REE_AF_REEXM_MAX_PRE_CNT,
++		    REE_AF_REEXM_MAX_PRE_CNT_COUNT);
++	rvu_write64(rvu, block->addr, REE_AF_REEXM_MAX_PTHREAD_CNT,
++		    REE_AF_REEXM_MAX_PTHREAD_COUNT);
++	rvu_write64(rvu, block->addr, REE_AF_REEXM_MAX_LATENCY_CNT,
++		    REE_AF_REEXM_MAX_LATENCY_COUNT);
++
++	/* REEX Set & Clear MAIN_CSR init */
++	rvu_write64(rvu, block->addr, REE_AF_REEXM_CTRL, 0x1);
++	rvu_write64(rvu, block->addr, REE_AF_REEXM_CTRL, 0x0);
++
++	/* REEX Poll MAIN_CSR INIT_DONE */
++	err = rvu_poll_reg(rvu, block->addr, REE_AF_REEXM_STATUS,
++			   BIT_ULL(0), false);
++	if (err) {
++		dev_err(rvu->dev, "REE reexm poll for init done failed");
++		return err;
++	}
++
++	/* Force Clock OFF */
++	ree_reex_force_clock(rvu, block, false);
++
++	return 0;
++}
++
++int rvu_ree_init(struct rvu *rvu)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++
++	hw->ree = devm_kcalloc(rvu->dev, MAX_REE_BLKS, sizeof(struct ree_rsrc),
++			       GFP_KERNEL);
++	if (!hw->ree)
++		return -ENOMEM;
++
++	rvu_ree_init_block(rvu, BLKADDR_REE0);
++	rvu_ree_init_block(rvu, BLKADDR_REE1);
++	return 0;
++}
++
++void rvu_ree_freemem_block(struct rvu *rvu, int blkaddr, int blkid)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	struct ree_rsrc *ree;
++	int i = 0;
++
++	if (!is_block_implemented(rvu->hw, blkaddr))
++		return;
++
++	block = &hw->block[blkaddr];
++	ree  = &hw->ree[blkid];
++
++	rvu_aq_free(rvu, block->aq);
++	if (ree->graph_ctx)
++		qmem_free(rvu->dev, ree->graph_ctx);
++	if (ree->prefix_ctx)
++		qmem_free(rvu->dev, ree->prefix_ctx);
++	if (ree->ruledb) {
++		for (i = 0; i < ree->ruledb_blocks; i++)
++			kfree(ree->ruledb[i]);
++		kfree(ree->ruledb);
++	}
++	kfree(ree->ruledbi);
++}
++
++void rvu_ree_freemem(struct rvu *rvu)
++{
++	rvu_ree_freemem_block(rvu, BLKADDR_REE0, 0);
++	rvu_ree_freemem_block(rvu, BLKADDR_REE1, 1);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+index 4061cd5edf19..53eab4db6160 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+@@ -825,11 +825,60 @@
+ #define SSO_AF_BAR2_ALIASX(a, b)	AF_BAR2_ALIASX(a, b)
+ 
+ /* REE */
++#define REE_AF_CMD_CTL			(0x00ull)
+ #define REE_AF_CONSTANTS		(0x0A0ull)
+-#define REE_AF_RVU_LF_CFG_DEBUG	(0x44000ull)
+-#define REE_AF_BLK_RST			(0x45000ull)
++#define REE_AF_AQ_SBUF_CTL		(0x100ull)
++#define REE_AF_AQ_SBUF_ADDR		(0x110ull)
++#define REE_AF_AQ_DONE			(0x128ull)
++#define REE_AF_AQ_DONE_ACK		(0x130ull)
++#define REE_AF_AQ_DONE_INT		(0x150ull)
++#define REE_AF_AQ_DONE_INT_ENA_W1S	(0x168ull)
++#define REE_AF_AQ_DONE_INT_ENA_W1C	(0x170ull)
++#define REE_AF_AQ_ENA			(0x180ull)
++#define REE_AF_AQ_DOORBELL		(0x200ull)
++#define REE_AF_PF_FUNC			(0x210ull)
++#define REE_AF_EM_BASE			(0x300ull)
++#define REE_AF_RAS			(0x980ull)
++#define REE_AF_RAS_ENA_W1C		(0x990ull)
++#define REE_AF_RAS_ENA_W1S		(0x998ull)
++#define REE_AF_QUE_SBUF_CTL(a)		(0x1200ull | (a) << 3)
++#define REE_PRIV_AF_INT_CFG		(0x4000ull)
++#define REE_AF_REEXM_STATUS		(0x8050ull)
++#define REE_AF_REEXM_CTRL		(0x80C0ull)
++#define REE_AF_REEXM_MAX_MATCH		(0x80C8ull)
++#define REE_AF_REEXM_MAX_PRE_CNT	(0x80D0ull)
++#define REE_AF_REEXM_MAX_PTHREAD_CNT	(0x80D8ull)
++#define REE_AF_REEXM_MAX_LATENCY_CNT	(0x80E0ull)
++#define REE_AF_REEXR_STATUS		(0x8250ull)
++#define REE_AF_REEXR_CTRL		(0x82C0ull)
+ #define REE_PRIV_LFX_CFG		(0x41000ull)
+ #define REE_PRIV_LFX_INT_CFG		(0x42000ull)
+ #define REE_AF_LF_RST			(0x43000ull)
++#define REE_AF_RVU_LF_CFG_DEBUG		(0x44000ull)
++#define REE_AF_BLK_RST			(0x45000ull)
++#define REE_AF_RVU_INT			(0x46000ull)
++#define REE_AF_RVU_INT_ENA_W1S		(0x46010ull)
++#define REE_AF_RVU_INT_ENA_W1C		(0x46018ull)
++#define REE_AF_AQ_INT			(0x46020ull)
++#define REE_AF_AQ_INT_ENA_W1S		(0x46030ull)
++#define REE_AF_AQ_INT_ENA_W1C		(0x46038ull)
++#define REE_AF_GRACEFUL_DIS_CTL		(0x46100ull)
++#define REE_AF_GRACEFUL_DIS_STATUS	(0x46110ull)
++
++#define REE_AF_FORCE_CSCLK		BIT_ULL(1)
++#define REE_AF_FORCE_CCLK		BIT_ULL(2)
++#define REE_AF_RAS_DAT_PSN		BIT_ULL(0)
++#define REE_AF_RAS_LD_CMD_PSN		BIT_ULL(1)
++#define REE_AF_RAS_LD_REEX_PSN		BIT_ULL(2)
++#define REE_AF_RVU_INT_UNMAPPED_SLOT	BIT_ULL(0)
++#define REE_AF_AQ_INT_DOVF		BIT_ULL(0)
++#define REE_AF_AQ_INT_IRDE		BIT_ULL(1)
++#define REE_AF_AQ_INT_PRDE		BIT_ULL(2)
++#define REE_AF_AQ_INT_PLLE		BIT_ULL(3)
++#define REE_AF_AQ_SBUF_CTL_SIZE_SHIFT	32
++#define REE_AF_REEXM_MAX_MATCH_MAX	0xFEull
++#define REE_AF_REEXM_MAX_PRE_CNT_COUNT	0x3F0ull
++#define REE_AF_REEXM_MAX_PTHREAD_COUNT	0xFFFFull
++#define REE_AF_REEXM_MAX_LATENCY_COUNT	0xFFFFull
+ 
+ #endif /* RVU_REG_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
+index b5e9fec3e9c5..5986e0a2c45a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_struct.h
+@@ -104,6 +104,15 @@ enum cpt_af_int_vec_e {
+ 	CPT_AF_INT_VEC_CNT	= 0x4,
+ };
+ 
++/* REE Admin function Interrupt Vector Enumeration */
++enum ree_af_int_vec_e {
++	REE_AF_INT_VEC_RAS	= 0x0,
++	REE_AF_INT_VEC_RVU	= 0x1,
++	REE_AF_INT_VEC_QUE_DONE	= 0x2,
++	REE_AF_INT_VEC_AQ	= 0x3,
++	REE_AF_INT_VEC_CNT	= 0x4,
++};
++
+ /**
+  * RVU PF Interrupt Vector Enumeration
+  */
+@@ -974,4 +983,26 @@ enum nix_vtag_size {
+ 	VTAGSIZE_T4   = 0x0,
+ 	VTAGSIZE_T8   = 0x1,
+ };
++
++/* REE admin queue instruction structure */
++struct ree_af_aq_inst_s {
++	u64 rof_ptr_addr;
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 reserved_111_127	: 17;
++	u64 length		: 15;
++	u64 reserved_68_95	: 28;
++	u64 doneint		:  1;
++	u64 reserved_66_66	:  1;
++	u64 nc			:  1;
++	u64 reserved_64_64	:  1;
++#else
++	u64 reserved_64_64	:  1;
++	u64 nc			:  1;
++	u64 reserved_66_66	:  1;
++	u64 doneint		:  1;
++	u64 reserved_68_95	: 28;
++	u64 length		: 15;
++	u64 reserved_111_127	: 17;
++#endif
++};
+ #endif /* RVU_STRUCT_H */
+-- 
+2.17.1
+

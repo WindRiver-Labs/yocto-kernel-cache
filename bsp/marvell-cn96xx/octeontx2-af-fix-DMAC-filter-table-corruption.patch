@@ -1,0 +1,127 @@
+From 897ac7438aa5ac4a1ae979ef2785c792688d162b Mon Sep 17 00:00:00 2001
+From: Sunil Kumar Kori <skori@marvell.com>
+Date: Thu, 30 Apr 2020 15:22:55 +0530
+Subject: [PATCH 3/4] octeontx2-af: fix DMAC filter table corruption
+
+commit 6c05d2a46a9246b85ed23874fa7a14900648adb1 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+DMAC filter table is being corrupted in following 2 scenarios:
+ - If CGXX has more than one lmac connected then default MAC
+   addresses are being written continuosly starting from 0th index.
+   Further if one DMAC filter is added to LMAC0 then entry will be
+   added at index 1 so default MAC address for LMAC1 is corrupted.
+
+ - If LMAC has DMAC filters confiured and further LMAC is set to
+   promiscious mode then only default MAC address entry is being
+   disabled while remaining are in enable state in conjunction of
+   CGX(0..2)_CMR(0..3)_RX_DMAC_CTL0[CAM_ACCEPT] == 0. Because of
+   this, mathcing traffic is dropped at CGX while they should pass
+   as system is in promiscious mode.
+
+Patch fixes both the issues.
+
+Change-Id: I85eae1f8b1672e5c0fa3eaf4ffb42940378606e6
+Signed-off-by: Sunil Kumar Kori <skori@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/29170
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/cgx.c   | 45 ++++++++++++++-----
+ 1 file changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index 0c6e0e703b1d..42cb2c8d304c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -195,14 +195,19 @@ static u64 mac2u64 (u8 *mac_addr)
+ int cgx_lmac_addr_set(u8 cgx_id, u8 lmac_id, u8 *mac_addr)
+ {
+ 	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx_dev);
++	int index;
+ 	u64 cfg;
+ 
+ 	/* copy 6bytes from macaddr */
+ 	/* memcpy(&cfg, mac_addr, 6); */
+ 
++	/* Calculate real index of CGX DMAC table */
++	index = lmac_id * lmac->mac_to_index_bmap.max;
++
+ 	cfg = mac2u64 (mac_addr);
+ 
+-	cgx_write(cgx_dev, 0, (CGXX_CMRX_RX_DMAC_CAM0 + (lmac_id * 0x8)),
++	cgx_write(cgx_dev, 0, (CGXX_CMRX_RX_DMAC_CAM0 + (index * 0x8)),
+ 		  cfg | CGX_DMAC_CAM_ADDR_ENABLE | ((u64)lmac_id << 49));
+ 
+ 	cfg = cgx_read(cgx_dev, lmac_id, CGXX_CMRX_RX_DMAC_CTL0);
+@@ -305,9 +310,13 @@ EXPORT_SYMBOL(cgx_lmac_addr_max_entries_get);
+ u64 cgx_lmac_addr_get(u8 cgx_id, u8 lmac_id)
+ {
+ 	struct cgx *cgx_dev = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx_dev);
++	int index;
+ 	u64 cfg;
+ 
+-	cfg = cgx_read(cgx_dev, 0, CGXX_CMRX_RX_DMAC_CAM0 + lmac_id * 0x8);
++	/* Calculate real index of CGX DMAC table */
++	index = lmac_id * lmac->mac_to_index_bmap.max;
++	cfg = cgx_read(cgx_dev, 0, CGXX_CMRX_RX_DMAC_CAM0 + index * 0x8);
+ 	return cfg & CGX_RX_DMAC_ADR_MASK;
+ }
+ EXPORT_SYMBOL(cgx_lmac_addr_get);
+@@ -377,6 +386,9 @@ EXPORT_SYMBOL(cgx_lmac_internal_loopback);
+ void cgx_lmac_promisc_config(int cgx_id, int lmac_id, bool enable)
+ {
+ 	struct cgx *cgx = cgx_get_pdata(cgx_id);
++	struct lmac *lmac = lmac_pdata(lmac_id, cgx);
++	u16 max_dmac = lmac->mac_to_index_bmap.max;
++	int index, i;
+ 	u64 cfg = 0;
+ 
+ 	if (!cgx)
+@@ -389,21 +401,30 @@ void cgx_lmac_promisc_config(int cgx_id, int lmac_id, bool enable)
+ 		cfg |= (CGX_DMAC_BCAST_MODE | CGX_DMAC_MCAST_MODE);
+ 		cgx_write(cgx, lmac_id, CGXX_CMRX_RX_DMAC_CTL0, cfg);
+ 
+-		cfg = cgx_read(cgx, 0,
+-			       (CGXX_CMRX_RX_DMAC_CAM0 + lmac_id * 0x8));
+-		cfg &= ~CGX_DMAC_CAM_ADDR_ENABLE;
+-		cgx_write(cgx, 0,
+-			  (CGXX_CMRX_RX_DMAC_CAM0 + lmac_id * 0x8), cfg);
++		for (i = 0; i < max_dmac; i++) {
++			index = lmac_id * max_dmac + i;
++			cfg = cgx_read(cgx, 0,
++				       (CGXX_CMRX_RX_DMAC_CAM0 + index * 0x8));
++			cfg &= ~CGX_DMAC_CAM_ADDR_ENABLE;
++			cgx_write(cgx, 0,
++				  (CGXX_CMRX_RX_DMAC_CAM0 + index * 0x8), cfg);
++		}
+ 	} else {
+ 		/* Disable promiscuous mode */
+ 		cfg = cgx_read(cgx, lmac_id, CGXX_CMRX_RX_DMAC_CTL0);
+ 		cfg |= CGX_DMAC_CAM_ACCEPT | CGX_DMAC_MCAST_MODE;
+ 		cgx_write(cgx, lmac_id, CGXX_CMRX_RX_DMAC_CTL0, cfg);
+-		cfg = cgx_read(cgx, 0,
+-			       (CGXX_CMRX_RX_DMAC_CAM0 + lmac_id * 0x8));
+-		cfg |= CGX_DMAC_CAM_ADDR_ENABLE;
+-		cgx_write(cgx, 0,
+-			  (CGXX_CMRX_RX_DMAC_CAM0 + lmac_id * 0x8), cfg);
++		for (i = 0; i < max_dmac; i++) {
++			index = lmac_id * max_dmac + i;
++			cfg = cgx_read(cgx, 0,
++				       (CGXX_CMRX_RX_DMAC_CAM0 + index * 0x8));
++			if ((cfg & CGX_RX_DMAC_ADR_MASK) != 0) {
++				cfg |= CGX_DMAC_CAM_ADDR_ENABLE;
++				cgx_write(cgx, 0,
++					  (CGXX_CMRX_RX_DMAC_CAM0 + index * 0x8),
++					  cfg);
++			}
++		}
+ 	}
+ }
+ EXPORT_SYMBOL(cgx_lmac_promisc_config);
+-- 
+2.17.1
+
