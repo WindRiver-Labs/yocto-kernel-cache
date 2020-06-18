@@ -1,0 +1,385 @@
+From b79cc1ee556e74784554e267967d764aa26457e4 Mon Sep 17 00:00:00 2001
+From: Bruce Allan <bruce.w.allan@intel.com>
+Date: Fri, 8 Feb 2019 12:50:32 -0800
+Subject: [PATCH 114/421] ice: fix stack hogs from struct ice_vsi_ctx
+ structures
+
+commit 198a666a4543be1a6e48f4b701dd3bd9387d37c3 upstream.
+
+struct ice_vsi_ctx has gotten large enough that function local declarations
+of it on the stack are causing stack hogs.  Fix that by allocating the
+structs on heap.  Cleanup some formatting issues in the code around these
+changes and fix incorrect data type uses of returned functions in a couple
+places.
+
+Signed-off-by: Bruce Allan <bruce.w.allan@intel.com>
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice_lib.c      | 98 ++++++++++++-------
+ drivers/net/ethernet/intel/ice/ice_main.c     | 27 +++--
+ .../net/ethernet/intel/ice/ice_virtchnl_pf.c  | 59 ++++++-----
+ 3 files changed, 117 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 82aae530d6c5..d93a0d5a783c 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -348,19 +348,25 @@ static int ice_get_free_slot(void *array, int size, int curr)
+ void ice_vsi_delete(struct ice_vsi *vsi)
+ {
+ 	struct ice_pf *pf = vsi->back;
+-	struct ice_vsi_ctx ctxt;
++	struct ice_vsi_ctx *ctxt;
+ 	enum ice_status status;
+ 
++	ctxt = devm_kzalloc(&pf->pdev->dev, sizeof(*ctxt), GFP_KERNEL);
++	if (!ctxt)
++		return;
++
+ 	if (vsi->type == ICE_VSI_VF)
+-		ctxt.vf_num = vsi->vf_id;
+-	ctxt.vsi_num = vsi->vsi_num;
++		ctxt->vf_num = vsi->vf_id;
++	ctxt->vsi_num = vsi->vsi_num;
+ 
+-	memcpy(&ctxt.info, &vsi->info, sizeof(ctxt.info));
++	memcpy(&ctxt->info, &vsi->info, sizeof(ctxt->info));
+ 
+-	status = ice_free_vsi(&pf->hw, vsi->idx, &ctxt, false, NULL);
++	status = ice_free_vsi(&pf->hw, vsi->idx, ctxt, false, NULL);
+ 	if (status)
+ 		dev_err(&pf->pdev->dev, "Failed to delete VSI %i in FW\n",
+ 			vsi->vsi_num);
++
++	devm_kfree(&pf->pdev->dev, ctxt);
+ }
+ 
+ /**
+@@ -908,37 +914,41 @@ static void ice_set_rss_vsi_ctx(struct ice_vsi_ctx *ctxt, struct ice_vsi *vsi)
+  */
+ static int ice_vsi_init(struct ice_vsi *vsi)
+ {
+-	struct ice_vsi_ctx ctxt = { 0 };
+ 	struct ice_pf *pf = vsi->back;
+ 	struct ice_hw *hw = &pf->hw;
++	struct ice_vsi_ctx *ctxt;
+ 	int ret = 0;
+ 
++	ctxt = devm_kzalloc(&pf->pdev->dev, sizeof(*ctxt), GFP_KERNEL);
++	if (!ctxt)
++		return -ENOMEM;
++
+ 	switch (vsi->type) {
+ 	case ICE_VSI_PF:
+-		ctxt.flags = ICE_AQ_VSI_TYPE_PF;
++		ctxt->flags = ICE_AQ_VSI_TYPE_PF;
+ 		break;
+ 	case ICE_VSI_VF:
+-		ctxt.flags = ICE_AQ_VSI_TYPE_VF;
++		ctxt->flags = ICE_AQ_VSI_TYPE_VF;
+ 		/* VF number here is the absolute VF number (0-255) */
+-		ctxt.vf_num = vsi->vf_id + hw->func_caps.vf_base_id;
++		ctxt->vf_num = vsi->vf_id + hw->func_caps.vf_base_id;
+ 		break;
+ 	default:
+ 		return -ENODEV;
+ 	}
+ 
+-	ice_set_dflt_vsi_ctx(&ctxt);
++	ice_set_dflt_vsi_ctx(ctxt);
+ 	/* if the switch is in VEB mode, allow VSI loopback */
+ 	if (vsi->vsw->bridge_mode == BRIDGE_MODE_VEB)
+-		ctxt.info.sw_flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
++		ctxt->info.sw_flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+ 
+ 	/* Set LUT type and HASH type if RSS is enabled */
+ 	if (test_bit(ICE_FLAG_RSS_ENA, pf->flags))
+-		ice_set_rss_vsi_ctx(&ctxt, vsi);
++		ice_set_rss_vsi_ctx(ctxt, vsi);
+ 
+-	ctxt.info.sw_id = vsi->port_info->sw_id;
+-	ice_vsi_setup_q_map(vsi, &ctxt);
++	ctxt->info.sw_id = vsi->port_info->sw_id;
++	ice_vsi_setup_q_map(vsi, ctxt);
+ 
+-	ret = ice_add_vsi(hw, vsi->idx, &ctxt, NULL);
++	ret = ice_add_vsi(hw, vsi->idx, ctxt, NULL);
+ 	if (ret) {
+ 		dev_err(&pf->pdev->dev,
+ 			"Add VSI failed, err %d\n", ret);
+@@ -946,11 +956,12 @@ static int ice_vsi_init(struct ice_vsi *vsi)
+ 	}
+ 
+ 	/* keep context for update VSI operations */
+-	vsi->info = ctxt.info;
++	vsi->info = ctxt->info;
+ 
+ 	/* record VSI number returned */
+-	vsi->vsi_num = ctxt.vsi_num;
++	vsi->vsi_num = ctxt->vsi_num;
+ 
++	devm_kfree(&pf->pdev->dev, ctxt);
+ 	return ret;
+ }
+ 
+@@ -1823,26 +1834,34 @@ int ice_vsi_manage_vlan_insertion(struct ice_vsi *vsi)
+ {
+ 	struct device *dev = &vsi->back->pdev->dev;
+ 	struct ice_hw *hw = &vsi->back->hw;
+-	struct ice_vsi_ctx ctxt = { 0 };
++	struct ice_vsi_ctx *ctxt;
+ 	enum ice_status status;
++	int ret = 0;
++
++	ctxt = devm_kzalloc(dev, sizeof(*ctxt), GFP_KERNEL);
++	if (!ctxt)
++		return -ENOMEM;
+ 
+ 	/* Here we are configuring the VSI to let the driver add VLAN tags by
+ 	 * setting vlan_flags to ICE_AQ_VSI_VLAN_MODE_ALL. The actual VLAN tag
+ 	 * insertion happens in the Tx hot path, in ice_tx_map.
+ 	 */
+-	ctxt.info.vlan_flags = ICE_AQ_VSI_VLAN_MODE_ALL;
++	ctxt->info.vlan_flags = ICE_AQ_VSI_VLAN_MODE_ALL;
+ 
+-	ctxt.info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
++	ctxt->info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
+ 
+-	status = ice_update_vsi(hw, vsi->idx, &ctxt, NULL);
++	status = ice_update_vsi(hw, vsi->idx, ctxt, NULL);
+ 	if (status) {
+ 		dev_err(dev, "update VSI for VLAN insert failed, err %d aq_err %d\n",
+ 			status, hw->adminq.sq_last_status);
+-		return -EIO;
++		ret = -EIO;
++		goto out;
+ 	}
+ 
+-	vsi->info.vlan_flags = ctxt.info.vlan_flags;
+-	return 0;
++	vsi->info.vlan_flags = ctxt->info.vlan_flags;
++out:
++	devm_kfree(dev, ctxt);
++	return ret;
+ }
+ 
+ /**
+@@ -1854,35 +1873,42 @@ int ice_vsi_manage_vlan_stripping(struct ice_vsi *vsi, bool ena)
+ {
+ 	struct device *dev = &vsi->back->pdev->dev;
+ 	struct ice_hw *hw = &vsi->back->hw;
+-	struct ice_vsi_ctx ctxt = { 0 };
++	struct ice_vsi_ctx *ctxt;
+ 	enum ice_status status;
++	int ret = 0;
++
++	ctxt = devm_kzalloc(dev, sizeof(*ctxt), GFP_KERNEL);
++	if (!ctxt)
++		return -ENOMEM;
+ 
+ 	/* Here we are configuring what the VSI should do with the VLAN tag in
+ 	 * the Rx packet. We can either leave the tag in the packet or put it in
+ 	 * the Rx descriptor.
+ 	 */
+-	if (ena) {
++	if (ena)
+ 		/* Strip VLAN tag from Rx packet and put it in the desc */
+-		ctxt.info.vlan_flags = ICE_AQ_VSI_VLAN_EMOD_STR_BOTH;
+-	} else {
++		ctxt->info.vlan_flags = ICE_AQ_VSI_VLAN_EMOD_STR_BOTH;
++	else
+ 		/* Disable stripping. Leave tag in packet */
+-		ctxt.info.vlan_flags = ICE_AQ_VSI_VLAN_EMOD_NOTHING;
+-	}
++		ctxt->info.vlan_flags = ICE_AQ_VSI_VLAN_EMOD_NOTHING;
+ 
+ 	/* Allow all packets untagged/tagged */
+-	ctxt.info.vlan_flags |= ICE_AQ_VSI_VLAN_MODE_ALL;
++	ctxt->info.vlan_flags |= ICE_AQ_VSI_VLAN_MODE_ALL;
+ 
+-	ctxt.info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
++	ctxt->info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
+ 
+-	status = ice_update_vsi(hw, vsi->idx, &ctxt, NULL);
++	status = ice_update_vsi(hw, vsi->idx, ctxt, NULL);
+ 	if (status) {
+ 		dev_err(dev, "update VSI for VLAN strip failed, ena = %d err %d aq_err %d\n",
+ 			ena, status, hw->adminq.sq_last_status);
+-		return -EIO;
++		ret = -EIO;
++		goto out;
+ 	}
+ 
+-	vsi->info.vlan_flags = ctxt.info.vlan_flags;
+-	return 0;
++	vsi->info.vlan_flags = ctxt->info.vlan_flags;
++out:
++	devm_kfree(dev, ctxt);
++	return ret;
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 15315cc12a39..8d559a7f9261 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -3708,30 +3708,39 @@ static int ice_vsi_update_bridge_mode(struct ice_vsi *vsi, u16 bmode)
+ 	struct device *dev = &vsi->back->pdev->dev;
+ 	struct ice_aqc_vsi_props *vsi_props;
+ 	struct ice_hw *hw = &vsi->back->hw;
+-	struct ice_vsi_ctx ctxt = { 0 };
++	struct ice_vsi_ctx *ctxt;
+ 	enum ice_status status;
++	int ret = 0;
+ 
+ 	vsi_props = &vsi->info;
+-	ctxt.info = vsi->info;
++
++	ctxt = devm_kzalloc(dev, sizeof(*ctxt), GFP_KERNEL);
++	if (!ctxt)
++		return -ENOMEM;
++
++	ctxt->info = vsi->info;
+ 
+ 	if (bmode == BRIDGE_MODE_VEB)
+ 		/* change from VEPA to VEB mode */
+-		ctxt.info.sw_flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
++		ctxt->info.sw_flags |= ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+ 	else
+ 		/* change from VEB to VEPA mode */
+-		ctxt.info.sw_flags &= ~ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
+-	ctxt.info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_SW_VALID);
++		ctxt->info.sw_flags &= ~ICE_AQ_VSI_SW_FLAG_ALLOW_LB;
++	ctxt->info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_SW_VALID);
+ 
+-	status = ice_update_vsi(hw, vsi->idx, &ctxt, NULL);
++	status = ice_update_vsi(hw, vsi->idx, ctxt, NULL);
+ 	if (status) {
+ 		dev_err(dev, "update VSI for bridge mode failed, bmode = %d err %d aq_err %d\n",
+ 			bmode, status, hw->adminq.sq_last_status);
+-		return -EIO;
++		ret = -EIO;
++		goto out;
+ 	}
+ 	/* Update sw flags for book keeping */
+-	vsi_props->sw_flags = ctxt.info.sw_flags;
++	vsi_props->sw_flags = ctxt->info.sw_flags;
+ 
+-	return 0;
++out:
++	devm_kfree(dev, ctxt);
++	return ret;
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+index 80b50e67cbef..79d793a76042 100644
+--- a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@ -345,25 +345,33 @@ static int ice_vsi_set_pvid(struct ice_vsi *vsi, u16 vid)
+ {
+ 	struct device *dev = &vsi->back->pdev->dev;
+ 	struct ice_hw *hw = &vsi->back->hw;
+-	struct ice_vsi_ctx ctxt = { 0 };
++	struct ice_vsi_ctx *ctxt;
+ 	enum ice_status status;
++	int ret = 0;
++
++	ctxt = devm_kzalloc(dev, sizeof(*ctxt), GFP_KERNEL);
++	if (!ctxt)
++		return -ENOMEM;
+ 
+-	ctxt.info.vlan_flags = ICE_AQ_VSI_VLAN_MODE_UNTAGGED |
+-			       ICE_AQ_VSI_PVLAN_INSERT_PVID |
+-			       ICE_AQ_VSI_VLAN_EMOD_STR;
+-	ctxt.info.pvid = cpu_to_le16(vid);
+-	ctxt.info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
++	ctxt->info.vlan_flags = (ICE_AQ_VSI_VLAN_MODE_UNTAGGED |
++				 ICE_AQ_VSI_PVLAN_INSERT_PVID |
++				 ICE_AQ_VSI_VLAN_EMOD_STR);
++	ctxt->info.pvid = cpu_to_le16(vid);
++	ctxt->info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
+ 
+-	status = ice_update_vsi(hw, vsi->idx, &ctxt, NULL);
++	status = ice_update_vsi(hw, vsi->idx, ctxt, NULL);
+ 	if (status) {
+ 		dev_info(dev, "update VSI for VLAN insert failed, err %d aq_err %d\n",
+ 			 status, hw->adminq.sq_last_status);
+-		return -EIO;
++		ret = -EIO;
++		goto out;
+ 	}
+ 
+-	vsi->info.pvid = ctxt.info.pvid;
+-	vsi->info.vlan_flags = ctxt.info.vlan_flags;
+-	return 0;
++	vsi->info.pvid = ctxt->info.pvid;
++	vsi->info.vlan_flags = ctxt->info.vlan_flags;
++out:
++	devm_kfree(dev, ctxt);
++	return ret;
+ }
+ 
+ /**
+@@ -2479,11 +2487,12 @@ int ice_get_vf_cfg(struct net_device *netdev, int vf_id,
+ int ice_set_vf_spoofchk(struct net_device *netdev, int vf_id, bool ena)
+ {
+ 	struct ice_netdev_priv *np = netdev_priv(netdev);
+-	struct ice_vsi_ctx ctx = { 0 };
+ 	struct ice_vsi *vsi = np->vsi;
+ 	struct ice_pf *pf = vsi->back;
++	struct ice_vsi_ctx *ctx;
++	enum ice_status status;
+ 	struct ice_vf *vf;
+-	int status;
++	int ret = 0;
+ 
+ 	/* validate the request */
+ 	if (vf_id >= pf->num_alloc_vfs) {
+@@ -2503,25 +2512,31 @@ int ice_set_vf_spoofchk(struct net_device *netdev, int vf_id, bool ena)
+ 		return 0;
+ 	}
+ 
+-	ctx.info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_SECURITY_VALID);
++	ctx = devm_kzalloc(&pf->pdev->dev, sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_SECURITY_VALID);
+ 
+ 	if (ena) {
+-		ctx.info.sec_flags |= ICE_AQ_VSI_SEC_FLAG_ENA_MAC_ANTI_SPOOF;
+-		ctx.info.sw_flags2 |= ICE_AQ_VSI_SW_FLAG_RX_PRUNE_EN_M;
++		ctx->info.sec_flags |= ICE_AQ_VSI_SEC_FLAG_ENA_MAC_ANTI_SPOOF;
++		ctx->info.sw_flags2 |= ICE_AQ_VSI_SW_FLAG_RX_PRUNE_EN_M;
+ 	}
+ 
+-	status = ice_update_vsi(&pf->hw, vsi->idx, &ctx, NULL);
++	status = ice_update_vsi(&pf->hw, vsi->idx, ctx, NULL);
+ 	if (status) {
+ 		dev_dbg(&pf->pdev->dev,
+ 			"Error %d, failed to update VSI* parameters\n", status);
+-		return -EIO;
++		ret = -EIO;
++		goto out;
+ 	}
+ 
+ 	vf->spoofchk = ena;
+-	vsi->info.sec_flags = ctx.info.sec_flags;
+-	vsi->info.sw_flags2 = ctx.info.sw_flags2;
+-
+-	return status;
++	vsi->info.sec_flags = ctx->info.sec_flags;
++	vsi->info.sw_flags2 = ctx->info.sw_flags2;
++out:
++	devm_kfree(&pf->pdev->dev, ctx);
++	return ret;
+ }
+ 
+ /**
+-- 
+2.17.1
+

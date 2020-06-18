@@ -1,0 +1,248 @@
+From 057ba938321cf51813dfd8176d1fa1c8f82725b5 Mon Sep 17 00:00:00 2001
+From: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Date: Thu, 18 Oct 2018 08:37:09 -0700
+Subject: [PATCH 066/421] ice: Poll for link status change
+
+commit 4f4be03bdeb32761f89cec3f2bec5e69dd41bc82 upstream.
+
+When the physical link goes up or down, the driver is supposed to
+receive a link status event (LSE). The driver currently has the code
+to handle LSEs but there is no firmware support for this feature yet.
+So this patch adds the ability for the driver to poll for link status
+changes. The polling itself is done in ice_watchdog_subtask.
+
+For namespace cleanliness, this patch also removes code that handles
+LSE. This code will be reintroduced once the feature is officially
+supported.
+
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice_common.c |  29 +-----
+ drivers/net/ethernet/intel/ice/ice_common.h |   6 --
+ drivers/net/ethernet/intel/ice/ice_main.c   | 110 +++++---------------
+ 3 files changed, 25 insertions(+), 120 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.c b/drivers/net/ethernet/intel/ice/ice_common.c
+index 5a91a9087d1e..8cd6a2401fd9 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -235,7 +235,7 @@ static enum ice_media_type ice_get_media_type(struct ice_port_info *pi)
+  *
+  * Get Link Status (0x607). Returns the link status of the adapter.
+  */
+-enum ice_status
++static enum ice_status
+ ice_aq_get_link_info(struct ice_port_info *pi, bool ena_lse,
+ 		     struct ice_link_status *link, struct ice_sq_cd *cd)
+ {
+@@ -2004,33 +2004,6 @@ ice_aq_set_link_restart_an(struct ice_port_info *pi, bool ena_link,
+ 	return ice_aq_send_cmd(pi->hw, &desc, NULL, 0, cd);
+ }
+ 
+-/**
+- * ice_aq_set_event_mask
+- * @hw: pointer to the hw struct
+- * @port_num: port number of the physical function
+- * @mask: event mask to be set
+- * @cd: pointer to command details structure or NULL
+- *
+- * Set event mask (0x0613)
+- */
+-enum ice_status
+-ice_aq_set_event_mask(struct ice_hw *hw, u8 port_num, u16 mask,
+-		      struct ice_sq_cd *cd)
+-{
+-	struct ice_aqc_set_event_mask *cmd;
+-	struct ice_aq_desc desc;
+-
+-	cmd = &desc.params.set_event_mask;
+-
+-	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_set_event_mask);
+-
+-	cmd->lport_num = port_num;
+-
+-	cmd->event_mask = cpu_to_le16(mask);
+-
+-	return ice_aq_send_cmd(hw, &desc, NULL, 0, cd);
+-}
+-
+ /**
+  * __ice_aq_get_set_rss_lut
+  * @hw: pointer to the hardware structure
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.h b/drivers/net/ethernet/intel/ice/ice_common.h
+index 876347e32b6f..cf760c24a6aa 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.h
++++ b/drivers/net/ethernet/intel/ice/ice_common.h
+@@ -86,12 +86,6 @@ enum ice_status
+ ice_aq_set_link_restart_an(struct ice_port_info *pi, bool ena_link,
+ 			   struct ice_sq_cd *cd);
+ enum ice_status
+-ice_aq_get_link_info(struct ice_port_info *pi, bool ena_lse,
+-		     struct ice_link_status *link, struct ice_sq_cd *cd);
+-enum ice_status
+-ice_aq_set_event_mask(struct ice_hw *hw, u8 port_num, u16 mask,
+-		      struct ice_sq_cd *cd);
+-enum ice_status
+ ice_dis_vsi_txq(struct ice_port_info *pi, u8 num_queues, u16 *q_ids,
+ 		u32 *q_teids, enum ice_disq_rst_src rst_src, u16 vmvf_num,
+ 		struct ice_sq_cd *cmd_details);
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index d2324b9ce374..008c35ecbc71 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -456,35 +456,6 @@ static void ice_reset_subtask(struct ice_pf *pf)
+ 	}
+ }
+ 
+-/**
+- * ice_watchdog_subtask - periodic tasks not using event driven scheduling
+- * @pf: board private structure
+- */
+-static void ice_watchdog_subtask(struct ice_pf *pf)
+-{
+-	int i;
+-
+-	/* if interface is down do nothing */
+-	if (test_bit(__ICE_DOWN, pf->state) ||
+-	    test_bit(__ICE_CFG_BUSY, pf->state))
+-		return;
+-
+-	/* make sure we don't do these things too often */
+-	if (time_before(jiffies,
+-			pf->serv_tmr_prev + pf->serv_tmr_period))
+-		return;
+-
+-	pf->serv_tmr_prev = jiffies;
+-
+-	/* Update the stats for active netdevs so the network stack
+-	 * can look at updated numbers whenever it cares to
+-	 */
+-	ice_update_pf_stats(pf);
+-	for (i = 0; i < pf->num_alloc_vsi; i++)
+-		if (pf->vsi[i] && pf->vsi[i]->netdev)
+-			ice_update_vsi_stats(pf->vsi[i]);
+-}
+-
+ /**
+  * ice_print_link_msg - print link up or down message
+  * @vsi: the VSI whose link status is being queried
+@@ -557,36 +528,6 @@ void ice_print_link_msg(struct ice_vsi *vsi, bool isup)
+ 		    speed, fc);
+ }
+ 
+-/**
+- * ice_init_link_events - enable/initialize link events
+- * @pi: pointer to the port_info instance
+- *
+- * Returns -EIO on failure, 0 on success
+- */
+-static int ice_init_link_events(struct ice_port_info *pi)
+-{
+-	u16 mask;
+-
+-	mask = ~((u16)(ICE_AQ_LINK_EVENT_UPDOWN | ICE_AQ_LINK_EVENT_MEDIA_NA |
+-		       ICE_AQ_LINK_EVENT_MODULE_QUAL_FAIL));
+-
+-	if (ice_aq_set_event_mask(pi->hw, pi->lport, mask, NULL)) {
+-		dev_dbg(ice_hw_to_dev(pi->hw),
+-			"Failed to set link event mask for port %d\n",
+-			pi->lport);
+-		return -EIO;
+-	}
+-
+-	if (ice_aq_get_link_info(pi, true, NULL, NULL)) {
+-		dev_dbg(ice_hw_to_dev(pi->hw),
+-			"Failed to enable link events for port %d\n",
+-			pi->lport);
+-		return -EIO;
+-	}
+-
+-	return 0;
+-}
+-
+ /**
+  * ice_vsi_link_event - update the vsi's netdev
+  * @vsi: the vsi on which the link event occurred
+@@ -674,27 +615,35 @@ ice_link_event(struct ice_pf *pf, struct ice_port_info *pi)
+ }
+ 
+ /**
+- * ice_handle_link_event - handle link event via ARQ
+- * @pf: pf that the link event is associated with
+- *
+- * Return -EINVAL if port_info is null
+- * Return status on succes
++ * ice_watchdog_subtask - periodic tasks not using event driven scheduling
++ * @pf: board private structure
+  */
+-static int ice_handle_link_event(struct ice_pf *pf)
++static void ice_watchdog_subtask(struct ice_pf *pf)
+ {
+-	struct ice_port_info *port_info;
+-	int status;
++	int i;
+ 
+-	port_info = pf->hw.port_info;
+-	if (!port_info)
+-		return -EINVAL;
++	/* if interface is down do nothing */
++	if (test_bit(__ICE_DOWN, pf->state) ||
++	    test_bit(__ICE_CFG_BUSY, pf->state))
++		return;
+ 
+-	status = ice_link_event(pf, port_info);
+-	if (status)
+-		dev_dbg(&pf->pdev->dev,
+-			"Could not process link event, error %d\n", status);
++	/* make sure we don't do these things too often */
++	if (time_before(jiffies,
++			pf->serv_tmr_prev + pf->serv_tmr_period))
++		return;
+ 
+-	return status;
++	pf->serv_tmr_prev = jiffies;
++
++	if (ice_link_event(pf, pf->hw.port_info))
++		dev_dbg(&pf->pdev->dev, "ice_link_event failed\n");
++
++	/* Update the stats for active netdevs so the network stack
++	 * can look at updated numbers whenever it cares to
++	 */
++	ice_update_pf_stats(pf);
++	for (i = 0; i < pf->num_alloc_vsi; i++)
++		if (pf->vsi[i] && pf->vsi[i]->netdev)
++			ice_update_vsi_stats(pf->vsi[i]);
+ }
+ 
+ /**
+@@ -800,11 +749,6 @@ static int __ice_clean_ctrlq(struct ice_pf *pf, enum ice_ctl_q q_type)
+ 		opcode = le16_to_cpu(event.desc.opcode);
+ 
+ 		switch (opcode) {
+-		case ice_aqc_opc_get_link_status:
+-			if (ice_handle_link_event(pf))
+-				dev_err(&pf->pdev->dev,
+-					"Could not handle link event\n");
+-			break;
+ 		case ice_mbx_opc_send_msg_to_pf:
+ 			ice_vc_process_vf_msg(pf, &event);
+ 			break;
+@@ -2210,12 +2154,6 @@ static int ice_probe(struct pci_dev *pdev,
+ 	/* since everything is good, start the service timer */
+ 	mod_timer(&pf->serv_tmr, round_jiffies(jiffies + pf->serv_tmr_period));
+ 
+-	err = ice_init_link_events(pf->hw.port_info);
+-	if (err) {
+-		dev_err(&pdev->dev, "ice_init_link_events failed: %d\n", err);
+-		goto err_alloc_sw_unroll;
+-	}
+-
+ 	return 0;
+ 
+ err_alloc_sw_unroll:
+-- 
+2.17.1
+

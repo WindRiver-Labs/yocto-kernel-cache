@@ -1,0 +1,377 @@
+From 87f8f7a0050cd0bb7d3304e621a6081019414d28 Mon Sep 17 00:00:00 2001
+From: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Date: Wed, 19 Sep 2018 17:23:08 -0700
+Subject: [PATCH 033/421] ice: Move common functions out of ice_main.c part 5/7
+
+commit 07309a0e59edf4247bbf64ed852f95ced207f27a upstream.
+
+This patch continues the code move out of ice_main.c
+
+The following top level functions (and related dependency functions) were
+moved to ice_lib.c:
+ice_vsi_clear
+ice_vsi_close
+ice_vsi_free_arrays
+ice_vsi_map_rings_to_vectors
+
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice_lib.c  | 133 ++++++++++++++++++++++
+ drivers/net/ethernet/intel/ice/ice_lib.h  |   8 ++
+ drivers/net/ethernet/intel/ice/ice_main.c | 132 ---------------------
+ 3 files changed, 141 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index df20d68c92ab..6ba82337d017 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -341,6 +341,71 @@ void ice_vsi_delete(struct ice_vsi *vsi)
+ 			vsi->vsi_num);
+ }
+ 
++/**
++ * ice_vsi_free_arrays - clean up VSI resources
++ * @vsi: pointer to VSI being cleared
++ * @free_qvectors: bool to specify if q_vectors should be deallocated
++ */
++void ice_vsi_free_arrays(struct ice_vsi *vsi, bool free_qvectors)
++{
++	struct ice_pf *pf = vsi->back;
++
++	/* free the ring and vector containers */
++	if (free_qvectors && vsi->q_vectors) {
++		devm_kfree(&pf->pdev->dev, vsi->q_vectors);
++		vsi->q_vectors = NULL;
++	}
++	if (vsi->tx_rings) {
++		devm_kfree(&pf->pdev->dev, vsi->tx_rings);
++		vsi->tx_rings = NULL;
++	}
++	if (vsi->rx_rings) {
++		devm_kfree(&pf->pdev->dev, vsi->rx_rings);
++		vsi->rx_rings = NULL;
++	}
++}
++
++/**
++ * ice_vsi_clear - clean up and deallocate the provided VSI
++ * @vsi: pointer to VSI being cleared
++ *
++ * This deallocates the VSI's queue resources, removes it from the PF's
++ * VSI array if necessary, and deallocates the VSI
++ *
++ * Returns 0 on success, negative on failure
++ */
++int ice_vsi_clear(struct ice_vsi *vsi)
++{
++	struct ice_pf *pf = NULL;
++
++	if (!vsi)
++		return 0;
++
++	if (!vsi->back)
++		return -EINVAL;
++
++	pf = vsi->back;
++
++	if (!pf->vsi[vsi->idx] || pf->vsi[vsi->idx] != vsi) {
++		dev_dbg(&pf->pdev->dev, "vsi does not exist at pf->vsi[%d]\n",
++			vsi->idx);
++		return -EINVAL;
++	}
++
++	mutex_lock(&pf->sw_mutex);
++	/* updates the PF for this cleared VSI */
++
++	pf->vsi[vsi->idx] = NULL;
++	if (vsi->idx < pf->next_vsi)
++		pf->next_vsi = vsi->idx;
++
++	ice_vsi_free_arrays(vsi, true);
++	mutex_unlock(&pf->sw_mutex);
++	devm_kfree(&pf->pdev->dev, vsi);
++
++	return 0;
++}
++
+ /**
+  * ice_msix_clean_rings - MSIX mode Interrupt Handler
+  * @irq: interrupt number
+@@ -700,6 +765,60 @@ int ice_vsi_alloc_rings(struct ice_vsi *vsi)
+ 	return -ENOMEM;
+ }
+ 
++/**
++ * ice_vsi_map_rings_to_vectors - Map VSI rings to interrupt vectors
++ * @vsi: the VSI being configured
++ *
++ * This function maps descriptor rings to the queue-specific vectors allotted
++ * through the MSI-X enabling code. On a constrained vector budget, we map Tx
++ * and Rx rings to the vector as "efficiently" as possible.
++ */
++void ice_vsi_map_rings_to_vectors(struct ice_vsi *vsi)
++{
++	int q_vectors = vsi->num_q_vectors;
++	int tx_rings_rem, rx_rings_rem;
++	int v_id;
++
++	/* initially assigning remaining rings count to VSIs num queue value */
++	tx_rings_rem = vsi->num_txq;
++	rx_rings_rem = vsi->num_rxq;
++
++	for (v_id = 0; v_id < q_vectors; v_id++) {
++		struct ice_q_vector *q_vector = vsi->q_vectors[v_id];
++		int tx_rings_per_v, rx_rings_per_v, q_id, q_base;
++
++		/* Tx rings mapping to vector */
++		tx_rings_per_v = DIV_ROUND_UP(tx_rings_rem, q_vectors - v_id);
++		q_vector->num_ring_tx = tx_rings_per_v;
++		q_vector->tx.ring = NULL;
++		q_base = vsi->num_txq - tx_rings_rem;
++
++		for (q_id = q_base; q_id < (q_base + tx_rings_per_v); q_id++) {
++			struct ice_ring *tx_ring = vsi->tx_rings[q_id];
++
++			tx_ring->q_vector = q_vector;
++			tx_ring->next = q_vector->tx.ring;
++			q_vector->tx.ring = tx_ring;
++		}
++		tx_rings_rem -= tx_rings_per_v;
++
++		/* Rx rings mapping to vector */
++		rx_rings_per_v = DIV_ROUND_UP(rx_rings_rem, q_vectors - v_id);
++		q_vector->num_ring_rx = rx_rings_per_v;
++		q_vector->rx.ring = NULL;
++		q_base = vsi->num_rxq - rx_rings_rem;
++
++		for (q_id = q_base; q_id < (q_base + rx_rings_per_v); q_id++) {
++			struct ice_ring *rx_ring = vsi->rx_rings[q_id];
++
++			rx_ring->q_vector = q_vector;
++			rx_ring->next = q_vector->rx.ring;
++			q_vector->rx.ring = rx_ring;
++		}
++		rx_rings_rem -= rx_rings_per_v;
++	}
++}
++
+ /**
+  * ice_add_mac_to_list - Add a mac address filter entry to the list
+  * @vsi: the VSI to be forwarded to
+@@ -1385,6 +1504,20 @@ void ice_vsi_free_rx_rings(struct ice_vsi *vsi)
+ 			ice_free_rx_ring(vsi->rx_rings[i]);
+ }
+ 
++/**
++ * ice_vsi_close - Shut down a VSI
++ * @vsi: the VSI being shut down
++ */
++void ice_vsi_close(struct ice_vsi *vsi)
++{
++	if (!test_and_set_bit(__ICE_DOWN, vsi->state))
++		ice_down(vsi);
++
++	ice_vsi_free_irq(vsi);
++	ice_vsi_free_tx_rings(vsi);
++	ice_vsi_free_rx_rings(vsi);
++}
++
+ /**
+  * ice_free_res - free a block of resources
+  * @res: pointer to the resource
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.h b/drivers/net/ethernet/intel/ice/ice_lib.h
+index ab5a4e1edcf8..002bbca8e7ea 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -6,6 +6,8 @@
+ 
+ #include "ice.h"
+ 
++void ice_vsi_map_rings_to_vectors(struct ice_vsi *vsi);
++
+ int ice_vsi_alloc_rings(struct ice_vsi *vsi);
+ 
+ void ice_vsi_set_rss_params(struct ice_vsi *vsi);
+@@ -16,6 +18,8 @@ int ice_get_free_slot(void *array, int size, int curr);
+ 
+ int ice_vsi_init(struct ice_vsi *vsi);
+ 
++void ice_vsi_free_arrays(struct ice_vsi *vsi, bool free_qvectors);
++
+ void ice_vsi_clear_rings(struct ice_vsi *vsi);
+ 
+ int ice_vsi_alloc_arrays(struct ice_vsi *vsi, bool alloc_qvectors);
+@@ -51,6 +55,10 @@ int ice_cfg_vlan_pruning(struct ice_vsi *vsi, bool ena);
+ 
+ void ice_vsi_delete(struct ice_vsi *vsi);
+ 
++int ice_vsi_clear(struct ice_vsi *vsi);
++
++void ice_vsi_close(struct ice_vsi *vsi);
++
+ int ice_free_res(struct ice_res_tracker *res, u16 index, u16 id);
+ 
+ int
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index d4a19aec1c14..4e27be5b6224 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -1316,60 +1316,6 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
+ 	return ret;
+ }
+ 
+-/**
+- * ice_vsi_map_rings_to_vectors - Map VSI rings to interrupt vectors
+- * @vsi: the VSI being configured
+- *
+- * This function maps descriptor rings to the queue-specific vectors allotted
+- * through the MSI-X enabling code. On a constrained vector budget, we map Tx
+- * and Rx rings to the vector as "efficiently" as possible.
+- */
+-static void ice_vsi_map_rings_to_vectors(struct ice_vsi *vsi)
+-{
+-	int q_vectors = vsi->num_q_vectors;
+-	int tx_rings_rem, rx_rings_rem;
+-	int v_id;
+-
+-	/* initially assigning remaining rings count to VSIs num queue value */
+-	tx_rings_rem = vsi->num_txq;
+-	rx_rings_rem = vsi->num_rxq;
+-
+-	for (v_id = 0; v_id < q_vectors; v_id++) {
+-		struct ice_q_vector *q_vector = vsi->q_vectors[v_id];
+-		int tx_rings_per_v, rx_rings_per_v, q_id, q_base;
+-
+-		/* Tx rings mapping to vector */
+-		tx_rings_per_v = DIV_ROUND_UP(tx_rings_rem, q_vectors - v_id);
+-		q_vector->num_ring_tx = tx_rings_per_v;
+-		q_vector->tx.ring = NULL;
+-		q_base = vsi->num_txq - tx_rings_rem;
+-
+-		for (q_id = q_base; q_id < (q_base + tx_rings_per_v); q_id++) {
+-			struct ice_ring *tx_ring = vsi->tx_rings[q_id];
+-
+-			tx_ring->q_vector = q_vector;
+-			tx_ring->next = q_vector->tx.ring;
+-			q_vector->tx.ring = tx_ring;
+-		}
+-		tx_rings_rem -= tx_rings_per_v;
+-
+-		/* Rx rings mapping to vector */
+-		rx_rings_per_v = DIV_ROUND_UP(rx_rings_rem, q_vectors - v_id);
+-		q_vector->num_ring_rx = rx_rings_per_v;
+-		q_vector->rx.ring = NULL;
+-		q_base = vsi->num_rxq - rx_rings_rem;
+-
+-		for (q_id = q_base; q_id < (q_base + rx_rings_per_v); q_id++) {
+-			struct ice_ring *rx_ring = vsi->rx_rings[q_id];
+-
+-			rx_ring->q_vector = q_vector;
+-			rx_ring->next = q_vector->rx.ring;
+-			q_vector->rx.ring = rx_ring;
+-		}
+-		rx_rings_rem -= rx_rings_per_v;
+-	}
+-}
+-
+ /**
+  * ice_vsi_alloc - Allocates the next available struct vsi in the PF
+  * @pf: board private structure
+@@ -1773,71 +1719,6 @@ static int ice_cfg_netdev(struct ice_vsi *vsi)
+ 	return 0;
+ }
+ 
+-/**
+- * ice_vsi_free_arrays - clean up vsi resources
+- * @vsi: pointer to VSI being cleared
+- * @free_qvectors: bool to specify if q_vectors should be deallocated
+- */
+-static void ice_vsi_free_arrays(struct ice_vsi *vsi, bool free_qvectors)
+-{
+-	struct ice_pf *pf = vsi->back;
+-
+-	/* free the ring and vector containers */
+-	if (free_qvectors && vsi->q_vectors) {
+-		devm_kfree(&pf->pdev->dev, vsi->q_vectors);
+-		vsi->q_vectors = NULL;
+-	}
+-	if (vsi->tx_rings) {
+-		devm_kfree(&pf->pdev->dev, vsi->tx_rings);
+-		vsi->tx_rings = NULL;
+-	}
+-	if (vsi->rx_rings) {
+-		devm_kfree(&pf->pdev->dev, vsi->rx_rings);
+-		vsi->rx_rings = NULL;
+-	}
+-}
+-
+-/**
+- * ice_vsi_clear - clean up and deallocate the provided vsi
+- * @vsi: pointer to VSI being cleared
+- *
+- * This deallocates the vsi's queue resources, removes it from the PF's
+- * VSI array if necessary, and deallocates the VSI
+- *
+- * Returns 0 on success, negative on failure
+- */
+-static int ice_vsi_clear(struct ice_vsi *vsi)
+-{
+-	struct ice_pf *pf = NULL;
+-
+-	if (!vsi)
+-		return 0;
+-
+-	if (!vsi->back)
+-		return -EINVAL;
+-
+-	pf = vsi->back;
+-
+-	if (!pf->vsi[vsi->idx] || pf->vsi[vsi->idx] != vsi) {
+-		dev_dbg(&pf->pdev->dev, "vsi does not exist at pf->vsi[%d]\n",
+-			vsi->idx);
+-		return -EINVAL;
+-	}
+-
+-	mutex_lock(&pf->sw_mutex);
+-	/* updates the PF for this cleared vsi */
+-
+-	pf->vsi[vsi->idx] = NULL;
+-	if (vsi->idx < pf->next_vsi)
+-		pf->next_vsi = vsi->idx;
+-
+-	ice_vsi_free_arrays(vsi, true);
+-	mutex_unlock(&pf->sw_mutex);
+-	devm_kfree(&pf->pdev->dev, vsi);
+-
+-	return 0;
+-}
+-
+ /**
+  * ice_vsi_alloc_q_vector - Allocate memory for a single interrupt vector
+  * @vsi: the VSI being configured
+@@ -3720,19 +3601,6 @@ static int ice_vsi_open(struct ice_vsi *vsi)
+ 	return err;
+ }
+ 
+-/**
+- * ice_vsi_close - Shut down a VSI
+- * @vsi: the VSI being shut down
+- */
+-static void ice_vsi_close(struct ice_vsi *vsi)
+-{
+-	if (!test_and_set_bit(__ICE_DOWN, vsi->state))
+-		ice_down(vsi);
+-
+-	ice_vsi_free_irq(vsi);
+-	ice_vsi_free_tx_rings(vsi);
+-	ice_vsi_free_rx_rings(vsi);
+-}
+ 
+ /**
+  * ice_rss_clean - Delete RSS related VSI structures that hold user inputs
+-- 
+2.17.1
+

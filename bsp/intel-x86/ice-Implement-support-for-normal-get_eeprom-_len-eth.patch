@@ -1,0 +1,211 @@
+From c92f53c11a9ef86b330e28bd6987b0ff69fd55f6 Mon Sep 17 00:00:00 2001
+From: Bruce Allan <bruce.w.allan@intel.com>
+Date: Wed, 19 Dec 2018 10:03:24 -0800
+Subject: [PATCH 099/421] ice: Implement support for normal get_eeprom[_len]
+ ethtool ops
+
+commit 4c98ab550cc624eb94b0cdb32f5deb1ebbb4f593 upstream.
+
+Add support for get_eeprom and get_eeprom_len ethtool ops
+
+Specification states that PF software accesses NVM (shadow-ram) via AQ
+commands (e.g. NVM Read, NVM Write) in the range 0x000000-0x00FFFF (64KB),
+so the get_eeprom_len op should return 64KB.  If additional regions of the
+16MB NVM must be read, another access method must be used.
+
+The ethtool kernel code, by default, will ask for multiple page-size hunks
+of the NVM not to exceed the value returned by ice_get_eeprom_len().
+ice_read_sr_buf() deals with arch page sizes different than 4KB.
+
+Signed-off-by: Bruce Allan <bruce.w.allan@intel.com>
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice_common.h  |  2 +
+ drivers/net/ethernet/intel/ice/ice_ethtool.c | 51 ++++++++++++
+ drivers/net/ethernet/intel/ice/ice_nvm.c     | 81 ++++++++++++++++++++
+ 3 files changed, 134 insertions(+)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.h b/drivers/net/ethernet/intel/ice/ice_common.h
+index b86cfe540045..81c1bb77a9fc 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.h
++++ b/drivers/net/ethernet/intel/ice/ice_common.h
+@@ -28,6 +28,8 @@ ice_acquire_res(struct ice_hw *hw, enum ice_aq_res_ids res,
+ 		enum ice_aq_res_access_type access, u32 timeout);
+ void ice_release_res(struct ice_hw *hw, enum ice_aq_res_ids res);
+ enum ice_status ice_init_nvm(struct ice_hw *hw);
++enum ice_status ice_read_sr_buf(struct ice_hw *hw, u16 offset, u16 *words,
++				u16 *data);
+ enum ice_status
+ ice_sq_send_cmd(struct ice_hw *hw, struct ice_ctl_q_info *cq,
+ 		struct ice_aq_desc *desc, void *buf, u16 buf_size,
+diff --git a/drivers/net/ethernet/intel/ice/ice_ethtool.c b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+index 6facb0a7eed4..2a0bcd460d23 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ethtool.c
++++ b/drivers/net/ethernet/intel/ice/ice_ethtool.c
+@@ -203,6 +203,55 @@ static void ice_set_msglevel(struct net_device *netdev, u32 data)
+ #endif /* !CONFIG_DYNAMIC_DEBUG */
+ }
+ 
++static int ice_get_eeprom_len(struct net_device *netdev)
++{
++	struct ice_netdev_priv *np = netdev_priv(netdev);
++	struct ice_pf *pf = np->vsi->back;
++
++	return (int)(pf->hw.nvm.sr_words * sizeof(u16));
++}
++
++static int
++ice_get_eeprom(struct net_device *netdev, struct ethtool_eeprom *eeprom,
++	       u8 *bytes)
++{
++	struct ice_netdev_priv *np = netdev_priv(netdev);
++	u16 first_word, last_word, nwords;
++	struct ice_vsi *vsi = np->vsi;
++	struct ice_pf *pf = vsi->back;
++	struct ice_hw *hw = &pf->hw;
++	enum ice_status status;
++	struct device *dev;
++	int ret = 0;
++	u16 *buf;
++
++	dev = &pf->pdev->dev;
++
++	eeprom->magic = hw->vendor_id | (hw->device_id << 16);
++
++	first_word = eeprom->offset >> 1;
++	last_word = (eeprom->offset + eeprom->len - 1) >> 1;
++	nwords = last_word - first_word + 1;
++
++	buf = devm_kcalloc(dev, nwords, sizeof(u16), GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	status = ice_read_sr_buf(hw, first_word, &nwords, buf);
++	if (status) {
++		dev_err(dev, "ice_read_sr_buf failed, err %d aq_err %d\n",
++			status, hw->adminq.sq_last_status);
++		eeprom->len = sizeof(u16) * nwords;
++		ret = -EIO;
++		goto out;
++	}
++
++	memcpy(bytes, (u8 *)buf + (eeprom->offset & 1), eeprom->len);
++out:
++	devm_kfree(dev, buf);
++	return ret;
++}
++
+ static void ice_get_strings(struct net_device *netdev, u32 stringset, u8 *data)
+ {
+ 	struct ice_netdev_priv *np = netdev_priv(netdev);
+@@ -1699,6 +1748,8 @@ static const struct ethtool_ops ice_ethtool_ops = {
+ 	.get_msglevel           = ice_get_msglevel,
+ 	.set_msglevel           = ice_set_msglevel,
+ 	.get_link		= ethtool_op_get_link,
++	.get_eeprom_len		= ice_get_eeprom_len,
++	.get_eeprom		= ice_get_eeprom,
+ 	.get_strings		= ice_get_strings,
+ 	.set_phys_id		= ice_set_phys_id,
+ 	.get_ethtool_stats      = ice_get_ethtool_stats,
+diff --git a/drivers/net/ethernet/intel/ice/ice_nvm.c b/drivers/net/ethernet/intel/ice/ice_nvm.c
+index 3274c543283c..ce64cecdae9c 100644
+--- a/drivers/net/ethernet/intel/ice/ice_nvm.c
++++ b/drivers/net/ethernet/intel/ice/ice_nvm.c
+@@ -124,6 +124,62 @@ ice_read_sr_word_aq(struct ice_hw *hw, u16 offset, u16 *data)
+ 	return status;
+ }
+ 
++/**
++ * ice_read_sr_buf_aq - Reads Shadow RAM buf via AQ
++ * @hw: pointer to the HW structure
++ * @offset: offset of the Shadow RAM word to read (0x000000 - 0x001FFF)
++ * @words: (in) number of words to read; (out) number of words actually read
++ * @data: words read from the Shadow RAM
++ *
++ * Reads 16 bit words (data buf) from the SR using the ice_read_sr_aq
++ * method. Ownership of the NVM is taken before reading the buffer and later
++ * released.
++ */
++static enum ice_status
++ice_read_sr_buf_aq(struct ice_hw *hw, u16 offset, u16 *words, u16 *data)
++{
++	enum ice_status status;
++	bool last_cmd = false;
++	u16 words_read = 0;
++	u16 i = 0;
++
++	do {
++		u16 read_size, off_w;
++
++		/* Calculate number of bytes we should read in this step.
++		 * It's not allowed to read more than one page at a time or
++		 * to cross page boundaries.
++		 */
++		off_w = offset % ICE_SR_SECTOR_SIZE_IN_WORDS;
++		read_size = off_w ?
++			min(*words,
++			    (u16)(ICE_SR_SECTOR_SIZE_IN_WORDS - off_w)) :
++			min((*words - words_read), ICE_SR_SECTOR_SIZE_IN_WORDS);
++
++		/* Check if this is last command, if so set proper flag */
++		if ((words_read + read_size) >= *words)
++			last_cmd = true;
++
++		status = ice_read_sr_aq(hw, offset, read_size,
++					data + words_read, last_cmd);
++		if (status)
++			goto read_nvm_buf_aq_exit;
++
++		/* Increment counter for words already read and move offset to
++		 * new read location
++		 */
++		words_read += read_size;
++		offset += read_size;
++	} while (words_read < *words);
++
++	for (i = 0; i < *words; i++)
++		data[i] = le16_to_cpu(((__le16 *)data)[i]);
++
++read_nvm_buf_aq_exit:
++	*words = words_read;
++	return status;
++}
++
+ /**
+  * ice_acquire_nvm - Generic request for acquiring the NVM ownership
+  * @hw: pointer to the HW structure
+@@ -234,3 +290,28 @@ enum ice_status ice_init_nvm(struct ice_hw *hw)
+ 
+ 	return status;
+ }
++
++/**
++ * ice_read_sr_buf - Reads Shadow RAM buf and acquire lock if necessary
++ * @hw: pointer to the HW structure
++ * @offset: offset of the Shadow RAM word to read (0x000000 - 0x001FFF)
++ * @words: (in) number of words to read; (out) number of words actually read
++ * @data: words read from the Shadow RAM
++ *
++ * Reads 16 bit words (data buf) from the SR using the ice_read_nvm_buf_aq
++ * method. The buf read is preceded by the NVM ownership take
++ * and followed by the release.
++ */
++enum ice_status
++ice_read_sr_buf(struct ice_hw *hw, u16 offset, u16 *words, u16 *data)
++{
++	enum ice_status status;
++
++	status = ice_acquire_nvm(hw, ICE_RES_READ);
++	if (!status) {
++		status = ice_read_sr_buf_aq(hw, offset, words, data);
++		ice_release_nvm(hw);
++	}
++
++	return status;
++}
+-- 
+2.17.1
+

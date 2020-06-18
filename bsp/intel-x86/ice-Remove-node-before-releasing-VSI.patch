@@ -1,0 +1,182 @@
+From b5ed09579490d3efb6d0537aedacd1bd753da2ee Mon Sep 17 00:00:00 2001
+From: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Date: Fri, 26 Oct 2018 10:41:02 -0700
+Subject: [PATCH 076/421] ice: Remove node before releasing VSI
+
+commit 10e03a22de45699b6208592b85437d87a4741b9b upstream.
+
+Before releasing the VSI, remove the VSI scheduler node. If not,
+the node is left in the scheduler tree and, on subsequent load, the
+scheduler tree contains the node so it does not set it in vsi_ctx.
+This, later, causes the node to not be found in ice_sched_get_free_qparent
+which leads to a "Failed to set LAN Tx queue context, error: -1".
+
+To remove the scheduler node, this patch introduces ice_rm_vsi_lan_cfg
+and related helpers.
+
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice_lib.c   |   1 +
+ drivers/net/ethernet/intel/ice/ice_sched.c | 108 ++++++++++++++++++++-
+ drivers/net/ethernet/intel/ice/ice_sched.h |   2 +
+ 3 files changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 11d0ab185dd2..1efd760debc2 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -2492,6 +2492,7 @@ int ice_vsi_release(struct ice_vsi *vsi)
+ 	}
+ 
+ 	ice_remove_vsi_fltr(&pf->hw, vsi->idx);
++	ice_rm_vsi_lan_cfg(vsi->port_info, vsi->idx);
+ 	ice_vsi_delete(vsi);
+ 	ice_vsi_free_q_vectors(vsi);
+ 	ice_vsi_clear_rings(vsi);
+diff --git a/drivers/net/ethernet/intel/ice/ice_sched.c b/drivers/net/ethernet/intel/ice/ice_sched.c
+index 7cc8aa18a22b..7e807b0e7514 100644
+--- a/drivers/net/ethernet/intel/ice/ice_sched.c
++++ b/drivers/net/ethernet/intel/ice/ice_sched.c
+@@ -1527,7 +1527,7 @@ ice_sched_update_vsi_child_nodes(struct ice_port_info *pi, u16 vsi_handle,
+ }
+ 
+ /**
+- * ice_sched_cfg_vsi - configure the new/exisiting VSI
++ * ice_sched_cfg_vsi - configure the new/existing VSI
+  * @pi: port information structure
+  * @vsi_handle: software VSI handle
+  * @tc: TC number
+@@ -1605,3 +1605,109 @@ ice_sched_cfg_vsi(struct ice_port_info *pi, u16 vsi_handle, u8 tc, u16 maxqs,
+ 
+ 	return status;
+ }
++
++/**
++ * ice_sched_rm_agg_vsi_entry - remove agg related VSI info entry
++ * @pi: port information structure
++ * @vsi_handle: software VSI handle
++ *
++ * This function removes single aggregator VSI info entry from
++ * aggregator list.
++ */
++static void
++ice_sched_rm_agg_vsi_info(struct ice_port_info *pi, u16 vsi_handle)
++{
++	struct ice_sched_agg_info *agg_info;
++	struct ice_sched_agg_info *atmp;
++
++	list_for_each_entry_safe(agg_info, atmp, &pi->agg_list, list_entry) {
++		struct ice_sched_agg_vsi_info *agg_vsi_info;
++		struct ice_sched_agg_vsi_info *vtmp;
++
++		list_for_each_entry_safe(agg_vsi_info, vtmp,
++					 &agg_info->agg_vsi_list, list_entry)
++			if (agg_vsi_info->vsi_handle == vsi_handle) {
++				list_del(&agg_vsi_info->list_entry);
++				devm_kfree(ice_hw_to_dev(pi->hw),
++					   agg_vsi_info);
++				return;
++			}
++	}
++}
++
++/**
++ * ice_sched_rm_vsi_cfg - remove the VSI and its children nodes
++ * @pi: port information structure
++ * @vsi_handle: software VSI handle
++ * @owner: LAN or RDMA
++ *
++ * This function removes the VSI and its LAN or RDMA children nodes from the
++ * scheduler tree.
++ */
++static enum ice_status
++ice_sched_rm_vsi_cfg(struct ice_port_info *pi, u16 vsi_handle, u8 owner)
++{
++	enum ice_status status = ICE_ERR_PARAM;
++	struct ice_vsi_ctx *vsi_ctx;
++	u8 i, j = 0;
++
++	if (!ice_is_vsi_valid(pi->hw, vsi_handle))
++		return status;
++	mutex_lock(&pi->sched_lock);
++	vsi_ctx = ice_get_vsi_ctx(pi->hw, vsi_handle);
++	if (!vsi_ctx)
++		goto exit_sched_rm_vsi_cfg;
++
++	for (i = 0; i < ICE_MAX_TRAFFIC_CLASS; i++) {
++		struct ice_sched_node *vsi_node, *tc_node;
++
++		tc_node = ice_sched_get_tc_node(pi, i);
++		if (!tc_node)
++			continue;
++
++		vsi_node = ice_sched_get_vsi_node(pi->hw, tc_node, vsi_handle);
++		if (!vsi_node)
++			continue;
++
++		while (j < vsi_node->num_children) {
++			if (vsi_node->children[j]->owner == owner) {
++				ice_free_sched_node(pi, vsi_node->children[j]);
++
++				/* reset the counter again since the num
++				 * children will be updated after node removal
++				 */
++				j = 0;
++			} else {
++				j++;
++			}
++		}
++		/* remove the VSI if it has no children */
++		if (!vsi_node->num_children) {
++			ice_free_sched_node(pi, vsi_node);
++			vsi_ctx->sched.vsi_node[i] = NULL;
++
++			/* clean up agg related vsi info if any */
++			ice_sched_rm_agg_vsi_info(pi, vsi_handle);
++		}
++		if (owner == ICE_SCHED_NODE_OWNER_LAN)
++			vsi_ctx->sched.max_lanq[i] = 0;
++	}
++	status = 0;
++
++exit_sched_rm_vsi_cfg:
++	mutex_unlock(&pi->sched_lock);
++	return status;
++}
++
++/**
++ * ice_rm_vsi_lan_cfg - remove VSI and its LAN children nodes
++ * @pi: port information structure
++ * @vsi_handle: software VSI handle
++ *
++ * This function clears the VSI and its LAN children nodes from scheduler tree
++ * for all TCs.
++ */
++enum ice_status ice_rm_vsi_lan_cfg(struct ice_port_info *pi, u16 vsi_handle)
++{
++	return ice_sched_rm_vsi_cfg(pi, vsi_handle, ICE_SCHED_NODE_OWNER_LAN);
++}
+diff --git a/drivers/net/ethernet/intel/ice/ice_sched.h b/drivers/net/ethernet/intel/ice/ice_sched.h
+index 5dc9cfa04c58..dc59fbac7dde 100644
+--- a/drivers/net/ethernet/intel/ice/ice_sched.h
++++ b/drivers/net/ethernet/intel/ice/ice_sched.h
+@@ -12,6 +12,7 @@
+ struct ice_sched_agg_vsi_info {
+ 	struct list_head list_entry;
+ 	DECLARE_BITMAP(tc_bitmap, ICE_MAX_TRAFFIC_CLASS);
++	u16 vsi_handle;
+ };
+ 
+ struct ice_sched_agg_info {
+@@ -39,4 +40,5 @@ ice_sched_get_free_qparent(struct ice_port_info *pi, u16 vsi_handle, u8 tc,
+ enum ice_status
+ ice_sched_cfg_vsi(struct ice_port_info *pi, u16 vsi_handle, u8 tc, u16 maxqs,
+ 		  u8 owner, bool enable);
++enum ice_status ice_rm_vsi_lan_cfg(struct ice_port_info *pi, u16 vsi_handle);
+ #endif /* _ICE_SCHED_H_ */
+-- 
+2.17.1
+

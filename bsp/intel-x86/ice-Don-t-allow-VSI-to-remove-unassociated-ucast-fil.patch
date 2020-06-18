@@ -1,0 +1,106 @@
+From 46de0f9c9433ee58605898098b377909b7164930 Mon Sep 17 00:00:00 2001
+From: Akeem G Abodunrin <akeem.g.abodunrin@intel.com>
+Date: Thu, 25 Jul 2019 02:53:52 -0700
+Subject: [PATCH 316/421] ice: Don't allow VSI to remove unassociated ucast
+ filter
+
+commit 8b2c858240aca43c59fc7762f10754354406883d upstream.
+
+If a VSI is not using a unicast filter or did not configure that
+particular unicast filter, driver should not allow it to be removed
+by the rogue VSI.
+
+Signed-off-by: Akeem G Abodunrin <akeem.g.abodunrin@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice_switch.c | 56 +++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_switch.c b/drivers/net/ethernet/intel/ice/ice_switch.c
+index c13107110ebc..6d3d645c6a84 100644
+--- a/drivers/net/ethernet/intel/ice/ice_switch.c
++++ b/drivers/net/ethernet/intel/ice/ice_switch.c
+@@ -2133,6 +2133,38 @@ ice_cfg_dflt_vsi(struct ice_hw *hw, u16 vsi_handle, bool set, u8 direction)
+ 	return status;
+ }
+ 
++/**
++ * ice_find_ucast_rule_entry - Search for a unicast MAC filter rule entry
++ * @hw: pointer to the hardware structure
++ * @recp_id: lookup type for which the specified rule needs to be searched
++ * @f_info: rule information
++ *
++ * Helper function to search for a unicast rule entry - this is to be used
++ * to remove unicast MAC filter that is not shared with other VSIs on the
++ * PF switch.
++ *
++ * Returns pointer to entry storing the rule if found
++ */
++static struct ice_fltr_mgmt_list_entry *
++ice_find_ucast_rule_entry(struct ice_hw *hw, u8 recp_id,
++			  struct ice_fltr_info *f_info)
++{
++	struct ice_switch_info *sw = hw->switch_info;
++	struct ice_fltr_mgmt_list_entry *list_itr;
++	struct list_head *list_head;
++
++	list_head = &sw->recp_list[recp_id].filt_rules;
++	list_for_each_entry(list_itr, list_head, list_entry) {
++		if (!memcmp(&f_info->l_data, &list_itr->fltr_info.l_data,
++			    sizeof(f_info->l_data)) &&
++		    f_info->fwd_id.hw_vsi_id ==
++		    list_itr->fltr_info.fwd_id.hw_vsi_id &&
++		    f_info->flag == list_itr->fltr_info.flag)
++			return list_itr;
++	}
++	return NULL;
++}
++
+ /**
+  * ice_remove_mac - remove a MAC address based filter rule
+  * @hw: pointer to the hardware structure
+@@ -2150,15 +2182,39 @@ enum ice_status
+ ice_remove_mac(struct ice_hw *hw, struct list_head *m_list)
+ {
+ 	struct ice_fltr_list_entry *list_itr, *tmp;
++	struct mutex *rule_lock; /* Lock to protect filter rule list */
+ 
+ 	if (!m_list)
+ 		return ICE_ERR_PARAM;
+ 
++	rule_lock = &hw->switch_info->recp_list[ICE_SW_LKUP_MAC].filt_rule_lock;
+ 	list_for_each_entry_safe(list_itr, tmp, m_list, list_entry) {
+ 		enum ice_sw_lkup_type l_type = list_itr->fltr_info.lkup_type;
++		u8 *add = &list_itr->fltr_info.l_data.mac.mac_addr[0];
++		u16 vsi_handle;
+ 
+ 		if (l_type != ICE_SW_LKUP_MAC)
+ 			return ICE_ERR_PARAM;
++
++		vsi_handle = list_itr->fltr_info.vsi_handle;
++		if (!ice_is_vsi_valid(hw, vsi_handle))
++			return ICE_ERR_PARAM;
++
++		list_itr->fltr_info.fwd_id.hw_vsi_id =
++					ice_get_hw_vsi_num(hw, vsi_handle);
++		if (is_unicast_ether_addr(add) && !hw->ucast_shared) {
++			/* Don't remove the unicast address that belongs to
++			 * another VSI on the switch, since it is not being
++			 * shared...
++			 */
++			mutex_lock(rule_lock);
++			if (!ice_find_ucast_rule_entry(hw, ICE_SW_LKUP_MAC,
++						       &list_itr->fltr_info)) {
++				mutex_unlock(rule_lock);
++				return ICE_ERR_DOES_NOT_EXIST;
++			}
++			mutex_unlock(rule_lock);
++		}
+ 		list_itr->status = ice_remove_rule_internal(hw,
+ 							    ICE_SW_LKUP_MAC,
+ 							    list_itr);
+-- 
+2.17.1
+

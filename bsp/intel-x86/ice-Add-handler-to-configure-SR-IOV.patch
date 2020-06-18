@@ -1,0 +1,1399 @@
+From 4ec936f83f4e486dd71abc15cd9e6d36a977f138 Mon Sep 17 00:00:00 2001
+From: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Date: Wed, 19 Sep 2018 17:42:55 -0700
+Subject: [PATCH 047/421] ice: Add handler to configure SR-IOV
+
+commit ddf30f7ff840d4467ef45ec0b443575f9e95bec6 upstream.
+
+This patch implements parts of ice_sriov_configure and VF reset flow.
+
+To create virtual functions (VFs), the user sets a value in num_vfs
+through sysfs. This results in the kernel calling the handler for
+.sriov_configure which is ice_sriov_configure.
+
+VF setup first starts with a VF reset, followed by allocation of the VF
+VSI using ice_vf_vsi_setup. Once the VF setup is complete a state bit
+ICE_VF_STATE_INIT is set in the vf->states bitmap to indicate that
+the VF is ready to go.
+
+Also for VF reset to go into effect, it's necessary to issue a disable
+queue command (ice_aqc_opc_dis_txqs). So this patch updates multiple
+functions in the disable queue flow to take additional parameters that
+distinguish if queues are being disabled due to VF reset.
+
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Signed-off-by: Yongxin Liu <yongxin.liu@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/Makefile       |   1 +
+ drivers/net/ethernet/intel/ice/ice.h          |  24 +
+ drivers/net/ethernet/intel/ice/ice_common.c   |  56 +-
+ drivers/net/ethernet/intel/ice/ice_common.h   |   4 +-
+ .../net/ethernet/intel/ice/ice_hw_autogen.h   |  38 +
+ drivers/net/ethernet/intel/ice/ice_lib.c      |   7 +-
+ drivers/net/ethernet/intel/ice/ice_lib.h      |   3 +-
+ drivers/net/ethernet/intel/ice/ice_main.c     |   6 +-
+ drivers/net/ethernet/intel/ice/ice_type.h     |  10 +
+ .../net/ethernet/intel/ice/ice_virtchnl_pf.c  | 847 ++++++++++++++++++
+ .../net/ethernet/intel/ice/ice_virtchnl_pf.h  |  74 ++
+ 11 files changed, 1061 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+ create mode 100644 drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+
+diff --git a/drivers/net/ethernet/intel/ice/Makefile b/drivers/net/ethernet/intel/ice/Makefile
+index 45125bd074d9..1999cd09239e 100644
+--- a/drivers/net/ethernet/intel/ice/Makefile
++++ b/drivers/net/ethernet/intel/ice/Makefile
+@@ -16,3 +16,4 @@ ice-y := ice_main.o	\
+ 	 ice_lib.o	\
+ 	 ice_txrx.o	\
+ 	 ice_ethtool.o
++ice-$(CONFIG_PCI_IOV) += ice_virtchnl_pf.o
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 639d45d1da49..f788cd63237a 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -28,6 +28,7 @@
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <linux/if_bridge.h>
++#include <linux/avf/virtchnl.h>
+ #include <net/ipv6.h>
+ #include "ice_devids.h"
+ #include "ice_type.h"
+@@ -35,6 +36,7 @@
+ #include "ice_switch.h"
+ #include "ice_common.h"
+ #include "ice_sched.h"
++#include "ice_virtchnl_pf.h"
+ 
+ extern const char ice_drv_ver[];
+ #define ICE_BAR0		0
+@@ -65,6 +67,12 @@ extern const char ice_drv_ver[];
+ #define ICE_INVAL_Q_INDEX	0xffff
+ #define ICE_INVAL_VFID		256
+ #define ICE_MAX_VF_COUNT	256
++#define ICE_MAX_QS_PER_VF		256
++#define ICE_MIN_QS_PER_VF		1
++#define ICE_DFLT_QS_PER_VF		4
++#define ICE_MAX_INTR_PER_VF		65
++#define ICE_MIN_INTR_PER_VF		(ICE_MIN_QS_PER_VF + 1)
++#define ICE_DFLT_INTR_PER_VF		(ICE_DFLT_QS_PER_VF + 1)
+ 
+ #define ICE_VSIQF_HKEY_ARRAY_SIZE	((VSIQF_HKEY_MAX_INDEX + 1) *	4)
+ 
+@@ -135,10 +143,20 @@ enum ice_state {
+ 	__ICE_EMPR_RECV,		/* set by OICR handler */
+ 	__ICE_SUSPENDED,		/* set on module remove path */
+ 	__ICE_RESET_FAILED,		/* set by reset/rebuild */
++	/* When checking for the PF to be in a nominal operating state, the
++	 * bits that are grouped at the beginning of the list need to be
++	 * checked.  Bits occurring before __ICE_STATE_NOMINAL_CHECK_BITS will
++	 * be checked.  If you need to add a bit into consideration for nominal
++	 * operating state, it must be added before
++	 * __ICE_STATE_NOMINAL_CHECK_BITS.  Do not move this entry's position
++	 * without appropriate consideration.
++	 */
++	__ICE_STATE_NOMINAL_CHECK_BITS,
+ 	__ICE_ADMINQ_EVENT_PENDING,
+ 	__ICE_MAILBOXQ_EVENT_PENDING,
+ 	__ICE_MDD_EVENT_PENDING,
+ 	__ICE_FLTR_OVERFLOW_PROMISC,
++	__ICE_VF_DIS,
+ 	__ICE_CFG_BUSY,
+ 	__ICE_SERVICE_SCHED,
+ 	__ICE_SERVICE_DIS,
+@@ -243,6 +261,7 @@ enum ice_pf_flags {
+ 	ICE_FLAG_MSIX_ENA,
+ 	ICE_FLAG_FLTR_SYNC,
+ 	ICE_FLAG_RSS_ENA,
++	ICE_FLAG_SRIOV_ENA,
+ 	ICE_FLAG_SRIOV_CAPABLE,
+ 	ICE_PF_FLAGS_NBITS		/* must be last */
+ };
+@@ -259,7 +278,12 @@ struct ice_pf {
+ 
+ 	struct ice_vsi **vsi;		/* VSIs created by the driver */
+ 	struct ice_sw *first_sw;	/* first switch created by firmware */
++	/* Virtchnl/SR-IOV config info */
++	struct ice_vf *vf;
++	int num_alloc_vfs;		/* actual number of VFs allocated */
+ 	u16 num_vfs_supported;		/* num VFs supported for this PF */
++	u16 num_vf_qps;			/* num queue pairs per VF */
++	u16 num_vf_msix;		/* num vectors per VF */
+ 	DECLARE_BITMAP(state, __ICE_STATE_NBITS);
+ 	DECLARE_BITMAP(avail_txqs, ICE_MAX_TXQS);
+ 	DECLARE_BITMAP(avail_rxqs, ICE_MAX_RXQS);
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.c b/drivers/net/ethernet/intel/ice/ice_common.c
+index 0fe054e4bfb8..c52f450f2c0d 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.c
++++ b/drivers/net/ethernet/intel/ice/ice_common.c
+@@ -2287,6 +2287,8 @@ ice_aq_add_lan_txq(struct ice_hw *hw, u8 num_qgrps,
+  * @num_qgrps: number of groups in the list
+  * @qg_list: the list of groups to disable
+  * @buf_size: the total size of the qg_list buffer in bytes
++ * @rst_src: if called due to reset, specifies the RST source
++ * @vmvf_num: the relative VM or VF number that is undergoing the reset
+  * @cd: pointer to command details structure or NULL
+  *
+  * Disable LAN Tx queue (0x0C31)
+@@ -2294,6 +2296,7 @@ ice_aq_add_lan_txq(struct ice_hw *hw, u8 num_qgrps,
+ static enum ice_status
+ ice_aq_dis_lan_txq(struct ice_hw *hw, u8 num_qgrps,
+ 		   struct ice_aqc_dis_txq_item *qg_list, u16 buf_size,
++		   enum ice_disq_rst_src rst_src, u16 vmvf_num,
+ 		   struct ice_sq_cd *cd)
+ {
+ 	struct ice_aqc_dis_txqs *cmd;
+@@ -2303,14 +2306,45 @@ ice_aq_dis_lan_txq(struct ice_hw *hw, u8 num_qgrps,
+ 	cmd = &desc.params.dis_txqs;
+ 	ice_fill_dflt_direct_cmd_desc(&desc, ice_aqc_opc_dis_txqs);
+ 
+-	if (!qg_list)
++	/* qg_list can be NULL only in VM/VF reset flow */
++	if (!qg_list && !rst_src)
+ 		return ICE_ERR_PARAM;
+ 
+ 	if (num_qgrps > ICE_LAN_TXQ_MAX_QGRPS)
+ 		return ICE_ERR_PARAM;
+-	desc.flags |= cpu_to_le16(ICE_AQ_FLAG_RD);
++
+ 	cmd->num_entries = num_qgrps;
+ 
++	cmd->vmvf_and_timeout = cpu_to_le16((5 << ICE_AQC_Q_DIS_TIMEOUT_S) &
++					    ICE_AQC_Q_DIS_TIMEOUT_M);
++
++	switch (rst_src) {
++	case ICE_VM_RESET:
++		cmd->cmd_type = ICE_AQC_Q_DIS_CMD_VM_RESET;
++		cmd->vmvf_and_timeout |=
++			cpu_to_le16(vmvf_num & ICE_AQC_Q_DIS_VMVF_NUM_M);
++		break;
++	case ICE_VF_RESET:
++		cmd->cmd_type = ICE_AQC_Q_DIS_CMD_VF_RESET;
++		/* In this case, FW expects vmvf_num to be absolute VF id */
++		cmd->vmvf_and_timeout |=
++			cpu_to_le16((vmvf_num + hw->func_caps.vf_base_id) &
++				    ICE_AQC_Q_DIS_VMVF_NUM_M);
++		break;
++	case ICE_NO_RESET:
++	default:
++		break;
++	}
++
++	/* If no queue group info, we are in a reset flow. Issue the AQ */
++	if (!qg_list)
++		goto do_aq;
++
++	/* set RD bit to indicate that command buffer is provided by the driver
++	 * and it needs to be read by the firmware
++	 */
++	desc.flags |= cpu_to_le16(ICE_AQ_FLAG_RD);
++
+ 	for (i = 0; i < num_qgrps; ++i) {
+ 		/* Calculate the size taken up by the queue IDs in this group */
+ 		sz += qg_list[i].num_qs * sizeof(qg_list[i].q_id);
+@@ -2326,6 +2360,7 @@ ice_aq_dis_lan_txq(struct ice_hw *hw, u8 num_qgrps,
+ 	if (buf_size != sz)
+ 		return ICE_ERR_PARAM;
+ 
++do_aq:
+ 	return ice_aq_send_cmd(hw, &desc, qg_list, buf_size, cd);
+ }
+ 
+@@ -2632,13 +2667,16 @@ ice_ena_vsi_txq(struct ice_port_info *pi, u16 vsi_handle, u8 tc, u8 num_qgrps,
+  * @num_queues: number of queues
+  * @q_ids: pointer to the q_id array
+  * @q_teids: pointer to queue node teids
++ * @rst_src: if called due to reset, specifies the RST source
++ * @vmvf_num: the relative VM or VF number that is undergoing the reset
+  * @cd: pointer to command details structure or NULL
+  *
+  * This function removes queues and their corresponding nodes in SW DB
+  */
+ enum ice_status
+ ice_dis_vsi_txq(struct ice_port_info *pi, u8 num_queues, u16 *q_ids,
+-		u32 *q_teids, struct ice_sq_cd *cd)
++		u32 *q_teids, enum ice_disq_rst_src rst_src, u16 vmvf_num,
++		struct ice_sq_cd *cd)
+ {
+ 	enum ice_status status = ICE_ERR_DOES_NOT_EXIST;
+ 	struct ice_aqc_dis_txq_item qg_list;
+@@ -2647,6 +2685,15 @@ ice_dis_vsi_txq(struct ice_port_info *pi, u8 num_queues, u16 *q_ids,
+ 	if (!pi || pi->port_state != ICE_SCHED_PORT_STATE_READY)
+ 		return ICE_ERR_CFG;
+ 
++	/* if queue is disabled already yet the disable queue command has to be
++	 * sent to complete the VF reset, then call ice_aq_dis_lan_txq without
++	 * any queue information
++	 */
++
++	if (!num_queues && rst_src)
++		return ice_aq_dis_lan_txq(pi->hw, 0, NULL, 0, rst_src, vmvf_num,
++					  NULL);
++
+ 	mutex_lock(&pi->sched_lock);
+ 
+ 	for (i = 0; i < num_queues; i++) {
+@@ -2659,7 +2706,8 @@ ice_dis_vsi_txq(struct ice_port_info *pi, u8 num_queues, u16 *q_ids,
+ 		qg_list.num_qs = 1;
+ 		qg_list.q_id[0] = cpu_to_le16(q_ids[i]);
+ 		status = ice_aq_dis_lan_txq(pi->hw, 1, &qg_list,
+-					    sizeof(qg_list), cd);
++					    sizeof(qg_list), rst_src, vmvf_num,
++					    cd);
+ 
+ 		if (status)
+ 			break;
+diff --git a/drivers/net/ethernet/intel/ice/ice_common.h b/drivers/net/ethernet/intel/ice/ice_common.h
+index 7b2a5bb2e550..1900681289a4 100644
+--- a/drivers/net/ethernet/intel/ice/ice_common.h
++++ b/drivers/net/ethernet/intel/ice/ice_common.h
+@@ -7,6 +7,7 @@
+ #include "ice.h"
+ #include "ice_type.h"
+ #include "ice_switch.h"
++#include <linux/avf/virtchnl.h>
+ 
+ void ice_debug_cq(struct ice_hw *hw, u32 mask, void *desc, void *buf,
+ 		  u16 buf_len);
+@@ -89,7 +90,8 @@ ice_aq_set_event_mask(struct ice_hw *hw, u8 port_num, u16 mask,
+ 		      struct ice_sq_cd *cd);
+ enum ice_status
+ ice_dis_vsi_txq(struct ice_port_info *pi, u8 num_queues, u16 *q_ids,
+-		u32 *q_teids, struct ice_sq_cd *cmd_details);
++		u32 *q_teids, enum ice_disq_rst_src rst_src, u16 vmvf_num,
++		struct ice_sq_cd *cmd_details);
+ enum ice_status
+ ice_cfg_vsi_lan(struct ice_port_info *pi, u16 vsi_handle, u8 tc_bitmap,
+ 		u16 *max_lanqs);
+diff --git a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+index c2d867b756ef..b676b3151d04 100644
+--- a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
++++ b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+@@ -90,10 +90,16 @@
+ #define GLGEN_RTRIG_CORER_M			BIT(0)
+ #define GLGEN_RTRIG_GLOBR_M			BIT(1)
+ #define GLGEN_STAT				0x000B612C
++#define GLGEN_VFLRSTAT(_i)			(0x00093A04 + ((_i) * 4))
+ #define PFGEN_CTRL				0x00091000
+ #define PFGEN_CTRL_PFSWR_M			BIT(0)
+ #define PFGEN_STATE				0x00088000
+ #define PRTGEN_STATUS				0x000B8100
++#define VFGEN_RSTAT(_VF)			(0x00074000 + ((_VF) * 4))
++#define VPGEN_VFRSTAT(_VF)			(0x00090800 + ((_VF) * 4))
++#define VPGEN_VFRSTAT_VFRD_M			BIT(0)
++#define VPGEN_VFRTRIG(_VF)			(0x00090000 + ((_VF) * 4))
++#define VPGEN_VFRTRIG_VFSWR_M			BIT(0)
+ #define PFHMC_ERRORDATA				0x00520500
+ #define PFHMC_ERRORINFO				0x00520400
+ #define GLINT_DYN_CTL(_INT)			(0x00160000 + ((_INT) * 4))
+@@ -106,6 +112,13 @@
+ #define GLINT_ITR(_i, _INT)			(0x00154000 + ((_i) * 8192 + (_INT) * 4))
+ #define GLINT_RATE(_INT)			(0x0015A000 + ((_INT) * 4))
+ #define GLINT_RATE_INTRL_ENA_M			BIT(6)
++#define GLINT_VECT2FUNC(_INT)			(0x00162000 + ((_INT) * 4))
++#define GLINT_VECT2FUNC_VF_NUM_S		0
++#define GLINT_VECT2FUNC_VF_NUM_M		ICE_M(0xFF, 0)
++#define GLINT_VECT2FUNC_PF_NUM_S		12
++#define GLINT_VECT2FUNC_PF_NUM_M		ICE_M(0x7, 12)
++#define GLINT_VECT2FUNC_IS_PF_S			16
++#define GLINT_VECT2FUNC_IS_PF_M			BIT(16)
+ #define PFINT_FW_CTL				0x0016C800
+ #define PFINT_FW_CTL_MSIX_INDX_M		ICE_M(0x7FF, 0)
+ #define PFINT_FW_CTL_ITR_INDX_S			11
+@@ -137,6 +150,12 @@
+ #define QINT_TQCTL_MSIX_INDX_S			0
+ #define QINT_TQCTL_ITR_INDX_S			11
+ #define QINT_TQCTL_CAUSE_ENA_M			BIT(30)
++#define VPINT_ALLOC(_VF)			(0x001D1000 + ((_VF) * 4))
++#define VPINT_ALLOC_FIRST_S			0
++#define VPINT_ALLOC_FIRST_M			ICE_M(0x7FF, 0)
++#define VPINT_ALLOC_LAST_S			12
++#define VPINT_ALLOC_LAST_M			ICE_M(0x7FF, 12)
++#define VPINT_ALLOC_VALID_M			BIT(31)
+ #define QRX_CONTEXT(_i, _QRX)			(0x00280000 + ((_i) * 8192 + (_QRX) * 4))
+ #define QRX_CTRL(_QRX)				(0x00120000 + ((_QRX) * 4))
+ #define QRX_CTRL_MAX_INDEX			2047
+@@ -149,6 +168,20 @@
+ #define QRX_TAIL_MAX_INDEX			2047
+ #define QRX_TAIL_TAIL_S				0
+ #define QRX_TAIL_TAIL_M				ICE_M(0x1FFF, 0)
++#define VPLAN_RX_QBASE(_VF)			(0x00072000 + ((_VF) * 4))
++#define VPLAN_RX_QBASE_VFFIRSTQ_S		0
++#define VPLAN_RX_QBASE_VFFIRSTQ_M		ICE_M(0x7FF, 0)
++#define VPLAN_RX_QBASE_VFNUMQ_S			16
++#define VPLAN_RX_QBASE_VFNUMQ_M			ICE_M(0xFF, 16)
++#define VPLAN_RXQ_MAPENA(_VF)			(0x00073000 + ((_VF) * 4))
++#define VPLAN_RXQ_MAPENA_RX_ENA_M		BIT(0)
++#define VPLAN_TX_QBASE(_VF)			(0x001D1800 + ((_VF) * 4))
++#define VPLAN_TX_QBASE_VFFIRSTQ_S		0
++#define VPLAN_TX_QBASE_VFFIRSTQ_M		ICE_M(0x3FFF, 0)
++#define VPLAN_TX_QBASE_VFNUMQ_S			16
++#define VPLAN_TX_QBASE_VFNUMQ_M			ICE_M(0xFF, 16)
++#define VPLAN_TXQ_MAPENA(_VF)			(0x00073800 + ((_VF) * 4))
++#define VPLAN_TXQ_MAPENA_TX_ENA_M		BIT(0)
+ #define GL_MDET_RX				0x00294C00
+ #define GL_MDET_RX_QNUM_S			0
+ #define GL_MDET_RX_QNUM_M			ICE_M(0x7FFF, 0)
+@@ -196,6 +229,9 @@
+ #define PF_FUNC_RID				0x0009E880
+ #define PF_FUNC_RID_FUNC_NUM_S			0
+ #define PF_FUNC_RID_FUNC_NUM_M			ICE_M(0x7, 0)
++#define PF_PCI_CIAA				0x0009E580
++#define PF_PCI_CIAA_VF_NUM_S			12
++#define PF_PCI_CIAD				0x0009E500
+ #define GL_PWR_MODE_CTL				0x000B820C
+ #define GL_PWR_MODE_CTL_CAR_MAX_BW_S		30
+ #define GL_PWR_MODE_CTL_CAR_MAX_BW_M		ICE_M(0x3, 30)
+@@ -276,5 +312,7 @@
+ #define GLV_UPTCH(_i)				(0x0030A004 + ((_i) * 8))
+ #define GLV_UPTCL(_i)				(0x0030A000 + ((_i) * 8))
+ #define VSIQF_HKEY_MAX_INDEX			12
++#define VFINT_DYN_CTLN(_i)			(0x00003800 + ((_i) * 4))
++#define VFINT_DYN_CTLN_CLEARPBA_M		BIT(1)
+ 
+ #endif /* _ICE_HW_AUTOGEN_H_ */
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index acf3478a3f3b..4b26705a9ab5 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -1784,8 +1784,11 @@ int ice_vsi_stop_rx_rings(struct ice_vsi *vsi)
+ /**
+  * ice_vsi_stop_tx_rings - Disable Tx rings
+  * @vsi: the VSI being configured
++ * @rst_src: reset source
++ * @rel_vmvf_num: Relative id of VF/VM
+  */
+-int ice_vsi_stop_tx_rings(struct ice_vsi *vsi)
++int ice_vsi_stop_tx_rings(struct ice_vsi *vsi, enum ice_disq_rst_src rst_src,
++			  u16 rel_vmvf_num)
+ {
+ 	struct ice_pf *pf = vsi->back;
+ 	struct ice_hw *hw = &pf->hw;
+@@ -1837,7 +1840,7 @@ int ice_vsi_stop_tx_rings(struct ice_vsi *vsi)
+ 		     GLINT_DYN_CTL_SWINT_TRIG_M | GLINT_DYN_CTL_INTENA_MSK_M);
+ 	}
+ 	status = ice_dis_vsi_txq(vsi->port_info, vsi->num_txq, q_ids, q_teids,
+-				 NULL);
++				 rst_src, rel_vmvf_num, NULL);
+ 	/* if the disable queue command was exercised during an active reset
+ 	 * flow, ICE_ERR_RESET_ONGOING is returned. This is not an error as
+ 	 * the reset operation disables queues at the hardware level anyway.
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.h b/drivers/net/ethernet/intel/ice/ice_lib.h
+index 2617afe01c82..677db40338f5 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.h
++++ b/drivers/net/ethernet/intel/ice/ice_lib.h
+@@ -31,7 +31,8 @@ int ice_vsi_start_rx_rings(struct ice_vsi *vsi);
+ 
+ int ice_vsi_stop_rx_rings(struct ice_vsi *vsi);
+ 
+-int ice_vsi_stop_tx_rings(struct ice_vsi *vsi);
++int ice_vsi_stop_tx_rings(struct ice_vsi *vsi, enum ice_disq_rst_src rst_src,
++			  u16 rel_vmvf_num);
+ 
+ int ice_cfg_vlan_pruning(struct ice_vsi *vsi, bool ena);
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 859d1987fe33..77ec9d9a1ae6 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -2188,6 +2188,8 @@ static void ice_remove(struct pci_dev *pdev)
+ 	set_bit(__ICE_DOWN, pf->state);
+ 	ice_service_task_stop(pf);
+ 
++	if (test_bit(ICE_FLAG_SRIOV_ENA, pf->flags))
++		ice_free_vfs(pf);
+ 	ice_vsi_release_all(pf);
+ 	ice_free_irq_msix_misc(pf);
+ 	ice_for_each_vsi(pf, i) {
+@@ -2223,6 +2225,7 @@ static struct pci_driver ice_driver = {
+ 	.id_table = ice_pci_tbl,
+ 	.probe = ice_probe,
+ 	.remove = ice_remove,
++	.sriov_configure = ice_sriov_configure,
+ };
+ 
+ /**
+@@ -2966,7 +2969,7 @@ int ice_down(struct ice_vsi *vsi)
+ 	}
+ 
+ 	ice_vsi_dis_irq(vsi);
+-	tx_err = ice_vsi_stop_tx_rings(vsi);
++	tx_err = ice_vsi_stop_tx_rings(vsi, ICE_NO_RESET, 0);
+ 	if (tx_err)
+ 		netdev_err(vsi->netdev,
+ 			   "Failed stop Tx rings, VSI %d error %d\n",
+@@ -3368,6 +3371,7 @@ static void ice_rebuild(struct ice_pf *pf)
+ 		goto err_vsi_rebuild;
+ 	}
+ 
++	ice_reset_all_vfs(pf, true);
+ 	/* if we get here, reset flow is successful */
+ 	clear_bit(__ICE_RESET_FAILED, pf->state);
+ 	return;
+diff --git a/drivers/net/ethernet/intel/ice/ice_type.h b/drivers/net/ethernet/intel/ice/ice_type.h
+index ea7dd581e0f8..f73944292afb 100644
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -104,6 +104,15 @@ struct ice_link_status {
+ 	u8 module_type[ICE_MODULE_TYPE_TOTAL_BYTE];
+ };
+ 
++/* Different reset sources for which a disable queue AQ call has to be made in
++ * order to clean the TX scheduler as a part of the reset
++ */
++enum ice_disq_rst_src {
++	ICE_NO_RESET = 0,
++	ICE_VM_RESET,
++	ICE_VF_RESET,
++};
++
+ /* PHY info such as phy_type, etc... */
+ struct ice_phy_info {
+ 	struct ice_link_status link_info;
+@@ -130,6 +139,7 @@ struct ice_hw_common_caps {
+ 
+ 	/* Virtualization support */
+ 	u8 sr_iov_1_1;			/* SR-IOV enabled */
++
+ 	/* RSS related capabilities */
+ 	u16 rss_table_size;		/* 512 for PFs and 64 for VFs */
+ 	u8 rss_table_entry_width;	/* RSS Entry width in bits */
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+new file mode 100644
+index 000000000000..7f041fd785d6
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.c
+@@ -0,0 +1,847 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2018, Intel Corporation. */
++
++#include "ice.h"
++#include "ice_lib.h"
++
++/**
++ * ice_get_vf_vector - get VF interrupt vector register offset
++ * @vf_msix: number of MSIx vector per VF on a PF
++ * @vf_id: VF identifier
++ * @i: index of MSIx vector
++ */
++static u32 ice_get_vf_vector(int vf_msix, int vf_id, int i)
++{
++	return ((i == 0) ? VFINT_DYN_CTLN(vf_id) :
++		 VFINT_DYN_CTLN(((vf_msix - 1) * (vf_id)) + (i - 1)));
++}
++
++/**
++ * ice_free_vf_res - Free a VF's resources
++ * @vf: pointer to the VF info
++ */
++static void ice_free_vf_res(struct ice_vf *vf)
++{
++	struct ice_pf *pf = vf->pf;
++	int i, pf_vf_msix;
++
++	/* First, disable VF's configuration API to prevent OS from
++	 * accessing the VF's VSI after it's freed or invalidated.
++	 */
++	clear_bit(ICE_VF_STATE_INIT, vf->vf_states);
++
++	/* free vsi & disconnect it from the parent uplink */
++	if (vf->lan_vsi_idx) {
++		ice_vsi_release(pf->vsi[vf->lan_vsi_idx]);
++		vf->lan_vsi_idx = 0;
++		vf->lan_vsi_num = 0;
++		vf->num_mac = 0;
++	}
++
++	pf_vf_msix = pf->num_vf_msix;
++	/* Disable interrupts so that VF starts in a known state */
++	for (i = 0; i < pf_vf_msix; i++) {
++		u32 reg_idx;
++
++		reg_idx = ice_get_vf_vector(pf_vf_msix, vf->vf_id, i);
++		wr32(&pf->hw, reg_idx, VFINT_DYN_CTLN_CLEARPBA_M);
++		ice_flush(&pf->hw);
++	}
++	/* reset some of the state variables keeping track of the resources */
++	clear_bit(ICE_VF_STATE_MC_PROMISC, vf->vf_states);
++	clear_bit(ICE_VF_STATE_UC_PROMISC, vf->vf_states);
++}
++
++/***********************enable_vf routines*****************************/
++
++/**
++ * ice_dis_vf_mappings
++ * @vf: pointer to the VF structure
++ */
++static void ice_dis_vf_mappings(struct ice_vf *vf)
++{
++	struct ice_pf *pf = vf->pf;
++	struct ice_vsi *vsi;
++	int first, last, v;
++	struct ice_hw *hw;
++
++	hw = &pf->hw;
++	vsi = pf->vsi[vf->lan_vsi_idx];
++
++	wr32(hw, VPINT_ALLOC(vf->vf_id), 0);
++
++	first = vf->first_vector_idx;
++	last = first + pf->num_vf_msix - 1;
++	for (v = first; v <= last; v++) {
++		u32 reg;
++
++		reg = (((1 << GLINT_VECT2FUNC_IS_PF_S) &
++			GLINT_VECT2FUNC_IS_PF_M) |
++		       ((hw->pf_id << GLINT_VECT2FUNC_PF_NUM_S) &
++			GLINT_VECT2FUNC_PF_NUM_M));
++		wr32(hw, GLINT_VECT2FUNC(v), reg);
++	}
++
++	if (vsi->tx_mapping_mode == ICE_VSI_MAP_CONTIG)
++		wr32(hw, VPLAN_TX_QBASE(vf->vf_id), 0);
++	else
++		dev_err(&pf->pdev->dev,
++			"Scattered mode for VF Tx queues is not yet implemented\n");
++
++	if (vsi->rx_mapping_mode == ICE_VSI_MAP_CONTIG)
++		wr32(hw, VPLAN_RX_QBASE(vf->vf_id), 0);
++	else
++		dev_err(&pf->pdev->dev,
++			"Scattered mode for VF Rx queues is not yet implemented\n");
++}
++
++/**
++ * ice_free_vfs - Free all VFs
++ * @pf: pointer to the PF structure
++ */
++void ice_free_vfs(struct ice_pf *pf)
++{
++	struct ice_hw *hw = &pf->hw;
++	int tmp, i;
++
++	if (!pf->vf)
++		return;
++
++	while (test_and_set_bit(__ICE_VF_DIS, pf->state))
++		usleep_range(1000, 2000);
++
++	/* Avoid wait time by stopping all VFs at the same time */
++	for (i = 0; i < pf->num_alloc_vfs; i++) {
++		if (!test_bit(ICE_VF_STATE_ENA, pf->vf[i].vf_states))
++			continue;
++
++		/* stop rings without wait time */
++		ice_vsi_stop_tx_rings(pf->vsi[pf->vf[i].lan_vsi_idx],
++				      ICE_NO_RESET, i);
++		ice_vsi_stop_rx_rings(pf->vsi[pf->vf[i].lan_vsi_idx]);
++
++		clear_bit(ICE_VF_STATE_ENA, pf->vf[i].vf_states);
++	}
++
++	/* Disable IOV before freeing resources. This lets any VF drivers
++	 * running in the host get themselves cleaned up before we yank
++	 * the carpet out from underneath their feet.
++	 */
++	if (!pci_vfs_assigned(pf->pdev))
++		pci_disable_sriov(pf->pdev);
++	else
++		dev_warn(&pf->pdev->dev, "VFs are assigned - not disabling SR-IOV\n");
++
++	tmp = pf->num_alloc_vfs;
++	pf->num_vf_qps = 0;
++	pf->num_alloc_vfs = 0;
++	for (i = 0; i < tmp; i++) {
++		if (test_bit(ICE_VF_STATE_INIT, pf->vf[i].vf_states)) {
++			/* disable VF qp mappings */
++			ice_dis_vf_mappings(&pf->vf[i]);
++
++			/* Set this state so that assigned VF vectors can be
++			 * reclaimed by PF for reuse in ice_vsi_release(). No
++			 * need to clear this bit since pf->vf array is being
++			 * freed anyways after this for loop
++			 */
++			set_bit(ICE_VF_STATE_CFG_INTR, pf->vf[i].vf_states);
++			ice_free_vf_res(&pf->vf[i]);
++		}
++	}
++
++	devm_kfree(&pf->pdev->dev, pf->vf);
++	pf->vf = NULL;
++
++	/* This check is for when the driver is unloaded while VFs are
++	 * assigned. Setting the number of VFs to 0 through sysfs is caught
++	 * before this function ever gets called.
++	 */
++	if (!pci_vfs_assigned(pf->pdev)) {
++		int vf_id;
++
++		/* Acknowledge VFLR for all VFs. Without this, VFs will fail to
++		 * work correctly when SR-IOV gets re-enabled.
++		 */
++		for (vf_id = 0; vf_id < tmp; vf_id++) {
++			u32 reg_idx, bit_idx;
++
++			reg_idx = (hw->func_caps.vf_base_id + vf_id) / 32;
++			bit_idx = (hw->func_caps.vf_base_id + vf_id) % 32;
++			wr32(hw, GLGEN_VFLRSTAT(reg_idx), BIT(bit_idx));
++		}
++	}
++	clear_bit(__ICE_VF_DIS, pf->state);
++	clear_bit(ICE_FLAG_SRIOV_ENA, pf->flags);
++}
++
++/**
++ * ice_trigger_vf_reset - Reset a VF on HW
++ * @vf: pointer to the VF structure
++ * @is_vflr: true if VFLR was issued, false if not
++ *
++ * Trigger hardware to start a reset for a particular VF. Expects the caller
++ * to wait the proper amount of time to allow hardware to reset the VF before
++ * it cleans up and restores VF functionality.
++ */
++static void ice_trigger_vf_reset(struct ice_vf *vf, bool is_vflr)
++{
++	struct ice_pf *pf = vf->pf;
++	u32 reg, reg_idx, bit_idx;
++	struct ice_hw *hw;
++	int vf_abs_id, i;
++
++	hw = &pf->hw;
++	vf_abs_id = vf->vf_id + hw->func_caps.vf_base_id;
++
++	/* Inform VF that it is no longer active, as a warning */
++	clear_bit(ICE_VF_STATE_ACTIVE, vf->vf_states);
++
++	/* Disable VF's configuration API during reset. The flag is re-enabled
++	 * in ice_alloc_vf_res(), when it's safe again to access VF's VSI.
++	 * It's normally disabled in ice_free_vf_res(), but it's safer
++	 * to do it earlier to give some time to finish to any VF config
++	 * functions that may still be running at this point.
++	 */
++	clear_bit(ICE_VF_STATE_INIT, vf->vf_states);
++
++	/* In the case of a VFLR, the HW has already reset the VF and we
++	 * just need to clean up, so don't hit the VFRTRIG register.
++	 */
++	if (!is_vflr) {
++		/* reset VF using VPGEN_VFRTRIG reg */
++		reg = rd32(hw, VPGEN_VFRTRIG(vf->vf_id));
++		reg |= VPGEN_VFRTRIG_VFSWR_M;
++		wr32(hw, VPGEN_VFRTRIG(vf->vf_id), reg);
++	}
++	/* clear the VFLR bit in GLGEN_VFLRSTAT */
++	reg_idx = (vf_abs_id) / 32;
++	bit_idx = (vf_abs_id) % 32;
++	wr32(hw, GLGEN_VFLRSTAT(reg_idx), BIT(bit_idx));
++	ice_flush(hw);
++
++	wr32(hw, PF_PCI_CIAA,
++	     VF_DEVICE_STATUS | (vf_abs_id << PF_PCI_CIAA_VF_NUM_S));
++	for (i = 0; i < 100; i++) {
++		reg = rd32(hw, PF_PCI_CIAD);
++		if ((reg & VF_TRANS_PENDING_M) != 0)
++			dev_err(&pf->pdev->dev,
++				"VF %d PCI transactions stuck\n", vf->vf_id);
++		udelay(1);
++	}
++}
++
++/**
++ * ice_vsi_set_pvid - Set port VLAN id for the VSI
++ * @vsi: the VSI being changed
++ * @vid: the VLAN id to set as a PVID
++ */
++static int ice_vsi_set_pvid(struct ice_vsi *vsi, u16 vid)
++{
++	struct device *dev = &vsi->back->pdev->dev;
++	struct ice_hw *hw = &vsi->back->hw;
++	struct ice_vsi_ctx ctxt = { 0 };
++	enum ice_status status;
++
++	ctxt.info.vlan_flags = ICE_AQ_VSI_VLAN_MODE_TAGGED |
++			       ICE_AQ_VSI_PVLAN_INSERT_PVID |
++			       ICE_AQ_VSI_VLAN_EMOD_STR;
++	ctxt.info.pvid = cpu_to_le16(vid);
++	ctxt.info.valid_sections = cpu_to_le16(ICE_AQ_VSI_PROP_VLAN_VALID);
++
++	status = ice_update_vsi(hw, vsi->idx, &ctxt, NULL);
++	if (status) {
++		dev_info(dev, "update VSI for VLAN insert failed, err %d aq_err %d\n",
++			 status, hw->adminq.sq_last_status);
++		return -EIO;
++	}
++
++	vsi->info.pvid = ctxt.info.pvid;
++	vsi->info.vlan_flags = ctxt.info.vlan_flags;
++	return 0;
++}
++
++/**
++ * ice_vf_vsi_setup - Set up a VF VSI
++ * @pf: board private structure
++ * @pi: pointer to the port_info instance
++ * @vf_id: defines VF id to which this VSI connects.
++ *
++ * Returns pointer to the successfully allocated VSI struct on success,
++ * otherwise returns NULL on failure.
++ */
++static struct ice_vsi *
++ice_vf_vsi_setup(struct ice_pf *pf, struct ice_port_info *pi, u16 vf_id)
++{
++	return ice_vsi_setup(pf, pi, ICE_VSI_VF, vf_id);
++}
++
++/**
++ * ice_alloc_vsi_res - Setup VF VSI and its resources
++ * @vf: pointer to the VF structure
++ *
++ * Returns 0 on success, negative value on failure
++ */
++static int ice_alloc_vsi_res(struct ice_vf *vf)
++{
++	struct ice_pf *pf = vf->pf;
++	LIST_HEAD(tmp_add_list);
++	u8 broadcast[ETH_ALEN];
++	struct ice_vsi *vsi;
++	int status = 0;
++
++	vsi = ice_vf_vsi_setup(pf, pf->hw.port_info, vf->vf_id);
++
++	if (!vsi) {
++		dev_err(&pf->pdev->dev, "Failed to create VF VSI\n");
++		return -ENOMEM;
++	}
++
++	vf->lan_vsi_idx = vsi->idx;
++	vf->lan_vsi_num = vsi->vsi_num;
++
++	/* first vector index is the VFs OICR index */
++	vf->first_vector_idx = vsi->hw_base_vector;
++	/* Since hw_base_vector holds the vector where data queue interrupts
++	 * starts, increment by 1 since VFs allocated vectors include OICR intr
++	 * as well.
++	 */
++	vsi->hw_base_vector += 1;
++
++	/* Check if port VLAN exist before, and restore it accordingly */
++	if (vf->port_vlan_id)
++		ice_vsi_set_pvid(vsi, vf->port_vlan_id);
++
++	eth_broadcast_addr(broadcast);
++
++	status = ice_add_mac_to_list(vsi, &tmp_add_list, broadcast);
++	if (status)
++		goto ice_alloc_vsi_res_exit;
++
++	if (is_valid_ether_addr(vf->dflt_lan_addr.addr)) {
++		status = ice_add_mac_to_list(vsi, &tmp_add_list,
++					     vf->dflt_lan_addr.addr);
++		if (status)
++			goto ice_alloc_vsi_res_exit;
++	}
++
++	status = ice_add_mac(&pf->hw, &tmp_add_list);
++	if (status)
++		dev_err(&pf->pdev->dev, "could not add mac filters\n");
++
++	/* Clear this bit after VF initialization since we shouldn't reclaim
++	 * and reassign interrupts for synchronous or asynchronous VFR events.
++	 * We don't want to reconfigure interrupts since AVF driver doesn't
++	 * expect vector assignment to be changed unless there is a request for
++	 * more vectors.
++	 */
++	clear_bit(ICE_VF_STATE_CFG_INTR, vf->vf_states);
++ice_alloc_vsi_res_exit:
++	ice_free_fltr_list(&pf->pdev->dev, &tmp_add_list);
++	return status;
++}
++
++/**
++ * ice_alloc_vf_res - Allocate VF resources
++ * @vf: pointer to the VF structure
++ */
++static int ice_alloc_vf_res(struct ice_vf *vf)
++{
++	int status;
++
++	/* setup VF VSI and necessary resources */
++	status = ice_alloc_vsi_res(vf);
++	if (status)
++		goto ice_alloc_vf_res_exit;
++
++	if (vf->trusted)
++		set_bit(ICE_VIRTCHNL_VF_CAP_PRIVILEGE, &vf->vf_caps);
++	else
++		clear_bit(ICE_VIRTCHNL_VF_CAP_PRIVILEGE, &vf->vf_caps);
++
++	/* VF is now completely initialized */
++	set_bit(ICE_VF_STATE_INIT, vf->vf_states);
++
++	return status;
++
++ice_alloc_vf_res_exit:
++	ice_free_vf_res(vf);
++	return status;
++}
++
++/**
++ * ice_ena_vf_mappings
++ * @vf: pointer to the VF structure
++ *
++ * Enable VF vectors and queues allocation by writing the details into
++ * respective registers.
++ */
++static void ice_ena_vf_mappings(struct ice_vf *vf)
++{
++	struct ice_pf *pf = vf->pf;
++	struct ice_vsi *vsi;
++	int first, last, v;
++	struct ice_hw *hw;
++	int abs_vf_id;
++	u32 reg;
++
++	hw = &pf->hw;
++	vsi = pf->vsi[vf->lan_vsi_idx];
++	first = vf->first_vector_idx;
++	last = (first + pf->num_vf_msix) - 1;
++	abs_vf_id = vf->vf_id + hw->func_caps.vf_base_id;
++
++	/* VF Vector allocation */
++	reg = (((first << VPINT_ALLOC_FIRST_S) & VPINT_ALLOC_FIRST_M) |
++	       ((last << VPINT_ALLOC_LAST_S) & VPINT_ALLOC_LAST_M) |
++	       VPINT_ALLOC_VALID_M);
++	wr32(hw, VPINT_ALLOC(vf->vf_id), reg);
++
++	/* map the interrupts to its functions */
++	for (v = first; v <= last; v++) {
++		reg = (((abs_vf_id << GLINT_VECT2FUNC_VF_NUM_S) &
++			GLINT_VECT2FUNC_VF_NUM_M) |
++		       ((hw->pf_id << GLINT_VECT2FUNC_PF_NUM_S) &
++			GLINT_VECT2FUNC_PF_NUM_M));
++		wr32(hw, GLINT_VECT2FUNC(v), reg);
++	}
++
++	/* VF Tx queues allocation */
++	if (vsi->tx_mapping_mode == ICE_VSI_MAP_CONTIG) {
++		wr32(hw, VPLAN_TXQ_MAPENA(vf->vf_id),
++		     VPLAN_TXQ_MAPENA_TX_ENA_M);
++		/* set the VF PF Tx queue range
++		 * VFNUMQ value should be set to (number of queues - 1). A value
++		 * of 0 means 1 queue and a value of 255 means 256 queues
++		 */
++		reg = (((vsi->txq_map[0] << VPLAN_TX_QBASE_VFFIRSTQ_S) &
++			VPLAN_TX_QBASE_VFFIRSTQ_M) |
++		       (((vsi->alloc_txq - 1) << VPLAN_TX_QBASE_VFNUMQ_S) &
++			VPLAN_TX_QBASE_VFNUMQ_M));
++		wr32(hw, VPLAN_TX_QBASE(vf->vf_id), reg);
++	} else {
++		dev_err(&pf->pdev->dev,
++			"Scattered mode for VF Tx queues is not yet implemented\n");
++	}
++
++	/* VF Rx queues allocation */
++	if (vsi->rx_mapping_mode == ICE_VSI_MAP_CONTIG) {
++		wr32(hw, VPLAN_RXQ_MAPENA(vf->vf_id),
++		     VPLAN_RXQ_MAPENA_RX_ENA_M);
++		/* set the VF PF Rx queue range
++		 * VFNUMQ value should be set to (number of queues - 1). A value
++		 * of 0 means 1 queue and a value of 255 means 256 queues
++		 */
++		reg = (((vsi->rxq_map[0] << VPLAN_RX_QBASE_VFFIRSTQ_S) &
++			VPLAN_RX_QBASE_VFFIRSTQ_M) |
++		       (((vsi->alloc_txq - 1) << VPLAN_RX_QBASE_VFNUMQ_S) &
++			VPLAN_RX_QBASE_VFNUMQ_M));
++		wr32(hw, VPLAN_RX_QBASE(vf->vf_id), reg);
++	} else {
++		dev_err(&pf->pdev->dev,
++			"Scattered mode for VF Rx queues is not yet implemented\n");
++	}
++}
++
++/**
++ * ice_determine_res
++ * @pf: pointer to the PF structure
++ * @avail_res: available resources in the PF structure
++ * @max_res: maximum resources that can be given per VF
++ * @min_res: minimum resources that can be given per VF
++ *
++ * Returns non-zero value if resources (queues/vectors) are available or
++ * returns zero if PF cannot accommodate for all num_alloc_vfs.
++ */
++static int
++ice_determine_res(struct ice_pf *pf, u16 avail_res, u16 max_res, u16 min_res)
++{
++	bool checked_min_res = false;
++	int res;
++
++	/* start by checking if PF can assign max number of resources for
++	 * all num_alloc_vfs.
++	 * if yes, return number per VF
++	 * If no, divide by 2 and roundup, check again
++	 * repeat the loop till we reach a point where even minimum resources
++	 * are not available, in that case return 0
++	 */
++	res = max_res;
++	while ((res >= min_res) && !checked_min_res) {
++		int num_all_res;
++
++		num_all_res = pf->num_alloc_vfs * res;
++		if (num_all_res <= avail_res)
++			return res;
++
++		if (res == min_res)
++			checked_min_res = true;
++
++		res = DIV_ROUND_UP(res, 2);
++	}
++	return 0;
++}
++
++/**
++ * ice_check_avail_res - check if vectors and queues are available
++ * @pf: pointer to the PF structure
++ *
++ * This function is where we calculate actual number of resources for VF VSIs,
++ * we don't reserve ahead of time during probe. Returns success if vectors and
++ * queues resources are available, otherwise returns error code
++ */
++static int ice_check_avail_res(struct ice_pf *pf)
++{
++	u16 num_msix, num_txq, num_rxq;
++
++	if (!pf->num_alloc_vfs)
++		return -EINVAL;
++
++	/* Grab from HW interrupts common pool
++	 * Note: By the time the user decides it needs more vectors in a VF
++	 * its already too late since one must decide this prior to creating the
++	 * VF interface. So the best we can do is take a guess as to what the
++	 * user might want.
++	 *
++	 * We have two policies for vector allocation:
++	 * 1. if num_alloc_vfs is from 1 to 16, then we consider this as small
++	 * number of NFV VFs used for NFV appliances, since this is a special
++	 * case, we try to assign maximum vectors per VF (65) as much as
++	 * possible, based on determine_resources algorithm.
++	 * 2. if num_alloc_vfs is from 17 to 256, then its large number of
++	 * regular VFs which are not used for any special purpose. Hence try to
++	 * grab default interrupt vectors (5 as supported by AVF driver).
++	 */
++	if (pf->num_alloc_vfs <= 16) {
++		num_msix = ice_determine_res(pf, pf->num_avail_hw_msix,
++					     ICE_MAX_INTR_PER_VF,
++					     ICE_MIN_INTR_PER_VF);
++	} else if (pf->num_alloc_vfs <= ICE_MAX_VF_COUNT) {
++		num_msix = ice_determine_res(pf, pf->num_avail_hw_msix,
++					     ICE_DFLT_INTR_PER_VF,
++					     ICE_MIN_INTR_PER_VF);
++	} else {
++		dev_err(&pf->pdev->dev,
++			"Number of VFs %d exceeds max VF count %d\n",
++			pf->num_alloc_vfs, ICE_MAX_VF_COUNT);
++		return -EIO;
++	}
++
++	if (!num_msix)
++		return -EIO;
++
++	/* Grab from the common pool
++	 * start by requesting Default queues (4 as supported by AVF driver),
++	 * Note that, the main difference between queues and vectors is, latter
++	 * can only be reserved at init time but queues can be requested by VF
++	 * at runtime through Virtchnl, that is the reason we start by reserving
++	 * few queues.
++	 */
++	num_txq = ice_determine_res(pf, pf->q_left_tx, ICE_DFLT_QS_PER_VF,
++				    ICE_MIN_QS_PER_VF);
++
++	num_rxq = ice_determine_res(pf, pf->q_left_rx, ICE_DFLT_QS_PER_VF,
++				    ICE_MIN_QS_PER_VF);
++
++	if (!num_txq || !num_rxq)
++		return -EIO;
++
++	/* since AVF driver works with only queue pairs which means, it expects
++	 * to have equal number of Rx and Tx queues, so take the minimum of
++	 * available Tx or Rx queues
++	 */
++	pf->num_vf_qps = min_t(int, num_txq, num_rxq);
++	pf->num_vf_msix = num_msix;
++
++	return 0;
++}
++
++/**
++ * ice_cleanup_and_realloc_vf - Clean up VF and reallocate resources after reset
++ * @vf: pointer to the VF structure
++ *
++ * Cleanup a VF after the hardware reset is finished. Expects the caller to
++ * have verified whether the reset is finished properly, and ensure the
++ * minimum amount of wait time has passed. Reallocate VF resources back to make
++ * VF state active
++ */
++static void ice_cleanup_and_realloc_vf(struct ice_vf *vf)
++{
++	struct ice_pf *pf = vf->pf;
++	struct ice_hw *hw;
++	u32 reg;
++
++	hw = &pf->hw;
++
++	/* PF software completes the flow by notifying VF that reset flow is
++	 * completed. This is done by enabling hardware by clearing the reset
++	 * bit in the VPGEN_VFRTRIG reg and setting VFR_STATE in the VFGEN_RSTAT
++	 * register to VFR completed (done at the end of this function)
++	 * By doing this we allow HW to access VF memory at any point. If we
++	 * did it any sooner, HW could access memory while it was being freed
++	 * in ice_free_vf_res(), causing an IOMMU fault.
++	 *
++	 * On the other hand, this needs to be done ASAP, because the VF driver
++	 * is waiting for this to happen and may report a timeout. It's
++	 * harmless, but it gets logged into Guest OS kernel log, so best avoid
++	 * it.
++	 */
++	reg = rd32(hw, VPGEN_VFRTRIG(vf->vf_id));
++	reg &= ~VPGEN_VFRTRIG_VFSWR_M;
++	wr32(hw, VPGEN_VFRTRIG(vf->vf_id), reg);
++
++	/* reallocate VF resources to finish resetting the VSI state */
++	if (!ice_alloc_vf_res(vf)) {
++		ice_ena_vf_mappings(vf);
++		set_bit(ICE_VF_STATE_ACTIVE, vf->vf_states);
++		clear_bit(ICE_VF_STATE_DIS, vf->vf_states);
++		vf->num_vlan = 0;
++	}
++
++	/* Tell the VF driver the reset is done. This needs to be done only
++	 * after VF has been fully initialized, because the VF driver may
++	 * request resources immediately after setting this flag.
++	 */
++	wr32(hw, VFGEN_RSTAT(vf->vf_id), VIRTCHNL_VFR_VFACTIVE);
++}
++
++/**
++ * ice_reset_all_vfs - reset all allocated VFs in one go
++ * @pf: pointer to the PF structure
++ * @is_vflr: true if VFLR was issued, false if not
++ *
++ * First, tell the hardware to reset each VF, then do all the waiting in one
++ * chunk, and finally finish restoring each VF after the wait. This is useful
++ * during PF routines which need to reset all VFs, as otherwise it must perform
++ * these resets in a serialized fashion.
++ *
++ * Returns true if any VFs were reset, and false otherwise.
++ */
++bool ice_reset_all_vfs(struct ice_pf *pf, bool is_vflr)
++{
++	struct ice_hw *hw = &pf->hw;
++	int v, i;
++
++	/* If we don't have any VFs, then there is nothing to reset */
++	if (!pf->num_alloc_vfs)
++		return false;
++
++	/* If VFs have been disabled, there is no need to reset */
++	if (test_and_set_bit(__ICE_VF_DIS, pf->state))
++		return false;
++
++	/* Begin reset on all VFs at once */
++	for (v = 0; v < pf->num_alloc_vfs; v++)
++		ice_trigger_vf_reset(&pf->vf[v], is_vflr);
++
++	/* Call Disable LAN Tx queue AQ call with VFR bit set and 0
++	 * queues to inform Firmware about VF reset.
++	 */
++	for (v = 0; v < pf->num_alloc_vfs; v++)
++		ice_dis_vsi_txq(pf->vsi[0]->port_info, 0, NULL, NULL,
++				ICE_VF_RESET, v, NULL);
++
++	/* HW requires some time to make sure it can flush the FIFO for a VF
++	 * when it resets it. Poll the VPGEN_VFRSTAT register for each VF in
++	 * sequence to make sure that it has completed. We'll keep track of
++	 * the VFs using a simple iterator that increments once that VF has
++	 * finished resetting.
++	 */
++	for (i = 0, v = 0; i < 10 && v < pf->num_alloc_vfs; i++) {
++		usleep_range(10000, 20000);
++
++		/* Check each VF in sequence */
++		while (v < pf->num_alloc_vfs) {
++			struct ice_vf *vf = &pf->vf[v];
++			u32 reg;
++
++			reg = rd32(hw, VPGEN_VFRSTAT(vf->vf_id));
++			if (!(reg & VPGEN_VFRSTAT_VFRD_M))
++				break;
++
++			/* If the current VF has finished resetting, move on
++			 * to the next VF in sequence.
++			 */
++			v++;
++		}
++	}
++
++	/* Display a warning if at least one VF didn't manage to reset in
++	 * time, but continue on with the operation.
++	 */
++	if (v < pf->num_alloc_vfs)
++		dev_warn(&pf->pdev->dev, "VF reset check timeout\n");
++	usleep_range(10000, 20000);
++
++	/* free VF resources to begin resetting the VSI state */
++	for (v = 0; v < pf->num_alloc_vfs; v++)
++		ice_free_vf_res(&pf->vf[v]);
++
++	if (ice_check_avail_res(pf)) {
++		dev_err(&pf->pdev->dev,
++			"Cannot allocate VF resources, try with fewer number of VFs\n");
++		return false;
++	}
++
++	/* Finish the reset on each VF */
++	for (v = 0; v < pf->num_alloc_vfs; v++)
++		ice_cleanup_and_realloc_vf(&pf->vf[v]);
++
++	ice_flush(hw);
++	clear_bit(__ICE_VF_DIS, pf->state);
++
++	return true;
++}
++
++/**
++ * ice_alloc_vfs - Allocate and set up VFs resources
++ * @pf: pointer to the PF structure
++ * @num_alloc_vfs: number of VFs to allocate
++ */
++static int ice_alloc_vfs(struct ice_pf *pf, u16 num_alloc_vfs)
++{
++	struct ice_hw *hw = &pf->hw;
++	struct ice_vf *vfs;
++	int i, ret;
++
++	/* Disable global interrupt 0 so we don't try to handle the VFLR. */
++	wr32(hw, GLINT_DYN_CTL(pf->hw_oicr_idx),
++	     ICE_ITR_NONE << GLINT_DYN_CTL_ITR_INDX_S);
++
++	ice_flush(hw);
++
++	ret = pci_enable_sriov(pf->pdev, num_alloc_vfs);
++	if (ret) {
++		pf->num_alloc_vfs = 0;
++		goto err_unroll_intr;
++	}
++	/* allocate memory */
++	vfs = devm_kcalloc(&pf->pdev->dev, num_alloc_vfs, sizeof(*vfs),
++			   GFP_KERNEL);
++	if (!vfs) {
++		ret = -ENOMEM;
++		goto err_unroll_sriov;
++	}
++	pf->vf = vfs;
++
++	/* apply default profile */
++	for (i = 0; i < num_alloc_vfs; i++) {
++		vfs[i].pf = pf;
++		vfs[i].vf_sw_id = pf->first_sw;
++		vfs[i].vf_id = i;
++
++		/* assign default capabilities */
++		set_bit(ICE_VIRTCHNL_VF_CAP_L2, &vfs[i].vf_caps);
++		vfs[i].spoofchk = true;
++
++		/* Set this state so that PF driver does VF vector assignment */
++		set_bit(ICE_VF_STATE_CFG_INTR, vfs[i].vf_states);
++	}
++	pf->num_alloc_vfs = num_alloc_vfs;
++
++	/* VF resources get allocated during reset */
++	if (!ice_reset_all_vfs(pf, false))
++		goto err_unroll_sriov;
++
++	goto err_unroll_intr;
++
++err_unroll_sriov:
++	pci_disable_sriov(pf->pdev);
++err_unroll_intr:
++	/* rearm interrupts here */
++	ice_irq_dynamic_ena(hw, NULL, NULL);
++	return ret;
++}
++
++/**
++ * ice_pf_state_is_nominal - checks the pf for nominal state
++ * @pf: pointer to pf to check
++ *
++ * Check the PF's state for a collection of bits that would indicate
++ * the PF is in a state that would inhibit normal operation for
++ * driver functionality.
++ *
++ * Returns true if PF is in a nominal state.
++ * Returns false otherwise
++ */
++static bool ice_pf_state_is_nominal(struct ice_pf *pf)
++{
++	DECLARE_BITMAP(check_bits, __ICE_STATE_NBITS) = { 0 };
++
++	if (!pf)
++		return false;
++
++	bitmap_set(check_bits, 0, __ICE_STATE_NOMINAL_CHECK_BITS);
++	if (bitmap_intersects(pf->state, check_bits, __ICE_STATE_NBITS))
++		return false;
++
++	return true;
++}
++
++/**
++ * ice_pci_sriov_ena - Enable or change number of VFs
++ * @pf: pointer to the PF structure
++ * @num_vfs: number of VFs to allocate
++ */
++static int ice_pci_sriov_ena(struct ice_pf *pf, int num_vfs)
++{
++	int pre_existing_vfs = pci_num_vf(pf->pdev);
++	struct device *dev = &pf->pdev->dev;
++	int err;
++
++	if (!ice_pf_state_is_nominal(pf)) {
++		dev_err(dev, "Cannot enable SR-IOV, device not ready\n");
++		return -EBUSY;
++	}
++
++	if (!test_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags)) {
++		dev_err(dev, "This device is not capable of SR-IOV\n");
++		return -ENODEV;
++	}
++
++	if (pre_existing_vfs && pre_existing_vfs != num_vfs)
++		ice_free_vfs(pf);
++	else if (pre_existing_vfs && pre_existing_vfs == num_vfs)
++		return num_vfs;
++
++	if (num_vfs > pf->num_vfs_supported) {
++		dev_err(dev, "Can't enable %d VFs, max VFs supported is %d\n",
++			num_vfs, pf->num_vfs_supported);
++		return -ENOTSUPP;
++	}
++
++	dev_info(dev, "Allocating %d VFs\n", num_vfs);
++	err = ice_alloc_vfs(pf, num_vfs);
++	if (err) {
++		dev_err(dev, "Failed to enable SR-IOV: %d\n", err);
++		return err;
++	}
++
++	set_bit(ICE_FLAG_SRIOV_ENA, pf->flags);
++	return num_vfs;
++}
++
++/**
++ * ice_sriov_configure - Enable or change number of VFs via sysfs
++ * @pdev: pointer to a pci_dev structure
++ * @num_vfs: number of VFs to allocate
++ *
++ * This function is called when the user updates the number of VFs in sysfs.
++ */
++int ice_sriov_configure(struct pci_dev *pdev, int num_vfs)
++{
++	struct ice_pf *pf = pci_get_drvdata(pdev);
++
++	if (num_vfs)
++		return ice_pci_sriov_ena(pf, num_vfs);
++
++	if (!pci_vfs_assigned(pdev)) {
++		ice_free_vfs(pf);
++	} else {
++		dev_err(&pf->pdev->dev,
++			"can't free VFs because some are assigned to VMs.\n");
++		return -EBUSY;
++	}
++
++	return 0;
++}
+diff --git a/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+new file mode 100644
+index 000000000000..85c263a7494c
+--- /dev/null
++++ b/drivers/net/ethernet/intel/ice/ice_virtchnl_pf.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2018, Intel Corporation. */
++
++#ifndef _ICE_VIRTCHNL_PF_H_
++#define _ICE_VIRTCHNL_PF_H_
++#include "ice.h"
++
++/* Static VF transaction/status register def */
++#define VF_DEVICE_STATUS		0xAA
++#define VF_TRANS_PENDING_M		0x20
++
++/* Specific VF states */
++enum ice_vf_states {
++	ICE_VF_STATE_INIT = 0,
++	ICE_VF_STATE_ACTIVE,
++	ICE_VF_STATE_ENA,
++	ICE_VF_STATE_DIS,
++	ICE_VF_STATE_MC_PROMISC,
++	ICE_VF_STATE_UC_PROMISC,
++	/* state to indicate if PF needs to do vector assignment for VF.
++	 * This needs to be set during first time VF initialization or later
++	 * when VF asks for more Vectors through virtchnl OP.
++	 */
++	ICE_VF_STATE_CFG_INTR,
++	ICE_VF_STATES_NBITS
++};
++
++/* VF capabilities */
++enum ice_virtchnl_cap {
++	ICE_VIRTCHNL_VF_CAP_L2 = 0,
++	ICE_VIRTCHNL_VF_CAP_PRIVILEGE,
++};
++
++/* VF information structure */
++struct ice_vf {
++	struct ice_pf *pf;
++
++	s16 vf_id;			/* VF id in the PF space */
++	int first_vector_idx;		/* first vector index of this VF */
++	struct ice_sw *vf_sw_id;	/* switch id the VF VSIs connect to */
++	struct virtchnl_ether_addr dflt_lan_addr;
++	u16 port_vlan_id;
++	u8 trusted;
++	u16 lan_vsi_idx;		/* index into PF struct */
++	u16 lan_vsi_num;		/* ID as used by firmware */
++	unsigned long vf_caps;		/* vf's adv. capabilities */
++	DECLARE_BITMAP(vf_states, ICE_VF_STATES_NBITS);	/* VF runtime states */
++	u8 spoofchk;
++	u16 num_mac;
++	u16 num_vlan;
++};
++
++#ifdef CONFIG_PCI_IOV
++int ice_sriov_configure(struct pci_dev *pdev, int num_vfs);
++void ice_free_vfs(struct ice_pf *pf);
++bool ice_reset_all_vfs(struct ice_pf *pf, bool is_vflr);
++#else /* CONFIG_PCI_IOV */
++#define ice_free_vfs(pf) do {} while (0)
++
++static inline bool
++ice_reset_all_vfs(struct ice_pf __always_unused *pf,
++		  bool __always_unused is_vflr)
++{
++	return true;
++}
++
++static inline int
++ice_sriov_configure(struct pci_dev __always_unused *pdev,
++		    int __always_unused num_vfs)
++{
++	return -EOPNOTSUPP;
++}
++#endif /* CONFIG_PCI_IOV */
++#endif /* _ICE_VIRTCHNL_PF_H_ */
+-- 
+2.17.1
+
