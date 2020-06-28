@@ -1,0 +1,168 @@
+From 44ea4e67f5bd60f8b9b50d98373cf4ac6d201080 Mon Sep 17 00:00:00 2001
+From: Richard Gong <richard.gong@intel.com>
+Date: Mon, 28 Oct 2019 14:39:57 -0500
+Subject: [PATCH] firmware: Fix incompatible function behavior for RSU driver
+
+commit 0db046dab47734708a1fe2c3cb39820ef746f21a from
+https://github.com/altera-opensource/linux-socfpga.git
+
+[upstream commit fe366a203cefcf3030a04906312d0510bbf88a9a]
+
+The older versions of remote system update (RSU) firmware don't support
+retry and notify features then the kernel module dies when it queries
+the RSU retry counter or performs notify operation.
+
+Update the Intel service layer and RSU drivers to be compatible with
+all versions of RSU firmware.
+
+Reported-by: Radu Barcau <radu.bacrau@intel.com>
+Reported-by: kbuild test robot <lkp@intel.com>
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Signed-off-by: Meng Li <Meng.Li@windriver.com>
+---
+ drivers/firmware/stratix10-rsu.c              | 42 ++++++++-----------
+ drivers/firmware/stratix10-svc.c              | 18 +++++++-
+ .../firmware/intel/stratix10-svc-client.h     |  8 ++++
+ 3 files changed, 43 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/firmware/stratix10-rsu.c b/drivers/firmware/stratix10-rsu.c
+index 4a6c971fadd6..4bee01ce7f52 100644
+--- a/drivers/firmware/stratix10-rsu.c
++++ b/drivers/firmware/stratix10-rsu.c
+@@ -20,7 +20,6 @@
+ #define RSU_VERSION_MASK		GENMASK_ULL(63, 32)
+ #define RSU_ERROR_LOCATION_MASK		GENMASK_ULL(31, 0)
+ #define RSU_ERROR_DETAIL_MASK		GENMASK_ULL(63, 32)
+-#define RSU_FW_VERSION_MASK		GENMASK_ULL(15, 0)
+ 
+ #define RSU_TIMEOUT	(msecs_to_jiffies(SVC_RSU_REQUEST_TIMEOUT_MS))
+ 
+@@ -109,9 +108,12 @@ static void rsu_command_callback(struct stratix10_svc_client *client,
+ {
+ 	struct stratix10_rsu_priv *priv = client->priv;
+ 
+-	if (data->status != BIT(SVC_STATUS_RSU_OK))
+-		dev_err(client->dev, "RSU returned status is %i\n",
+-			data->status);
++	if (data->status == BIT(SVC_STATUS_RSU_NO_SUPPORT))
++		dev_warn(client->dev, "Secure FW doesn't support notify\n");
++	else if (data->status == BIT(SVC_STATUS_RSU_ERROR))
++		dev_err(client->dev, "Failure, returned status is %lu\n",
++			BIT(data->status));
++
+ 	complete(&priv->completion);
+ }
+ 
+@@ -131,9 +133,11 @@ static void rsu_retry_callback(struct stratix10_svc_client *client,
+ 
+ 	if (data->status == BIT(SVC_STATUS_RSU_OK))
+ 		priv->retry_counter = *counter;
++	else if (data->status == BIT(SVC_STATUS_RSU_NO_SUPPORT))
++		dev_warn(client->dev, "Secure FW doesn't support retry\n");
+ 	else
+-		dev_err(client->dev, "Failed to get retry counter %i\n",
+-			data->status);
++		dev_err(client->dev, "Failed to get retry counter %lu\n",
++			BIT(data->status));
+ 
+ 	complete(&priv->completion);
+ }
+@@ -331,15 +335,10 @@ static ssize_t notify_store(struct device *dev,
+ 		return ret;
+ 	}
+ 
+-	/* only 19.3 or late version FW supports retry counter feature */
+-	if (FIELD_GET(RSU_FW_VERSION_MASK, priv->status.version)) {
+-		ret = rsu_send_msg(priv, COMMAND_RSU_RETRY,
+-				   0, rsu_retry_callback);
+-		if (ret) {
+-			dev_err(dev,
+-				"Error, getting RSU retry %i\n", ret);
+-			return ret;
+-		}
++	ret = rsu_send_msg(priv, COMMAND_RSU_RETRY, 0, rsu_retry_callback);
++	if (ret) {
++		dev_err(dev, "Error, getting RSU retry %i\n", ret);
++		return ret;
+ 	}
+ 
+ 	return count;
+@@ -411,15 +410,10 @@ static int stratix10_rsu_probe(struct platform_device *pdev)
+ 		stratix10_svc_free_channel(priv->chan);
+ 	}
+ 
+-	/* only 19.3 or late version FW supports retry counter feature */
+-	if (FIELD_GET(RSU_FW_VERSION_MASK, priv->status.version)) {
+-		ret = rsu_send_msg(priv, COMMAND_RSU_RETRY, 0,
+-				   rsu_retry_callback);
+-		if (ret) {
+-			dev_err(dev,
+-				"Error, getting RSU retry %i\n", ret);
+-			stratix10_svc_free_channel(priv->chan);
+-		}
++	ret = rsu_send_msg(priv, COMMAND_RSU_RETRY, 0, rsu_retry_callback);
++	if (ret) {
++		dev_err(dev, "Error, getting RSU retry %i\n", ret);
++		stratix10_svc_free_channel(priv->chan);
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/firmware/stratix10-svc.c b/drivers/firmware/stratix10-svc.c
+index b485321189e1..c6c31402848d 100644
+--- a/drivers/firmware/stratix10-svc.c
++++ b/drivers/firmware/stratix10-svc.c
+@@ -493,8 +493,24 @@ static int svc_normal_to_secure_thread(void *data)
+ 			pdata->chan->scl->receive_cb(pdata->chan->scl, cbdata);
+ 			break;
+ 		default:
+-			pr_warn("it shouldn't happen\n");
++			pr_warn("Secure firmware doesn't support...\n");
++
++			/*
++			 * be compatible with older version firmware which
++			 * doesn't support RSU notify or retry
++			 */
++			if ((pdata->command == COMMAND_RSU_RETRY) ||
++				(pdata->command == COMMAND_RSU_NOTIFY)) {
++				cbdata->status =
++					BIT(SVC_STATUS_RSU_NO_SUPPORT);
++				cbdata->kaddr1 = NULL;
++				cbdata->kaddr2 = NULL;
++				cbdata->kaddr3 = NULL;
++				pdata->chan->scl->receive_cb(
++					pdata->chan->scl, cbdata);
++			}
+ 			break;
++
+ 		}
+ 	};
+ 
+diff --git a/include/linux/firmware/intel/stratix10-svc-client.h b/include/linux/firmware/intel/stratix10-svc-client.h
+index b6c4302a39e0..59bc6e2af693 100644
+--- a/include/linux/firmware/intel/stratix10-svc-client.h
++++ b/include/linux/firmware/intel/stratix10-svc-client.h
+@@ -41,6 +41,12 @@
+  *
+  * SVC_STATUS_RSU_OK:
+  * Secure firmware accepts the request of remote status update (RSU).
++ *
++ * SVC_STATUS_RSU_ERROR:
++ * Error encountered during remote system update.
++ *
++ * SVC_STATUS_RSU_NO_SUPPORT:
++ * Secure firmware doesn't support RSU retry or notify feature.
+  */
+ #define SVC_STATUS_RECONFIG_REQUEST_OK		0
+ #define SVC_STATUS_RECONFIG_BUFFER_SUBMITTED	1
+@@ -50,6 +56,8 @@
+ #define SVC_STATUS_RECONFIG_ERROR		5
+ #define SVC_STATUS_RSU_OK			6
+ #define SVC_STATUS_RSU_ERROR			7
++#define SVC_STATUS_RSU_NO_SUPPORT		8
++
+ /**
+  * Flag bit for COMMAND_RECONFIG
+  *
+-- 
+2.17.1
+
