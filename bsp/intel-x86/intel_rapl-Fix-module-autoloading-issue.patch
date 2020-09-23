@@ -1,0 +1,198 @@
+From 130f2db82e7e8826686f556f3c86888d788e309a Mon Sep 17 00:00:00 2001
+From: Zhang Rui <rui.zhang@intel.com>
+Date: Wed, 10 Jul 2019 21:44:34 +0800
+Subject: [PATCH 12/12] intel_rapl: Fix module autoloading issue
+
+commit abcfaeb3f5dc8bded4ba446eb2fb017a7a41d9bc upstream.
+
+intel_rapl driver used to have a list of cpuids, which is used to
+1. check if the processor support RAPL MSRs
+2. do some cpu model specific setting
+3. module autoloading
+
+Now, the cpu model specific setting are moved to intel_rapl_common.c as
+part of the common code, because the setup is also needed by RAPL MMIO
+interface on those platforms.
+But removing the cpuid list from intel_rapl MSR interface driver results
+in that the driver can not be loaded automatically.
+
+Maintaining another copy of the cpuid list in intel_rapl_msr.c does not make
+sense because it increases the complexity when enabling RAPL support on a
+new cpu model.
+
+Fix the problem by creating an "intel_rapl_msr" platform device in the
+common code, and make RAPL MSR interface driver (intel_rapl_msr.c) probe the
+platform device directly.
+
+Reviewed-by: Pandruvada, Srinivas <srinivas.pandruvada@intel.com>
+Tested-by: Pandruvada, Srinivas <srinivas.pandruvada@intel.com>
+Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/powercap/intel_rapl_common.c | 45 +++++++++++++++++-----------
+ drivers/powercap/intel_rapl_msr.c    | 24 ++++++++++++---
+ 2 files changed, 48 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/powercap/intel_rapl_common.c b/drivers/powercap/intel_rapl_common.c
+index 5e53a3dca605..f122bfc5e075 100644
+--- a/drivers/powercap/intel_rapl_common.c
++++ b/drivers/powercap/intel_rapl_common.c
+@@ -18,10 +18,11 @@
+ #include <linux/cpu.h>
+ #include <linux/powercap.h>
+ #include <linux/suspend.h>
+-#include <asm/iosf_mbi.h>
+ #include <linux/intel_rapl.h>
+-
+ #include <linux/processor.h>
++#include <linux/platform_device.h>
++
++#include <asm/iosf_mbi.h>
+ #include <asm/cpu_device_id.h>
+ #include <asm/intel-family.h>
+ 
+@@ -136,8 +137,6 @@ static int rapl_write_data_raw(struct rapl_domain *rd,
+ static u64 rapl_unit_xlate(struct rapl_domain *rd,
+ 			   enum unit_type type, u64 value, int to_raw);
+ static void package_power_limit_irq_save(struct rapl_package *rp);
+-static int rapl_init_core(void);
+-static void rapl_remove_core(void);
+ 
+ static LIST_HEAD(rapl_packages);	/* guarded by CPU hotplug lock */
+ 
+@@ -1261,8 +1260,6 @@ void rapl_remove_package(struct rapl_package *rp)
+ 	powercap_unregister_zone(rp->priv->control_type,
+ 				 &rd_package->power_zone);
+ 	list_del(&rp->plist);
+-	if (list_empty(&rapl_packages))
+-		rapl_remove_core();
+ 	kfree(rp);
+ }
+ EXPORT_SYMBOL_GPL(rapl_remove_package);
+@@ -1291,10 +1288,6 @@ struct rapl_package *rapl_add_package(int cpu, struct rapl_if_priv *priv)
+ 	struct cpuinfo_x86 *c = &cpu_data(cpu);
+ 	int ret;
+ 
+-	ret = rapl_init_core();
+-	if (ret)
+-		return ERR_PTR(ret);
+-
+ 	rp = kzalloc(sizeof(struct rapl_package), GFP_KERNEL);
+ 	if (!rp)
+ 		return ERR_PTR(-ENOMEM);
+@@ -1412,14 +1405,13 @@ static struct notifier_block rapl_pm_notifier = {
+ 	.notifier_call = rapl_pm_callback,
+ };
+ 
+-static int rapl_init_core(void)
++static struct platform_device *rapl_msr_platdev;
++
++static int __init rapl_init(void)
+ {
+ 	const struct x86_cpu_id *id;
+ 	int ret;
+ 
+-	if (rapl_defaults)
+-		return 0;
+-
+ 	id = x86_match_cpu(rapl_ids);
+ 	if (!id) {
+ 		pr_err("driver does not support CPU family %d model %d\n",
+@@ -1431,16 +1423,35 @@ static int rapl_init_core(void)
+ 	rapl_defaults = (struct rapl_defaults *)id->driver_data;
+ 
+ 	ret = register_pm_notifier(&rapl_pm_notifier);
++	if (ret)
++		return ret;
+ 
+-	return 0;
++	rapl_msr_platdev = platform_device_alloc("intel_rapl_msr", 0);
++	if (!rapl_msr_platdev) {
++		ret = -ENOMEM;
++		goto end;
++	}
++
++	ret = platform_device_add(rapl_msr_platdev);
++	if (ret)
++		platform_device_put(rapl_msr_platdev);
++
++end:
++	if (ret)
++		unregister_pm_notifier(&rapl_pm_notifier);
++
++	return ret;
+ }
+ 
+-static void rapl_remove_core(void)
++static void __exit rapl_exit(void)
+ {
++	platform_device_unregister(rapl_msr_platdev);
+ 	unregister_pm_notifier(&rapl_pm_notifier);
+-	rapl_defaults = NULL;
+ }
+ 
++module_init(rapl_init);
++module_exit(rapl_exit);
++
+ MODULE_DESCRIPTION("Intel Runtime Average Power Limit (RAPL) common code");
+ MODULE_AUTHOR("Jacob Pan <jacob.jun.pan@intel.com>");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/powercap/intel_rapl_msr.c b/drivers/powercap/intel_rapl_msr.c
+index bc14a4579acb..d5487965bdfe 100644
+--- a/drivers/powercap/intel_rapl_msr.c
++++ b/drivers/powercap/intel_rapl_msr.c
+@@ -20,6 +20,7 @@
+ #include <linux/suspend.h>
+ #include <linux/intel_rapl.h>
+ #include <linux/processor.h>
++#include <linux/platform_device.h>
+ 
+ #include <asm/iosf_mbi.h>
+ #include <asm/cpu_device_id.h>
+@@ -122,7 +123,7 @@ static int rapl_msr_write_raw(int cpu, struct reg_action *ra)
+ 	return ra->err;
+ }
+ 
+-static int __init rapl_msr_init(void)
++static int rapl_msr_probe(struct platform_device *pdev)
+ {
+ 	int ret;
+ 
+@@ -152,15 +153,30 @@ static int __init rapl_msr_init(void)
+ 	return ret;
+ }
+ 
+-static void __exit rapl_msr_exit(void)
++static int rapl_msr_remove(struct platform_device *pdev)
+ {
+ 	cpuhp_remove_state(rapl_msr_priv.pcap_rapl_online);
+ 	rapl_remove_platform_domain(&rapl_msr_priv);
+ 	powercap_unregister_control_type(rapl_msr_priv.control_type);
++	return 0;
+ }
+ 
+-module_init(rapl_msr_init);
+-module_exit(rapl_msr_exit);
++static const struct platform_device_id rapl_msr_ids[] = {
++	{ .name = "intel_rapl_msr", },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, rapl_msr_ids);
++
++static struct platform_driver intel_rapl_msr_driver = {
++	.probe = rapl_msr_probe,
++	.remove = rapl_msr_remove,
++	.id_table = rapl_msr_ids,
++	.driver = {
++		.name = "intel_rapl_msr",
++	},
++};
++
++module_platform_driver(intel_rapl_msr_driver);
+ 
+ MODULE_DESCRIPTION("Driver for Intel RAPL (Running Average Power Limit) control via MSR interface");
+ MODULE_AUTHOR("Zhang Rui <rui.zhang@intel.com>");
+-- 
+2.17.1
+
