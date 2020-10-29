@@ -1,0 +1,275 @@
+From 3f9c375f7c7f75f9ae7a215c9a69ec51f72490d6 Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Tue, 1 Sep 2020 12:49:27 +0530
+Subject: [PATCH 16/22] octeontx2-bphy-netdev: Added ioctl to set low level
+ link state
+
+This patch adds ioctl support to set the low level link state
+of RFOE and CPRI links from ODP BPHY application. The initial
+link state of thse links are not known to the netdev driver, so
+the low level link is set to RUNNING state upon intf bring UP.
+The ODP application must poll the actual link state and pass
+the information to the netdev driver.
+
+Change-Id: I895db31bb0c11a6824cebc5b95baae04585f2b94
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/38228
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ .../marvell/octeontx2/bphy/otx2_bphy.h        |   9 ++
+ .../marvell/octeontx2/bphy/otx2_bphy_main.c   | 102 ++++++++++++++++++
+ .../marvell/octeontx2/bphy/otx2_cpri.c        |   3 +
+ .../marvell/octeontx2/bphy/otx2_cpri.h        |   7 ++
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        |   3 +
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        |   7 ++
+ 6 files changed, 131 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
+index 5a2916ad9894..fa00f245b97f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
+@@ -48,11 +48,20 @@ extern void __iomem *cpri_reg_base;
+ 					     struct bcn_sec_offset_cfg)
+ #define OTX2_RFOE_IOCTL_MODE_CPRI	_IOW(OTX2_RFOE_IOCTL_BASE, 0x06, \
+ 					     int)
++#define OTX2_RFOE_IOCTL_LINK_EVENT	_IOW(OTX2_RFOE_IOCTL_BASE, 0x07, \
++					     struct otx2_rfoe_link_event)
++#define OTX2_CPRI_IOCTL_LINK_EVENT	_IOW(OTX2_RFOE_IOCTL_BASE, 0x08, \
++					     struct otx2_cpri_link_event)
+ 
+ //#define ASIM		/* ASIM environment */
+ 
+ #define OTX2_BPHY_MHAB_INST		3
+ 
++enum port_link_state {
++	LINK_STATE_DOWN,
++	LINK_STATE_UP,
++};
++
+ /* char driver private data */
+ struct otx2_bphy_cdev_priv {
+ 	struct device			*dev;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+index 1691933c9d4f..b7e6c5ad0764 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+@@ -354,6 +354,108 @@ static long otx2_bphy_cdev_ioctl(struct file *filp, unsigned int cmd,
+ 		ret = 0;
+ 		goto out;
+ 	}
++	case OTX2_RFOE_IOCTL_LINK_EVENT:
++	{
++		struct otx2_rfoe_drv_ctx *drv_ctx = NULL;
++		struct otx2_rfoe_ndev_priv *priv;
++		struct otx2_rfoe_link_event cfg;
++		struct net_device *netdev;
++		int idx;
++
++		if (!cdev->odp_intf_cfg) {
++			dev_info(cdev->dev, "odp interface cfg is not done\n");
++			ret = -EBUSY;
++			goto out;
++		}
++		if (copy_from_user(&cfg, (void __user *)arg,
++				   sizeof(struct otx2_rfoe_link_event))) {
++			dev_err(cdev->dev, "copy from user fault\n");
++			ret = -EFAULT;
++			goto out;
++		}
++		for (idx = 0; idx < RFOE_MAX_INTF; idx++) {
++			drv_ctx = &rfoe_drv_ctx[idx];
++			if (drv_ctx->valid &&
++			    drv_ctx->rfoe_num == cfg.rfoe_num &&
++			    drv_ctx->lmac_id == cfg.lmac_id)
++				break;
++		}
++		if (idx >= RFOE_MAX_INTF) {
++			dev_err(cdev->dev, "drv ctx not found\n");
++			ret = -EINVAL;
++			goto out;
++		}
++		netdev = drv_ctx->netdev;
++		priv = netdev_priv(netdev);
++		if (priv->link_state != cfg.link_state) {
++			if (cfg.link_state == LINK_STATE_DOWN) {
++				netdev_info(netdev, "Link DOWN\n");
++				netif_carrier_off(netdev);
++				netif_stop_queue(netdev);
++				set_bit(RFOE_INTF_DOWN, &priv->state);
++				priv->link_state = 0;
++			} else {
++				netdev_info(netdev, "Link UP\n");
++				netif_carrier_on(netdev);
++				netif_start_queue(netdev);
++				clear_bit(RFOE_INTF_DOWN, &priv->state);
++				priv->link_state = 1;
++			}
++		}
++		ret = 0;
++		goto out;
++	}
++	case OTX2_CPRI_IOCTL_LINK_EVENT:
++	{
++		struct otx2_cpri_drv_ctx *drv_ctx = NULL;
++		struct otx2_cpri_ndev_priv *priv;
++		struct otx2_cpri_link_event cfg;
++		struct net_device *netdev;
++		int idx;
++
++		if (!cdev->odp_intf_cfg) {
++			dev_info(cdev->dev, "odp interface cfg is not done\n");
++			ret = -EBUSY;
++			goto out;
++		}
++		if (copy_from_user(&cfg, (void __user *)arg,
++				   sizeof(struct otx2_cpri_link_event))) {
++			dev_err(cdev->dev, "copy from user fault\n");
++			ret = -EFAULT;
++			goto out;
++		}
++		for (idx = 0; idx < OTX2_BPHY_CPRI_MAX_INTF; idx++) {
++			drv_ctx = &cpri_drv_ctx[idx];
++			if (drv_ctx->valid &&
++			    drv_ctx->cpri_num == cfg.cpri_num &&
++			    drv_ctx->lmac_id == cfg.lmac_id)
++				break;
++		}
++		if (idx >= OTX2_BPHY_CPRI_MAX_INTF) {
++			dev_err(cdev->dev, "drv ctx not found\n");
++			ret = -EINVAL;
++			goto out;
++		}
++		netdev = drv_ctx->netdev;
++		priv = netdev_priv(netdev);
++		if (priv->link_state != cfg.link_state) {
++			if (cfg.link_state == LINK_STATE_DOWN) {
++				netdev_info(netdev, "Link DOWN\n");
++				netif_carrier_off(netdev);
++				netif_stop_queue(netdev);
++				set_bit(CPRI_INTF_DOWN, &priv->state);
++				priv->link_state = 0;
++			} else {
++				netdev_info(netdev, "Link UP\n");
++				netif_carrier_on(netdev);
++				netif_start_queue(netdev);
++				clear_bit(CPRI_INTF_DOWN, &priv->state);
++				priv->link_state = 1;
++			}
++		}
++		ret = 0;
++		goto out;
++	}
+ 	default:
+ 	{
+ 		dev_info(cdev->dev, "ioctl: no match\n");
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
+index a56397916950..de027ad28d43 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
+@@ -430,6 +430,7 @@ static int otx2_cpri_eth_open(struct net_device *netdev)
+ 	netif_start_queue(netdev);
+ 
+ 	clear_bit(CPRI_INTF_DOWN, &priv->state);
++	priv->link_state = 1;
+ 
+ 	return 0;
+ }
+@@ -444,6 +445,7 @@ static int otx2_cpri_eth_stop(struct net_device *netdev)
+ 
+ 	netif_stop_queue(netdev);
+ 	netif_carrier_off(netdev);
++	priv->link_state = 0;
+ 
+ 	napi_disable(&priv->napi);
+ 
+@@ -598,6 +600,7 @@ int otx2_cpri_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 			netif_carrier_off(netdev);
+ 			netif_stop_queue(netdev);
+ 			set_bit(CPRI_INTF_DOWN, &priv->state);
++			priv->link_state = 0;
+ 
+ 			/* initialize global ctx */
+ 			drv_ctx = &cpri_drv_ctx[intf_idx];
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
+index d62fc045b189..15aa206b1eef 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
+@@ -96,6 +96,12 @@ struct cpri_common_cfg {
+ 	struct ul_cbuf_cfg		ul_cfg;
+ };
+ 
++struct otx2_cpri_link_event {
++	u8				cpri_num;
++	u8				lmac_id;
++	u8				link_state;
++};
++
+ /* cpri netdev priv */
+ struct otx2_cpri_ndev_priv {
+ 	u8				cpri_num;
+@@ -115,6 +121,7 @@ struct otx2_cpri_ndev_priv {
+ 	/* priv lock */
+ 	spinlock_t			lock;
+ 	int				if_type;
++	u8				link_state;
+ };
+ 
+ int otx2_cpri_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index 99a09465ef57..bc8cc278db34 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -1021,6 +1021,7 @@ static int otx2_rfoe_eth_open(struct net_device *netdev)
+ 	netif_start_queue(netdev);
+ 
+ 	clear_bit(RFOE_INTF_DOWN, &priv->state);
++	priv->link_state = 1;
+ 
+ 	return 0;
+ }
+@@ -1037,6 +1038,7 @@ static int otx2_rfoe_eth_stop(struct net_device *netdev)
+ 
+ 	netif_stop_queue(netdev);
+ 	netif_carrier_off(netdev);
++	priv->link_state = 0;
+ 
+ 	for (idx = 0; idx < PACKET_TYPE_MAX; idx++) {
+ 		if (!(priv->pkt_type_mask & (1U << idx)))
+@@ -1332,6 +1334,7 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 			netif_carrier_off(netdev);
+ 			netif_stop_queue(netdev);
+ 			set_bit(RFOE_INTF_DOWN, &priv->state);
++			priv->link_state = 0;
+ 
+ 			/* initialize global ctx */
+ 			drv_ctx = &rfoe_drv_ctx[intf_idx];
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index 843c77161207..6a2e0d0ce47a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -239,6 +239,12 @@ struct ptp_bcn_off_cfg {
+ 	spinlock_t			lock;
+ };
+ 
++struct otx2_rfoe_link_event {
++	u8				rfoe_num;
++	u8				lmac_id;
++	u8				link_state;
++};
++
+ /* netdev priv */
+ struct otx2_rfoe_ndev_priv {
+ 	u8				rfoe_num;
+@@ -273,6 +279,7 @@ struct otx2_rfoe_ndev_priv {
+ 	struct ptp_bcn_off_cfg		*ptp_cfg;
+ 	s32				sec_bcn_offset;
+ 	int				if_type;
++	u8				link_state;
+ };
+ 
+ void otx2_rfoe_rx_napi_schedule(int rfoe_num, u32 status);
+-- 
+2.17.1
+
