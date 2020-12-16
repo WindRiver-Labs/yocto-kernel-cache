@@ -1,0 +1,235 @@
+From 5059a2e34ccb10eae967a75859f1b0a8f96c2163 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Fri, 4 Jan 2019 12:56:09 -0800
+Subject: [PATCH 2/6] make 'user_access_begin()' do 'access_ok()'
+
+commit 594cc251fdd0d231d342d88b2fdff4bc42fb0690 upstream.
+
+Originally, the rule used to be that you'd have to do access_ok()
+separately, and then user_access_begin() before actually doing the
+direct (optimized) user access.
+
+But experience has shown that people then decide not to do access_ok()
+at all, and instead rely on it being implied by other operations or
+similar.  Which makes it very hard to verify that the access has
+actually been range-checked.
+
+If you use the unsafe direct user accesses, hardware features (either
+SMAP - Supervisor Mode Access Protection - on x86, or PAN - Privileged
+Access Never - on ARM) do force you to use user_access_begin().  But
+nothing really forces the range check.
+
+By putting the range check into user_access_begin(), we actually force
+people to do the right thing (tm), and the range check vill be visible
+near the actual accesses.  We have way too long a history of people
+trying to avoid them.
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Miles Chen <miles.chen@mediatek.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[OP: - backport of 216284c4a126 from 4.19.y branch of linux-stable
+     - adjusted context for kernel version 4.18
+     - add VERIFY_WRITE parameter to user_access_begin() in fs/readdir.c]
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+---
+ arch/x86/include/asm/uaccess.h             | 12 +++++++++++-
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c | 16 ++++++++++++++--
+ fs/readdir.c                               |  4 ++--
+ include/linux/uaccess.h                    |  2 +-
+ kernel/compat.c                            |  6 ++----
+ kernel/exit.c                              |  6 ++----
+ lib/strncpy_from_user.c                    |  9 +++++----
+ lib/strnlen_user.c                         |  9 +++++----
+ 8 files changed, 42 insertions(+), 22 deletions(-)
+
+diff --git a/arch/x86/include/asm/uaccess.h b/arch/x86/include/asm/uaccess.h
+index 8f14e4983db9..ce95f7e35a49 100644
+--- a/arch/x86/include/asm/uaccess.h
++++ b/arch/x86/include/asm/uaccess.h
+@@ -710,7 +710,17 @@ extern struct movsl_mask {
+  * checking before using them, but you have to surround them with the
+  * user_access_begin/end() pair.
+  */
+-#define user_access_begin()	__uaccess_begin()
++static __must_check inline bool user_access_begin(int type,
++						  const void __user *ptr,
++						  size_t len)
++{
++	if (unlikely(!access_ok(type, ptr, len)))
++		return 0;
++	__uaccess_begin();
++	return 1;
++}
++
++#define user_access_begin(a, b, c)	user_access_begin(a, b, c)
+ #define user_access_end()	__uaccess_end()
+ 
+ #define unsafe_put_user(x, ptr, err_label)					\
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index b43bc767ec3d..0bb830f9ca60 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1592,7 +1592,9 @@ static int eb_copy_relocations(const struct i915_execbuffer *eb)
+ 		 * happened we would make the mistake of assuming that the
+ 		 * relocations were valid.
+ 		 */
+-		user_access_begin();
++		if (!user_access_begin(VERIFY_WRITE, urelocs, size))
++			goto end_user;
++
+ 		for (copied = 0; copied < nreloc; copied++)
+ 			unsafe_put_user(-1,
+ 					&urelocs[copied].presumed_offset,
+@@ -2646,7 +2648,17 @@ i915_gem_execbuffer2_ioctl(struct drm_device *dev, void *data,
+ 		unsigned int i;
+ 
+ 		/* Copy the new buffer offsets back to the user's exec list. */
+-		user_access_begin();
++		/*
++		 * Note: count * sizeof(*user_exec_list) does not overflow,
++		 * because we checked 'count' in check_buffer_count().
++		 *
++		 * And this range already got effectively checked earlier
++		 * when we did the "copy_from_user()" above.
++		 */
++		if (!user_access_begin(VERIFY_WRITE, user_exec_list,
++				       count * sizeof(*user_exec_list)))
++			goto end_user;
++
+ 		for (i = 0; i < args->buffer_count; i++) {
+ 			if (!(exec2_list[i].offset & UPDATE))
+ 				continue;
+diff --git a/fs/readdir.c b/fs/readdir.c
+index 0c0ad26b7484..3c39deed6f2c 100644
+--- a/fs/readdir.c
++++ b/fs/readdir.c
+@@ -240,7 +240,7 @@ static int filldir(struct dir_context *ctx, const char *name, int namlen,
+ 	 * Note! This range-checks 'previous' (which may be NULL).
+ 	 * The real range was checked in getdents
+ 	 */
+-	if (!user_access_begin(dirent, sizeof(*dirent)))
++	if (!user_access_begin(VERIFY_WRITE, dirent, sizeof(*dirent)))
+ 		goto efault;
+ 	if (dirent)
+ 		unsafe_put_user(offset, &dirent->d_off, efault_end);
+@@ -327,7 +327,7 @@ static int filldir64(struct dir_context *ctx, const char *name, int namlen,
+ 	 * Note! This range-checks 'previous' (which may be NULL).
+ 	 * The real range was checked in getdents
+ 	 */
+-	if (!user_access_begin(dirent, sizeof(*dirent)))
++	if (!user_access_begin(VERIFY_WRITE, dirent, sizeof(*dirent)))
+ 		goto efault;
+ 	if (dirent)
+ 		unsafe_put_user(offset, &dirent->d_off, efault_end);
+diff --git a/include/linux/uaccess.h b/include/linux/uaccess.h
+index 0d9619a14090..42f96eab1007 100644
+--- a/include/linux/uaccess.h
++++ b/include/linux/uaccess.h
+@@ -267,7 +267,7 @@ extern long strncpy_from_unsafe(char *dst, const void *unsafe_addr, long count);
+ 	probe_kernel_read(&retval, addr, sizeof(retval))
+ 
+ #ifndef user_access_begin
+-#define user_access_begin() do { } while (0)
++#define user_access_begin(type, ptr, len) access_ok(type, ptr, len)
+ #define user_access_end() do { } while (0)
+ #define unsafe_op_wrap(op, err) do { if (unlikely(op)) goto err; } while (0)
+ #define unsafe_get_user(x,p,e) unsafe_op_wrap(__get_user(x,p),e)
+diff --git a/kernel/compat.c b/kernel/compat.c
+index 702aa846ddac..66b13dd82c24 100644
+--- a/kernel/compat.c
++++ b/kernel/compat.c
+@@ -383,10 +383,9 @@ long compat_get_bitmap(unsigned long *mask, const compat_ulong_t __user *umask,
+ 	bitmap_size = ALIGN(bitmap_size, BITS_PER_COMPAT_LONG);
+ 	nr_compat_longs = BITS_TO_COMPAT_LONGS(bitmap_size);
+ 
+-	if (!access_ok(VERIFY_READ, umask, bitmap_size / 8))
++	if (!user_access_begin(VERIFY_READ, umask, bitmap_size / 8))
+ 		return -EFAULT;
+ 
+-	user_access_begin();
+ 	while (nr_compat_longs > 1) {
+ 		compat_ulong_t l1, l2;
+ 		unsafe_get_user(l1, umask++, Efault);
+@@ -413,10 +412,9 @@ long compat_put_bitmap(compat_ulong_t __user *umask, unsigned long *mask,
+ 	bitmap_size = ALIGN(bitmap_size, BITS_PER_COMPAT_LONG);
+ 	nr_compat_longs = BITS_TO_COMPAT_LONGS(bitmap_size);
+ 
+-	if (!access_ok(VERIFY_WRITE, umask, bitmap_size / 8))
++	if (!user_access_begin(VERIFY_WRITE, umask, bitmap_size / 8))
+ 		return -EFAULT;
+ 
+-	user_access_begin();
+ 	while (nr_compat_longs > 1) {
+ 		unsigned long m = *mask++;
+ 		unsafe_put_user((compat_ulong_t)m, umask++, Efault);
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 5f0e1fb0f37c..92a98592bf6b 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -1619,10 +1619,9 @@ SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
+ 	if (!infop)
+ 		return err;
+ 
+-	if (!access_ok(VERIFY_WRITE, infop, sizeof(*infop)))
++	if (!user_access_begin(VERIFY_WRITE, infop, sizeof(*infop)))
+ 		return -EFAULT;
+ 
+-	user_access_begin();
+ 	unsafe_put_user(signo, &infop->si_signo, Efault);
+ 	unsafe_put_user(0, &infop->si_errno, Efault);
+ 	unsafe_put_user(info.cause, &infop->si_code, Efault);
+@@ -1747,10 +1746,9 @@ COMPAT_SYSCALL_DEFINE5(waitid,
+ 	if (!infop)
+ 		return err;
+ 
+-	if (!access_ok(VERIFY_WRITE, infop, sizeof(*infop)))
++	if (!user_access_begin(VERIFY_WRITE, infop, sizeof(*infop)))
+ 		return -EFAULT;
+ 
+-	user_access_begin();
+ 	unsafe_put_user(signo, &infop->si_signo, Efault);
+ 	unsafe_put_user(0, &infop->si_errno, Efault);
+ 	unsafe_put_user(info.cause, &infop->si_code, Efault);
+diff --git a/lib/strncpy_from_user.c b/lib/strncpy_from_user.c
+index e304b54c9c7d..b8570a11776d 100644
+--- a/lib/strncpy_from_user.c
++++ b/lib/strncpy_from_user.c
+@@ -115,10 +115,11 @@ long strncpy_from_user(char *dst, const char __user *src, long count)
+ 
+ 		kasan_check_write(dst, count);
+ 		check_object_size(dst, count, false);
+-		user_access_begin();
+-		retval = do_strncpy_from_user(dst, src, count, max);
+-		user_access_end();
+-		return retval;
++		if (user_access_begin(VERIFY_READ, src, max)) {
++			retval = do_strncpy_from_user(dst, src, count, max);
++			user_access_end();
++			return retval;
++		}
+ 	}
+ 	return -EFAULT;
+ }
+diff --git a/lib/strnlen_user.c b/lib/strnlen_user.c
+index 184f80f7bacf..f5fa5b266ea2 100644
+--- a/lib/strnlen_user.c
++++ b/lib/strnlen_user.c
+@@ -114,10 +114,11 @@ long strnlen_user(const char __user *str, long count)
+ 		unsigned long max = max_addr - src_addr;
+ 		long retval;
+ 
+-		user_access_begin();
+-		retval = do_strnlen_user(str, count, max);
+-		user_access_end();
+-		return retval;
++		if (user_access_begin(VERIFY_READ, str, max)) {
++			retval = do_strnlen_user(str, count, max);
++			user_access_end();
++			return retval;
++		}
+ 	}
+ 	return 0;
+ }
+-- 
+2.26.1
+
