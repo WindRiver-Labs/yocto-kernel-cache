@@ -1,0 +1,105 @@
+From 305db78e33f2ba069efa6733f7c8f481972812ab Mon Sep 17 00:00:00 2001
+From: He Zhe <zhe.he@windriver.com>
+Date: Fri, 5 Jun 2020 16:32:18 +0800
+Subject: [PATCH] eventfd: Enlarge recursion limit to allow vhost to work
+
+commit 85f0a97f3aac6bb2c9549af607843644dd2ef5c7 upstream [linux-yocto]
+
+Upstream link: https://lore.kernel.org/lkml/20200410114720.24838-1-zhe.he@windriver.com/
+
+commit b5e683d5cab8 ("eventfd: track eventfd_signal() recursion depth")
+introduces a percpu counter that tracks the percpu recursion depth and
+warn if it greater than zero, to avoid potential deadlock and stack
+overflow.
+
+However sometimes different eventfds may be used in parallel. Specifically,
+when heavy network load goes through kvm and vhost, working as below, it
+would trigger the following call trace.
+
+-  100.00%
+   - 66.51%
+        ret_from_fork
+        kthread
+      - vhost_worker
+         - 33.47% handle_tx_kick
+              handle_tx
+              handle_tx_copy
+              vhost_tx_batch.isra.0
+              vhost_add_used_and_signal_n
+              eventfd_signal
+         - 33.05% handle_rx_net
+              handle_rx
+              vhost_add_used_and_signal_n
+              eventfd_signal
+   - 33.49%
+        ioctl
+        entry_SYSCALL_64_after_hwframe
+        do_syscall_64
+        __x64_sys_ioctl
+        ksys_ioctl
+        do_vfs_ioctl
+        kvm_vcpu_ioctl
+        kvm_arch_vcpu_ioctl_run
+        vmx_handle_exit
+        handle_ept_misconfig
+        kvm_io_bus_write
+        __kvm_io_bus_write
+        eventfd_signal
+
+001: WARNING: CPU: 1 PID: 1503 at fs/eventfd.c:73 eventfd_signal+0x85/0xa0
+---- snip ----
+001: Call Trace:
+001:  vhost_signal+0x15e/0x1b0 [vhost]
+001:  vhost_add_used_and_signal_n+0x2b/0x40 [vhost]
+001:  handle_rx+0xb9/0x900 [vhost_net]
+001:  handle_rx_net+0x15/0x20 [vhost_net]
+001:  vhost_worker+0xbe/0x120 [vhost]
+001:  kthread+0x106/0x140
+001:  ? log_used.part.0+0x20/0x20 [vhost]
+001:  ? kthread_park+0x90/0x90
+001:  ret_from_fork+0x35/0x40
+001: ---[ end trace 0000000000000003 ]---
+
+This patch enlarges the limit to 1 which is the maximum recursion depth we
+have found so far.
+
+Signed-off-by: He Zhe <zhe.he@windriver.com>
+Signed-off-by: Bruce Ashfield <bruce.ashfield@gmail.com>
+[CE: backport of 85f0a97f3aac from v5.4 branch of linux-yocto]
+Signed-off-by: Catalin Enache <catalin.enache@windriver.com>
+---
+ fs/eventfd.c            | 3 ++-
+ include/linux/eventfd.h | 3 +++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/fs/eventfd.c b/fs/eventfd.c
+index 78e41c7c3d05..8b9bd6fb08cd 100644
+--- a/fs/eventfd.c
++++ b/fs/eventfd.c
+@@ -70,7 +70,8 @@ __u64 eventfd_signal(struct eventfd_ctx *ctx, __u64 n)
+ 	 * it returns true, the eventfd_signal() call should be deferred to a
+ 	 * safe context.
+ 	 */
+-	if (WARN_ON_ONCE(this_cpu_read(eventfd_wake_count)))
++	if (WARN_ON_ONCE(this_cpu_read(eventfd_wake_count) >
++	    EFD_WAKE_COUNT_MAX))
+ 		return 0;
+ 
+ 	spin_lock_irqsave(&ctx->wqh.lock, flags);
+diff --git a/include/linux/eventfd.h b/include/linux/eventfd.h
+index dc4fd8a6644d..e7684d768e3f 100644
+--- a/include/linux/eventfd.h
++++ b/include/linux/eventfd.h
+@@ -29,6 +29,9 @@
+ #define EFD_SHARED_FCNTL_FLAGS (O_CLOEXEC | O_NONBLOCK)
+ #define EFD_FLAGS_SET (EFD_SHARED_FCNTL_FLAGS | EFD_SEMAPHORE)
+ 
++/* This is the maximum recursion depth we find so far */
++#define EFD_WAKE_COUNT_MAX 1
++
+ struct eventfd_ctx;
+ struct file;
+ 
+-- 
+2.26.1
+
