@@ -1,0 +1,159 @@
+From 4ca145aa10a6b726b94fb9cf27e6280856204120 Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Fri, 29 Jan 2021 21:47:00 +0530
+Subject: [PATCH 09/11] octeontx2-bphy-netdev: Add timeout to ptp transmit
+ timestamp polling
+
+commit fc7200902365ac842960cbb5660bea61f3c72dec from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+When there is any error due to which PTP transmit timestamp
+is not updated by hardware, the code indefinitely checks for
+timestamp valid bit to be set which will be never set. This
+stalls the PTP queue processing in the driver. This patch adds
+a timeout when checking the valid bit. Also added ethtool stats
+to display the stats of ptp timestamp polling timeout.
+
+Change-Id: I6504c4866bb5eca8283f1db04df84c91f850e6ad
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/45131
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        | 78 +++++++++++--------
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        |  1 +
+ .../octeontx2/bphy/otx2_rfoe_ethtool.c        |  1 +
+ 3 files changed, 47 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index 6a7e24441d2c..96dda9be88dd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -317,6 +317,8 @@ static void otx2_rfoe_ptp_submit_work(struct work_struct *work)
+ 	spin_unlock_irqrestore(&job_cfg->lock, flags);
+ }
+ 
++#define OTX2_RFOE_PTP_TSTMP_POLL_CNT	100
++
+ /* ptp interrupt processing bottom half */
+ static void otx2_rfoe_ptp_tx_work(struct work_struct *work)
+ {
+@@ -326,6 +328,7 @@ static void otx2_rfoe_ptp_tx_work(struct work_struct *work)
+ 	struct skb_shared_hwtstamps ts;
+ 	u64 timestamp, tstmp_w1;
+ 	u16 jobid;
++	int cnt;
+ 
+ 	if (!priv->ptp_tx_skb) {
+ 		netif_err(priv, tx_done, priv->netdev,
+@@ -333,40 +336,49 @@ static void otx2_rfoe_ptp_tx_work(struct work_struct *work)
+ 		goto submit_next_req;
+ 	}
+ 
+-	/* read RFOE(0..2)_TX_PTP_TSTMP_W1(0..3) */
+-	tstmp_w1 = readq(priv->rfoe_reg_base +
+-			 RFOEX_TX_PTP_TSTMP_W1(priv->rfoe_num, priv->lmac_id));
+-
+-	/* check valid bit */
+-	if (tstmp_w1 & (1ULL << 63)) {
+-		/* check err or drop condition */
+-		if ((tstmp_w1 & (1ULL << 21)) || (tstmp_w1 & (1ULL << 20))) {
+-			netif_err(priv, tx_done, priv->netdev,
+-				  "ptp timestamp error tstmp_w1=0x%llx\n",
+-				  tstmp_w1);
+-			goto submit_next_req;
+-		}
+-		/* match job id */
+-		jobid = (tstmp_w1 >> 4) & 0xffff;
+-		if (jobid != priv->ptp_job_tag) {
+-			netif_err(priv, tx_done, priv->netdev,
+-				  "ptp job id doesn't match, tstmp_w1->job_id=0x%x skb->job_tag=0x%x\n",
+-				  jobid, priv->ptp_job_tag);
+-			goto submit_next_req;
+-		}
+-		/* update timestamp value in skb */
+-		timestamp = readq(priv->rfoe_reg_base +
+-				  RFOEX_TX_PTP_TSTMP_W0(priv->rfoe_num,
+-							priv->lmac_id));
+-		otx2_rfoe_calc_ptp_ts(priv, &timestamp);
+-		memset(&ts, 0, sizeof(ts));
+-		ts.hwtstamp = ns_to_ktime(timestamp);
+-		skb_tstamp_tx(priv->ptp_tx_skb, &ts);
+-	} else {
+-		/* reschedule to check later */
+-		schedule_work(&priv->ptp_tx_work);
+-		return;
++	/* poll for timestamp valid bit to go high */
++	for (cnt = 0; cnt < OTX2_RFOE_PTP_TSTMP_POLL_CNT; cnt++) {
++		/* read RFOE(0..2)_TX_PTP_TSTMP_W1(0..3) */
++		tstmp_w1 = readq(priv->rfoe_reg_base +
++				 RFOEX_TX_PTP_TSTMP_W1(priv->rfoe_num,
++						       priv->lmac_id));
++		/* check valid bit */
++		if (tstmp_w1 & (1ULL << 63))
++			break;
++		usleep_range(5, 10);
++	}
++
++	if (cnt >= OTX2_RFOE_PTP_TSTMP_POLL_CNT) {
++		netif_err(priv, tx_err, priv->netdev,
++			  "ptp tx timestamp polling timeout, skb=%pS\n",
++			  priv->ptp_tx_skb);
++		priv->stats.tx_hwtstamp_failures++;
++		goto submit_next_req;
++	}
++
++	/* check err or drop condition */
++	if ((tstmp_w1 & (1ULL << 21)) || (tstmp_w1 & (1ULL << 20))) {
++		netif_err(priv, tx_done, priv->netdev,
++			  "ptp timestamp error tstmp_w1=0x%llx\n",
++			  tstmp_w1);
++		goto submit_next_req;
++	}
++	/* match job id */
++	jobid = (tstmp_w1 >> 4) & 0xffff;
++	if (jobid != priv->ptp_job_tag) {
++		netif_err(priv, tx_done, priv->netdev,
++			  "ptp job id doesn't match, tstmp_w1->job_id=0x%x skb->job_tag=0x%x\n",
++			  jobid, priv->ptp_job_tag);
++		goto submit_next_req;
+ 	}
++	/* update timestamp value in skb */
++	timestamp = readq(priv->rfoe_reg_base +
++			  RFOEX_TX_PTP_TSTMP_W0(priv->rfoe_num,
++						priv->lmac_id));
++	otx2_rfoe_calc_ptp_ts(priv, &timestamp);
++	memset(&ts, 0, sizeof(ts));
++	ts.hwtstamp = ns_to_ktime(timestamp);
++	skb_tstamp_tx(priv->ptp_tx_skb, &ts);
+ 
+ submit_next_req:
+ 	if (priv->ptp_tx_skb)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index 1ccad7d0fbfa..5526391d2332 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -194,6 +194,7 @@ struct otx2_rfoe_stats {
+ 	u64 tx_dropped;		/* tx dropped */
+ 	u64 ptp_tx_dropped;	/* ptp tx dropped */
+ 	u64 ecpri_tx_dropped;	/* ptp tx dropped */
++	u64 tx_hwtstamp_failures; /* ptp tx timestamp failures */
+ 
+ 	/* per LMAC stats */
+ 	u64 EthIfInFrames;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c
+index 1a136efc09ea..096c54471abe 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c
+@@ -25,6 +25,7 @@ static const char ethtool_stat_strings[][ETH_GSTRING_LEN] = {
+ 	"oth_tx_dropped",
+ 	"ptp_tx_dropped",
+ 	"ecpri_tx_dropped",
++	"ptp_tx_hwtstamp_failures",
+ 	"EthIfInFrames",
+ 	"EthIfInOctets",
+ 	"EthIfOutFrames",
+-- 
+2.26.1
+
