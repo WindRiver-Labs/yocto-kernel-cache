@@ -1,0 +1,128 @@
+From eb170e57df3bdf85b130fe108998a88d65113cf1 Mon Sep 17 00:00:00 2001
+From: Jakub Palider <jpalider@marvell.com>
+Date: Thu, 11 Feb 2021 04:05:19 +0530
+Subject: [PATCH 03/13] misc: bphy: Get max irq number from firmware
+
+commit e3edf68b7f584a4a7ab9f560f38e05f335df3eb7 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+The driver learns maximum number of interrupts from ATF and
+uses this value for runtime resources allocation and may
+forward this value to driver users via ioctl().
+
+Change-Id: Ia6f3a1ff6c7ef22ca0376e73da9a550e73d3d56f
+Signed-off-by: Jakub Palider <jpalider@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/45892
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Jerin Jacob Kollanukkaran <jerinj@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/47714
+Reviewed-by: Naveen Mamindlapalli <Naveen.Mamindlapalli@cavium.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/misc/otx_bphy_ctr.c | 35 +++++++++++++++++++++++++++--------
+ 1 file changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/misc/otx_bphy_ctr.c b/drivers/misc/otx_bphy_ctr.c
+index 029ed5d49570..218fa8f9671c 100644
+--- a/drivers/misc/otx_bphy_ctr.c
++++ b/drivers/misc/otx_bphy_ctr.c
+@@ -17,26 +17,29 @@
+ #include <linux/mmu_context.h>
+ #include <linux/ioctl.h>
+ #include <linux/fs.h>
++#include <linux/slab.h>
+ 
+ #define DEVICE_NAME	"otx-bphy-ctr"
+ #define OTX_IOC_MAGIC	0xF3
+-#define MAX_IRQ		27
+ 
++static unsigned long bphy_max_irq;
+ static struct device *otx_device;
+ static struct class *otx_class;
+ static struct cdev *otx_cdev;
+ static dev_t otx_dev;
+ static DEFINE_SPINLOCK(el3_inthandler_lock);
+ static int in_use;
+-static int irq_installed[MAX_IRQ];
+-static struct thread_info *irq_installed_threads[MAX_IRQ];
+-static struct task_struct *irq_installed_tasks[MAX_IRQ];
++static int *irq_installed;
++static struct thread_info **irq_installed_threads;
++static struct task_struct **irq_installed_tasks;
+ 
+ /* SMC definitons */
+ /* X1 - irq_num, X2 - sp, X3 - cpu, X4 - ttbr0 */
+ #define OCTEONTX_INSTALL_BPHY_PSM_ERRINT       0xc2000803
+ /* X1 - irq_num */
+ #define OCTEONTX_REMOVE_BPHY_PSM_ERRINT        0xc2000804
++/* no params */
++#define OCTEONTX_GET_BPHY_PSM_MAX_IRQ          0xc2000805
+ 
+ struct otx_irq_usr_data {
+ 	u64	isr_base;
+@@ -133,7 +136,7 @@ static long otx_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ 	switch (cmd) {
+ 	case OTX_IOC_SET_BPHY_HANDLER: /*Install ISR handler*/
+ 		ret = copy_from_user(&irq_usr, (void *)arg, _IOC_SIZE(cmd));
+-		if (irq_usr.irq_num >= MAX_IRQ)
++		if (irq_usr.irq_num >= bphy_max_irq)
+ 			return -EINVAL;
+ 		if (ret)
+ 			return -EFAULT;
+@@ -151,14 +154,14 @@ static long otx_dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+ 		break;
+ 	case OTX_IOC_CLR_BPHY_HANDLER: /*Clear ISR handler*/
+ 		irq_usr.irq_num = arg;
+-		if (irq_usr.irq_num >= MAX_IRQ)
++		if (irq_usr.irq_num >= bphy_max_irq)
+ 			return -EINVAL;
+ 		ret = __remove_el3_inthandler(irq_usr.irq_num);
+ 		if (ret != 0)
+ 			return -ENOENT;
+ 		break;
+ 	case OTX_IOC_GET_BPHY_MAX_IRQ:
+-		irq_num = MAX_IRQ;
++		irq_num = bphy_max_irq;
+ 		if (copy_to_user((u64 *)arg, &irq_num, sizeof(irq_num)))
+ 			return -EFAULT;
+ 		break;
+@@ -172,7 +175,7 @@ static void cleanup_el3_irqs(struct task_struct *task)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < MAX_IRQ; i++) {
++	for (i = 0; i < bphy_max_irq; i++) {
+ 		if (irq_installed[i] &&
+ 		    irq_installed_tasks[i] &&
+ 		    (irq_installed_tasks[i] == task)) {
+@@ -188,10 +191,26 @@ static void cleanup_el3_irqs(struct task_struct *task)
+ 				pr_alert("Exiting, thread info matches, not removing handler for BPHY IRQ %d\n", i);
+ 		}
+ 	}
++
++	kfree(irq_installed);
++	kfree(irq_installed_threads);
++	kfree(irq_installed_tasks);
+ }
+ 
+ static int otx_dev_open(struct inode *inode, struct file *fp)
+ {
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_GET_BPHY_PSM_MAX_IRQ, 0,
++		      0, 0, 0, 0, 0, 0, &res);
++	bphy_max_irq = res.a0;
++
++	irq_installed = kcalloc(bphy_max_irq, sizeof(int), GFP_KERNEL);
++	irq_installed_threads = (struct thread_info **)
++		kcalloc(bphy_max_irq, sizeof(struct thread_info *), GFP_KERNEL);
++	irq_installed_tasks = (struct task_struct **)
++		kcalloc(bphy_max_irq, sizeof(struct task_struct *), GFP_KERNEL);
++
+ 	in_use = 1;
+ 	return 0;
+ }
+-- 
+2.17.0
+

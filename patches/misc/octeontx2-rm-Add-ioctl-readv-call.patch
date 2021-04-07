@@ -1,0 +1,147 @@
+From c6c889708aa9cd657562ab066ff09e5dbd7a6252 Mon Sep 17 00:00:00 2001
+From: Yuri Tolstov <ytolstov@marvell.com>
+Date: Sat, 20 Mar 2021 09:38:36 -0700
+Subject: [PATCH 10/13] octeontx2-rm: Add ioctl:readv call
+
+commit bbf8dc96915d4bc3cfda3b97d327e0e1d9b3653e from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+1. Added vectorized physical memory access through ioctl interface.
+
+2. Removed ME interrupt reenable from FLR handler.
+PF_RST on a FLR is causing RVU_PF_VF_BAR4_ADDR also getting cleared.
+Due to that RVU_PF_VF_BAR4_ADDR is also getting cleared which would
+break PF::VF communication.
+
+Signed-off-by: Yuri Tolstov <ytolstov@marvell.com>
+Change-Id: I3be5bb0bf0ecab97a6e88febb9b858d2f6b6ddd3
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/48370
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/soc/marvell/octeontx2-rm/otx2_rm.c  | 49 +++++++++++++++++----
+ drivers/soc/marvell/octeontx2-rm/otxrmcmd.h | 14 ++++--
+ 2 files changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/soc/marvell/octeontx2-rm/otx2_rm.c b/drivers/soc/marvell/octeontx2-rm/otx2_rm.c
+index ea76bd3db6e4..beb7a07e5a71 100644
+--- a/drivers/soc/marvell/octeontx2-rm/otx2_rm.c
++++ b/drivers/soc/marvell/octeontx2-rm/otx2_rm.c
+@@ -70,8 +70,7 @@ static dev_t devno; /* Char device major:minor */
+ static spinlock_t rm_lst_lock;
+ LIST_HEAD(rm_dev_lst_head);
+ 
+-static void
+-rm_write64(struct rm_dev *rvu, u64 b, u64 s, u64 o, u64 v)
++static void rm_write64(struct rm_dev *rvu, u64 b, u64 s, u64 o, u64 v)
+ {
+ 	writeq_relaxed(v, rvu->bar2 + ((b << 20) | (s << 12) | o));
+ }
+@@ -457,10 +456,6 @@ static void rm_pfvf_flr_handler(struct work_struct *work)
+ 	idx = vf->vf_id / 64;
+ 	rm_write64(rm, BLKADDR_RVUM, 0, RVU_PF_VFTRPENDX(idx),
+ 		   BIT_ULL(vf->intr_idx));
+-
+-	/* Re-enable ME interrupt as it gets cleared in HWVF_RST reset */
+-	rm_write64(rm, BLKADDR_RVUM, 0, RVU_PF_VFME_INT_ENA_W1SX(idx),
+-		   BIT_ULL(vf->intr_idx));
+ }
+ 
+ static void rm_pfvf_mbox_handler_up(struct work_struct *work)
+@@ -1716,7 +1711,6 @@ static int mem_read(struct otx_mem *umem)
+ {
+ 	struct otx_mem mem;
+ 	uint8_t *base;
+-	int rc;
+ 
+ 	if (copy_from_user(&mem, umem, sizeof(struct otx_mem)))
+ 		return -EIO;
+@@ -1725,8 +1719,42 @@ static int mem_read(struct otx_mem *umem)
+ 	if (base == NULL)
+ 		return -ENOMEM;
+ 
+-	rc = copy_to_user(mem.buf, base, mem.nbytes);
+-	iounmap(base);
++	return copy_to_user(mem.buf, base, mem.nbytes);
++}
++
++static int mem_readv(struct otx_memv *umemv)
++{
++	struct otx_memv memv;
++	struct otx_mem *mm;
++	uint8_t *base, *addr;
++	int i, rc = 0;
++
++	if (copy_from_user(&memv, umemv, sizeof(struct otx_memv)))
++		return -EIO;
++
++	mm = kcalloc(memv.msize, sizeof(struct otx_mem), GFP_KERNEL);
++	if (mm == NULL)
++		return -ENOMEM;
++
++	base = phys_to_virt(memv.pbase);
++	if (base == NULL) {
++		rc = -ENOMEM;
++		goto eexit;
++	}
++	for (i = 0; i < memv.msize; i++) {
++		if (copy_from_user(&mm[i], &memv.mm[i],
++				   sizeof(struct otx_mem))) {
++			rc = -EIO;
++			goto eexit;
++		}
++		addr = base + mm[i].pa;
++		if (copy_to_user(mm[i].buf, addr, mm[i].nbytes)) {
++			rc = -EIO;
++			goto eexit;
++		}
++	}
++eexit:
++	kfree(mm);
+ 	return rc;
+ }
+ 
+@@ -1738,6 +1766,9 @@ static ssize_t rm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	case IOC_MEMREAD:
+ 		rc = mem_read((void *)arg);
+ 		break;
++	case IOC_MEMREADV:
++		rc = mem_readv((void *)arg);
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	};
+diff --git a/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h b/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h
+index 0f606559c03f..0ae5b9cac613 100644
+--- a/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h
++++ b/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h
+@@ -21,14 +21,22 @@
+ 
+ /* MEM */
+ struct otx_mem {
+-	uint64_t pa; /* Phys.base address */
+-	uint64_t nbytes; /* Number of bytes to read */
+-	uint8_t  *buf; /* Buffer address for return memory values */
++	uint64_t pa; /* Phys.base address or offset from base address */
++	uint16_t nbytes; /* Number of bytes to read */
++	uint8_t *buf; /* Buffer address for return memory values */
++} __packed;
++
++/* MEMV */
++struct otx_memv {
++	uint64_t pbase; /* Base physical address */
++	uint16_t msize; /* Array of mem size */
++	struct otx_mem *mm; /* Array of mem */
+ } __packed;
+ 
+ /* OTXRM IOCTL commands/messages */
+ #define IOC_TYPE	110
+ 
+ #define IOC_MEMREAD     _IOWR(IOC_TYPE, 1, struct otx_mem *)
++#define IOC_MEMREADV    _IOWR(IOC_TYPE, 2, struct otx_memv *)
+ 
+ #endif /* __OTXRMCMD_H__ */
+-- 
+2.17.0
+
