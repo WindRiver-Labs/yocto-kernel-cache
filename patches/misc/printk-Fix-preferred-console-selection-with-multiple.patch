@@ -1,0 +1,178 @@
+From 691d836761444f214a2a21b2b84574a44ae19475 Mon Sep 17 00:00:00 2001
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date: Thu, 13 Feb 2020 10:51:32 +0100
+Subject: [PATCH 11/28] printk: Fix preferred console selection with multiple
+ matches
+
+commit e369d8227fd211be36242fc44a9dc2209e246b9a upstream
+
+In the following circumstances, the rule of selecting the console
+corresponding to the last "console=" entry on the command line as
+the preferred console (CON_CONSDEV, ie, /dev/console) fails. This
+is a specific example, but it could happen with different consoles
+that have a similar name aliasing mechanism.
+
+  - The kernel command line has both console=tty0 and console=ttyS0
+    in that order (the latter with speed etc... arguments).
+    This is common with some cloud setups such as Amazon Linux.
+
+  - add_preferred_console is called early to register "uart0". In
+    our case that happens from acpi_parse_spcr() on arm64 since the
+    "enable_console" argument is true on that architecture. This causes
+    "uart0" to become entry 0 of the console_cmdline array.
+
+Now, because of the above, what happens is:
+
+  - add_preferred_console is called by the cmdline parsing for tty0
+    and ttyS0 respectively, thus occupying entries 1 and 2 of the
+    console_cmdline array (since this happens after ACPI SPCR parsing).
+    At that point preferred_console is set to 2 as expected.
+
+  - When the tty layer kicks in, it will call register_console for tty0.
+    This will match entry 1 in console_cmdline array. It isn't our
+    preferred console but because it's our only console at this point,
+    it will end up "first" in the consoles list.
+
+  - When 8250 probes the actual serial port later on, it calls
+    register_console for ttyS0. At that point the loop in register_console
+    tries to match it with the entries in the console_cmdline array.
+    Ideally this should match ttyS0 in entry 2, which is preferred, causing
+    it to be inserted first and to replace tty0 as CONSDEV. However, 8250
+    provides a "match" hook in its struct console, and that hook will match
+    "uart" as an alias to "ttyS". So we match uart0 at entry 0 in the array
+    which is not the preferred console and will not match entry 2 which is
+    since we break out of the loop on the first match. As a result,
+    we don't set CONSDEV and don't insert it first, but second in
+    the console list.
+
+    As a result, we end up with tty0 remaining first in the array, and thus
+    /dev/console going there instead of the last user specified one which
+    is ttyS0.
+
+This tentative fix register_console() to scan first for consoles
+specified on the command line, and only if none is found, to then
+scan for consoles specified by the architecture.
+
+Link: https://lore.kernel.org/r/20200213095133.23176-3-pmladek@suse.com
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Reviewed-by: Petr Mladek <pmladek@suse.com>
+Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+---
+ kernel/printk/console_cmdline.h |  1 +
+ kernel/printk/printk.c          | 29 ++++++++++++++++++-----------
+ 2 files changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/kernel/printk/console_cmdline.h b/kernel/printk/console_cmdline.h
+index 11f19c466af5..3ca74ad391d6 100644
+--- a/kernel/printk/console_cmdline.h
++++ b/kernel/printk/console_cmdline.h
+@@ -6,6 +6,7 @@ struct console_cmdline
+ {
+ 	char	name[16];			/* Name of the driver	    */
+ 	int	index;				/* Minor dev. to use	    */
++	bool	user_specified;			/* Specified by command line vs. platform */
+ 	char	*options;			/* Options for the driver   */
+ #ifdef CONFIG_A11Y_BRAILLE_CONSOLE
+ 	char	*brl_options;			/* Options for braille driver */
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index f59eb8887bc2..e9c45836bd8b 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -2050,7 +2050,7 @@ asmlinkage __visible void early_printk(const char *fmt, ...)
+ #endif
+ 
+ static int __add_preferred_console(char *name, int idx, char *options,
+-				   char *brl_options)
++				   char *brl_options, bool user_specified)
+ {
+ 	struct console_cmdline *c;
+ 	int i;
+@@ -2065,6 +2065,8 @@ static int __add_preferred_console(char *name, int idx, char *options,
+ 		if (strcmp(c->name, name) == 0 && c->index == idx) {
+ 			if (!brl_options)
+ 				preferred_console = i;
++			if (user_specified)
++				c->user_specified = true;
+ 			return 0;
+ 		}
+ 	}
+@@ -2074,6 +2076,7 @@ static int __add_preferred_console(char *name, int idx, char *options,
+ 		preferred_console = i;
+ 	strlcpy(c->name, name, sizeof(c->name));
+ 	c->options = options;
++	c->user_specified = user_specified;
+ 	braille_set_options(c, brl_options);
+ 
+ 	c->index = idx;
+@@ -2128,7 +2131,7 @@ static int __init console_setup(char *str)
+ 	idx = simple_strtoul(s, NULL, 10);
+ 	*s = 0;
+ 
+-	__add_preferred_console(buf, idx, options, brl_options);
++	__add_preferred_console(buf, idx, options, brl_options, true);
+ 	console_set_on_cmdline = 1;
+ 	return 1;
+ }
+@@ -2149,7 +2152,7 @@ __setup("console=", console_setup);
+  */
+ int add_preferred_console(char *name, int idx, char *options)
+ {
+-	return __add_preferred_console(name, idx, options, NULL);
++	return __add_preferred_console(name, idx, options, NULL, false);
+ }
+ 
+ bool console_suspend_enabled = true;
+@@ -2392,7 +2395,7 @@ early_param("keep_bootcon", keep_bootcon_setup);
+  * Care need to be taken with consoles that are statically
+  * enabled such as netconsole
+  */
+-static int try_enable_new_console(struct console *newcon)
++static int try_enable_new_console(struct console *newcon, bool user_specified)
+ {
+ 	struct console_cmdline *c;
+ 	int i;
+@@ -2400,6 +2403,8 @@ static int try_enable_new_console(struct console *newcon)
+ 	for (i = 0, c = console_cmdline;
+ 	     i < MAX_CMDLINECONSOLES && c->name[0];
+ 	     i++, c++) {
++		if (c->user_specified != user_specified)
++			continue;
+ 		if (!newcon->match ||
+ 		    newcon->match(newcon, c->name, c->index, c->options) != 0) {
+ 			/* default matching */
+@@ -2429,9 +2434,10 @@ static int try_enable_new_console(struct console *newcon)
+ 
+ 	/*
+ 	 * Some consoles, such as pstore and netconsole, can be enabled even
+-	 * without matching.
++	 * without matching. Accept the pre-enabled consoles only when match()
++	 * and setup() had a change to be called.
+ 	 */
+-	if (newcon->flags & CON_ENABLED)
++	if (newcon->flags & CON_ENABLED && c->user_specified ==	user_specified)
+ 		return 0;
+ 
+ 	return -ENOENT;
+@@ -2505,11 +2511,12 @@ void register_console(struct console *newcon)
+ 		}
+ 	}
+ 
+-	/*
+-	 * See if this console matches one we selected on
+-	 * the command line or if it was statically enabled
+-	 */
+-	err = try_enable_new_console(newcon);
++	/* See if this console matches one we selected on the command line */
++	err = try_enable_new_console(newcon, true);
++
++	/* If not, try to match against the platform default(s) */
++	if (err == -ENOENT)
++		err = try_enable_new_console(newcon, false);
+ 
+ 	/* printk() messages are not printed to the Braille console. */
+ 	if (err || newcon->flags & CON_BRL)
+-- 
+2.31.1
+
