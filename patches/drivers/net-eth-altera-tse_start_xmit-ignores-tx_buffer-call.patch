@@ -1,0 +1,103 @@
+From d02b55b337624864f9ef6c579f6d274dbf83d9b7 Mon Sep 17 00:00:00 2001
+From: Dalon Westergreen <dalon.westergreen@intel.com>
+Date: Tue, 9 Oct 2018 11:59:36 -0700
+Subject: [PATCH 068/120] net: eth: altera: tse_start_xmit ignores tx_buffer
+ call response
+
+commit 83c93cc796018875238d124ab739ef2d99be89ae from
+https://github.com/altera-opensource/linux-socfpga.git
+
+The return from tx_buffer call in tse_start_xmit is
+inapropriately ignored.  tse_buffer calls should return
+0 for success or NETDEV_TX_BUSY.  tse_start_xmit should
+return not report a successful transmit when the tse_buffer
+call returns an error condition.
+
+In addition to the above, the msgdma and sgdma do not return
+the same value on success or failure.  The sgdma_tx_buffer
+returned 0 on failure and a positive number of transmitted
+packets on success.  Given that it only ever sends 1 packet,
+this made no sense.  The msgdma implementation msgdma_tx_buffer
+returns 0 on success.
+
+  -> Don't ignore the return from tse_buffer calls
+  -> Fix sgdma tse_buffer call to return 0 on success
+     and NETDEV_TX_BUSY on failure.
+
+Signed-off-by: Dalon Westergreen <dalon.westergreen@intel.com>
+Signed-off-by: Joyce Ooi <joyce.ooi@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/net/ethernet/altera/altera_sgdma.c    | 19 ++++++++++++-------
+ drivers/net/ethernet/altera/altera_tse_main.c |  4 +++-
+ 2 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/altera/altera_sgdma.c b/drivers/net/ethernet/altera/altera_sgdma.c
+index db97170da8c7..fe6276c7e4a3 100644
+--- a/drivers/net/ethernet/altera/altera_sgdma.c
++++ b/drivers/net/ethernet/altera/altera_sgdma.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/list.h>
++#include <linux/netdevice.h>
+ #include "altera_utils.h"
+ #include "altera_tse.h"
+ #include "altera_sgdmahw.h"
+@@ -159,10 +160,11 @@ void sgdma_clear_txirq(struct altera_tse_private *priv)
+ 		    SGDMA_CTRLREG_CLRINT);
+ }
+ 
+-/* transmits buffer through SGDMA. Returns number of buffers
+- * transmitted, 0 if not possible.
+- *
+- * tx_lock is held by the caller
++/* transmits buffer through SGDMA.
++ *   original behavior returned the number of transmitted packets (always 1) &
++ *   returned 0 on error.  This differs from the msgdma.  the calling function
++ *   will now actually look at the code, so from now, 0 is good and return
++ *   NETDEV_TX_BUSY when busy.
+  */
+ int sgdma_tx_buffer(struct altera_tse_private *priv, struct tse_buffer *buffer)
+ {
+@@ -173,8 +175,11 @@ int sgdma_tx_buffer(struct altera_tse_private *priv, struct tse_buffer *buffer)
+ 	struct sgdma_descrip __iomem *ndesc = &descbase[1];
+ 
+ 	/* wait 'til the tx sgdma is ready for the next transmit request */
+-	if (sgdma_txbusy(priv))
+-		return 0;
++	if (sgdma_txbusy(priv)) {
++		if (!netif_queue_stopped(priv->dev))
++			netif_stop_queue(priv->dev);
++		return NETDEV_TX_BUSY;
++	}
+ 
+ 	sgdma_setup_descrip(cdesc,			/* current descriptor */
+ 			    ndesc,			/* next descriptor */
+@@ -191,7 +196,7 @@ int sgdma_tx_buffer(struct altera_tse_private *priv, struct tse_buffer *buffer)
+ 	/* enqueue the request to the pending transmit queue */
+ 	queue_tx(priv, buffer);
+ 
+-	return 1;
++	return 0;
+ }
+ 
+ 
+diff --git a/drivers/net/ethernet/altera/altera_tse_main.c b/drivers/net/ethernet/altera/altera_tse_main.c
+index bb032be7fe31..b9d2070f0307 100644
+--- a/drivers/net/ethernet/altera/altera_tse_main.c
++++ b/drivers/net/ethernet/altera/altera_tse_main.c
+@@ -595,7 +595,9 @@ static int tse_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	buffer->dma_addr = dma_addr;
+ 	buffer->len = nopaged_len;
+ 
+-	priv->dmaops->tx_buffer(priv, buffer);
++	ret = priv->dmaops->tx_buffer(priv, buffer);
++	if (ret)
++		goto out;
+ 
+ 	skb_tx_timestamp(skb);
+ 
+-- 
+2.31.1
+

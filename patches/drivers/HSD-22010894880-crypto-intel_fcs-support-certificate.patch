@@ -1,0 +1,161 @@
+From 1807b78d2ef462a98ef095359d071a514558c8db Mon Sep 17 00:00:00 2001
+From: Richard Gong <richard.gong@intel.com>
+Date: Tue, 21 Jul 2020 14:51:13 -0500
+Subject: [PATCH 054/120] HSD #22010894880: crypto: intel_fcs: support
+ certificate status word
+
+commit c7a315e8df405fc8372c34de24c34fa564877a5f from
+https://github.com/altera-opensource/linux-socfpga.git
+
+Update Intel crypto driver to capture the certificate status.
+
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/crypto/intel_fcs.c           | 40 ++++++++++++++++++++--------
+ include/uapi/linux/intel_fcs-ioctl.h |  2 ++
+ 2 files changed, 31 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/crypto/intel_fcs.c b/drivers/crypto/intel_fcs.c
+index 7372c31c0ae0..8f4ad2a4d3a3 100644
+--- a/drivers/crypto/intel_fcs.c
++++ b/drivers/crypto/intel_fcs.c
+@@ -25,6 +25,7 @@
+ 
+ #define RANDOM_NUMBER_SIZE	32
+ #define FILE_NAME_SIZE		32
++#define PS_BUF_SIZE		64
+ #define INVALID_STATUS		0xff
+ 
+ #define FCS_REQUEST_TIMEOUT (msecs_to_jiffies(SVC_FCS_REQUEST_TIMEOUT_MS))
+@@ -45,19 +46,21 @@ struct intel_fcs_priv {
+ };
+ 
+ static void fcs_data_callback(struct stratix10_svc_client *client,
+-			     struct stratix10_svc_cb_data *data)
++			      struct stratix10_svc_cb_data *data)
+ {
+ 	struct intel_fcs_priv *priv = client->priv;
+ 
+-	if (data->status == BIT(SVC_STATUS_OK)) {
++	if ((data->status == BIT(SVC_STATUS_OK)) ||
++	    (data->status == BIT(SVC_STATUS_COMPLETED))) {
+ 		priv->status = 0;
+ 		priv->kbuf = data->kaddr2;
+ 		priv->size = *((unsigned int *)data->kaddr3);
+ 	} else if (data->status == BIT(SVC_STATUS_ERROR)) {
+ 		priv->status = *((unsigned int *)data->kaddr1);
+ 		dev_err(client->dev, "error, mbox_error=0x%x\n", priv->status);
+-		priv->kbuf = NULL;
+-		priv->size = 0;
++		priv->kbuf = data->kaddr2;
++		priv->size = (data->kaddr3) ?
++			*((unsigned int *)data->kaddr3) : 0;
+ 	} else {
+ 		dev_err(client->dev, "rejected\n");
+ 		priv->status = -EINVAL;
+@@ -80,7 +83,7 @@ static void fcs_vab_callback(struct stratix10_svc_client *client,
+ 		priv->status = -EINVAL;
+ 		dev_warn(client->dev, "rejected, invalid param\n");
+ 	} else if (data->status == BIT(SVC_STATUS_ERROR)) {
+-		priv->status = *status;
++		priv->status = *((unsigned int *)data->kaddr1);
+ 		dev_err(client->dev, "mbox_error=0x%x\n", priv->status);
+ 	} else if (data->status == BIT(SVC_STATUS_BUSY)) {
+ 		priv->status = -ETIMEDOUT;
+@@ -141,6 +144,7 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 	size_t tsz, datasz;
+ 	void *s_buf;
+ 	void *d_buf;
++	void *ps_buf;
+ 	int ret = 0;
+ 	int i;
+ 
+@@ -197,7 +201,7 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 		if (!ret && !priv->status) {
+ 			/* to query the complete status */
+ 			msg->command = COMMAND_POLL_SERVICE_STATUS;
+-			priv->client.receive_cb = fcs_vab_callback;
++			priv->client.receive_cb = fcs_data_callback;
+ 			ret = fcs_request_service(priv, (void *)msg,
+ 						  FCS_COMPLETED_TIMEOUT);
+ 			dev_dbg(dev, "fcs_request_service ret=%d\n", ret);
+@@ -238,6 +242,12 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 			return -ENOMEM;
+ 		}
+ 
++		ps_buf = stratix10_svc_allocate_memory(priv->chan, PS_BUF_SIZE);
++		if (!ps_buf) {
++			dev_err(dev, "failed to allocate p-status buf\n");
++			return -ENOMEM;
++		}
++
+ 		/* Copy the test word */
+ 		memcpy(s_buf, &data->com_paras.c_request.test, tsz);
+ 
+@@ -247,7 +257,7 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 				     data->com_paras.s_request.size);
+ 		if (ret) {
+ 			dev_err(dev, "failed copy buf ret=%d\n", ret);
+-			stratix10_svc_free_memory(priv->chan, s_buf);
++			fcs_close_services(priv, s_buf, ps_buf);
+ 			return -EFAULT;
+ 		}
+ 
+@@ -261,15 +271,23 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 		dev_dbg(dev, "fcs_request_service ret=%d\n", ret);
+ 		if (!ret && !priv->status) {
+ 			/* to query the complete status */
++			msg->payload = ps_buf;
++			msg->payload_length = PS_BUF_SIZE;
+ 			msg->command = COMMAND_POLL_SERVICE_STATUS;
+-			priv->client.receive_cb = fcs_vab_callback;
++			priv->client.receive_cb = fcs_data_callback;
+ 			ret = fcs_request_service(priv, (void *)msg,
+ 						  FCS_COMPLETED_TIMEOUT);
+ 			dev_dbg(dev, "request service ret=%d\n", ret);
+ 			if (!ret && !priv->status)
+ 				data->status = 0;
+-			else
+-				data->status = priv->status;
++			else {
++				if (priv->kbuf)
++					data->com_paras.c_request.c_status =
++						(*(u32 *)priv->kbuf);
++				else
++					data->com_paras.c_request.c_status =
++						INVALID_STATUS;
++			}
+ 		} else
+ 			data->status = priv->status;
+ 
+@@ -279,7 +297,7 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 			ret = -EFAULT;
+ 		}
+ 
+-		fcs_close_services(priv, s_buf, NULL);
++		fcs_close_services(priv, s_buf, ps_buf);
+ 		break;
+ 
+ 	case INTEL_FCS_DEV_RANDOM_NUMBER_GEN:
+diff --git a/include/uapi/linux/intel_fcs-ioctl.h b/include/uapi/linux/intel_fcs-ioctl.h
+index 52b7799de195..66419850c1dc 100644
+--- a/include/uapi/linux/intel_fcs-ioctl.h
++++ b/include/uapi/linux/intel_fcs-ioctl.h
+@@ -71,11 +71,13 @@ struct fcs_key_manage_request {
+  * @test: test bit (1 if want to write to cache instead of fuses)
+  * @addr: the virtual address of the signed object,
+  * @size: the size of the signed object
++ * @c_status: returned certificate status
+  */
+ struct fcs_certificate_request {
+ 	struct intel_fcs_cert_test_word test;
+ 	void *addr;
+ 	__u32 size;
++	__u32 c_status;
+ };
+ 
+ /**
+-- 
+2.31.1
+
