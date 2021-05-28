@@ -1,0 +1,228 @@
+From 370e544a8917971891c6a57be4f8530756a3b49d Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Fri, 27 Nov 2020 23:35:15 +0530
+Subject: [PATCH 681/767] octeontx2-bphy-netdev: Add PTP hardware clock support
+ to rfoe interfaces
+
+commit 1e512fba3bc405a56ce2e75c3fdf6390aec58037 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Added PTP Hardware Cock (PHC) support to rfoe interfaces. As of now,
+only the gettime64() callback is implemented by the driver as per the
+requirement. The BCN offset is added to the timestamp read by gettime,
+similar to the PTP timestamp calculations in the receive and transmit
+path of PTP packets on rfoe interfaces.
+
+Change-Id: If6987df64fd5efa9616b4ae3911829822e36cdfa
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/41603
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/bphy/Makefile  |  2 +-
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        |  6 +-
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        | 10 +++
+ .../octeontx2/bphy/otx2_rfoe_ethtool.c        |  4 +-
+ .../marvell/octeontx2/bphy/otx2_rfoe_ptp.c    | 85 +++++++++++++++++++
+ 5 files changed, 103 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ptp.c
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile b/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile
+index ed2d966da3f1..2877230405b0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile
+@@ -7,5 +7,5 @@ obj-$(CONFIG_OCTEONTX2_BPHY_RFOE_NETDEV) += octeontx2_bphy_netdev.o
+ 
+ #EXTRA_CFLAGS += -DDEBUG
+ 
+-octeontx2_bphy_netdev-y := otx2_bphy_main.o otx2_rfoe.o otx2_rfoe_ethtool.o \
++octeontx2_bphy_netdev-y := otx2_bphy_main.o otx2_rfoe.o otx2_rfoe_ethtool.o otx2_rfoe_ptp.o \
+ 				otx2_cpri.o otx2_cpri_ethtool.o
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index 4ddf6dc09a39..395721ff8ac2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -135,6 +135,7 @@ void otx2_bphy_rfoe_cleanup(void)
+ 				kfree(priv->ptp_cfg);
+ 				priv->ptp_cfg = NULL;
+ 			}
++			otx2_rfoe_ptp_destroy(priv);
+ 			unregister_netdev(netdev);
+ 			for (idx = 0; idx < PACKET_TYPE_MAX; idx++) {
+ 				if (!(priv->pkt_type_mask & (1U << idx)))
+@@ -149,8 +150,7 @@ void otx2_bphy_rfoe_cleanup(void)
+ 	}
+ }
+ 
+-static void otx2_rfoe_calc_ptp_ts(struct otx2_rfoe_ndev_priv *priv,
+-				  u64 *ts)
++void otx2_rfoe_calc_ptp_ts(struct otx2_rfoe_ndev_priv *priv, u64 *ts)
+ {
+ 	u64 ptp_diff_nsec, ptp_diff_psec;
+ 	struct ptp_bcn_off_cfg *ptp_cfg;
+@@ -1316,6 +1316,7 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 				 "rfoe%d", intf_idx);
+ 			netdev->netdev_ops = &otx2_rfoe_netdev_ops;
+ 			otx2_rfoe_set_ethtool_ops(netdev);
++			otx2_rfoe_ptp_init(priv);
+ 			netdev->watchdog_timeo = (15 * HZ);
+ 			netdev->mtu = 1500U;
+ 			netdev->min_mtu = ETH_MIN_MTU;
+@@ -1356,6 +1357,7 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 		if (drv_ctx->valid) {
+ 			netdev = drv_ctx->netdev;
+ 			priv = netdev_priv(netdev);
++			otx2_rfoe_ptp_destroy(priv);
+ 			unregister_netdev(netdev);
+ 			for (idx = 0; idx < PACKET_TYPE_MAX; idx++) {
+ 				if (!(priv->pkt_type_mask & (1U << idx)))
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index 6a2e0d0ce47a..6b7e15e81fcf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -19,6 +19,7 @@
+ #include <linux/ethtool.h>
+ #include <linux/if_ether.h>
+ #include <linux/net_tstamp.h>
++#include <linux/ptp_clock_kernel.h>
+ 
+ #include "otx2_bphy.h"
+ #include "otx2_bphy_hw.h"
+@@ -274,6 +275,10 @@ struct otx2_rfoe_ndev_priv {
+ 	struct work_struct		ptp_tx_work;
+ 	struct work_struct		ptp_queue_work;
+ 	struct ptp_tx_skb_list		ptp_skb_list;
++	struct ptp_clock		*ptp_clock;
++	struct ptp_clock_info		ptp_clock_info;
++	/* ptp lock */
++	struct mutex			ptp_lock;
+ 	struct otx2_rfoe_stats		stats;
+ 	u8				mac_addr[ETH_ALEN];
+ 	struct ptp_bcn_off_cfg		*ptp_cfg;
+@@ -294,4 +299,9 @@ void otx2_rfoe_disable_intf(int rfoe_num);
+ /* ethtool */
+ void otx2_rfoe_set_ethtool_ops(struct net_device *netdev);
+ 
++/* ptp */
++void otx2_rfoe_calc_ptp_ts(struct otx2_rfoe_ndev_priv *priv, u64 *ts);
++int otx2_rfoe_ptp_init(struct otx2_rfoe_ndev_priv *priv);
++void otx2_rfoe_ptp_destroy(struct otx2_rfoe_ndev_priv *priv);
++
+ #endif
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c
+index 5ba9def44644..76d09cf11d78 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ethtool.c
+@@ -72,6 +72,8 @@ static void otx2_rfoe_get_drvinfo(struct net_device *netdev,
+ static int otx2_rfoe_get_ts_info(struct net_device *netdev,
+ 				 struct ethtool_ts_info *info)
+ {
++	struct otx2_rfoe_ndev_priv *priv = netdev_priv(netdev);
++
+ 	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
+ 				SOF_TIMESTAMPING_RX_SOFTWARE |
+ 				SOF_TIMESTAMPING_SOFTWARE |
+@@ -79,7 +81,7 @@ static int otx2_rfoe_get_ts_info(struct net_device *netdev,
+ 				SOF_TIMESTAMPING_RX_HARDWARE |
+ 				SOF_TIMESTAMPING_RAW_HARDWARE;
+ 
+-	info->phc_index = -1;
++	info->phc_index =  ptp_clock_index(priv->ptp_clock);
+ 
+ 	info->tx_types = (1 << HWTSTAMP_TX_OFF) | (1 << HWTSTAMP_TX_ON);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ptp.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ptp.c
+new file mode 100644
+index 000000000000..f4b74c2ec4dc
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe_ptp.c
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell BPHY RFOE PTP PHC support.
++ *
++ * Copyright (C) 2020 Marvell.
++ */
++
++#include "otx2_rfoe.h"
++
++static int otx2_rfoe_ptp_adjtime(struct ptp_clock_info *ptp_info, s64 delta)
++{
++	return -EOPNOTSUPP;
++}
++
++static int otx2_rfoe_ptp_adjfine(struct ptp_clock_info *ptp, long scaled_ppm)
++{
++	return -EOPNOTSUPP;
++}
++
++static int otx2_rfoe_ptp_gettime(struct ptp_clock_info *ptp_info,
++				 struct timespec64 *ts)
++{
++	struct otx2_rfoe_ndev_priv *priv = container_of(ptp_info,
++						struct otx2_rfoe_ndev_priv,
++						ptp_clock_info);
++	u64 nsec;
++
++	mutex_lock(&priv->ptp_lock);
++	nsec = readq(priv->ptp_reg_base + MIO_PTP_CLOCK_HI);
++	otx2_rfoe_calc_ptp_ts(priv, &nsec);
++	mutex_unlock(&priv->ptp_lock);
++
++	*ts = ns_to_timespec64(nsec);
++
++	return 0;
++}
++
++static int otx2_rfoe_ptp_settime(struct ptp_clock_info *ptp_info,
++				 const struct timespec64 *ts)
++{
++	return -EOPNOTSUPP;
++}
++
++static int otx2_rfoe_ptp_enable(struct ptp_clock_info *ptp_info,
++				struct ptp_clock_request *rq, int on)
++{
++	return -EOPNOTSUPP;
++}
++
++static const struct ptp_clock_info otx2_rfoe_ptp_clock_info = {
++	.owner          = THIS_MODULE,
++	.max_adj        = 1000000000ull,
++	.n_ext_ts       = 0,
++	.n_pins         = 0,
++	.pps            = 0,
++	.adjfine	= otx2_rfoe_ptp_adjfine,
++	.adjtime        = otx2_rfoe_ptp_adjtime,
++	.gettime64      = otx2_rfoe_ptp_gettime,
++	.settime64      = otx2_rfoe_ptp_settime,
++	.enable         = otx2_rfoe_ptp_enable,
++};
++
++int otx2_rfoe_ptp_init(struct otx2_rfoe_ndev_priv *priv)
++{
++	int err;
++
++	priv->ptp_clock_info = otx2_rfoe_ptp_clock_info;
++	snprintf(priv->ptp_clock_info.name, 16, "%s", priv->netdev->name);
++	priv->ptp_clock = ptp_clock_register(&priv->ptp_clock_info,
++					     &priv->pdev->dev);
++	if (IS_ERR_OR_NULL(priv->ptp_clock)) {
++		priv->ptp_clock = NULL;
++		err = PTR_ERR(priv->ptp_clock);
++		return err;
++	}
++
++	mutex_init(&priv->ptp_lock);
++
++	return 0;
++}
++
++void otx2_rfoe_ptp_destroy(struct otx2_rfoe_ndev_priv *priv)
++{
++	ptp_clock_unregister(priv->ptp_clock);
++	priv->ptp_clock = NULL;
++}
+-- 
+2.31.1
+

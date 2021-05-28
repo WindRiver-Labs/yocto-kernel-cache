@@ -1,0 +1,398 @@
+From 393a0e003024e55f6bd68dc01e0f5917d8a2bed2 Mon Sep 17 00:00:00 2001
+From: Satheesh Paul A <psatheesh@marvell.com>
+Date: Tue, 31 Mar 2020 15:31:27 +0530
+Subject: [PATCH 530/767] octeontx2-af: support for custom L2 header
+
+commit af7636cb7499dcdae74eddeece2d2ef8bbbc1058 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+This patch adds packet parsing support for custom L2 headers,
+adds support to include a field from the custom header for
+flow tag generation.
+
+Change-Id: Ie376957cb64ce1e2a934e26f3e6658e5223f8852
+Signed-off-by: Satheesh Paul A <psatheesh@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/25950
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |   3 +-
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |   4 +-
+ .../marvell/octeontx2/af/npc_profile.h        | 277 +++++++++++++++++-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |   7 +
+ 4 files changed, 287 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 402aa5e97cb3..3f8251c66a65 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -86,7 +86,7 @@ struct mbox_msghdr {
+ #define OTX2_MBOX_REQ_SIG (0xdead)
+ #define OTX2_MBOX_RSP_SIG (0xbeef)
+ 	u16 sig;         /* Signature, for validating corrupted msgs */
+-#define OTX2_MBOX_VERSION (0x0005)
++#define OTX2_MBOX_VERSION (0x0006)
+ 	u16 ver;         /* Version of msg's structure for this ID */
+ 	u16 next_msgoff; /* Offset of next msg within mailbox region */
+ 	int rc;          /* Msg process'ed response code */
+@@ -908,6 +908,7 @@ struct nix_rss_flowkey_cfg {
+ #define NIX_FLOW_KEY_TYPE_INNR_UDP      BIT(15)
+ #define NIX_FLOW_KEY_TYPE_INNR_SCTP     BIT(16)
+ #define NIX_FLOW_KEY_TYPE_INNR_ETH_DMAC BIT(17)
++#define NIX_FLOW_KEY_TYPE_CH_LEN_90B    BIT(18)
+ #define NIX_FLOW_KEY_TYPE_L4_DST_ONLY BIT(28)
+ #define NIX_FLOW_KEY_TYPE_L4_SRC_ONLY BIT(29)
+ #define NIX_FLOW_KEY_TYPE_L3_DST_ONLY BIT(30)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index d7e310d798d0..86fafb8b6c56 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -33,6 +33,7 @@ enum npc_kpu_la_ltype {
+ 	NPC_LT_LA_IH_2_ETHER,
+ 	NPC_LT_LA_HIGIG2_ETHER,
+ 	NPC_LT_LA_IH_NIX_HIGIG2_ETHER,
++	NPC_LT_LA_CH_LEN_90B_ETHER,
+ 	NPC_LT_LA_CUSTOM0 = 0xE,
+ 	NPC_LT_LA_CUSTOM1 = 0xF,
+ };
+@@ -145,7 +146,8 @@ enum npc_kpu_lh_ltype {
+ };
+ 
+ enum npc_pkind_type {
+-	NPC_TX_HIGIG_PKIND = 60ULL,
++	NPC_RX_CHLEN90B_PKIND = 59ULL,
++	NPC_TX_HIGIG_PKIND,
+ 	NPC_RX_HIGIG_PKIND,
+ 	NPC_RX_EDSA_PKIND,
+ 	NPC_TX_DEF_PKIND,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h b/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
+index 931affe34700..2ac5295b45ec 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
+@@ -158,6 +158,7 @@ enum npc_kpu_parser_state {
+ 	NPC_S_KPU1_EXDSA,
+ 	NPC_S_KPU1_HIGIG2,
+ 	NPC_S_KPU1_IH_NIX_HIGIG2,
++	NPC_S_KPU1_CH_LEN_90B,
+ 	NPC_S_KPU2_CTAG,
+ 	NPC_S_KPU2_CTAG2,
+ 	NPC_S_KPU2_SBTAG,
+@@ -985,8 +986,8 @@ static struct npc_kpu_profile_action ikpu_action_entries[] = {
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		12, 16, 20, 0, 0,
+-		NPC_S_KPU1_ETHER, 0, 0,
++		102, 106, 110, 0, 0,
++		NPC_S_KPU1_CH_LEN_90B, 0, 0,
+ 		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+@@ -1699,6 +1700,150 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 		0x0000,
+ 	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_IP,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_IP6,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_ARP,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_RARP,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_PTP,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_FCOE,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_CTAG,
++		0xffff,
++		NPC_ETYPE_CTAG,
++		0xffff,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_CTAG,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_SBTAG,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_QINQ,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_ETAG,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_ITAG,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_MPLSU,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_MPLSM,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		NPC_ETYPE_NSH,
++		0xffff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
++	{
++		NPC_S_KPU1_CH_LEN_90B, 0xff,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++		0x0000,
++	},
+ 	{
+ 		NPC_S_NA, 0X00,
+ 		0x0000,
+@@ -8098,6 +8243,134 @@ static struct npc_kpu_profile_action kpu1_action_entries[] = {
+ 			| NPC_F_LA_L_UNK_ETYPE,
+ 		0, 0, 0, 0,
+ 	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		8, 0, 6, 3, 0,
++		NPC_S_KPU5_IP, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		0,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		6, 0, 0, 3, 0,
++		NPC_S_KPU5_IP6, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		0,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		0, 0, 0, 3, 0,
++		NPC_S_KPU5_ARP, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		0,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		0, 0, 0, 3, 0,
++		NPC_S_KPU5_RARP, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		0,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		0, 0, 0, 3, 0,
++		NPC_S_KPU5_PTP, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		0,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		0, 0, 0, 3, 0,
++		NPC_S_KPU5_FCOE, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		0,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		8, 12, 0, 0, 0,
++		NPC_S_KPU2_CTAG2, 102, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		4, 8, 0, 0, 0,
++		NPC_S_KPU2_CTAG, 102, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		4, 8, 22, 0, 0,
++		NPC_S_KPU2_SBTAG, 102, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		4, 8, 0, 0, 0,
++		NPC_S_KPU2_QINQ, 102, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		8, 12, 26, 0, 0,
++		NPC_S_KPU2_ETAG, 102, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_ETAG,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		18, 22, 26, 0, 0,
++		NPC_S_KPU2_ITAG, 102, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_ITAG,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		2, 6, 10, 2, 0,
++		NPC_S_KPU4_MPLS, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_L_WITH_MPLS,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		2, 6, 10, 2, 0,
++		NPC_S_KPU4_MPLS, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_L_WITH_MPLS,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		2, 0, 0, 2, 0,
++		NPC_S_KPU4_NSH, 104, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_L_WITH_NSH,
++		0, 0, 0, 0,
++	},
++	{
++		NPC_ERRLEV_RE, NPC_EC_NOERR,
++		0, 0, 0, 0, 1,
++		NPC_S_NA, 0, 1,
++		NPC_LID_LA, NPC_LT_LA_CH_LEN_90B_ETHER,
++		NPC_F_LA_L_UNK_ETYPE,
++		0, 0, 0, 0,
++	},
+ 	{
+ 		NPC_ERRLEV_LA, NPC_EC_L2_K1,
+ 		0, 0, 0, 0, 1,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index afc71488a89c..6c0d2a279b5c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -3024,6 +3024,13 @@ static int set_flowkey_fields(struct nix_rx_flowkey_alg *alg, u32 flow_cfg)
+ 			field->ltype_match = NPC_LT_LE_GTPU;
+ 			field->ltype_mask = 0xF;
+ 			break;
++		case NIX_FLOW_KEY_TYPE_CH_LEN_90B:
++			field->lid = NPC_LID_LA;
++			field->hdr_offset = 24;
++			field->bytesm1 = 1; /* 2 Bytes*/
++			field->ltype_match = NPC_LT_LA_CH_LEN_90B_ETHER;
++			field->ltype_mask = 0xF;
++			break;
+ 		}
+ 		field->ena = 1;
+ 
+-- 
+2.31.1
+

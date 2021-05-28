@@ -1,0 +1,191 @@
+From d7e0c9cbd51ff8153fa7e373a4c46809a8bcc961 Mon Sep 17 00:00:00 2001
+From: Christina Jacob <cjacob@marvell.com>
+Date: Thu, 20 Dec 2018 15:27:27 +0530
+Subject: [PATCH 062/767] octeontx2-pf: IRQ coalescing config and tuning via
+ ethtool
+
+commit cb056a38dcf30856bd7e44ca8ec894dbafca6f5d from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Did default configuration of CQ IRQ coalescing and added support
+to tune/modify CQE and CQ time wait thresholds via ethtool.
+
+Change-Id: I1daacaee4bb4397ce69cb466135229fd2d7b2f16
+Signed-off-by: Christina Jacob <cjacob@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.h       |  2 +
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 85 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 13 +--
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  7 ++
+ 4 files changed, 101 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 5dd57b9edef5..fae9fb453b94 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -152,6 +152,8 @@ struct otx2_nic {
+ 	u16			pcifunc;
+ 	u16			rx_chan_base;
+ 	u16			tx_chan_base;
++	u8			cq_time_wait;
++	u32			cq_ecount_wait;
+ 	struct work_struct	reset_task;
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index c926d607e809..d52af1eace88 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -277,6 +277,89 @@ static int otx2_set_ringparam(struct net_device *netdev,
+ 	return 0;
+ }
+ 
++static int otx2_get_coalesce(struct net_device *netdev,
++			     struct ethtool_coalesce *cmd)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++
++	cmd->rx_coalesce_usecs = pfvf->cq_time_wait / 10;
++	cmd->rx_max_coalesced_frames = pfvf->cq_ecount_wait + 1;
++	cmd->tx_coalesce_usecs = pfvf->cq_time_wait / 10;
++	cmd->tx_max_coalesced_frames = pfvf->cq_ecount_wait + 1;
++
++	return 0;
++}
++
++static int otx2_set_coalesce(struct net_device *netdev,
++			     struct ethtool_coalesce *ec)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++	bool if_up = netif_running(netdev);
++
++	if (ec->use_adaptive_rx_coalesce || ec->use_adaptive_tx_coalesce ||
++	    ec->rx_coalesce_usecs_irq || ec->rx_max_coalesced_frames_irq ||
++	    ec->tx_coalesce_usecs_irq || ec->tx_max_coalesced_frames_irq ||
++	    ec->stats_block_coalesce_usecs || ec->pkt_rate_low ||
++	    ec->rx_coalesce_usecs_low || ec->rx_max_coalesced_frames_low ||
++	    ec->tx_coalesce_usecs_low || ec->tx_max_coalesced_frames_low ||
++	    ec->pkt_rate_high || ec->rx_coalesce_usecs_high ||
++	    ec->rx_max_coalesced_frames_high || ec->tx_coalesce_usecs_high ||
++	    ec->tx_max_coalesced_frames_high || ec->rate_sample_interval)
++		return -EOPNOTSUPP;
++
++	if (!ec->rx_max_coalesced_frames || !ec->tx_max_coalesced_frames)
++		return 0;
++
++	if (if_up)
++		otx2_stop(netdev);
++
++	/* RQ and SQ are tied to CQ setting, so any of the below
++	 * values reflects on CQ.
++	 * cq_time_wait is in multiple of 100ns, rx_coalesce_usecs is in usecs
++	 * hence cq_time_wait should be 10 times of rx/tx_coalesce_usecs.
++	 */
++	if (ec->rx_coalesce_usecs >= CQ_TIMER_THRESH_MAX)
++		ec->rx_coalesce_usecs = CQ_TIMER_THRESH_MAX;
++	if (ec->tx_coalesce_usecs >= CQ_TIMER_THRESH_MAX)
++		ec->tx_coalesce_usecs = CQ_TIMER_THRESH_MAX;
++
++	if (ec->tx_coalesce_usecs == ec->rx_coalesce_usecs) {
++		pfvf->cq_time_wait = (u8)ec->rx_coalesce_usecs * 10;
++	} else {
++		/* If both the values are supplied and is different from
++		 * previously set values arbitrarly taking the rx_coalesce_usecs
++		 * if any of the value is same as previous value the different
++		 * value is taken.
++		 */
++		pfvf->cq_time_wait = (pfvf->cq_time_wait ==
++				      (u8)ec->rx_coalesce_usecs * 10) ?
++			(u8)ec->tx_coalesce_usecs * 10 :
++			(u8)ec->rx_coalesce_usecs * 10;
++	}
++
++	/* @rx_max_coalesced_frames: Maximum number of packets to receive
++	 * before an RX interrupt.
++	 * A completion interrupt is generated when
++	 * NIX_LF_CINT(0..63)_CNT[ECOUNT] > NIX_LF_CINT(0..63)_WAIT[ECOUNT_WAIT]
++	 * after either  value is updated. So cq_ecount_wait =
++	 * rx/tx_max_coalesced frames -1
++	 */
++	if (ec->rx_max_coalesced_frames == ec->tx_max_coalesced_frames) {
++		pfvf->cq_ecount_wait = ec->rx_max_coalesced_frames - 1;
++	} else {
++		/* same as above */
++		pfvf->cq_ecount_wait = (pfvf->cq_ecount_wait ==
++				      ec->rx_max_coalesced_frames - 1) ?
++			 ec->tx_max_coalesced_frames - 1 :
++			 ec->rx_max_coalesced_frames - 1;
++	}
++
++	if (if_up)
++		otx2_open(netdev);
++
++	return 0;
++}
++
+ static const struct ethtool_ops otx2_ethtool_ops = {
+ 	.get_drvinfo		= otx2_get_drvinfo,
+ 	.get_strings		= otx2_get_strings,
+@@ -286,6 +369,8 @@ static const struct ethtool_ops otx2_ethtool_ops = {
+ 	.get_channels		= otx2_get_channels,
+ 	.get_ringparam		= otx2_get_ringparam,
+ 	.set_ringparam		= otx2_set_ringparam,
++	.get_coalesce		= otx2_get_coalesce,
++	.set_coalesce		= otx2_set_coalesce,
+ };
+ 
+ void otx2_set_ethtool_ops(struct net_device *netdev)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 5d597347589c..ea11b1fbfd38 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -682,12 +682,10 @@ int otx2_open(struct net_device *netdev)
+ 		}
+ 		vec++;
+ 
+-		/* Configure CQE interrupt coalescing parameters.
+-		 * Set ECOUNT_WAIT and QCOUNT_WAIT to non-zero values.
+-		 * TODO: Add timer expiry coalescing as well,
+-		 * for now trigger a IRQ when CQE count >= 1.
+-		 */
+-		otx2_write64(pf, NIX_LF_CINTX_WAIT(qidx), 0x00);
++		/* Configure CQE interrupt coalescing parameters */
++		otx2_write64(pf, NIX_LF_CINTX_WAIT(qidx),
++			     ((u64)pf->cq_time_wait << 48) |
++			     pf->cq_ecount_wait);
+ 
+ 		/* Enable CQ IRQ */
+ 		otx2_write64(pf, NIX_LF_CINTX_INT(qidx), BIT_ULL(0));
+@@ -929,6 +927,9 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (!is_9xxx_pass1_silicon(pdev))
+ 		hw->hw_tso = true;
+ 
++	pf->cq_time_wait = CQ_TIMER_THRESH_DEFAULT;
++	pf->cq_ecount_wait = CQ_CQE_THRESH_DEFAULT;
++
+ 	/* NPA's pool is a stack to which SW frees buffer pointers via Aura.
+ 	 * HW allocates buffer pointer from stack and uses it for DMA'ing
+ 	 * ingress packet. In some scenarios HW can free back allocated buffer
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index 0b38e113cdc3..4191c6776709 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -34,6 +34,13 @@
+ #define OTX2_MAX_GSO_SEGS	255
+ #define OTX2_MAX_FRAGS_IN_SQE	9
+ 
++#define CQ_CQE_THRESH_DEFAULT	0x0ULL /* IRQ triggered when
++					* NIX_LF_CINTX_CNT[QCOUNT]
++					* crosses this value
++					*/
++#define CQ_TIMER_THRESH_DEFAULT	0xAULL /* ~1usec i.e (0xA * 100nsec) */
++#define CQ_TIMER_THRESH_MAX     255
++
+ struct queue_stats {
+ 	u64	bytes;
+ 	u64	pkts;
+-- 
+2.31.1
+

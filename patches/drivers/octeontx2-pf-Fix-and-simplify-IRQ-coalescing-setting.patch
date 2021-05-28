@@ -1,0 +1,222 @@
+From f9d117e84410cdacc082bcc935b5a718d732aaad Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 8 Aug 2019 16:48:16 +0530
+Subject: [PATCH 307/767] octeontx2-pf: Fix and simplify IRQ coalescing
+ settings
+
+commit bf8012eebdbe80d61f917e06066588711aebf08c from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Current logic has +/- 1 of time_wait and mul/div by 10 of
+count_wait everywhere which is confusing. Also there are
+many scenarios where time_wait is not being set properly.
+This patch simplifies the logic and fixes the issues.
+
+Change-Id: If7c51d60fcc708fa9af02c28632b220b6abc5d6b
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/14056
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 14 ++++
+ .../marvell/octeontx2/nic/otx2_common.h       |  1 +
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 78 ++++++++-----------
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  6 +-
+ .../marvell/octeontx2/nic/otx2_txrx.h         | 18 +++--
+ 5 files changed, 59 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 612683f9662e..0ae740f1089a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -343,6 +343,20 @@ int otx2_rss_init(struct otx2_nic *pfvf)
+ 	return otx2_set_flowkey_cfg(pfvf);
+ }
+ 
++void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx)
++{
++	/* Configure CQE interrupt coalescing parameters
++	 *
++	 * HW triggers an irq when ECOUNT > cq_ecount_wait, hence
++	 * set 1 less than cq_ecount_wait. And cq_time_wait is in
++	 * usecs, convert that to 100ns count.
++	 */
++	otx2_write64(pfvf, NIX_LF_CINTX_WAIT(qidx),
++		     ((u64)(pfvf->cq_time_wait * 10) << 48) |
++		     ((u64)pfvf->cq_qcount_wait << 32) |
++		     (pfvf->cq_ecount_wait - 1));
++}
++
+ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 			   gfp_t gfp)
+ {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index f4a188d34f08..a794c231c81f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -550,6 +550,7 @@ int otx2_change_mtu(struct net_device *netdev, int new_mtu);
+ int otx2_hw_set_mtu(struct otx2_nic *pfvf, int mtu);
+ void otx2_tx_timeout(struct net_device *netdev);
+ void otx2_get_mac_from_af(struct net_device *netdev);
++void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx);
+ 
+ /* RVU block related APIs */
+ int otx2_attach_npa_nix(struct otx2_nic *pfvf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index 6ab4a6ee268a..d1d52c546cb1 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -391,10 +391,10 @@ static int otx2_get_coalesce(struct net_device *netdev,
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+ 
+-	cmd->rx_coalesce_usecs = pfvf->cq_time_wait / 10;
+-	cmd->rx_max_coalesced_frames = pfvf->cq_ecount_wait + 1;
+-	cmd->tx_coalesce_usecs = pfvf->cq_time_wait / 10;
+-	cmd->tx_max_coalesced_frames = pfvf->cq_ecount_wait + 1;
++	cmd->rx_coalesce_usecs = pfvf->cq_time_wait;
++	cmd->rx_max_coalesced_frames = pfvf->cq_ecount_wait;
++	cmd->tx_coalesce_usecs = pfvf->cq_time_wait;
++	cmd->tx_max_coalesced_frames = pfvf->cq_ecount_wait;
+ 
+ 	return 0;
+ }
+@@ -403,7 +403,7 @@ static int otx2_set_coalesce(struct net_device *netdev,
+ 			     struct ethtool_coalesce *ec)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+-	bool if_up = netif_running(netdev);
++	int qidx;
+ 
+ 	if (ec->use_adaptive_rx_coalesce || ec->use_adaptive_tx_coalesce ||
+ 	    ec->rx_coalesce_usecs_irq || ec->rx_max_coalesced_frames_irq ||
+@@ -419,52 +419,38 @@ static int otx2_set_coalesce(struct net_device *netdev,
+ 	if (!ec->rx_max_coalesced_frames || !ec->tx_max_coalesced_frames)
+ 		return 0;
+ 
+-	if (if_up)
+-		otx2_stop(netdev);
+-
+-	/* RQ and SQ are tied to CQ setting, so any of the below
+-	 * values reflects on CQ.
+-	 * cq_time_wait is in multiple of 100ns, rx_coalesce_usecs is in usecs
+-	 * hence cq_time_wait should be 10 times of rx/tx_coalesce_usecs.
++	/* 'cq_time_wait' is 8bit and is in multiple of 100ns,
++	 * so clamp the user given value to the range of 1 to 25usec.
+ 	 */
+-	if (ec->rx_coalesce_usecs >= CQ_TIMER_THRESH_MAX)
+-		ec->rx_coalesce_usecs = CQ_TIMER_THRESH_MAX;
+-	if (ec->tx_coalesce_usecs >= CQ_TIMER_THRESH_MAX)
+-		ec->tx_coalesce_usecs = CQ_TIMER_THRESH_MAX;
++	ec->rx_coalesce_usecs = clamp_t(u8, ec->rx_coalesce_usecs,
++					1, CQ_TIMER_THRESH_MAX);
++	ec->tx_coalesce_usecs = clamp_t(u8, ec->tx_coalesce_usecs,
++					1, CQ_TIMER_THRESH_MAX);
+ 
+-	if (ec->tx_coalesce_usecs == ec->rx_coalesce_usecs) {
+-		pfvf->cq_time_wait = (u8)ec->rx_coalesce_usecs * 10;
+-	} else {
+-		/* If both the values are supplied and is different from
+-		 * previously set values arbitrarly taking the rx_coalesce_usecs
+-		 * if any of the value is same as previous value the different
+-		 * value is taken.
+-		 */
+-		pfvf->cq_time_wait = (pfvf->cq_time_wait ==
+-				      (u8)ec->rx_coalesce_usecs * 10) ?
+-			(u8)ec->tx_coalesce_usecs * 10 :
+-			(u8)ec->rx_coalesce_usecs * 10;
+-	}
++	/* Rx and Tx are mapped to same CQ, check which one
++	 * is changed, if both then choose the min.
++	 */
++	if (pfvf->cq_time_wait == ec->rx_coalesce_usecs)
++		pfvf->cq_time_wait = ec->tx_coalesce_usecs;
++	else if (pfvf->cq_time_wait == ec->tx_coalesce_usecs)
++		pfvf->cq_time_wait = ec->rx_coalesce_usecs;
++	else
++		pfvf->cq_time_wait = min_t(u8, ec->rx_coalesce_usecs,
++					   ec->tx_coalesce_usecs);
+ 
+-	/* @rx_max_coalesced_frames: Maximum number of packets to receive
+-	 * before an RX interrupt.
+-	 * A completion interrupt is generated when
+-	 * NIX_LF_CINT(0..63)_CNT[ECOUNT] > NIX_LF_CINT(0..63)_WAIT[ECOUNT_WAIT]
+-	 * after either  value is updated. So cq_ecount_wait =
+-	 * rx/tx_max_coalesced frames -1
++	/* Rx and Tx are mapped to same CQ, check which one
++	 * is changed, if both then choose the min.
+ 	 */
+-	if (ec->rx_max_coalesced_frames == ec->tx_max_coalesced_frames) {
+-		pfvf->cq_ecount_wait = ec->rx_max_coalesced_frames - 1;
+-	} else {
+-		/* same as above */
+-		pfvf->cq_ecount_wait = (pfvf->cq_ecount_wait ==
+-				      ec->rx_max_coalesced_frames - 1) ?
+-			 ec->tx_max_coalesced_frames - 1 :
+-			 ec->rx_max_coalesced_frames - 1;
+-	}
++	if (pfvf->cq_ecount_wait == ec->rx_max_coalesced_frames)
++		pfvf->cq_ecount_wait = ec->tx_max_coalesced_frames;
++	else if (pfvf->cq_ecount_wait == ec->tx_max_coalesced_frames)
++		pfvf->cq_ecount_wait = ec->rx_max_coalesced_frames;
++	else
++		pfvf->cq_ecount_wait = min_t(u8, ec->rx_max_coalesced_frames,
++					     ec->tx_max_coalesced_frames);
+ 
+-	if (if_up)
+-		otx2_open(netdev);
++	for (qidx = 0; qidx < pfvf->hw.cint_cnt; qidx++)
++		otx2_config_irq_coalescing(pfvf, qidx);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 33d8904f1f02..e389e904d093 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1565,11 +1565,7 @@ int otx2_open(struct net_device *netdev)
+ 		}
+ 		vec++;
+ 
+-		/* Configure CQE interrupt coalescing parameters */
+-		otx2_write64(pf, NIX_LF_CINTX_WAIT(qidx),
+-			     ((u64)pf->cq_time_wait << 48) |
+-			     ((u64)pf->cq_qcount_wait << 32) |
+-			     pf->cq_ecount_wait);
++		otx2_config_irq_coalescing(pf, qidx);
+ 
+ 		/* Enable CQ IRQ */
+ 		otx2_write64(pf, NIX_LF_CINTX_INT(qidx), BIT_ULL(0));
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index cb9d07825f44..757df4aa42ca 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -34,13 +34,17 @@
+ #define OTX2_MAX_GSO_SEGS	255
+ #define OTX2_MAX_FRAGS_IN_SQE	9
+ 
+-#define CQ_CQE_THRESH_DEFAULT	0xAULL /* IRQ triggered when
+-					* NIX_LF_CINTX_CNT[ECOUNT]
+-					* crosses this value
+-					*/
+-#define CQ_TIMER_THRESH_DEFAULT	0xAULL /* ~1usec i.e (0xA * 100nsec) */
+-#define CQ_TIMER_THRESH_MAX     255
+-#define CQ_QCOUNT_DEFAULT	0x1ULL
++/* IRQ triggered when NIX_LF_CINTX_CNT[ECOUNT]
++ * is equal to this value.
++ */
++#define CQ_CQE_THRESH_DEFAULT	10
++
++/* IRQ triggered when NIX_LF_CINTX_CNT[ECOUNT]
++ * is nonzero and this much time elapses after that.
++ */
++#define CQ_TIMER_THRESH_DEFAULT	1  /* 1 usec */
++#define CQ_TIMER_THRESH_MAX     25 /* 25 usec */
++#define CQ_QCOUNT_DEFAULT	1
+ 
+ struct queue_stats {
+ 	u64	bytes;
+-- 
+2.31.1
+

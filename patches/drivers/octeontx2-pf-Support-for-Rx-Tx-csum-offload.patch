@@ -1,0 +1,129 @@
+From ad86e46bc52a79917e9dd8930f6cad6543538a21 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 17 Dec 2018 11:55:01 +0530
+Subject: [PATCH 051/767] octeontx2-pf: Support for Rx/Tx csum offload
+
+commit df19843ba2b3b87cf1a871f58e53eb71d3affa38 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Added support for offloading ingress packet's checksum
+verification and egress packets's checksum calculation.
+
+Change-Id: I833be25ec0054dd0e45d51f1c24c941d25ad472e
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  4 +++
+ .../marvell/octeontx2/nic/otx2_struct.h       | 15 +++++++++
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 32 +++++++++++++++++--
+ 3 files changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 25db838f1b7b..6af3de454fc5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -756,6 +756,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	 */
+ 	pf->iommu_domain = iommu_get_domain_for_dev(dev);
+ 
++	netdev->hw_features = (NETIF_F_RXCSUM |
++			       NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM);
++	netdev->features |= netdev->hw_features;
++
+ 	netdev->netdev_ops = &otx2_netdev_ops;
+ 
+ 	/* MTU range: 68 - 9190 */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+index 212ce914c7f3..f7c5996fc437 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+@@ -28,6 +28,21 @@ enum nix_send_ldtype {
+ 	NIX_SEND_LDTYPE_LDWB = 0x2,
+ };
+ 
++/* CSUM offload */
++enum nix_sendl3type {
++	NIX_SENDL3TYPE_NONE = 0x0,
++	NIX_SENDL3TYPE_IP4 = 0x2,
++	NIX_SENDL3TYPE_IP4_CKSUM = 0x3,
++	NIX_SENDL3TYPE_IP6 = 0x4,
++};
++
++enum nix_sendl4type {
++	NIX_SENDL4TYPE_NONE,
++	NIX_SENDL4TYPE_TCP_CKSUM,
++	NIX_SENDL4TYPE_SCTP_CKSUM,
++	NIX_SENDL4TYPE_UDP_CKSUM,
++};
++
+ /* NIX wqe/cqe types */
+ enum nix_xqe_type {
+ 	NIX_XQE_TYPE_INVALID   = 0x0,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index a54e3ebaff01..71261d600d40 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -226,6 +226,8 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 
+ 	skb_record_rx_queue(skb, cq->cq_idx);
+ 	skb->protocol = eth_type_trans(skb, pfvf->netdev);
++	if (pfvf->netdev->features & NETIF_F_RXCSUM)
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+ 	napi_gro_receive(&qset->napi[cq->cint_idx].napi, skb);
+ }
+@@ -382,9 +384,12 @@ static bool otx2_sqe_add_sg(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+ 
+ /* Add SQE header subdescriptor structure */
+ static void otx2_sqe_add_hdr(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+-			     struct nix_sqe_hdr_s *sqe_hdr, int len, u16 qidx)
++			     struct nix_sqe_hdr_s *sqe_hdr,
++			     struct sk_buff *skb, u16 qidx)
+ {
+-	sqe_hdr->total = len;
++	int proto = 0;
++
++	sqe_hdr->total = skb->len;
+ 	/* Don't free Tx buffers to Aura */
+ 	sqe_hdr->df = 1;
+ 	sqe_hdr->aura = sq->aura_id;
+@@ -393,6 +398,27 @@ static void otx2_sqe_add_hdr(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+ 	sqe_hdr->sq = qidx;
+ 	/* Set SQE identifier which will be used later for freeing SKB */
+ 	sqe_hdr->sqe_id = sq->head;
++
++	/* Offload TCP/UDP checksum to HW */
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		sqe_hdr->ol3ptr = skb_network_offset(skb);
++		sqe_hdr->ol4ptr = skb_transport_offset(skb);
++
++		if (skb->protocol == htons(ETH_P_IP)) {
++			proto = ip_hdr(skb)->protocol;
++			/* In case of TSO, HW needs this to be explicitly set.
++			 * So set this always, instead of adding a check.
++			 */
++			sqe_hdr->ol3type = NIX_SENDL3TYPE_IP4_CKSUM;
++		} else if (skb->protocol == htons(ETH_P_IPV6)) {
++			proto = ipv6_hdr(skb)->nexthdr;
++		}
++
++		if (proto == IPPROTO_TCP)
++			sqe_hdr->ol4type = NIX_SENDL4TYPE_TCP_CKSUM;
++		else if (proto == IPPROTO_UDP)
++			sqe_hdr->ol4type = NIX_SENDL4TYPE_UDP_CKSUM;
++	}
+ }
+ 
+ bool otx2_sq_append_skb(struct net_device *netdev, struct otx2_snd_queue *sq,
+@@ -413,7 +439,7 @@ bool otx2_sq_append_skb(struct net_device *netdev, struct otx2_snd_queue *sq,
+ 	/* Set SQE's SEND_HDR */
+ 	memset(sq->sqe_base, 0, sq->sqe_size);
+ 	sqe_hdr = (struct nix_sqe_hdr_s *)(sq->sqe_base);
+-	otx2_sqe_add_hdr(pfvf, sq, sqe_hdr, skb->len, qidx);
++	otx2_sqe_add_hdr(pfvf, sq, sqe_hdr, skb, qidx);
+ 	offset = sizeof(*sqe_hdr);
+ 
+ 	num_segs = skb_shinfo(skb)->nr_frags + 1;
+-- 
+2.31.1
+

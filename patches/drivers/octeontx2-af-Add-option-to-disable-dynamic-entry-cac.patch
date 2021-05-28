@@ -1,0 +1,217 @@
+From 1cac794c00066d3afc3cd3673d22eb74721e2853 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 6 Jun 2019 12:11:12 +0530
+Subject: [PATCH 189/767] octeontx2-af: Add option to disable dynamic entry
+ caching in NDC
+
+commit 2e95351b0f314c123ec0e8f28e899bb8a2d293ce from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+A config option is added to disable caching of dynamic entries
+like SQEs and stack pages. Also locks down all HW contexts in NDC,
+preventing them from being evicted.
+
+This option is useful in reducing number of cache misses thus
+getting rid of a probability of hitting couple of related HW issues.
+
+Note: This config option will result in performance loss
+
+Change-Id: I5e0bef0d1ce7b602ced1dc36ba6d7853d769614b
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/Kconfig    |  9 +++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 64 ++++++++++++++++++-
+ .../ethernet/marvell/octeontx2/af/rvu_npa.c   | 42 ++++++++++++
+ 3 files changed, 112 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/Kconfig b/drivers/net/ethernet/marvell/octeontx2/Kconfig
+index 26c4b97238d5..31f794965a5d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/Kconfig
++++ b/drivers/net/ethernet/marvell/octeontx2/Kconfig
+@@ -17,6 +17,15 @@ config OCTEONTX2_AF
+ 	  and provides a medium to other PF/VFs to configure HW. Should be
+ 	  enabled for other RVU device drivers to work.
+ 
++config NDC_DIS_DYNAMIC_CACHING
++	bool "Disable caching of dynamic entries in NDC"
++	depends on OCTEONTX2_AF
++	default n
++	---help---
++	  This config option disables caching of dynamic entries such as NIX SQEs
++	  , NPA stack pages etc in NDC. Also locks down NIX SQ/CQ/RQ/RSS and
++	  NPA Aura/Pool contexts.
++
+ config OCTEONTX2_PF
+ 	tristate "Marvell OcteonTX2 NIC Physical Function driver"
+ 	depends on PCI && ARM64 && ARM64_LSE_ATOMICS
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 8a5bb3a7c22a..4341e8fd194a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -811,6 +811,21 @@ static int rvu_nix_aq_enq_inst(struct rvu *rvu, struct nix_aq_enq_req *req,
+ 	return 0;
+ }
+ 
++static const char *nix_get_ctx_name(int ctype)
++{
++	switch (ctype) {
++	case NIX_AQ_CTYPE_CQ:
++		return "CQ";
++	case NIX_AQ_CTYPE_SQ:
++		return "SQ";
++	case NIX_AQ_CTYPE_RQ:
++		return "RQ";
++	case NIX_AQ_CTYPE_RSS:
++		return "RSS";
++	}
++	return "";
++}
++
+ static int nix_lf_hwctx_disable(struct rvu *rvu, struct hwctx_disable_req *req)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, req->hdr.pcifunc);
+@@ -855,21 +870,60 @@ static int nix_lf_hwctx_disable(struct rvu *rvu, struct hwctx_disable_req *req)
+ 		if (rc) {
+ 			err = rc;
+ 			dev_err(rvu->dev, "Failed to disable %s:%d context\n",
+-				(req->ctype == NIX_AQ_CTYPE_CQ) ?
+-				"CQ" : ((req->ctype == NIX_AQ_CTYPE_RQ) ?
+-				"RQ" : "SQ"), qidx);
++				nix_get_ctx_name(req->ctype), qidx);
+ 		}
+ 	}
+ 
+ 	return err;
+ }
+ 
++#ifdef CONFIG_NDC_DIS_DYNAMIC_CACHING
++static int nix_lf_hwctx_lockdown(struct rvu *rvu, struct nix_aq_enq_req *req)
++{
++	struct nix_aq_enq_req lock_ctx_req;
++	int err;
++
++	if (req->op != NIX_AQ_INSTOP_INIT)
++		return 0;
++
++	if (req->ctype == NIX_AQ_CTYPE_MCE ||
++	    req->ctype == NIX_AQ_CTYPE_DYNO)
++		return 0;
++
++	memset(&lock_ctx_req, 0, sizeof(struct nix_aq_enq_req));
++	lock_ctx_req.hdr.pcifunc = req->hdr.pcifunc;
++	lock_ctx_req.ctype = req->ctype;
++	lock_ctx_req.op = NIX_AQ_INSTOP_LOCK;
++	lock_ctx_req.qidx = req->qidx;
++	err = rvu_nix_aq_enq_inst(rvu, &lock_ctx_req, NULL);
++	if (err)
++		dev_err(rvu->dev,
++			"PFUNC 0x%x: Failed to lock NIX %s:%d context\n",
++			req->hdr.pcifunc,
++			nix_get_ctx_name(req->ctype), req->qidx);
++	return err;
++}
++
++int rvu_mbox_handler_nix_aq_enq(struct rvu *rvu,
++				struct nix_aq_enq_req *req,
++				struct nix_aq_enq_rsp *rsp)
++{
++	int err;
++
++	err = rvu_nix_aq_enq_inst(rvu, req, rsp);
++	if (!err)
++		err = nix_lf_hwctx_lockdown(rvu, req);
++	return err;
++}
++#else
++
+ int rvu_mbox_handler_nix_aq_enq(struct rvu *rvu,
+ 				struct nix_aq_enq_req *req,
+ 				struct nix_aq_enq_rsp *rsp)
+ {
+ 	return rvu_nix_aq_enq_inst(rvu, req, rsp);
+ }
++#endif
+ 
+ int rvu_mbox_handler_nix_hwctx_disable(struct rvu *rvu,
+ 				       struct hwctx_disable_req *req,
+@@ -3243,6 +3297,10 @@ static int nix_aq_init(struct rvu *rvu, struct rvu_block *block)
+ 	/* Do not bypass NDC cache */
+ 	cfg = rvu_read64(rvu, block->addr, NIX_AF_NDC_CFG);
+ 	cfg &= ~0x3FFEULL;
++#ifdef CONFIG_NDC_DIS_DYNAMIC_CACHING
++	/* Disable caching of SQB aka SQEs */
++	cfg |= 0x04ULL;
++#endif
+ 	rvu_write64(rvu, block->addr, NIX_AF_NDC_CFG, cfg);
+ 
+ 	/* Result structure can be followed by RQ/SQ/CQ context at
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+index 83790acb5a84..5ccc0be5d5f9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npa.c
+@@ -243,12 +243,50 @@ static int npa_lf_hwctx_disable(struct rvu *rvu, struct hwctx_disable_req *req)
+ 	return err;
+ }
+ 
++#ifdef CONFIG_NDC_DIS_DYNAMIC_CACHING
++static int npa_lf_hwctx_lockdown(struct rvu *rvu, struct npa_aq_enq_req *req)
++{
++	struct npa_aq_enq_req lock_ctx_req;
++	int err;
++
++	if (req->op != NPA_AQ_INSTOP_INIT)
++		return 0;
++
++	memset(&lock_ctx_req, 0, sizeof(struct npa_aq_enq_req));
++	lock_ctx_req.hdr.pcifunc = req->hdr.pcifunc;
++	lock_ctx_req.ctype = req->ctype;
++	lock_ctx_req.op = NPA_AQ_INSTOP_LOCK;
++	lock_ctx_req.aura_id = req->aura_id;
++	err = rvu_npa_aq_enq_inst(rvu, &lock_ctx_req, NULL);
++	if (err)
++		dev_err(rvu->dev,
++			"PFUNC 0x%x: Failed to lock NPA context %s:%d\n",
++			req->hdr.pcifunc,
++			(req->ctype == NPA_AQ_CTYPE_AURA) ?
++			"Aura" : "Pool", req->aura_id);
++	return err;
++}
++
++int rvu_mbox_handler_npa_aq_enq(struct rvu *rvu,
++				struct npa_aq_enq_req *req,
++				struct npa_aq_enq_rsp *rsp)
++{
++	int err;
++
++	err = rvu_npa_aq_enq_inst(rvu, req, rsp);
++	if (!err)
++		err = npa_lf_hwctx_lockdown(rvu, req);
++	return err;
++}
++#else
++
+ int rvu_mbox_handler_npa_aq_enq(struct rvu *rvu,
+ 				struct npa_aq_enq_req *req,
+ 				struct npa_aq_enq_rsp *rsp)
+ {
+ 	return rvu_npa_aq_enq_inst(rvu, req, rsp);
+ }
++#endif
+ 
+ int rvu_mbox_handler_npa_hwctx_disable(struct rvu *rvu,
+ 				       struct hwctx_disable_req *req,
+@@ -429,6 +467,10 @@ static int npa_aq_init(struct rvu *rvu, struct rvu_block *block)
+ 	/* Do not bypass NDC cache */
+ 	cfg = rvu_read64(rvu, block->addr, NPA_AF_NDC_CFG);
+ 	cfg &= ~0x03DULL;
++#ifdef CONFIG_NDC_DIS_DYNAMIC_CACHING
++	/* Disable caching of stack pages */
++	cfg |= 0x10ULL;
++#endif
+ 	rvu_write64(rvu, block->addr, NPA_AF_NDC_CFG, cfg);
+ 
+ 	/* Result structure can be followed by Aura/Pool context at
+-- 
+2.31.1
+

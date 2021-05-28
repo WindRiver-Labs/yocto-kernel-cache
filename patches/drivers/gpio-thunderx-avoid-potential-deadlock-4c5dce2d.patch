@@ -1,0 +1,137 @@
+From 56ae5d3f21386af76714add13cbd6d8565ebef2f Mon Sep 17 00:00:00 2001
+From: Peter Swain <peter.swain@marvell.com>
+Date: Thu, 23 Aug 2018 06:41:06 -0700
+Subject: [PATCH 404/767] gpio: thunderx: avoid potential deadlock
+
+commit b007fa51a62eaf7450d3a80188929c45a093dc20 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Because GPIOs can IRQ, and the lock is taken servicing IRQ,
+all GPIO locking must be done with irqsave/restore,
+and of course irq_set_handler_locked() must be called under lock
+
+CONFIG_LOCKDEP=y noted this, during mmc setup
+[   36.370289] WARNING: HARDIRQ-safe -> HARDIRQ-unsafe lock order detected
+[   36.370294] 4.14.47-00162-ged77c8968048 #18 Not tainted
+[   36.370297] -----------------------------------------------------
+[   36.370303] kworker/0:2/117 [HC0[0]:SC0[0]:HE0:SE1] is trying to acquire:
+[   36.370307]  (&txgpio->lock){+.+.}, at: [<ffff0000085bf784>] thunderx_gpio_irq_set_type+0x8c/0x130
+[   36.370328]
+[   36.370328] and this task is already holding:
+[   36.370330]  (&irq_desc_lock_class){-.-.}, at: [<ffff000008129ee0>] __setup_irq+0xe8/0x7d8
+[   36.370346] which would create a new lock dependency:
+[   36.370348]  (&irq_desc_lock_class){-.-.} -> (&txgpio->lock){+.+.}
+[   36.370369]
+[   36.370369] but this new dependency connects a HARDIRQ-irq-safe lock:
+[   36.370372]  (&irq_desc_lock_class){-.-.}
+[   36.370380]
+[   36.370380] ... which became HARDIRQ-irq-safe at:
+[   36.370386]   lock_acquire+0xd0/0x2a0
+[   36.370393]   _raw_spin_lock+0x4c/0x88
+[   36.370398]   handle_fasteoi_irq+0x2c/0x188
+...
+[   36.370491] to a HARDIRQ-irq-unsafe lock:
+[   36.370493]  (&txgpio->lock){+.+.}
+[   36.370502]
+[   36.370502] ... which became HARDIRQ-irq-unsafe at:
+[   36.370504] ...
+[   36.370510]   lock_acquire+0xd0/0x2a0
+[   36.370515]   _raw_spin_lock+0x4c/0x88
+[   36.370520]   thunderx_gpio_set_config+0x80/0x2b0
+[   36.370525]   _gpiod_direction_output_raw+0x130/0x1b8
+[   36.370530]   gpiod_direction_output_raw+0x48/0xc8
+[   36.370535]   gpio_request_one+0x94/0x118
+...
+[   36.370612]  Possible interrupt unsafe locking scenario:
+[   36.370612]
+[   36.370614]        CPU0                    CPU1
+[   36.370617]        ----                    ----
+[   36.370620]   lock(&txgpio->lock);
+[   36.370628]                                local_irq_disable();
+[   36.370630]                                lock(&irq_desc_lock_class);
+[   36.370638]                                lock(&txgpio->lock);
+[   36.370646]   <Interrupt>
+[   36.370648]     lock(&irq_desc_lock_class);
+[   36.370656]
+[   36.370656]  *** DEADLOCK ***
+...
+[   36.371078]  ... acquired at:
+[   36.371083]    validate_chain.isra.11+0xa24/0xcb8
+[   36.371088]    __lock_acquire+0x2d4/0x748
+[   36.371093]    lock_acquire+0xd0/0x2a0
+[   36.371097]    _raw_spin_lock+0x4c/0x88
+[   36.371102]    thunderx_gpio_irq_set_type+0x8c/0x130
+[   36.371107]    __irq_set_trigger+0x68/0x1f0
+[   36.371112]    __setup_irq+0x6d4/0x7d8
+[   36.371117]    request_threaded_irq+0xf0/0x1b0
+[   36.371122]    devm_request_threaded_irq+0x80/0xf8
+[   36.371151]    mmc_gpiod_request_cd_irq+0x94/0xf8 [mmc_core]
+[   36.371175]    mmc_start_host+0x6c/0x98 [mmc_core]
+[   36.371200]    mmc_add_host+0x4c/0x68 [mmc_core]
+[   36.371210]    cvm_mmc_of_slot_probe+0x308/0x470 [thunderx_mmc]
+[   36.371218]    thunder_mmc_probe+0x444/0x460 [thunderx_mmc]
+
+Change-Id: Ia5609e239c0808fe0096603091f846f13a6930fc
+Signed-off-by: Peter Swain <peter.swain@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/18210
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/gpio/gpio-thunderx.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpio/gpio-thunderx.c b/drivers/gpio/gpio-thunderx.c
+index 6810abe412b5..686588e928ec 100644
+--- a/drivers/gpio/gpio-thunderx.c
++++ b/drivers/gpio/gpio-thunderx.c
+@@ -575,11 +575,13 @@ static int thunderx_gpio_spi_irq_set_type(struct irq_data *data,
+ 		container_of(chip, struct thunderx_gpio, chip);
+ 	unsigned int line = data->hwirq;
+ 	u64 bit_cfg;
++	unsigned long flags;
+ 
+ 	irqd_set_trigger_type(data, flow_type);
+ 
+ 	bit_cfg = GLITCH_FILTER_400NS | GPIO_BIT_CFG_INT_EN;
+ 
++	raw_spin_lock_irqsave(&gpio->lock, flags);
+ 	if (flow_type & IRQ_TYPE_EDGE_BOTH) {
+ 		irq_set_handler_locked(data, handle_edge_irq);
+ 		bit_cfg |= GPIO_BIT_CFG_INT_TYPE;
+@@ -587,7 +589,6 @@ static int thunderx_gpio_spi_irq_set_type(struct irq_data *data,
+ 		irq_set_handler_locked(data, handle_level_irq);
+ 	}
+ 
+-	raw_spin_lock(&gpio->lock);
+ 	if (flow_type & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_LEVEL_LOW)) {
+ 		bit_cfg |= GPIO_BIT_CFG_PIN_XOR;
+ 		set_bit(line, gpio->invert_mask);
+@@ -596,7 +597,7 @@ static int thunderx_gpio_spi_irq_set_type(struct irq_data *data,
+ 	}
+ 	clear_bit(line, gpio->od_mask);
+ 	writeq(bit_cfg, gpio->register_base + bit_cfg_reg(line));
+-	raw_spin_unlock(&gpio->lock);
++	raw_spin_unlock_irqrestore(&gpio->lock, flags);
+ 
+ 	return IRQ_SET_MASK_OK;
+ }
+@@ -681,6 +682,7 @@ static int thunderx_gpio_irq_set_type(struct irq_data *data,
+ 
+ 	bit_cfg = txline->fil_bits | GPIO_BIT_CFG_INT_EN;
+ 
++	raw_spin_lock_irqsave(&txgpio->lock, flags);
+ 	if (flow_type & IRQ_TYPE_EDGE_BOTH) {
+ 		irq_set_handler_locked(data, handle_fasteoi_ack_irq);
+ 		bit_cfg |= GPIO_BIT_CFG_INT_TYPE;
+@@ -688,7 +690,6 @@ static int thunderx_gpio_irq_set_type(struct irq_data *data,
+ 		irq_set_handler_locked(data, handle_fasteoi_mask_irq);
+ 	}
+ 
+-	raw_spin_lock_irqsave(&txgpio->lock, flags);
+ 	if (flow_type & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_LEVEL_LOW)) {
+ 		bit_cfg |= GPIO_BIT_CFG_PIN_XOR;
+ 		set_bit(txline->line, txgpio->invert_mask);
+-- 
+2.31.1
+

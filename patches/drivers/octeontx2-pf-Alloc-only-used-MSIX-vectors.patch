@@ -1,0 +1,226 @@
+From d87eec9aa4b64f48f7dd7990b4a677519958f612 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 28 Oct 2019 15:37:32 +0530
+Subject: [PATCH 389/767] octeontx2-pf: Alloc only used MSIX vectors
+
+commit c94525c3a9b0e992be718aa5dc214bdda0ebd3b8 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Each of the CGX mapped RVU PFVF has 210 MSIX vectors and kernel
+globally support only 8192 IRQs. So enabling 210 vectors for all PF,
+their VFs and LBKVFs results in failure of pci_alloc_vectors for some
+of the devices. Increasing the Linux IRQ count from 8192 has upstream
+depencency and for reasons unknown resulted in performance regression
+on Armada silicon.
+
+Since netdev drivers are not registering NPA block IRQs, reverse the
+NPA and NIX MSIX vectors allocation. This way we will end up using
+vectors less than half of what we are using currently. Vectors
+allocated are PF_INT + NIX_QINT + NIX_CINT (max queues/cores).
+
+Change-Id: I495c2d43caf0f9a8b12407ef44cfbe13bd01c25e
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/17958
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |  6 +--
+ .../marvell/octeontx2/nic/otx2_common.c       |  1 +
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 38 +++++++++++++++++--
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  | 35 ++++++++++++++++-
+ 4 files changed, 72 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 473acfeaaae6..e88b5253f2d1 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -1344,12 +1344,12 @@ int rvu_mbox_handler_attach_resources(struct rvu *rvu,
+ 		goto exit;
+ 
+ 	/* Now attach the requested resources */
+-	if (attach->npalf)
+-		rvu_attach_block(rvu, pcifunc, BLKTYPE_NPA, 1);
+-
+ 	if (attach->nixlf)
+ 		rvu_attach_block(rvu, pcifunc, BLKTYPE_NIX, 1);
+ 
++	if (attach->npalf)
++		rvu_attach_block(rvu, pcifunc, BLKTYPE_NPA, 1);
++
+ 	if (attach->sso) {
+ 		/* RVU func doesn't know which exact LF or slot is attached
+ 		 * to it, it always sees as slot 0,1,2. So for a 'modify'
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 01b5f1765e42..5575f6971245 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -1268,6 +1268,7 @@ int otx2_attach_npa_nix(struct otx2_nic *pfvf)
+ 			"RVUPF: Invalid MSIX vector offset for NPA/NIX\n");
+ 		return -EINVAL;
+ 	}
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(otx2_attach_npa_nix);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 2cf58dd54cd0..021f726682fd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -996,7 +996,7 @@ static void otx2_disable_mbox_intr(struct otx2_nic *pf)
+ 	free_irq(vector, pf);
+ }
+ 
+-static int otx2_register_mbox_intr(struct otx2_nic *pf)
++static int otx2_register_mbox_intr(struct otx2_nic *pf, bool probe_af)
+ {
+ 	struct otx2_hw *hw = &pf->hw;
+ 	struct msg_req *req;
+@@ -1020,6 +1020,9 @@ static int otx2_register_mbox_intr(struct otx2_nic *pf)
+ 	otx2_write64(pf, RVU_PF_INT, BIT_ULL(0));
+ 	otx2_write64(pf, RVU_PF_INT_ENA_W1S, BIT_ULL(0));
+ 
++	if (!probe_af)
++		return 0;
++
+ 	/* Check mailbox communication with AF */
+ 	req = otx2_mbox_alloc_msg_ready(&pf->mbox);
+ 	if (!req) {
+@@ -2102,6 +2105,30 @@ static int otx2_check_pf_usable(struct otx2_nic *nic)
+ 	return 0;
+ }
+ 
++static int otx2_realloc_msix_vectors(struct otx2_nic *pf)
++{
++	struct otx2_hw *hw = &pf->hw;
++	int num_vec, err;
++
++	num_vec = hw->nix_msixoff;
++	num_vec += NIX_LF_CINT_VEC_START + hw->max_queues;
++
++	otx2_disable_mbox_intr(pf);
++	pci_free_irq_vectors(hw->pdev);
++	pci_free_irq_vectors(hw->pdev);
++	err = pci_alloc_irq_vectors(hw->pdev, num_vec, num_vec, PCI_IRQ_MSIX);
++	if (err < 0) {
++		dev_err(pf->dev, "%s: Failed to realloc %d IRQ vectors\n",
++			__func__, num_vec);
++		return err;
++	}
++
++	err = otx2_register_mbox_intr(pf, false);
++	if (err)
++		return err;
++	return 0;
++}
++
+ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -2184,7 +2211,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_free_netdev;
+ 
+-	err = pci_alloc_irq_vectors(hw->pdev, num_vec, num_vec, PCI_IRQ_MSIX);
++	err = pci_alloc_irq_vectors(hw->pdev, RVU_PF_INT_VEC_CNT,
++				    RVU_PF_INT_VEC_CNT, PCI_IRQ_MSIX);
+ 	if (err < 0) {
+ 		dev_err(dev, "%s: Failed to alloc %d IRQ vectors\n",
+ 			__func__, num_vec);
+@@ -2197,7 +2225,7 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_free_irq_vectors;
+ 
+ 	/* Register mailbox interrupt */
+-	err = otx2_register_mbox_intr(pf);
++	err = otx2_register_mbox_intr(pf, true);
+ 	if (err)
+ 		goto err_mbox_destroy;
+ 
+@@ -2208,6 +2236,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_disable_mbox_intr;
+ 
++	err = otx2_realloc_msix_vectors(pf);
++	if (err)
++		goto err_mbox_destroy;
++
+ 	err = otx2_set_real_num_queues(netdev, hw->tx_queues, hw->rx_queues);
+ 	if (err)
+ 		goto err_detach_rsrc;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 6bc5487581c1..c42bf0049384 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -259,7 +259,7 @@ static void otx2vf_disable_mbox_intr(struct otx2_nic *vf)
+ 	free_irq(vector, vf);
+ }
+ 
+-static int otx2vf_register_mbox_intr(struct otx2_nic *vf)
++static int otx2vf_register_mbox_intr(struct otx2_nic *vf, bool probe_pf)
+ {
+ 	struct otx2_hw *hw = &vf->hw;
+ 	struct msg_req *req;
+@@ -283,6 +283,9 @@ static int otx2vf_register_mbox_intr(struct otx2_nic *vf)
+ 	otx2_write64(vf, RVU_VF_INT, BIT_ULL(0));
+ 	otx2_write64(vf, RVU_VF_INT_ENA_W1S, BIT_ULL(0));
+ 
++	if (!probe_pf)
++		return 0;
++
+ 	/* Check mailbox communication with PF */
+ 	req = otx2_mbox_alloc_msg_ready(&vf->mbox);
+ 	if (!req) {
+@@ -459,6 +462,30 @@ static const struct net_device_ops otx2vf_netdev_ops = {
+ 	.ndo_features_check = otx2_features_check,
+ };
+ 
++static int otx2vf_realloc_msix_vectors(struct otx2_nic *vf)
++{
++	struct otx2_hw *hw = &vf->hw;
++	int num_vec, err;
++
++	num_vec = hw->nix_msixoff;
++	num_vec += NIX_LF_CINT_VEC_START + hw->max_queues;
++
++	otx2vf_disable_mbox_intr(vf);
++	pci_free_irq_vectors(hw->pdev);
++	pci_free_irq_vectors(hw->pdev);
++	err = pci_alloc_irq_vectors(hw->pdev, num_vec, num_vec, PCI_IRQ_MSIX);
++	if (err < 0) {
++		dev_err(vf->dev, "%s: Failed to realloc %d IRQ vectors\n",
++			__func__, num_vec);
++		return err;
++	}
++
++	err = otx2vf_register_mbox_intr(vf, false);
++	if (err)
++		return err;
++	return 0;
++}
++
+ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	int num_vec = pci_msix_vec_count(pdev);
+@@ -545,7 +572,7 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_free_irq_vectors;
+ 
+ 	/* Register mailbox interrupt */
+-	err = otx2vf_register_mbox_intr(vf);
++	err = otx2vf_register_mbox_intr(vf, true);
+ 	if (err)
+ 		goto err_mbox_destroy;
+ 
+@@ -554,6 +581,10 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_disable_mbox_intr;
+ 
++	err = otx2vf_realloc_msix_vectors(vf);
++	if (err)
++		goto err_mbox_destroy;
++
+ 	err = otx2_set_real_num_queues(netdev, qcount, qcount);
+ 	if (err)
+ 		goto err_detach_rsrc;
+-- 
+2.31.1
+

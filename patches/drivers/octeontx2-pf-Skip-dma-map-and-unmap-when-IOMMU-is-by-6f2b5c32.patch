@@ -1,0 +1,191 @@
+From b9e3f71ad102c73ce4b145078b7e70b5fb26b07e Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 2 Dec 2019 17:50:05 +0530
+Subject: [PATCH 427/767] octeontx2-pf: Skip dma map and unmap when IOMMU is
+ bypassed
+
+commit 94cef32782641d0e0d89a93db273c583d8fb5dd6 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+HW takes care of data coherency at LLC level, to save some
+CPU cycles skip calling dma_map and dma_unmap apis when
+IOMMU is bypassed. This improves IP forwarding performance
+by ~5%. These changes are not for upstream.
+
+Change-Id: Ie1be6982d62ffe4bbb4434092c0c5ce3575d9339
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/19664
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       |  8 ++---
+ .../marvell/octeontx2/nic/otx2_common.h       | 31 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  5 ++-
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 22 ++++++-------
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |  2 ++
+ 5 files changed, 50 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index faf3365e2a11..778398032ec3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -364,10 +364,10 @@ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 
+ 	pool->page_offset = 0;
+ ret:
+-	iova = (u64)dma_map_page_attrs(pfvf->dev, pool->page,
+-				       pool->page_offset, pool->rbsize,
+-				       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+-	if (unlikely(dma_mapping_error(pfvf->dev, iova))) {
++	iova = (u64)otx2_dma_map_page(pfvf, pool->page, pool->page_offset,
++				      pool->rbsize, DMA_FROM_DEVICE,
++				      DMA_ATTR_SKIP_CPU_SYNC);
++	if (!iova) {
+ 		if (!pool->page_offset)
+ 			__free_pages(pool->page, 0);
+ 		pool->page = NULL;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index f5c1e792f26e..1a141420c77c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -14,6 +14,7 @@
+ #include <linux/pci.h>
+ #include <linux/ptp_clock_kernel.h>
+ #include <linux/timecounter.h>
++#include <linux/iommu.h>
+ 
+ #include <mbox.h>
+ #include "otx2_reg.h"
+@@ -236,6 +237,7 @@ struct otx2_nic {
+ 	void __iomem		*reg_base;
+ 	struct net_device	*netdev;
+ 	void			*iommu_domain;
++	u16			iommu_domain_type;
+ 	u16			xtra_hdr;
+ 	u16			max_frs;
+ 
+@@ -631,6 +633,35 @@ static inline int rvu_get_pf(u16 pcifunc)
+ 	return (pcifunc >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
+ }
+ 
++static inline dma_addr_t otx2_dma_map_page(struct otx2_nic *pfvf,
++					   struct page *page,
++					   size_t offset, size_t size,
++					   enum dma_data_direction dir,
++					   unsigned long attrs)
++{
++	dma_addr_t iova;
++
++	if (pfvf->iommu_domain_type == IOMMU_DOMAIN_IDENTITY)
++		return page_to_phys(page) + offset;
++
++	iova = dma_map_page_attrs(pfvf->dev, page,
++				  offset, size, dir, attrs);
++	if (unlikely(dma_mapping_error(pfvf->dev, iova)))
++		return (dma_addr_t)NULL;
++	return iova;
++}
++
++static inline void otx2_dma_unmap_page(struct otx2_nic *pfvf,
++				       dma_addr_t addr, size_t size,
++				       enum dma_data_direction dir,
++				       unsigned long attrs)
++{
++	if (pfvf->iommu_domain_type == IOMMU_DOMAIN_IDENTITY)
++		return;
++
++	dma_unmap_page_attrs(pfvf->dev, addr, size, dir, attrs);
++}
++
+ /* MSI-X APIs */
+ void otx2_free_cints(struct otx2_nic *pfvf, int n);
+ void otx2_set_cints_affinity(struct otx2_nic *pfvf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index ea37e652939f..26be61c3a54c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -2271,11 +2271,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	 * So the only way to convert Rx packet's buffer address is to use
+ 	 * IOMMU's iova_to_phys() handler which translates the address by
+ 	 * walking through the translation tables.
+-	 *
+-	 * So check if device is binded to IOMMU, otherwise translation is
+-	 * not needed.
+ 	 */
+ 	pf->iommu_domain = iommu_get_domain_for_dev(dev);
++	pf->iommu_domain_type =
++		 ((struct iommu_domain *)pf->iommu_domain)->type;
+ 
+ 	netdev->hw_features = (NETIF_F_RXCSUM | NETIF_F_IP_CSUM |
+ 			       NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 179d90a761c5..6864fa315900 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -61,8 +61,8 @@ static dma_addr_t otx2_dma_map_skb_frag(struct otx2_nic *pfvf,
+ 		offset = frag->page_offset;
+ 		*len = skb_frag_size(frag);
+ 	}
+-	return dma_map_page_attrs(pfvf->dev, page, offset, *len,
+-				  DMA_TO_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++	return otx2_dma_map_page(pfvf, page, offset, *len,
++				 DMA_TO_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+ }
+ 
+ static void otx2_dma_unmap_skb_frags(struct otx2_nic *pfvf, struct sg_list *sg)
+@@ -70,9 +70,9 @@ static void otx2_dma_unmap_skb_frags(struct otx2_nic *pfvf, struct sg_list *sg)
+ 	int seg;
+ 
+ 	for (seg = 0; seg < sg->num_segs; seg++) {
+-		dma_unmap_page_attrs(pfvf->dev, sg->dma_addr[seg],
+-				     sg->size[seg], DMA_TO_DEVICE,
+-				     DMA_ATTR_SKIP_CPU_SYNC);
++		otx2_dma_unmap_page(pfvf, sg->dma_addr[seg],
++				    sg->size[seg], DMA_TO_DEVICE,
++				    DMA_ATTR_SKIP_CPU_SYNC);
+ 	}
+ 	sg->num_segs = 0;
+ }
+@@ -215,8 +215,8 @@ static void otx2_skb_add_frag(struct otx2_nic *pfvf, struct sk_buff *skb,
+ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+ 			va - page_address(page) + off, len - off, RCV_FRAG_LEN);
+ 
+-	dma_unmap_page_attrs(pfvf->dev, iova - OTX2_HEAD_ROOM, RCV_FRAG_LEN,
+-			     DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++	otx2_dma_unmap_page(pfvf, iova - OTX2_HEAD_ROOM, RCV_FRAG_LEN,
++			    DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+ }
+ 
+ static inline bool otx2_check_rcv_errors(struct otx2_nic *pfvf,
+@@ -983,10 +983,10 @@ void otx2_cleanup_rx_cqes(struct otx2_nic *pfvf, struct otx2_cq_queue *cq)
+ 				*iova -= OTX2_HEAD_ROOM;
+ 				pa = otx2_iova_to_phys(pfvf->iommu_domain,
+ 						       *iova);
+-				dma_unmap_page_attrs(pfvf->dev, *iova,
+-						     RCV_FRAG_LEN,
+-						     DMA_FROM_DEVICE,
+-						     DMA_ATTR_SKIP_CPU_SYNC);
++				otx2_dma_unmap_page(pfvf, *iova,
++						    RCV_FRAG_LEN,
++						    DMA_FROM_DEVICE,
++						    DMA_ATTR_SKIP_CPU_SYNC);
+ 				put_page(virt_to_page(phys_to_virt(pa)));
+ 				iova++;
+ 			}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 129c693e62aa..23f954eef881 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -535,6 +535,8 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	vf->pdev = pdev;
+ 	vf->dev = dev;
+ 	vf->iommu_domain = iommu_get_domain_for_dev(dev);
++	vf->iommu_domain_type =
++		 ((struct iommu_domain *)vf->iommu_domain)->type;
+ 	vf->flags |= OTX2_FLAG_INTF_DOWN;
+ 	hw = &vf->hw;
+ 	hw->pdev = vf->pdev;
+-- 
+2.31.1
+

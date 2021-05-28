@@ -1,0 +1,303 @@
+From b4e1ff59f9dda39c32a96f3908d5489b4e96feb9 Mon Sep 17 00:00:00 2001
+From: Hariprasad Kelam <hkelam@marvell.com>
+Date: Wed, 29 Apr 2020 16:40:56 +0530
+Subject: [PATCH 544/767] octeontx2-af: Add flow steering support for FDSA tag
+
+commit 32fad52bd254e5286d6ff9876f2680d01f7d7b8e from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Marvell switches support distributed switch architecture (DSA) by
+implementing FORWARD(FDSA). Special pkind 62 is reserved to parse
+this tag.
+
+This patch adds support to configure pkind and flow steering for
+the same. To distribute fdsa packets among PF/VF , one can
+specify NPC_FDSA_VAL in mcam features .Rx vtag Type 6 is reserved
+to strip FDSA tag.
+
+*other changes
+Change mcam rule display  to be more clear.
+
+Change-Id: Iaec0779fbe4a77e714e7f6d290ee2f94d98eb3a2
+Signed-off-by: Hariprasad Kelam <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/27667
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  2 ++
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |  7 +++++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../marvell/octeontx2/af/rvu_debugfs.c        | 29 ++++++++++---------
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  8 +++--
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   |  9 +++++-
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 14 +++++++--
+ 7 files changed, 51 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 3f8251c66a65..fdff64373cb7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -554,6 +554,7 @@ struct npc_set_pkind {
+ #define OTX2_PRIV_FLAGS_DEFAULT  BIT_ULL(0)
+ #define OTX2_PRIV_FLAGS_EDSA     BIT_ULL(1)
+ #define OTX2_PRIV_FLAGS_HIGIG    BIT_ULL(2)
++#define OTX2_PRIV_FLAGS_FDSA     BIT_ULL(3)
+ #define OTX2_PRIV_FLAGS_CUSTOM   BIT_ULL(63)
+ 	u64 mode;
+ #define PKIND_TX		BIT_ULL(0)
+@@ -1326,6 +1327,7 @@ enum header_fields {
+ 	NPC_DPORT_TCP,
+ 	NPC_SPORT_UDP,
+ 	NPC_DPORT_UDP,
++	NPC_FDSA_VAL,
+ 	NPC_HEADER_FIELDS_MAX,
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index 86fafb8b6c56..3a658042b876 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -153,6 +153,13 @@ enum npc_pkind_type {
+ 	NPC_TX_DEF_PKIND,
+ };
+ 
++enum npc_interface_type {
++	NPC_INTF_MODE_DEF,
++	NPC_INTF_MODE_EDSA,
++	NPC_INTF_MODE_HIGIG,
++	NPC_INTF_MODE_FDSA,
++};
++
+ struct npc_kpu_profile_cam {
+ 	u8 state;
+ 	u8 state_mask;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 781c20d3b800..ca0fcbfdf8b3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -300,6 +300,7 @@ struct rvu_pfvf {
+ 	int	cgx_users;  /* number of cgx users - used only by PFs */
+ 
+ 	u8	nix_blkaddr; /* BLKADDR_NIX0/1 assigned to this PF */
++	int     intf_mode;
+ };
+ 
+ struct nix_txsch {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+index 84aaa62efe73..73953ae35119 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+@@ -1472,17 +1472,18 @@ static void rvu_dbg_npc_mcam_show_flows(struct seq_file *s,
+ 		switch (bit) {
+ 		case NPC_DMAC:
+ 			seq_printf(s, "%pM ", rule->packet.dmac);
+-			seq_printf(s, "%pM\n", rule->mask.dmac);
++			seq_printf(s, "mask %pM\n", rule->mask.dmac);
+ 			break;
+ 		case NPC_SMAC:
+ 			seq_printf(s, "%pM ", rule->packet.smac);
+-			seq_printf(s, "%pM\n", rule->mask.smac);
++			seq_printf(s, "mask %pM\n", rule->mask.smac);
+ 			break;
+ 		case NPC_ETYPE:
+ 			seq_printf(s, "0x%x ", ntohs(rule->packet.etype));
+-			seq_printf(s, "0x%x\n", ntohs(rule->mask.etype));
++			seq_printf(s, "mask 0x%x\n", ntohs(rule->mask.etype));
+ 			break;
+ 		case NPC_OUTER_VID:
++		case NPC_FDSA_VAL:
+ 			seq_printf(s, "%d ", ntohs(rule->packet.vlan_tci));
+ 			seq_printf(s, "mask 0x%x\n",
+ 				   ntohs(rule->mask.vlan_tci));
+@@ -1493,19 +1494,19 @@ static void rvu_dbg_npc_mcam_show_flows(struct seq_file *s,
+ 			break;
+ 		case NPC_SIP_IPV4:
+ 			seq_printf(s, "%pI4 ", &rule->packet.ip4src);
+-			seq_printf(s, "%pI4\n", &rule->mask.ip4src);
++			seq_printf(s, "mask %pI4\n", &rule->mask.ip4src);
+ 			break;
+ 		case NPC_DIP_IPV4:
+ 			seq_printf(s, "%pI4 ", &rule->packet.ip4dst);
+-			seq_printf(s, "%pI4\n", &rule->mask.ip4dst);
++			seq_printf(s, "mask %pI4\n", &rule->mask.ip4dst);
+ 			break;
+ 		case NPC_SIP_IPV6:
+ 			seq_printf(s, "%pI6 ", rule->packet.ip6src);
+-			seq_printf(s, "%pI6\n", rule->mask.ip6src);
++			seq_printf(s, "mask %pI6\n", rule->mask.ip6src);
+ 			break;
+ 		case NPC_DIP_IPV6:
+ 			seq_printf(s, "%pI6 ", rule->packet.ip6dst);
+-			seq_printf(s, "%pI6\n", rule->mask.ip6dst);
++			seq_printf(s, "mask %pI6\n", rule->mask.ip6dst);
+ 			break;
+ 		case NPC_SPORT_TCP:
+ 		case NPC_SPORT_UDP:
+@@ -1590,7 +1591,7 @@ static int rvu_dbg_npc_mcam_show_rules(struct seq_file *s, void *unused)
+ 	mutex_lock(&mcam->lock);
+ 	list_for_each_entry(iter, &mcam->mcam_rules, list) {
+ 		pf = (iter->owner >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
+-		seq_printf(s, "\n\tPF%d ", pf);
++		seq_printf(s, "\n\tInstalled by: PF%d ", pf);
+ 
+ 		if (iter->owner & RVU_PFVF_FUNC_MASK) {
+ 			vf = (iter->owner & RVU_PFVF_FUNC_MASK) - 1;
+@@ -1598,23 +1599,23 @@ static int rvu_dbg_npc_mcam_show_rules(struct seq_file *s, void *unused)
+ 		}
+ 		seq_puts(s, "\n");
+ 
++		seq_printf(s, "\tdirection: %s\n", (iter->intf == NIX_INTF_RX) ?
++						    "RX" : "TX");
++		seq_printf(s, "\tmcam entry: %d\n", iter->entry);
++
++		rvu_dbg_npc_mcam_show_flows(s, iter);
+ 		if (iter->intf == NIX_INTF_RX) {
+-			seq_puts(s, "\tdirection: RX\n");
+ 			target = iter->rx_action.pf_func;
+ 			pf = (target >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
+-			seq_printf(s, "\ttarget: PF%d ", pf);
++			seq_printf(s, "\tForward to: PF%d ", pf);
+ 
+ 			if (target & RVU_PFVF_FUNC_MASK) {
+ 				vf = (target & RVU_PFVF_FUNC_MASK) - 1;
+ 				seq_printf(s, "VF%d", vf);
+ 			}
+ 			seq_puts(s, "\n");
+-		} else {
+-			seq_puts(s, "\tdirection: TX\n");
+ 		}
+ 
+-		seq_printf(s, "\tmcam entry: %d\n", iter->entry);
+-		rvu_dbg_npc_mcam_show_flows(s, iter);
+ 		rvu_dbg_npc_mcam_show_action(s, iter);
+ 		seq_printf(s, "\tenabled: %s\n", iter->enable ? "yes" : "no");
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index a5eb7a5fe349..70bb06ae8c00 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -1221,6 +1221,10 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	rvu_write64(rvu, blkaddr,
+ 		    NIX_AF_LFX_RX_VTAG_TYPEX(nixlf, NIX_AF_LFX_RX_VTAG_TYPE7),
+ 		    VTAGSIZE_T4 | BIT_ULL(4));
++	/* Configure RX VTAG Type 6 (strip) for fdsa */
++	rvu_write64(rvu, blkaddr,
++		    NIX_AF_LFX_RX_VTAG_TYPEX(nixlf, NIX_AF_LFX_RX_VTAG_TYPE6),
++		    VTAGSIZE_T4 | BIT_ULL(4) | BIT_ULL(5));
+ 
+ 	goto exit;
+ 
+@@ -2239,8 +2243,8 @@ static int nix_rx_vtag_cfg(struct rvu *rvu, int nixlf, int blkaddr,
+ 	    req->vtag_size > VTAGSIZE_T8)
+ 		return -EINVAL;
+ 
+-	/* RX VTAG Type 7 reserved for vf vlan */
+-	if (req->rx.vtag_type == NIX_AF_LFX_RX_VTAG_TYPE7)
++	/* RX VTAG Type 7,6 are reserved for vf vlan& FDSA tag strip */
++	if (req->rx.vtag_type >= NIX_AF_LFX_RX_VTAG_TYPE6)
+ 		return NIX_AF_ERR_RX_VTAG_INUSE;
+ 
+ 	if (req->rx.capture_vtag)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 85109a28a845..ca2ea77f2975 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -2630,18 +2630,23 @@ int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+ 
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	int blkaddr, nixlf, rc, intf_mode;
+ 	int pf = rvu_get_pf(pcifunc);
+ 	bool enable_higig2 = false;
+-	int blkaddr, nixlf, rc;
+ 	u64 rxpkind, txpkind;
+ 	u8 cgx_id, lmac_id;
+ 
+ 	/* use default pkind to disable edsa/higig */
+ 	rxpkind = rvu_npc_get_pkind(rvu, pf);
+ 	txpkind = NPC_TX_DEF_PKIND;
++	intf_mode = NPC_INTF_MODE_DEF;
+ 
+ 	if (mode & OTX2_PRIV_FLAGS_EDSA) {
+ 		rxpkind = NPC_RX_EDSA_PKIND;
++		intf_mode = NPC_INTF_MODE_EDSA;
++	} else if (mode & OTX2_PRIV_FLAGS_FDSA) {
++		rxpkind = NPC_RX_EDSA_PKIND;
++		intf_mode = NPC_INTF_MODE_FDSA;
+ 	} else if (mode & OTX2_PRIV_FLAGS_HIGIG) {
+ 		/* Silicon does not support enabling higig in time stamp mode */
+ 		if (pfvf->hw_rx_tstamp_en ||
+@@ -2650,6 +2655,7 @@ int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+ 
+ 		rxpkind = NPC_RX_HIGIG_PKIND;
+ 		txpkind = NPC_TX_HIGIG_PKIND;
++		intf_mode = NPC_INTF_MODE_HIGIG;
+ 		enable_higig2 = true;
+ 	} else if (mode & OTX2_PRIV_FLAGS_CUSTOM) {
+ 		rxpkind = pkind;
+@@ -2681,6 +2687,7 @@ int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+ 	if (enable_higig2 ^ rvu_cgx_is_higig2_enabled(rvu, pf))
+ 		rvu_cgx_enadis_higig2(rvu, pf, enable_higig2);
+ 
++	pfvf->intf_mode = intf_mode;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 86e1d8f6674a..83c850fe46d2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -30,6 +30,7 @@ static const char * const npc_flow_names[] = {
+ 	[NPC_DPORT_TCP]	= "tcp destination port",
+ 	[NPC_SPORT_UDP]	= "udp source port",
+ 	[NPC_DPORT_UDP]	= "udp destination port",
++	[NPC_FDSA_VAL]	= "FDSA tag value ",
+ 	[NPC_UNKNOWN]	= "unknown",
+ };
+ 
+@@ -430,6 +431,7 @@ do {									       \
+ 	NPC_SCAN_HDR(NPC_ETYPE_TAG2, NPC_LID_LB, NPC_LT_LB_STAG_QINQ, 8, 2);
+ 	NPC_SCAN_HDR(NPC_VLAN_TAG1, NPC_LID_LB, NPC_LT_LB_CTAG, 2, 2);
+ 	NPC_SCAN_HDR(NPC_VLAN_TAG2, NPC_LID_LB, NPC_LT_LB_STAG_QINQ, 2, 2);
++	NPC_SCAN_HDR(NPC_FDSA_VAL, NPC_LID_LB, NPC_LT_LB_FDSA, 1, 1);
+ 	NPC_SCAN_HDR(NPC_DMAC, NPC_LID_LA, la_ltype, la_start, 6);
+ 	NPC_SCAN_HDR(NPC_SMAC, NPC_LID_LA, la_ltype, la_start, 6);
+ 	/* PF_FUNC is 2 bytes at 0th byte of NPC_LT_LA_IH_NIX_ETHER */
+@@ -461,9 +463,12 @@ static void npc_set_features(struct rvu *rvu, int blkaddr, u8 intf)
+ 			*features &= ~tcp_udp;
+ 
+ 	/* for vlan corresponding layer type should be in the key */
+-	if (*features & BIT_ULL(NPC_OUTER_VID))
+-		if (npc_check_field(rvu, blkaddr, NPC_LB, intf))
++	if (*features & BIT_ULL(NPC_OUTER_VID) ||
++	    *features & BIT_ULL(NPC_FDSA_VAL))
++		if (npc_check_field(rvu, blkaddr, NPC_LB, intf)) {
+ 			*features &= ~BIT_ULL(NPC_OUTER_VID);
++			*features &= ~BIT_ULL(NPC_FDSA_VAL);
++		}
+ }
+ 
+ /* Scan key extraction profile and record how fields of our interest
+@@ -702,6 +707,9 @@ do {									      \
+ 		npc_update_entry(rvu, NPC_LB, entry,
+ 				 NPC_LT_LB_STAG_QINQ | NPC_LT_LB_CTAG, 0,
+ 				 NPC_LT_LB_STAG_QINQ & NPC_LT_LB_CTAG, 0, intf);
++	if (features & BIT_ULL(NPC_FDSA_VAL))
++		npc_update_entry(rvu, NPC_LB, entry, NPC_LT_LB_FDSA,
++				 0, ~0ULL, 0, intf);
+ 
+ 	NPC_WRITE_FLOW(NPC_DMAC, dmac, dmac_val, 0, dmac_mask, 0);
+ 	NPC_WRITE_FLOW(NPC_SMAC, smac, smac_val, 0, smac_mask, 0);
+@@ -721,6 +729,8 @@ do {									      \
+ 		       ntohs(mask->dport), 0);
+ 	NPC_WRITE_FLOW(NPC_OUTER_VID, vlan_tci, ntohs(pkt->vlan_tci), 0,
+ 		       ntohs(mask->vlan_tci), 0);
++	NPC_WRITE_FLOW(NPC_FDSA_VAL, vlan_tci, ntohs(pkt->vlan_tci), 0,
++		       ntohs(mask->vlan_tci), 0);
+ }
+ 
+ static struct rvu_npc_mcam_rule *rvu_mcam_find_rule(struct npc_mcam *mcam,
+-- 
+2.31.1
+

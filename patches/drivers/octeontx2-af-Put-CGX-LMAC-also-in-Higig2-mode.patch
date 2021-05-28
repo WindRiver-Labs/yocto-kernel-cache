@@ -1,0 +1,477 @@
+From 709a60e8dc51ab40db904755b08c6ffe5a024ab7 Mon Sep 17 00:00:00 2001
+From: hariprasad <hkelam@marvell.com>
+Date: Tue, 7 Jan 2020 17:12:16 +0530
+Subject: [PATCH 446/767] octeontx2-af: Put CGX LMAC also in Higig2 mode
+
+commit 3542442b8af2a2bb37958abdfd00e412413972e9 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Currently upon user request to enable Higig2 mode, only NPC packet
+parsing related settings are done. This patch adds config to put
+CGX LMAC also in Higig2 mode. Actual HW config is done by firmware,
+so send a request to FW to get the config done.
+
+Other changes
+- Higig2 flow control enable/disable support.
+- CGX HW doesn't support timestamping when in Higig2 mode, so
+  made PTP and Higig2 settings mutually exclusive.
+
+Change-Id: Id524b965f81835bc6364a4d17c025471e0cf74ff
+Signed-off-by: hariprasad <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/21181
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/cgx.c   | 133 ++++++++++++++++--
+ .../net/ethernet/marvell/octeontx2/af/cgx.h   |  16 ++-
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |   2 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   3 +
+ .../ethernet/marvell/octeontx2/af/rvu_cgx.c   |  40 +++++-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  29 +++-
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   |  14 +-
+ 7 files changed, 218 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index 7366d25f86d0..8c9d01be959d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -541,8 +541,21 @@ int cgx_lmac_tx_enable(void *cgxd, int lmac_id, bool enable)
+ }
+ EXPORT_SYMBOL(cgx_lmac_tx_enable);
+ 
+-int cgx_lmac_get_pause_frm(void *cgxd, int lmac_id,
+-			   u8 *tx_pause, u8 *rx_pause)
++static int  cgx_lmac_get_higig2_pause_frm_status(void *cgxd, int lmac_id,
++						 u8 *tx_pause, u8 *rx_pause)
++{
++	struct cgx *cgx = cgxd;
++	u64 cfg;
++
++	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL);
++
++	*rx_pause = !!(cfg & CGXX_SMUX_HG2_CONTROL_RX_ENABLE);
++	*tx_pause = !!(cfg & CGXX_SMUX_HG2_CONTROL_TX_ENABLE);
++	return 0;
++}
++
++int cgx_lmac_get_pause_frm_status(void *cgxd, int lmac_id,
++				  u8 *tx_pause, u8 *rx_pause)
+ {
+ 	struct cgx *cgx = cgxd;
+ 	u64 cfg;
+@@ -550,6 +563,10 @@ int cgx_lmac_get_pause_frm(void *cgxd, int lmac_id,
+ 	if (!cgx || lmac_id >= cgx->lmac_count)
+ 		return -ENODEV;
+ 
++	if (is_higig2_enabled(cgxd, lmac_id))
++		return cgx_lmac_get_higig2_pause_frm_status(cgxd, lmac_id,
++							    tx_pause, rx_pause);
++
+ 	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_RX_FRM_CTL);
+ 	*rx_pause = !!(cfg & CGX_SMUX_RX_FRM_CTL_CTL_BCK);
+ 
+@@ -557,16 +574,53 @@ int cgx_lmac_get_pause_frm(void *cgxd, int lmac_id,
+ 	*tx_pause = !!(cfg & CGX_SMUX_TX_CTL_L2P_BP_CONV);
+ 	return 0;
+ }
+-EXPORT_SYMBOL(cgx_lmac_get_pause_frm);
++EXPORT_SYMBOL(cgx_lmac_get_pause_frm_status);
+ 
+-int cgx_lmac_set_pause_frm(void *cgxd, int lmac_id,
+-			   u8 tx_pause, u8 rx_pause)
++static int cgx_lmac_enadis_higig2_pause_frm(void *cgxd, int lmac_id,
++					    u8 tx_pause, u8 rx_pause)
+ {
+ 	struct cgx *cgx = cgxd;
+ 	u64 cfg;
+ 
+-	if (!cgx || lmac_id >= cgx->lmac_count)
+-		return -ENODEV;
++	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL);
++	cfg &= ~CGXX_SMUX_HG2_CONTROL_RX_ENABLE;
++	cfg |= rx_pause ? CGXX_SMUX_HG2_CONTROL_RX_ENABLE : 0x0;
++	cgx_write(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL, cfg);
++
++	/* Forward PAUSE information to TX block */
++	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_RX_FRM_CTL);
++	cfg &= ~CGX_SMUX_RX_FRM_CTL_CTL_BCK;
++	cfg |= rx_pause ? CGX_SMUX_RX_FRM_CTL_CTL_BCK : 0x0;
++	cgx_write(cgx, lmac_id, CGXX_SMUX_RX_FRM_CTL, cfg);
++
++	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL);
++	cfg &= ~CGXX_SMUX_HG2_CONTROL_TX_ENABLE;
++	cfg |= tx_pause ? CGXX_SMUX_HG2_CONTROL_TX_ENABLE : 0x0;
++	cgx_write(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL, cfg);
++
++	/* allow intra packet hg2 generation */
++	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_TX_PAUSE_PKT_INTERVAL);
++	cfg &= ~CGXX_SMUX_TX_PAUSE_PKT_HG2_INTRA_EN;
++	cfg |= tx_pause ? CGXX_SMUX_TX_PAUSE_PKT_HG2_INTRA_EN : 0x0;
++	cgx_write(cgx, lmac_id, CGXX_SMUX_TX_PAUSE_PKT_INTERVAL, cfg);
++
++	cfg = cgx_read(cgx, 0, CGXX_CMR_RX_OVR_BP);
++	if (tx_pause) {
++		cfg &= ~CGX_CMR_RX_OVR_BP_EN(lmac_id);
++	} else {
++		cfg |= CGX_CMR_RX_OVR_BP_EN(lmac_id);
++		cfg &= ~CGX_CMR_RX_OVR_BP_BP(lmac_id);
++	}
++	cgx_write(cgx, 0, CGXX_CMR_RX_OVR_BP, cfg);
++
++	return 0;
++}
++
++static int cgx_lmac_enadis_8023_pause_frm(void *cgxd, int lmac_id,
++					  u8 tx_pause, u8 rx_pause)
++{
++	struct cgx *cgx = cgxd;
++	u64 cfg;
+ 
+ 	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_RX_FRM_CTL);
+ 	cfg &= ~CGX_SMUX_RX_FRM_CTL_CTL_BCK;
+@@ -586,9 +640,27 @@ int cgx_lmac_set_pause_frm(void *cgxd, int lmac_id,
+ 		cfg &= ~CGX_CMR_RX_OVR_BP_BP(lmac_id);
+ 	}
+ 	cgx_write(cgx, 0, CGXX_CMR_RX_OVR_BP, cfg);
++
+ 	return 0;
+ }
+-EXPORT_SYMBOL(cgx_lmac_set_pause_frm);
++
++int cgx_lmac_enadis_pause_frm(void *cgxd, int lmac_id,
++			      u8 tx_pause, u8 rx_pause)
++{
++	struct cgx *cgx = cgxd;
++
++	if (!cgx || lmac_id >= cgx->lmac_count)
++		return -ENODEV;
++
++	if (is_higig2_enabled(cgxd, lmac_id))
++		return	cgx_lmac_enadis_higig2_pause_frm(cgxd, lmac_id,
++						   tx_pause, rx_pause);
++	else
++		return  cgx_lmac_enadis_8023_pause_frm(cgxd, lmac_id,
++						   tx_pause, rx_pause);
++	return 0;
++}
++EXPORT_SYMBOL(cgx_lmac_enadis_pause_frm);
+ 
+ void cgx_lmac_ptp_config(void *cgxd, int lmac_id, bool enable)
+ {
+@@ -650,6 +722,12 @@ static void cgx_lmac_pause_frm_config(struct cgx *cgx, int lmac_id, bool enable)
+ 		cgx_write(cgx, lmac_id, CGXX_SMUX_TX_PAUSE_PKT_INTERVAL,
+ 			  cfg | (DEFAULT_PAUSE_TIME / 2));
+ 
++		cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_TX_PAUSE_PKT_INTERVAL);
++		cfg = FIELD_SET(HG2_INTRA_INTERVAL, (DEFAULT_PAUSE_TIME / 2),
++				cfg);
++		cgx_write(cgx, lmac_id, CGXX_SMUX_TX_PAUSE_PKT_INTERVAL,
++			  cfg);
++
+ 		cgx_write(cgx, lmac_id, CGXX_GMP_GMI_TX_PAUSE_PKT_TIME,
+ 			  DEFAULT_PAUSE_TIME);
+ 
+@@ -668,10 +746,18 @@ static void cgx_lmac_pause_frm_config(struct cgx *cgx, int lmac_id, bool enable)
+ 		cfg &= ~CGX_GMP_GMI_RXX_FRM_CTL_CTL_BCK;
+ 		cgx_write(cgx, lmac_id, CGXX_GMP_GMI_RXX_FRM_CTL, cfg);
+ 
++		cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL);
++		cfg &= ~CGXX_SMUX_HG2_CONTROL_RX_ENABLE;
++		cgx_write(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL, cfg);
++
+ 		/* Disable pause frames transmission */
+ 		cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_TX_CTL);
+ 		cfg &= ~CGX_SMUX_TX_CTL_L2P_BP_CONV;
+ 		cgx_write(cgx, lmac_id, CGXX_SMUX_TX_CTL, cfg);
++
++		cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL);
++		cfg &= ~CGXX_SMUX_HG2_CONTROL_TX_ENABLE;
++		cgx_write(cgx, lmac_id, CGXX_SMUX_HG2_CONTROL, cfg);
+ 	}
+ }
+ 
+@@ -1284,6 +1370,37 @@ int cgx_lmac_linkup_start(void *cgxd)
+ }
+ EXPORT_SYMBOL(cgx_lmac_linkup_start);
+ 
++void cgx_lmac_enadis_higig2(void *cgxd, int lmac_id, bool enable)
++{
++	struct cgx *cgx = cgxd;
++	u64 req = 0, resp;
++
++	/* disable 802.3 pause frames before enabling higig2 */
++	if (enable) {
++		cgx_lmac_enadis_8023_pause_frm(cgxd, lmac_id, false, false);
++		cgx_lmac_enadis_higig2_pause_frm(cgxd, lmac_id, true, true);
++	}
++
++	req = FIELD_SET(CMDREG_ID, CGX_CMD_HIGIG, req);
++	req = FIELD_SET(CMDREG_ENABLE, enable, req);
++	cgx_fwi_cmd_generic(req, &resp, cgx, lmac_id);
++
++	/* enable 802.3 pause frames as higig2 disabled */
++	if (!enable) {
++		cgx_lmac_enadis_higig2_pause_frm(cgxd, lmac_id, false, false);
++		cgx_lmac_enadis_8023_pause_frm(cgxd, lmac_id, true, true);
++	}
++}
++
++bool is_higig2_enabled(void *cgxd, int lmac_id)
++{
++	struct cgx *cgx = cgxd;
++	u64 cfg;
++
++	cfg = cgx_read(cgx, lmac_id, CGXX_SMUX_TX_CTL);
++	return (cfg & CGXX_SMUX_TX_CTL_HIGIG_EN);
++}
++
+ static int cgx_lmac_init(struct cgx *cgx)
+ {
+ 	struct lmac *lmac;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+index 4445e23b688b..920c33700ee8 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+@@ -71,14 +71,20 @@
+ #define CGX_GMP_GMI_RXX_FRM_CTL_CTL_BCK	BIT_ULL(3)
+ #define CGX_GMP_GMI_RXX_FRM_CTL_PTP_MODE BIT_ULL(12)
+ #define CGXX_SMUX_TX_CTL		0x20178
++#define CGXX_SMUX_TX_CTL_HIGIG_EN	BIT_ULL(8)
+ #define CGXX_SMUX_TX_PAUSE_PKT_TIME	0x20110
+ #define CGXX_SMUX_TX_PAUSE_PKT_INTERVAL	0x20120
++#define CGXX_SMUX_TX_PAUSE_PKT_HG2_INTRA_EN	BIT_ULL(32)
++#define HG2_INTRA_INTERVAL		GENMASK_ULL(31, 16)
+ #define CGXX_GMP_GMI_TX_PAUSE_PKT_TIME	0x38230
+ #define CGXX_GMP_GMI_TX_PAUSE_PKT_INTERVAL	0x38248
+ #define CGX_SMUX_TX_CTL_L2P_BP_CONV	BIT_ULL(7)
+ #define CGXX_CMR_RX_OVR_BP		0x130
+ #define CGX_CMR_RX_OVR_BP_EN(X)		BIT_ULL((X + 8))
+ #define CGX_CMR_RX_OVR_BP_BP(X)		BIT_ULL((X + 4))
++#define CGXX_SMUX_HG2_CONTROL		0x20210
++#define CGXX_SMUX_HG2_CONTROL_TX_ENABLE		BIT_ULL(18)
++#define CGXX_SMUX_HG2_CONTROL_RX_ENABLE		BIT_ULL(17)
+ 
+ #define CGX_COMMAND_REG			CGXX_SCRATCH1_REG
+ #define CGX_EVENT_REG			CGXX_SCRATCH0_REG
+@@ -154,13 +160,15 @@ int cgx_get_fwdata_base(u64 *base);
+ int cgx_set_fec(u64 fec, int cgx_id, int lmac_id);
+ int cgx_set_link_mode(void *cgxd, struct cgx_set_link_mode_args args,
+ 		      int cgx_id, int lmac_id);
+-int cgx_lmac_get_pause_frm(void *cgxd, int lmac_id,
+-			   u8 *tx_pause, u8 *rx_pause);
+-int cgx_lmac_set_pause_frm(void *cgxd, int lmac_id,
+-			   u8 tx_pause, u8 rx_pause);
++int cgx_lmac_get_pause_frm_status(void *cgxd, int lmac_id,
++				  u8 *tx_pause, u8 *rx_pause);
++int cgx_lmac_enadis_pause_frm(void *cgxd, int lmac_id,
++			      u8 tx_pause, u8 rx_pause);
+ void cgx_lmac_ptp_config(void *cgxd, int lmac_id, bool enable);
+ int cgx_set_link_state(void *cgxd, int lmac_id, bool enable);
+ int cgx_set_phy_mod_type(int mod, void *cgxd, int lmac_id);
+ int cgx_get_phy_mod_type(void *cgxd, int lmac_id);
+ int cgx_get_phy_fec_stats(void *cgxd, int lmac_id);
++void cgx_lmac_enadis_higig2(void *cgxd, int lmac_id, bool enable);
++bool is_higig2_enabled(void *cgxd, int lmac_id);
+ #endif /* CGX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 9b5b4935a92a..a36571b80334 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -674,6 +674,7 @@ enum nix_af_status {
+ 	NIX_AF_INVAL_SSO_PF_FUNC    = -420,
+ 	NIX_AF_ERR_TX_VTAG_NOSPC    = -421,
+ 	NIX_AF_ERR_RX_VTAG_INUSE    = -422,
++	NIX_AF_ERR_PTP_CONFIG_FAIL  = -423,
+ };
+ 
+ /* For NIX RX vtag action  */
+@@ -1143,6 +1144,7 @@ enum npc_af_status {
+ 	NPC_MCAM_ALLOC_DENIED	= -702,
+ 	NPC_MCAM_ALLOC_FAILED	= -703,
+ 	NPC_MCAM_PERM_DENIED	= -704,
++	NPC_AF_ERR_HIGIG_CONFIG_FAIL	= -705,
+ };
+ 
+ struct npc_mcam_alloc_entry_req {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 723460b6f747..0fb43dfae9a9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -582,6 +582,8 @@ int rvu_cgx_exit(struct rvu *rvu);
+ void *rvu_cgx_pdata(u8 cgx_id, struct rvu *rvu);
+ int rvu_cgx_config_rxtx(struct rvu *rvu, u16 pcifunc, bool start);
+ void rvu_cgx_enadis_rx_bp(struct rvu *rvu, int pf, bool enable);
++void rvu_cgx_enadis_higig2(struct rvu *rvu, int pf, bool enable);
++bool rvu_cgx_is_higig2_enabled(struct rvu *rvu, int pf);
+ void rvu_cgx_disable_dmac_entries(struct rvu *rvu, u16 pcifunc);
+ int rvu_cgx_start_stop_io(struct rvu *rvu, u16 pcifunc, bool start);
+ int rvu_cgx_nix_cuml_stats(struct rvu *rvu, void *cgxd, int lmac_id, int index,
+@@ -618,6 +620,7 @@ int nix_get_nixlf(struct rvu *rvu, u16 pcifunc, int *nixlf);
+ int rvu_nix_register_interrupts(struct rvu *rvu);
+ void rvu_nix_unregister_interrupts(struct rvu *rvu);
+ void rvu_nix_reset_mac(struct rvu_pfvf *pfvf, int pcifunc);
++bool rvu_nix_is_ptp_tx_enabled(struct rvu *rvu, u16 pcifunc);
+ 
+ /* NPC APIs */
+ int rvu_npc_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+index 145329cf5eaf..f5aa540d726e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+@@ -376,6 +376,33 @@ void rvu_cgx_enadis_rx_bp(struct rvu *rvu, int pf, bool enable)
+ 		cgx_lmac_enadis_rx_pause_fwding(cgxd, lmac_id, false);
+ }
+ 
++void rvu_cgx_enadis_higig2(struct rvu *rvu, int pf, bool enable)
++{
++	u8 cgx_id, lmac_id;
++	void *cgxd;
++
++	if (!is_pf_cgxmapped(rvu, pf))
++		return;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++	cgxd = rvu_cgx_pdata(cgx_id, rvu);
++	cgx_lmac_enadis_higig2(cgxd, lmac_id, enable);
++}
++
++bool rvu_cgx_is_higig2_enabled(struct rvu *rvu, int pf)
++{
++	u8 cgx_id, lmac_id;
++	void *cgxd;
++
++	if (!is_pf_cgxmapped(rvu, pf))
++		return false;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++	cgxd = rvu_cgx_pdata(cgx_id, rvu);
++
++	return is_higig2_enabled(cgxd, lmac_id);
++}
++
+ int rvu_cgx_config_rxtx(struct rvu *rvu, u16 pcifunc, bool start)
+ {
+ 	int pf = rvu_get_pf(pcifunc);
+@@ -633,6 +660,10 @@ int rvu_mbox_handler_cgx_ptp_rx_enable(struct rvu *rvu, struct msg_req *req,
+ 	if (!is_cgx_config_permitted(rvu, pcifunc))
+ 		return -EPERM;
+ 
++	/* Silicon does not support enabling time stamp in higig mode */
++	if (rvu_cgx_is_higig2_enabled(rvu, pf))
++		return NIX_AF_ERR_PTP_CONFIG_FAIL;
++
+ 	cgx_notify_up_ptp_info(rvu, pf, true);
+ 
+ 	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
+@@ -774,11 +805,12 @@ int rvu_mbox_handler_cgx_cfg_pause_frm(struct rvu *rvu,
+ 	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
+ 
+ 	if (req->set)
+-		cgx_lmac_set_pause_frm(rvu_cgx_pdata(cgx_id, rvu), lmac_id,
+-				       req->tx_pause, req->rx_pause);
++		cgx_lmac_enadis_pause_frm(rvu_cgx_pdata(cgx_id, rvu), lmac_id,
++					  req->tx_pause, req->rx_pause);
+ 	else
+-		cgx_lmac_get_pause_frm(rvu_cgx_pdata(cgx_id, rvu), lmac_id,
+-				       &rsp->tx_pause, &rsp->rx_pause);
++		cgx_lmac_get_pause_frm_status(rvu_cgx_pdata(cgx_id, rvu),
++					      lmac_id, &rsp->tx_pause,
++					      &rsp->rx_pause);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index cea96aca7fb9..291b89ee9fbd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -205,8 +205,8 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf)
+ 
+ 		/* By default we enable pause frames */
+ 		if ((pcifunc & RVU_PFVF_FUNC_MASK) == 0)
+-			cgx_lmac_set_pause_frm(rvu_cgx_pdata(cgx_id, rvu),
+-					       lmac_id, true, true);
++			cgx_lmac_enadis_pause_frm(rvu_cgx_pdata(cgx_id, rvu),
++						  lmac_id, true, true);
+ 		break;
+ 	case NIX_INTF_TYPE_LBK:
+ 		vf = (pcifunc & RVU_PFVF_FUNC_MASK) - 1;
+@@ -3576,6 +3576,10 @@ int rvu_mbox_handler_nix_lf_ptp_tx_enable(struct rvu *rvu, struct msg_req *req,
+ 	int nixlf;
+ 	u64 cfg;
+ 
++	/* Silicon does not support enabling time stamp in higig mode */
++	if (rvu_cgx_is_higig2_enabled(rvu, rvu_get_pf(pcifunc)))
++		return NIX_AF_ERR_PTP_CONFIG_FAIL;
++
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
+ 	if (blkaddr < 0)
+ 		return NIX_AF_ERR_AF_LF_INVALID;
+@@ -3991,3 +3995,24 @@ void rvu_nix_reset_mac(struct rvu_pfvf *pfvf, int pcifunc)
+ 	if (from_vf)
+ 		ether_addr_copy(pfvf->mac_addr, pfvf->default_mac);
+ }
++
++bool rvu_nix_is_ptp_tx_enabled(struct rvu *rvu, u16 pcifunc)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	struct rvu_block *block;
++	int blkaddr;
++	int nixlf;
++	u64 cfg;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
++	if (blkaddr < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	block = &hw->block[blkaddr];
++	nixlf = rvu_get_lf(rvu, block, pcifunc, 0);
++	if (nixlf < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	cfg = rvu_read64(rvu, blkaddr, NIX_AF_LFX_TX_CFG(nixlf));
++	return (cfg & BIT_ULL(32));
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 51271a46ac36..9e44269b929f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -2641,7 +2641,9 @@ int rvu_mbox_handler_npc_set_pkind(struct rvu *rvu,
+ 				   struct msg_rsp *rsp)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, req->hdr.pcifunc);
+-	int pf = rvu_get_pf(req->hdr.pcifunc);
++	u16 pcifunc = req->hdr.pcifunc;
++	int pf = rvu_get_pf(pcifunc);
++	bool enable_higig2 = false;
+ 	int blkaddr, nixlf, rc;
+ 	u64 rxpkind, txpkind;
+ 	u8 cgx_id, lmac_id;
+@@ -2653,8 +2655,14 @@ int rvu_mbox_handler_npc_set_pkind(struct rvu *rvu,
+ 	if (req->mode & OTX2_PRIV_FLAGS_EDSA) {
+ 		rxpkind = NPC_RX_EDSA_PKIND;
+ 	} else if (req->mode & OTX2_PRIV_FLAGS_HIGIG) {
++		/* Silicon does not support enabling higig in time stamp mode */
++		if (pfvf->hw_rx_tstamp_en ||
++		    rvu_nix_is_ptp_tx_enabled(rvu, pcifunc))
++			return NPC_AF_ERR_HIGIG_CONFIG_FAIL;
++
+ 		rxpkind = NPC_RX_HIGIG_PKIND;
+ 		txpkind = NPC_TX_HIGIG_PKIND;
++		enable_higig2 = true;
+ 	} else if (req->mode & OTX2_PRIV_FLAGS_CUSTOM) {
+ 		rxpkind = req->pkind;
+ 		txpkind = req->pkind;
+@@ -2685,5 +2693,9 @@ int rvu_mbox_handler_npc_set_pkind(struct rvu *rvu,
+ 		rvu_write64(rvu, blkaddr, NIX_AF_LFX_TX_PARSE_CFG(nixlf),
+ 			    txpkind);
+ 	}
++
++	if (enable_higig2 ^ rvu_cgx_is_higig2_enabled(rvu, pf))
++		rvu_cgx_enadis_higig2(rvu, pf, enable_higig2);
++
+ 	return 0;
+ }
+-- 
+2.31.1
+

@@ -1,0 +1,153 @@
+From f1884c3a62e9f1b9c889c98e7ad2d7354740cdb6 Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Wed, 22 Jan 2020 11:55:57 +0530
+Subject: [PATCH 458/767] coresight: tmc: Get Trace buffer size through SMC
+ instead of dts
+
+commit 2327887b40c863d4ae79b3b63081c705a9589e6a from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+With firmware now supporting, larger and configurable trace buffer
+size, its easier and cleaner to keep all secure tracebuffer management
+hooks through SMC calls.
+
+- Trace buffer size is now obtained through newly introduced SMC call
+  instead of dts node attribute.
+- With possibility of larger trace buffer, cache locking is disabled by
+  default.
+- Fixed a bug in coresight_get_enabled_sink API so that ETR probe
+  failures gets handled gracefully when trace buffer is not available.
+- Trace buffer size for each ETR can be read using,
+ /sys/bus/coresight/devices/XXX.etrX/tracebuffer_size
+
+Change-Id: I7dfd5c7a4ff2fda73c616ac086220f22e9defdc6
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/22252
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+[Kevin: Just some minor context mods in order to port to linux-yocto]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/hwtracing/coresight/coresight-tmc.c | 41 ++++++++++++++++-----
+ drivers/hwtracing/coresight/coresight-tmc.h | 18 +++++++++
+ drivers/hwtracing/coresight/coresight.c     |  2 +
+ 3 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.c b/drivers/hwtracing/coresight/coresight-tmc.c
+index 01f3619fcf50..e63dfcd7134f 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.c
++++ b/drivers/hwtracing/coresight/coresight-tmc.c
+@@ -325,9 +325,27 @@ static ssize_t buffer_size_store(struct device *dev,
+ 
+ static DEVICE_ATTR_RW(buffer_size);
+ 
++static ssize_t tracebuffer_size_store(struct device *dev,
++			     struct device_attribute *attr,
++			     const char *buf, size_t size)
++{
++	return -EINVAL;
++}
++
++static ssize_t tracebuffer_size_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct tmc_drvdata *drvdata = dev_get_drvdata(dev->parent);
++	unsigned long val = drvdata->size;
++
++	return sprintf(buf, "%#lx\n", val);
++}
++static DEVICE_ATTR_RW(tracebuffer_size);
++
+ static struct attribute *coresight_tmc_attrs[] = {
+ 	&dev_attr_trigger_cntr.attr,
+ 	&dev_attr_buffer_size.attr,
++	&dev_attr_tracebuffer_size.attr,
+ 	NULL,
+ };
+ 
+@@ -454,21 +472,24 @@ static int tmc_probe(struct amba_device *adev, const struct amba_id *id)
+ 		TMC_FFSR_FT_NOT_PRESENT);
+ 
+ 	if (drvdata->config_type == TMC_CONFIG_TYPE_ETR) {
+-		if (np)
+-			ret = of_property_read_u32(np,
+-						   "arm,buffer-size",
+-						   &drvdata->size);
+-		if (ret)
++		if (drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF) {
++			if (tmc_get_cpu_tracebufsize(drvdata,
++						     &drvdata->size) ||
++			    !drvdata->size) {
++				dev_info(drvdata->dev,
++					 "Secure tracebuffer not available\n");
++				ret = -ENOMEM;
++				goto out;
++			}
++		} else
+ 			drvdata->size = SZ_1M;
+-
+-		/* Cache locked buffer */
+-		if (np)
+-			drvdata->cache_lock_en = of_property_read_bool(np,
+-						   "cache-lock");
+ 	} else {
+ 		drvdata->size = readl_relaxed(drvdata->base + TMC_RSZ) * 4;
+ 	}
+ 
++	/* Keep cache lock disabled by default */
++	drvdata->cache_lock_en = false;
++
+ 	desc.pdata = pdata;
+ 	desc.dev = dev;
+ 	desc.groups = coresight_tmc_groups;
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.h b/drivers/hwtracing/coresight/coresight-tmc.h
+index 5304c9167905..50b94b5b8231 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.h
++++ b/drivers/hwtracing/coresight/coresight-tmc.h
+@@ -148,6 +148,10 @@ enum tmc_mem_intf_width {
+ #define OCTEONTX_TRC_FREE_SBUF		0xc2000c08
+ /* Args: x1 - non secure buffer address, x2 - size */
+ #define OCTEONTX_TRC_UNREGISTER_DRVBUF	0xc2000c09
++/* Args: Nil
++ * Returns: cpu trace buffer size
++ */
++#define OCTEONTX_TRC_GET_CPU_BUFSIZE    0xc2000c0a
+ 
+ enum etr_mode {
+ 	ETR_MODE_FLAT,		/* Uses contiguous flat buffer */
+@@ -379,6 +383,20 @@ tmc_sg_table_buf_size(struct tmc_sg_table *sg_table)
+ 
+ struct coresight_device *tmc_etr_get_catu_device(struct tmc_drvdata *drvdata);
+ 
++static inline int tmc_get_cpu_tracebufsize(struct tmc_drvdata *drvdata,
++					  u32 *len)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_TRC_GET_CPU_BUFSIZE, 0, 0, 0,
++		      0, 0, 0, 0, &res);
++	if (res.a0 != SMCCC_RET_SUCCESS)
++		return -EFAULT;
++
++	*len = (u32)res.a1;
++	return 0;
++}
++
+ static inline int tmc_alloc_secbuf(struct tmc_drvdata *drvdata,
+ 				   size_t len, dma_addr_t *s_paddr)
+ {
+diff --git a/drivers/hwtracing/coresight/coresight.c b/drivers/hwtracing/coresight/coresight.c
+index 0d708682b3ad..96fd2da90fce 100644
+--- a/drivers/hwtracing/coresight/coresight.c
++++ b/drivers/hwtracing/coresight/coresight.c
+@@ -550,6 +550,8 @@ struct coresight_device *coresight_get_enabled_sink(struct coresight_device *s,
+ 	 * nothing to search further.
+ 	 */
+ 	child = s->conns[0].child_dev;
++	if (child == NULL)
++		return NULL;
+ 	if (s->nr_outport == 1 &&
+ 	    child->type == CORESIGHT_DEV_TYPE_SINK &&
+ 	    child->subtype.sink_subtype == CORESIGHT_DEV_SUBTYPE_SINK_BUFFER &&
+-- 
+2.31.1
+

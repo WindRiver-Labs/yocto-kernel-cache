@@ -1,0 +1,310 @@
+From 0aec8c7fed0ec44d8a6700b378e7c7c90e82248f Mon Sep 17 00:00:00 2001
+From: Tomasz Duszynski <tduszynski@marvell.com>
+Date: Fri, 12 Apr 2019 16:02:03 +0530
+Subject: [PATCH 146/767] octeontx2-pf: Notify VFs about link changes
+
+commit 9dd7f18cbc1018e7cae7025d901af2fe404e379b from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Send a notification message to existing VFs whenever PF
+detects a link change. Also added support for handling
+these link events in the VF driver.
+
+Change-Id: Ibdb1d6d51a394e3886bf8f93519fe8aaa8d85469
+Signed-off-by: Tomasz Duszynski <tduszynski@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.h       |   7 +
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 122 ++++++++++++++++--
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |  23 ++++
+ 3 files changed, 142 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 04ce9b4619e4..528f1121198c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -142,6 +142,12 @@ struct otx2_hw {
+ 
+ struct otx2_ptp;
+ 
++struct otx2_vf_config {
++	struct otx2_nic *pf;
++	struct delayed_work link_event_work;
++	bool intf_down; /* interface was either configured or not */
++};
++
+ struct flr_work {
+ 	struct work_struct work;
+ 	struct otx2_nic *pf;
+@@ -171,6 +177,7 @@ struct otx2_nic {
+ 	struct work_struct	reset_task;
+ 	u64			reset_count;
+ 	u8			total_vfs;
++	struct otx2_vf_config	*vf_configs;
+ 	struct cgx_link_user_info linfo;
+ 	u16			rxvlan_entry;
+ 	bool			rxvlan_alloc;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 60431c1ab75a..143fbb660e8a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -519,6 +519,8 @@ static void otx2_pfvf_mbox_up_handler(struct work_struct *work)
+ 		}
+ 
+ 		switch (msg->id) {
++		case MBOX_MSG_CGX_LINK_EVENT:
++			break;
+ 		default:
+ 			if (msg->rc)
+ 				dev_err(pf->dev,
+@@ -728,6 +730,8 @@ static int otx2_register_pfvf_mbox_intr(struct otx2_nic *pf)
+ static void otx2_process_pfaf_mbox_msg(struct otx2_nic *pf,
+ 				       struct mbox_msghdr *msg)
+ {
++	int devid;
++
+ 	if (msg->id >= MBOX_MSG_MAX) {
+ 		dev_err(pf->dev,
+ 			"Mbox msg with unknown ID 0x%x\n", msg->id);
+@@ -741,6 +745,26 @@ static void otx2_process_pfaf_mbox_msg(struct otx2_nic *pf,
+ 		return;
+ 	}
+ 
++	/* message response heading VF */
++	devid = msg->pcifunc & RVU_PFVF_FUNC_MASK;
++	if (devid) {
++		struct otx2_vf_config *config = &pf->vf_configs[devid - 1];
++		struct delayed_work *dwork;
++
++		switch (msg->id) {
++		case MBOX_MSG_NIX_LF_START_RX:
++			config->intf_down = false;
++			dwork = &config->link_event_work;
++			schedule_delayed_work(dwork, msecs_to_jiffies(100));
++			break;
++		case MBOX_MSG_NIX_LF_STOP_RX:
++			config->intf_down = true;
++			break;
++		}
++
++		return;
++	}
++
+ 	switch (msg->id) {
+ 	case MBOX_MSG_READY:
+ 		pf->pcifunc = msg->pcifunc;
+@@ -817,14 +841,11 @@ static void otx2_pfaf_mbox_handler(struct work_struct *work)
+ 	otx2_write64(pf, RVU_PF_INT, BIT_ULL(0));
+ }
+ 
+-int otx2_mbox_up_handler_cgx_link_event(struct otx2_nic *pf,
+-					struct cgx_link_info_msg *msg,
+-					struct msg_rsp *rsp)
++static void otx2_handle_link_event(struct otx2_nic *pf)
+ {
+-	struct cgx_link_user_info *linfo = &msg->link_info;
++	struct cgx_link_user_info *linfo = &pf->linfo;
+ 	struct net_device *netdev = pf->netdev;
+ 
+-	pf->linfo = msg->link_info;
+ 	pr_info("%s NIC Link is %s %d Mbps %s duplex\n", netdev->name,
+ 		linfo->link_up ? "UP" : "DOWN", linfo->speed,
+ 		linfo->full_duplex ? "Full" : "Half");
+@@ -835,8 +856,35 @@ int otx2_mbox_up_handler_cgx_link_event(struct otx2_nic *pf,
+ 		netif_tx_stop_all_queues(netdev);
+ 		netif_carrier_off(netdev);
+ 	}
++}
++
++int otx2_mbox_up_handler_cgx_link_event(struct otx2_nic *pf,
++					struct cgx_link_info_msg *msg,
++					struct msg_rsp *rsp)
++{
++	int i;
++
++	pf->linfo = msg->link_info;
++
++	/* notify VFs about link event */
++	for (i = 0; i < pci_num_vf(pf->pdev); i++) {
++		struct otx2_vf_config *config = &pf->vf_configs[i];
++		struct delayed_work *dwork = &config->link_event_work;
++
++		if (config->intf_down)
++			continue;
++
++		schedule_delayed_work(dwork, msecs_to_jiffies(100));
++	}
++
++	/* interface has not been fully configured yet */
++	if (pf->intf_down)
++		return 0;
++
++	otx2_handle_link_event(pf);
+ 	return 0;
+ }
++EXPORT_SYMBOL(otx2_mbox_up_handler_cgx_link_event);
+ 
+ static int otx2_process_mbox_msg_up(struct otx2_nic *pf,
+ 				    struct mbox_msghdr *req)
+@@ -1616,6 +1664,10 @@ int otx2_open(struct net_device *netdev)
+ 
+ 	pf->intf_down = false;
+ 
++	/* we have already received link status notification */
++	if (pf->linfo.link_up)
++		otx2_handle_link_event(pf);
++
+ 	/* When reinitializing enable time stamping if it is enabled before */
+ 	if (pf->hw_tx_tstamp) {
+ 		pf->hw_tx_tstamp = 0;
+@@ -1626,9 +1678,6 @@ int otx2_open(struct net_device *netdev)
+ 		otx2_config_hw_rx_tstamp(pf, true);
+ 	}
+ 
+-	/* Enable link notifications */
+-	otx2_cgx_config_linkevents(pf, true);
+-
+ 	/* Alloc rxvlan entry in MCAM for PFs only */
+ 	if (!(pf->pcifunc & RVU_PFVF_FUNC_MASK))
+ 		otx2_alloc_rxvlan(pf);
+@@ -2095,6 +2144,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	INIT_LIST_HEAD(&pf->flows);
+ 	pf->max_flows = MAX_ETHTOOL_FLOWS;
+ 	otx2_set_ethtool_ops(netdev);
++
++	/* Enable link notifications */
++	otx2_cgx_config_linkevents(pf, true);
++
+ 	return 0;
+ 
+ err_ptp_destroy:
+@@ -2116,11 +2169,39 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return err;
+ }
+ 
++static void otx2_vf_link_event_task(struct work_struct *work)
++{
++	struct otx2_vf_config *config;
++	struct cgx_link_info_msg *req;
++	struct mbox_msghdr *msghdr;
++	struct otx2_nic *pf;
++	int vf_idx;
++
++	config = container_of(work, struct otx2_vf_config,
++			      link_event_work.work);
++	vf_idx = config - config->pf->vf_configs;
++	pf = config->pf;
++
++	msghdr = otx2_mbox_alloc_msg_rsp(&pf->mbox_pfvf[0].mbox_up, vf_idx,
++					 sizeof(*req), sizeof(struct msg_rsp));
++	if (!msghdr) {
++		dev_err(pf->dev, "Failed to create VF%d link event\n", vf_idx);
++		return;
++	}
++
++	req = (struct cgx_link_info_msg *)msghdr;
++	req->hdr.id = MBOX_MSG_CGX_LINK_EVENT;
++	req->hdr.sig = OTX2_MBOX_REQ_SIG;
++	memcpy(&req->link_info, &pf->linfo, sizeof(req->link_info));
++
++	otx2_sync_mbox_up_msg(&pf->mbox_pfvf[0], vf_idx);
++}
++
+ static int otx2_sriov_enable(struct pci_dev *pdev, int numvfs)
+ {
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct otx2_nic *pf = netdev_priv(netdev);
+-	int ret;
++	int ret, i;
+ 
+ 	if (numvfs > pf->total_vfs)
+ 		numvfs = pf->total_vfs;
+@@ -2134,9 +2215,23 @@ static int otx2_sriov_enable(struct pci_dev *pdev, int numvfs)
+ 	if (ret)
+ 		goto free_mbox;
+ 
++	pf->vf_configs = kcalloc(numvfs, sizeof(struct otx2_vf_config),
++				 GFP_KERNEL);
++	if (!pf->vf_configs) {
++		ret = -ENOMEM;
++		goto free_intr;
++	}
++
++	for (i = 0; i < numvfs; i++) {
++		pf->vf_configs[i].pf = pf;
++		pf->vf_configs[i].intf_down = true;
++		INIT_DELAYED_WORK(&pf->vf_configs[i].link_event_work,
++				  otx2_vf_link_event_task);
++	}
++
+ 	ret = otx2_pf_flr_init(pf, numvfs);
+ 	if (ret)
+-		goto free_intr;
++		goto free_configs;
+ 
+ 	ret = otx2_register_flr_me_intr(pf);
+ 	if (ret)
+@@ -2151,6 +2246,8 @@ static int otx2_sriov_enable(struct pci_dev *pdev, int numvfs)
+ 	otx2_disable_flr_me_intr(pf);
+ free_flr:
+ 	otx2_flr_wq_destroy(pf);
++free_configs:
++	kfree(pf->vf_configs);
+ free_intr:
+ 	otx2_disable_pfvf_mbox_intr(pf);
+ free_mbox:
+@@ -2162,12 +2259,17 @@ static int otx2_sriov_disable(struct pci_dev *pdev)
+ {
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct otx2_nic *pf = netdev_priv(netdev);
++	int i;
+ 
+ 	if (!pci_num_vf(pdev))
+ 		return 0;
+ 
+ 	pci_disable_sriov(pdev);
+ 
++	for (i = 0; i < pci_num_vf(pdev); i++)
++		cancel_delayed_work_sync(&pf->vf_configs[i].link_event_work);
++	kfree(pf->vf_configs);
++
+ 	otx2_disable_flr_me_intr(pf);
+ 	otx2_flr_wq_destroy(pf);
+ 	otx2_disable_pfvf_mbox_intr(pf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 809945646de4..8e2889c0fed7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -126,6 +126,29 @@ static int otx2vf_process_mbox_msg_up(struct otx2_nic *vf,
+ 	}
+ 
+ 	switch (req->id) {
++#define M(_name, _id, _fn_name, _req_type, _rsp_type)			\
++	case _id: {							\
++		struct _rsp_type *rsp;					\
++		int err;						\
++									\
++		rsp = (struct _rsp_type *)otx2_mbox_alloc_msg(		\
++			&vf->mbox.mbox_up, 0,				\
++			sizeof(struct _rsp_type));			\
++		if (!rsp)						\
++			return -ENOMEM;					\
++									\
++		rsp->hdr.id = _id;					\
++		rsp->hdr.sig = OTX2_MBOX_RSP_SIG;			\
++		rsp->hdr.pcifunc = 0;					\
++		rsp->hdr.rc = 0;					\
++									\
++		err = otx2_mbox_up_handler_ ## _fn_name(		\
++			vf, (struct _req_type *)req, rsp);		\
++		return err;						\
++	}
++MBOX_UP_CGX_MESSAGES
++#undef M
++		break;
+ 	default:
+ 		otx2_reply_invalid_msg(&vf->mbox.mbox_up, 0, 0, req->id);
+ 		return -ENODEV;
+-- 
+2.31.1
+

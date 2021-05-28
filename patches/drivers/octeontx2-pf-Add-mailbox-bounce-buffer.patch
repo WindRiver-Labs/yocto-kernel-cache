@@ -1,0 +1,117 @@
+From 5349f618483d6e5eba04fb573f030a076ff4fbfb Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Mon, 10 Dec 2018 16:22:12 +0530
+Subject: [PATCH 037/767] octeontx2-pf: Add mailbox bounce buffer
+
+commit 8bcc1477d5985bc6cdcc6739afc707f1eb9806af from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+When device is attached to a VM via VFIO, one stage mapping
+from intermediate physical address (IPA) to PA of mailbox region
+is marked as device memory. Even if driver in the VM does
+a VA to IPA mapping as normal memory, the whole region will be
+treated as device memory, so unaligned accesses won't be permitted.
+
+This patch adds a bounce buffer for mailbox region so that device
+can prepare mbox messages in the bounce buffer which will unaligned
+accesses. Before triggering notification to admin function, messages
+are copied to HW mbox region.
+
+Change-Id: Iab8e4b22d3232a3c10c54058973cfe9fd0150196
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.h       | 44 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  6 +++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 6b5b764df4c1..94aaa4b83663 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -30,6 +30,7 @@ struct  mbox {
+ 	struct otx2_mbox	mbox_up;
+ 	struct work_struct	mbox_up_wrk;
+ 	struct otx2_nic		*pfvf;
++	void *bbuf_base; /* Bounce buffer for mbox memory */
+ };
+ 
+ struct otx2_hw {
+@@ -66,6 +67,49 @@ static inline u64 otx2_read64(struct otx2_nic *nic, u64 offset)
+ 	return readq(nic->reg_base + offset);
+ }
+ 
++/* Mbox bounce buffer APIs */
++static inline int otx2_mbox_bbuf_init(struct mbox *mbox, struct pci_dev *pdev)
++{
++	struct otx2_mbox_dev *mdev;
++	struct otx2_mbox *otx2_mbox;
++
++	mbox->bbuf_base = devm_kmalloc(&pdev->dev, MBOX_SIZE, GFP_KERNEL);
++	if (!mbox->bbuf_base)
++		return -ENOMEM;
++
++	/* Overwrite mbox mbase to point to bounce buffer, so that PF/VF
++	 * prepare all mbox messages in bounce buffer instead of directly
++	 * in hw mbox memory.
++	 */
++	otx2_mbox = &mbox->mbox;
++	mdev = &otx2_mbox->dev[0];
++	mdev->mbase = mbox->bbuf_base;
++
++	return 0;
++}
++
++static inline void otx2_sync_mbox_bbuf(struct otx2_mbox *mbox, int devid)
++{
++	u16 msgs_offset = ALIGN(sizeof(struct mbox_hdr), MBOX_MSG_ALIGN);
++	void *hw_mbase = mbox->hwbase + (devid * MBOX_SIZE);
++	struct otx2_mbox_dev *mdev = &mbox->dev[devid];
++	struct mbox_hdr *hdr;
++	u64 msg_size;
++
++	if (mdev->mbase == hw_mbase)
++		return;
++
++	hdr = hw_mbase + mbox->rx_start;
++	msg_size = hdr->msg_size;
++
++	if (msg_size > mbox->rx_size - msgs_offset)
++		msg_size = mbox->rx_size - msgs_offset;
++
++	/* Copy mbox messages from mbox memory to bounce buffer */
++	memcpy(mdev->mbase + mbox->rx_start,
++	       hw_mbase + mbox->rx_start, msg_size + msgs_offset);
++}
++
+ /* Mbox APIs */
+ static inline int otx2_sync_mbox_msg(struct mbox *mbox)
+ {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 992f5a0baff5..05d3a1b7ca59 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -108,6 +108,8 @@ static irqreturn_t otx2_pfaf_mbox_intr_handler(int irq, void *pf_irq)
+ 	/* Check for AF => PF response messages */
+ 	mbox = &pf->mbox.mbox;
+ 	mdev = &mbox->dev[0];
++	otx2_sync_mbox_bbuf(mbox, 0);
++
+ 	hdr = (struct mbox_hdr *)(mdev->mbase + mbox->rx_start);
+ 	if (hdr->num_msgs)
+ 		queue_work(pf->mbox_wq, &pf->mbox.mbox_wrk);
+@@ -214,6 +216,10 @@ static int otx2_pfaf_mbox_init(struct otx2_nic *pf)
+ 	if (err)
+ 		goto exit;
+ 
++	err = otx2_mbox_bbuf_init(mbox, pf->pdev);
++	if (err)
++		goto exit;
++
+ 	INIT_WORK(&mbox->mbox_wrk, otx2_pfaf_mbox_handler);
+ 
+ 	return 0;
+-- 
+2.31.1
+

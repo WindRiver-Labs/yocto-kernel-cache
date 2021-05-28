@@ -1,0 +1,144 @@
+From 08fd57cdb8a57eb2e3459e5e76ea41d45e263684 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Mon, 19 Nov 2018 18:44:32 +0530
+Subject: [PATCH 406/767] PCI: Assign bus numbers present in EA capability for
+ bridges
+
+commit 44d192796068a3734738803c3845ec6217f6d0d1 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+The "Enhanced Allocation (EA) for Memory and I/O Resources" ECN, approved
+23 October 2014, sec 6.9.1.2, specifies a second DW in the capability for
+type 1 (bridge) functions to describe fixed secondary and subordinate bus
+numbers.  This ECN was included in the PCIe r4.0 spec, but sec 6.9.1.2 was
+omitted, presumably by mistake.
+
+Read fixed bus numbers from the EA capability for bridges.
+
+Change-Id: I2d7718bdf2c93ab3412a952b3204671c2561e837
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+[bhelgaas: add pci_ea_fixed_busnrs() return value]
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-on: https://sj1git1.cavium.com/18494
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/pci/probe.c           | 54 ++++++++++++++++++++++++++++++++---
+ include/uapi/linux/pci_regs.h |  6 ++++
+ 2 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index c5e75a6ca55a..0e8e2c186f50 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -1087,6 +1087,36 @@ static void pci_enable_crs(struct pci_dev *pdev)
+ 
+ static unsigned int pci_scan_child_bus_extend(struct pci_bus *bus,
+ 					      unsigned int available_buses);
++/**
++ * pci_ea_fixed_busnrs() - Read fixed Secondary and Subordinate bus
++ * numbers from EA capability.
++ * @dev: Bridge
++ * @sec: updated with secondary bus number from EA
++ * @sub: updated with subordinate bus number from EA
++ *
++ * If @dev is a bridge with EA capability, update @sec and @sub with
++ * fixed bus numbers from the capability and return true.  Otherwise,
++ * return false.
++ */
++static bool pci_ea_fixed_busnrs(struct pci_dev *dev, u8 *sec, u8 *sub)
++{
++	int ea, offset;
++	u32 dw;
++
++	if (dev->hdr_type != PCI_HEADER_TYPE_BRIDGE)
++		return false;
++
++	/* find PCI EA capability in list */
++	ea = pci_find_capability(dev, PCI_CAP_ID_EA);
++	if (!ea)
++		return false;
++
++	offset = ea + PCI_EA_FIRST_ENT;
++	pci_read_config_dword(dev, offset, &dw);
++	*sec =  dw & PCI_EA_SEC_BUS_MASK;
++	*sub = (dw & PCI_EA_SUB_BUS_MASK) >> PCI_EA_SUB_BUS_SHIFT;
++	return true;
++}
+ 
+ /*
+  * pci_scan_bridge_extend() - Scan buses behind a bridge
+@@ -1121,6 +1151,9 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
+ 	u16 bctl;
+ 	u8 primary, secondary, subordinate;
+ 	int broken = 0;
++	bool fixed_buses;
++	u8 fixed_sec, fixed_sub;
++	int next_busnr;
+ 
+ 	/*
+ 	 * Make sure the bridge is powered on to be able to access config
+@@ -1220,17 +1253,24 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
+ 		/* Clear errors */
+ 		pci_write_config_word(dev, PCI_STATUS, 0xffff);
+ 
++		/* Read bus numbers from EA Capability (if present) */
++		fixed_buses = pci_ea_fixed_busnrs(dev, &fixed_sec, &fixed_sub);
++		if (fixed_buses)
++			next_busnr = fixed_sec;
++		else
++			next_busnr = max + 1;
++
+ 		/*
+ 		 * Prevent assigning a bus number that already exists.
+ 		 * This can happen when a bridge is hot-plugged, so in this
+ 		 * case we only re-scan this bus.
+ 		 */
+-		child = pci_find_bus(pci_domain_nr(bus), max+1);
++		child = pci_find_bus(pci_domain_nr(bus), next_busnr);
+ 		if (!child) {
+-			child = pci_add_new_bus(bus, dev, max+1);
++			child = pci_add_new_bus(bus, dev, next_busnr);
+ 			if (!child)
+ 				goto out;
+-			pci_bus_insert_busn_res(child, max+1,
++			pci_bus_insert_busn_res(child, next_busnr,
+ 						bus->busn_res.end);
+ 		}
+ 		max++;
+@@ -1291,7 +1331,13 @@ static int pci_scan_bridge_extend(struct pci_bus *bus, struct pci_dev *dev,
+ 			max += i;
+ 		}
+ 
+-		/* Set subordinate bus number to its real value */
++		/*
++		 * Set subordinate bus number to its real value.
++		 * If fixed subordinate bus number exists from EA
++		 * capability then use it.
++		 */
++		if (fixed_buses)
++			max = fixed_sub;
+ 		pci_bus_update_busn_res_end(child, max);
+ 		pci_write_config_byte(dev, PCI_SUBORDINATE_BUS, max);
+ 	}
+diff --git a/include/uapi/linux/pci_regs.h b/include/uapi/linux/pci_regs.h
+index f7d3e7831fa8..27164769d184 100644
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -370,6 +370,12 @@
+ #define PCI_EA_FIRST_ENT_BRIDGE	8	/* First EA Entry for Bridges */
+ #define  PCI_EA_ES		0x00000007 /* Entry Size */
+ #define  PCI_EA_BEI		0x000000f0 /* BAR Equivalent Indicator */
++
++/* EA fixed Secondary and Subordinate bus numbers for Bridge */
++#define PCI_EA_SEC_BUS_MASK	0xff
++#define PCI_EA_SUB_BUS_MASK	0xff00
++#define PCI_EA_SUB_BUS_SHIFT	8
++
+ /* 0-5 map to BARs 0-5 respectively */
+ #define   PCI_EA_BEI_BAR0		0
+ #define   PCI_EA_BEI_BAR5		5
+-- 
+2.31.1
+

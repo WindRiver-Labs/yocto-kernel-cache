@@ -1,0 +1,162 @@
+From 1411d8c595af134dc76dacb4f5243316edebbd64 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Thu, 5 Dec 2019 18:04:12 +0530
+Subject: [PATCH 425/767] octeontx2-pf: Use mutex for mbox locking
+
+commit 46a0ce95e2db7ffd083cd2634b7037f32e27501f from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Used mutex instead atomic variables for
+mailbox lock. Also changed WARN_ON to
+dev_err.
+
+Change-Id: I18e1d3cc013bfc058db47a33ed5d123185d3c5ef
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/20141
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 11 ++++++----
+ .../marvell/octeontx2/nic/otx2_common.h       |  9 ++++----
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 21 ++++++++++++-------
+ 3 files changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index de18887535c5..ab6bd745b881 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -529,7 +529,7 @@ int otx2_txsch_alloc(struct otx2_nic *pfvf)
+ int otx2_txschq_stop(struct otx2_nic *pfvf)
+ {
+ 	struct nix_txsch_free_req *free_req;
+-	int lvl, schq;
++	int lvl, schq, err;
+ 
+ 	otx2_mbox_lock(&pfvf->mbox);
+ 	/* Free the transmit schedulers */
+@@ -540,7 +540,7 @@ int otx2_txschq_stop(struct otx2_nic *pfvf)
+ 	}
+ 
+ 	free_req->flags = TXSCHQ_FREE_ALL;
+-	WARN_ON(otx2_sync_mbox_msg(&pfvf->mbox));
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
+ 	otx2_mbox_unlock(&pfvf->mbox);
+ 
+ 	/* Clear the txschq list */
+@@ -548,7 +548,7 @@ int otx2_txschq_stop(struct otx2_nic *pfvf)
+ 		for (schq = 0; schq < MAX_TXSCHQ_PER_FUNC; schq++)
+ 			pfvf->hw.txschq_list[lvl][schq] = 0;
+ 	}
+-	return 0;
++	return err;
+ }
+ 
+ /* RED and drop levels of CQ on packet reception.
+@@ -1310,7 +1310,10 @@ void otx2_ctx_disable(struct mbox *mbox, int type, bool npa)
+ 
+ 	req->ctype = type;
+ 
+-	WARN_ON(otx2_sync_mbox_msg(mbox));
++	if (otx2_sync_mbox_msg(mbox))
++		dev_err(mbox->pfvf->dev, "%s failed to disable context\n",
++			__func__);
++
+ 	otx2_mbox_unlock(mbox);
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 75e48838b436..b88763010b85 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -146,7 +146,7 @@ struct  mbox {
+ 	struct work_struct	mbox_up_wrk;
+ 	struct otx2_nic		*pfvf;
+ 	void			*bbuf_base; /* Bounce buffer for mbox memory */
+-	atomic_t		lock;	/* serialize mailbox access */
++	struct mutex		lock;	/* serialize mailbox access */
+ 	int			num_msgs; /*mbox number of messages*/
+ 	int			up_num_msgs;/* mbox_up number of messages*/
+ };
+@@ -429,18 +429,17 @@ static inline void otx2_sync_mbox_bbuf(struct otx2_mbox *mbox, int devid)
+ 
+ static inline void otx2_mbox_lock_init(struct mbox *mbox)
+ {
+-	atomic_set(&mbox->lock, 0);
++	mutex_init(&mbox->lock);
+ }
+ 
+ static inline void otx2_mbox_lock(struct mbox *mbox)
+ {
+-	while (!(atomic_add_return(1, &mbox->lock) == 1))
+-		cpu_relax();
++	mutex_lock(&mbox->lock);
+ }
+ 
+ static inline void otx2_mbox_unlock(struct mbox *mbox)
+ {
+-	atomic_set(&mbox->lock, 0);
++	mutex_unlock(&mbox->lock);
+ }
+ 
+ /* With the absence of API for 128-bit IO memory access for arm64,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index dd86a7c217a2..abd6c08c7c2f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1384,7 +1384,8 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	otx2_free_cq_res(pf);
+ 	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_RQ, false);
+ err_free_txsch:
+-	otx2_txschq_stop(pf);
++	if (otx2_txschq_stop(pf))
++		dev_err(pf->dev, "%s failed to stop TX schedulers\n", __func__);
+ err_free_sq_ptrs:
+ 	otx2_sq_free_sqbs(pf);
+ err_free_rq_ptrs:
+@@ -1397,13 +1398,16 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	free_req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
+ 	if (free_req) {
+ 		free_req->flags = NIX_LF_DISABLE_FLOWS;
+-		WARN_ON(otx2_sync_mbox_msg(mbox));
++		if (otx2_sync_mbox_msg(mbox))
++			dev_err(pf->dev, "%s failed to free nixlf\n", __func__);
+ 	}
+ err_free_npa_lf:
+ 	/* Reset NPA LF */
+ 	req = otx2_mbox_alloc_msg_npa_lf_free(mbox);
+-	if (req)
+-		WARN_ON(otx2_sync_mbox_msg(mbox));
++	if (req) {
++		if (otx2_sync_mbox_msg(mbox))
++			dev_err(pf->dev, "%s failed to free npalf\n", __func__);
++	}
+ exit:
+ 	otx2_mbox_unlock(mbox);
+ 	return err;
+@@ -1453,7 +1457,8 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 	free_req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
+ 	if (free_req) {
+ 		free_req->flags = NIX_LF_DISABLE_FLOWS;
+-		WARN_ON(otx2_sync_mbox_msg(mbox));
++		if (otx2_sync_mbox_msg(mbox))
++			dev_err(pf->dev, "%s failed to free nixlf\n", __func__);
+ 	}
+ 	otx2_mbox_unlock(mbox);
+ 
+@@ -1465,8 +1470,10 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 	otx2_mbox_lock(mbox);
+ 	/* Reset NPA LF */
+ 	req = otx2_mbox_alloc_msg_npa_lf_free(mbox);
+-	if (req)
+-		WARN_ON(otx2_sync_mbox_msg(mbox));
++	if (req) {
++		if (otx2_sync_mbox_msg(mbox))
++			dev_err(pf->dev, "%s failed to free npalf\n", __func__);
++	}
+ 	otx2_mbox_unlock(mbox);
+ }
+ 
+-- 
+2.31.1
+

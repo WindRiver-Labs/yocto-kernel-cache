@@ -1,0 +1,111 @@
+From 58fe038e83958b5775bf72bf30c63dd2b11b2ad3 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Thu, 7 Mar 2019 11:45:00 +0530
+Subject: [PATCH 116/767] octeontx2-pf: Skip CQ_STATUS read if pending CQEs
+ greater than budget
+
+commit ad5b9928832454b1975d6882d540a0ae3a12fd71 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+We can avoid costly CQ_STATUS read in next napi run if the
+pending CQEs >= napi budget(64) after processing CQEs in current run.
+
+Change-Id: I537526455bcd8dfbe7851525cf36d7c22a4b2a4e
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 34 ++++++++++++-------
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  7 ++--
+ 2 files changed, 27 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 8e24b9879017..11c856dc7132 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -277,15 +277,18 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ int otx2_napi_handler(struct otx2_cq_queue *cq,
+ 		      struct otx2_nic *pfvf, int budget)
+ {
++	int tx_pkts = 0, tx_bytes = 0, pool_ptrs = 0;
+ 	struct otx2_pool *rbpool = cq->rbpool;
+ 	int processed_cqe = 0, workdone = 0;
+-	int cq_head, cq_tail, pool_ptrs = 0;
+ 	struct nix_cqe_hdr_s *cqe_hdr;
+-	int tx_pkts = 0, tx_bytes = 0;
+ 	struct netdev_queue *txq;
+ 	u64 cq_status;
+ 	s64 bufptr;
+ 
++	/* If the pending CQE > 64 skip CQ status read */
++	if (cq->pend_cqe >= budget)
++		goto process_cqe;
++
+ 	cq_status = otx2_nix_cq_op_status(pfvf, cq->cq_idx);
+ 	if (cq_status & BIT_ULL(63)) {
+ 		dev_err(pfvf->dev, "CQ operation error");
+@@ -300,23 +303,30 @@ int otx2_napi_handler(struct otx2_cq_queue *cq,
+ 		return 0;
+ 	}
+ 
+-	cq_head = (cq_status >> 20) & 0xFFFFF;
+-	cq_tail = cq_status & 0xFFFFF;
++	cq->cq_head = (cq_status >> 20) & 0xFFFFF;
++	cq->cq_tail = cq_status & 0xFFFFF;
+ 
+ 	/* Since multiple CQs may be mapped to same CINT,
+ 	 * check if there are valid CQEs in this CQ.
+ 	 */
+-	if (cq_head == cq_tail)
++	if (cq->cq_head == cq->cq_tail)
+ 		return 0;
+-
+-	while (cq_head != cq_tail) {
+-		if (workdone >= budget)
++process_cqe:
++	cq->pend_cqe = 0;
++	while (cq->cq_head != cq->cq_tail) {
++		if (workdone >= budget) {
++			/* Calculate number of pending CQEs */
++			if (cq->cq_tail < cq->cq_head)
++				cq->pend_cqe = (cq->cqe_cnt - cq->cq_head)
++						+ cq->cq_tail;
++			else
++				cq->pend_cqe = cq->cq_tail - cq->cq_head;
+ 			break;
++		}
+ 
+-		cqe_hdr = (struct nix_cqe_hdr_s *)CQE_ADDR(cq, cq_head);
+-		cq_head++;
+-		cq_head &= (cq->cqe_cnt - 1);
+-		prefetch(CQE_ADDR(cq, cq_head));
++		cqe_hdr = (struct nix_cqe_hdr_s *)CQE_ADDR(cq, cq->cq_head);
++		cq->cq_head++;
++		cq->cq_head &= (cq->cqe_cnt - 1);
+ 
+ 		switch (cqe_hdr->cqe_type) {
+ 		case NIX_XQE_TYPE_RX:
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index 4191c6776709..51bb303c9ffd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -96,12 +96,15 @@ struct otx2_pool {
+ struct otx2_cq_queue {
+ 	u8			cq_idx;
+ 	u8			cint_idx; /* CQ interrupt id */
+-	u32			cqe_cnt;
+ 	u16			cqe_size;
++	u32			cqe_cnt;
++	u32			cq_head;
++	u32			cq_tail;
++	u32			pend_cqe;
+ 	void			*cqe_base;
+ 	struct qmem		*cqe;
+ 	struct otx2_pool	*rbpool;
+-};
++} ____cacheline_aligned_in_smp;
+ 
+ struct otx2_qset {
+ #define OTX2_MAX_CQ_CNT		64
+-- 
+2.31.1
+

@@ -1,0 +1,232 @@
+From 4efdd085ee37b9094107e5f5c08b7a36967aba90 Mon Sep 17 00:00:00 2001
+From: Yuri Tolstov <ytolstov@marvell.com>
+Date: Wed, 16 Sep 2020 13:37:43 -0700
+Subject: [PATCH 651/767] octeontx2-rm: Add char driver to RM
+
+Added character driver to ODP RM. This driver provides standard Linux
+driver ioctl interface. Only one instance of the driver is created and
+exposed through the /dev/otxrm entry.
+
+Signed-off-by: Yuri Tolstov <ytolstov@marvell.com>
+Change-Id: I901b5354fcc7fe538ea2cfc99208d26faa01211c
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/37276
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/soc/marvell/octeontx2-rm/otx2_rm.c  | 118 +++++++++++++++++++-
+ drivers/soc/marvell/octeontx2-rm/otxrmcmd.h |  34 ++++++
+ 2 files changed, 147 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/soc/marvell/octeontx2-rm/otxrmcmd.h
+
+diff --git a/drivers/soc/marvell/octeontx2-rm/otx2_rm.c b/drivers/soc/marvell/octeontx2-rm/otx2_rm.c
+index bf0e023abdda..00845dafa9c2 100644
+--- a/drivers/soc/marvell/octeontx2-rm/otx2_rm.c
++++ b/drivers/soc/marvell/octeontx2-rm/otx2_rm.c
+@@ -12,9 +12,12 @@
+ #include <linux/irq.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
++#include <linux/cdev.h>
+ #include <linux/pci.h>
+ #include <linux/sysfs.h>
++#include <asm/cputype.h>
+ 
++#include "otxrmcmd.h"
+ #include "rvu_reg.h"
+ #include "rvu_struct.h"
+ #include "otx2_rm.h"
+@@ -24,15 +27,25 @@
+ #endif
+ 
+ #define DRV_NAME	"octeontx2-rm"
+-#define DRV_VERSION	"1.0"
++#define DRV_VERSION	"1.1"
++#define CLS_NAME	"otxrm"
++#define DEV_NAME	"otxrm"
++#define DEV_MINOR	102
+ 
+ #define PCI_DEVID_OCTEONTX2_SSO_PF	0xA0F9
+ #define PCI_DEVID_OCTEONTX2_SSO_VF	0xA0FA
+ 
+-/* PCI BAR nos */
+-#define PCI_AF_REG_BAR_NUM		0
+-#define PCI_CFG_REG_BAR_NUM		2
+-#define PCI_MBOX_BAR_NUM		4
++/* OCTEONTX2 models */
++#define CPU_MODEL_98XX_PART	0xB1
++#define CPU_MODEL_96XX_PART	0xB2
++#define CPU_MODEL_95XX_PART	0xB3
++#define CPU_MODEL_95XXN_PART	0xB4
++#define CPU_MODEL_95XXMM_PART	0xB5
++
++/* PCI BAR info */
++#define PCI_AF_REG_BAR_NUM	0
++#define PCI_CFG_REG_BAR_NUM	2
++#define PCI_MBOX_BAR_NUM	4
+ 
+ /* Supported devices */
+ static const struct pci_device_id rvu_rm_id_table[] = {
+@@ -46,6 +59,10 @@ MODULE_LICENSE("GPL v2");
+ MODULE_VERSION(DRV_VERSION);
+ MODULE_DEVICE_TABLE(pci, rvu_rm_id_table);
+ 
++static struct class *cls; /* Device class */
++static struct cdev cdev; /* Char device control */
++static dev_t devno; /* Char device major:minor */
++
+ /* All PF devices found are stored here */
+ static spinlock_t rm_lst_lock;
+ LIST_HEAD(rm_dev_lst_head);
+@@ -1564,17 +1581,108 @@ static struct pci_driver rm_driver = {
+ 	.sriov_configure = rm_sriov_configure,
+ };
+ 
++static int rm_open(struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int rm_close(struct inode *inode, struct file *filp)
++{
++	return 0;
++}
++
++static int mem_read(struct otx_mem *umem)
++{
++	struct otx_mem mem;
++	uint8_t *base;
++	int rc;
++
++	if (copy_from_user(&mem, umem, sizeof(struct otx_mem)))
++		return -EIO;
++
++	base = phys_to_virt(mem.pa);
++	if (base == NULL)
++		return -ENOMEM;
++
++	rc = copy_to_user(mem.buf, base, mem.nbytes);
++	iounmap(base);
++	return rc;
++}
++
++static ssize_t rm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	int rc = 0;
++
++	switch (cmd) {
++	case IOC_MEMREAD:
++		rc = mem_read((void *)arg);
++		break;
++	default:
++		return -EINVAL;
++	};
++	return rc;
++}
++
++static const struct file_operations rm_fops = {
++	.owner = THIS_MODULE,
++	.open = rm_open,
++	.release = rm_close,
++	.unlocked_ioctl = rm_ioctl,
++};
++
+ static int __init otx2_rm_init_module(void)
+ {
++	dev_t dev;
++
+ 	pr_info("%s\n", DRV_NAME);
++	switch (MIDR_PARTNUM(read_cpuid_id())) {
++	case CPU_MODEL_98XX_PART:
++	case CPU_MODEL_96XX_PART:
++	case CPU_MODEL_95XX_PART:
++	case CPU_MODEL_95XXN_PART:
++	case CPU_MODEL_95XXMM_PART:
++		break;
++	default:
++		return 0;
++	}
++	cls = class_create(THIS_MODULE, CLS_NAME);
++	if (cls == NULL)
++		goto eexit1;
++
++	if (alloc_chrdev_region(&devno, 0, 1, DEV_NAME) < 0)
++		goto eexit2;
++
++	dev = MKDEV(MAJOR(devno), DEV_MINOR);
++	if (device_create(cls, NULL, dev, NULL, DEV_NAME) == NULL)
++		goto eexit3;
++
++	cdev_init(&cdev, &rm_fops);
++	if (cdev_add(&cdev, dev, 1) != 0)
++		goto eexit4;
+ 
+ 	spin_lock_init(&rm_lst_lock);
+ 	return pci_register_driver(&rm_driver);
++
++eexit4:
++	device_destroy(cls, dev);
++eexit3:
++	unregister_chrdev_region(devno, 1);
++eexit2:
++	class_destroy(cls);
++eexit1:
++	pr_info("%s: failed to install\n", DEV_NAME);
++	return -EIO;
+ }
+ 
+ static void __exit otx2_rm_exit_module(void)
+ {
++	dev_t dev = MKDEV(MAJOR(devno), DEV_MINOR);
++
+ 	pci_unregister_driver(&rm_driver);
++	cdev_del(&cdev);
++	device_destroy(cls, dev);
++	unregister_chrdev_region(devno, 1);
++	class_destroy(cls);
+ }
+ 
+ module_init(otx2_rm_init_module);
+diff --git a/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h b/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h
+new file mode 100644
+index 000000000000..0f606559c03f
+--- /dev/null
++++ b/drivers/soc/marvell/octeontx2-rm/otxrmcmd.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Marvell OcteonTx2 RVU Resource Manager driver
++ *
++ * Copyright (C) 2020 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#ifndef __OTXRMCMD_H__
++#define __OTXRMCMD_H__
++
++#include <linux/ioctl.h>
++
++#define VERPACK(_mj, _mn, _rl) ((_mj) << 16 | (_mn) << 8 | (_rl))
++#define VERMAJ(_v) ((_v) >> 16)
++#define VERMIN(_v) (((_v) >> 8) & 0xFF)
++
++#define OTXRM_VERSION VERPACK(1, 0, 0)
++#define OTXRM_DRVNAME "/dev/otxrm"
++
++/* MEM */
++struct otx_mem {
++	uint64_t pa; /* Phys.base address */
++	uint64_t nbytes; /* Number of bytes to read */
++	uint8_t  *buf; /* Buffer address for return memory values */
++} __packed;
++
++/* OTXRM IOCTL commands/messages */
++#define IOC_TYPE	110
++
++#define IOC_MEMREAD     _IOWR(IOC_TYPE, 1, struct otx_mem *)
++
++#endif /* __OTXRMCMD_H__ */
+-- 
+2.31.1
+

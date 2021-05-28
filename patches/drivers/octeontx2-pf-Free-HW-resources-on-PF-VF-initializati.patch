@@ -1,0 +1,235 @@
+From 730dc3753f0d742b078bad71d6c523eb8cf96146 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Wed, 19 Jun 2019 16:10:05 +0530
+Subject: [PATCH 252/767] octeontx2-pf: Free HW resources on PF/VF
+ initialization failure
+
+commit 44d77e3a94ef68fd023ae1a4a9d7698ced96477a from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Current code don't free the allocated resources
+(NIX/NPA LFs, and context etc.,) if init_hw_resources() returns
+unexpectedly. This patch fixes the issue by freeing the allocated
+resources on device initialization failure.
+
+Change-Id: I51edbace46b0929a01f68524a89587e8b9f22312
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/11414
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       |   2 +
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 122 +++++++++++++-----
+ 2 files changed, 92 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index ff6a7782b68f..4775b115a77c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -1126,6 +1126,7 @@ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf)
+ 
+ 	return 0;
+ fail:
++	otx2_mbox_reset(&pfvf->mbox.mbox, 0);
+ 	otx2_aura_pool_free(pfvf);
+ 	return err;
+ }
+@@ -1177,6 +1178,7 @@ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf)
+ 
+ 	return 0;
+ fail:
++	otx2_mbox_reset(&pfvf->mbox.mbox, 0);
+ 	otx2_aura_pool_free(pfvf);
+ 	return err;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index b533bfb60646..3ae7104e17de 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1362,9 +1362,46 @@ static void otx2_disable_napi(struct otx2_nic *pf)
+ 	}
+ }
+ 
++static void otx2_free_cq_res(struct otx2_nic *pf)
++{
++	struct otx2_qset *qset = &pf->qset;
++	struct mbox *mbox = &pf->mbox;
++	struct otx2_cq_queue *cq;
++	int qidx;
++
++	/* Disable CQs*/
++	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_CQ, false);
++	for (qidx = 0; qidx < qset->cq_cnt; qidx++) {
++		cq = &qset->cq[qidx];
++		qmem_free(pf->dev, cq->cqe);
++	}
++}
++
++static void otx2_free_sq_res(struct otx2_nic *pf)
++{
++	struct otx2_qset *qset = &pf->qset;
++	struct mbox *mbox = &pf->mbox;
++	struct otx2_snd_queue *sq;
++	int qidx;
++
++	/* Disable SQs */
++	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_SQ, false);
++	for (qidx = 0; qidx < pf->hw.tx_queues; qidx++) {
++		sq = &qset->sq[qidx];
++		qmem_free(pf->dev, sq->sqe);
++		if (!pf->hw.hw_tso)
++			qmem_free(pf->dev, sq->tso_hdrs);
++		kfree(sq->sg);
++		qmem_free(pf->dev, sq->timestamps);
++	}
++}
++
+ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ {
++	struct nix_lf_free_req *free_req;
++	struct mbox *mbox = &pf->mbox;
+ 	struct otx2_hw *hw = &pf->hw;
++	struct msg_req *req;
+ 	int err = 0, lvl;
+ 
+ 	/* Set required NPA LF's pool counts
+@@ -1375,7 +1412,7 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	hw->sqpool_cnt = hw->tx_queues;
+ 	hw->pool_cnt = hw->rqpool_cnt + hw->sqpool_cnt;
+ 
+-	otx2_mbox_lock(&pf->mbox);
++	otx2_mbox_lock(mbox);
+ 	/* NPA init */
+ 	err = otx2_config_npa(pf);
+ 	if (err)
+@@ -1384,36 +1421,72 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	/* NIX init */
+ 	err = otx2_config_nix(pf);
+ 	if (err)
+-		goto exit;
++		goto err_free_npa_lf;
+ 
+ 	/* Enable backpressure */
+ 	otx2_nix_config_bp(pf, true);
+ 
+ 	/* Init Auras and pools used by NIX RQ, for free buffer ptrs */
+ 	err = otx2_rq_aura_pool_init(pf);
+-	if (err)
+-		goto exit;
+-
++	if (err) {
++		otx2_mbox_unlock(mbox);
++		goto err_free_nix_lf;
++	}
+ 	/* Init Auras and pools used by NIX SQ, for queueing SQEs */
+ 	err = otx2_sq_aura_pool_init(pf);
+-	if (err)
+-		goto exit;
++	if (err) {
++		otx2_mbox_unlock(mbox);
++		goto err_free_rq_ptrs;
++	}
+ 
+ 	err = otx2_txsch_alloc(pf);
+-	if (err)
+-		goto exit;
++	if (err) {
++		otx2_mbox_unlock(mbox);
++		goto err_free_sq_ptrs;
++	}
+ 
+ 	err = otx2_config_nix_queues(pf);
+-	if (err)
+-		goto exit;
+-
++	if (err) {
++		otx2_mbox_unlock(mbox);
++		goto err_free_txsch;
++	}
+ 	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
+ 		err = otx2_txschq_config(pf, lvl);
+-		if (err)
+-			goto exit;
++		if (err) {
++			otx2_mbox_unlock(mbox);
++			goto err_free_nix_queues;
++		}
++	}
++	otx2_mbox_unlock(mbox);
++	return err;
++
++err_free_nix_queues:
++	otx2_free_sq_res(pf);
++	otx2_free_cq_res(pf);
++	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_RQ, false);
++err_free_txsch:
++	otx2_txschq_stop(pf);
++err_free_sq_ptrs:
++	otx2_free_aura_ptr(pf, AURA_NIX_SQ);
++err_free_rq_ptrs:
++	otx2_free_aura_ptr(pf, AURA_NIX_RQ);
++	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_POOL, true);
++	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_AURA, true);
++	otx2_aura_pool_free(pf);
++err_free_nix_lf:
++	otx2_mbox_lock(mbox);
++	free_req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
++	if (free_req) {
++		free_req->flags = NIX_LF_DISABLE_FLOWS;
++		WARN_ON(otx2_sync_mbox_msg(mbox));
+ 	}
++err_free_npa_lf:
++	/* Reset NPA LF */
++	req = otx2_mbox_alloc_msg_npa_lf_free(mbox);
++	if (req)
++		WARN_ON(otx2_sync_mbox_msg(mbox));
+ exit:
+-	otx2_mbox_unlock(&pf->mbox);
++	otx2_mbox_unlock(mbox);
+ 	return err;
+ }
+ 
+@@ -1422,7 +1495,6 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 	struct otx2_qset *qset = &pf->qset;
+ 	struct nix_lf_free_req *free_req;
+ 	struct mbox *mbox = &pf->mbox;
+-	struct otx2_snd_queue *sq;
+ 	struct otx2_cq_queue *cq;
+ 	int err, qidx, cqe_count;
+ 	struct msg_req *req;
+@@ -1438,16 +1510,7 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 		otx2_nix_config_bp(pf, false);
+ 	otx2_mbox_unlock(mbox);
+ 
+-	/* Disable SQs */
+-	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_SQ, false);
+-	for (qidx = 0; qidx < pf->hw.tx_queues; qidx++) {
+-		sq = &qset->sq[qidx];
+-		qmem_free(pf->dev, sq->sqe);
+-		if (!pf->hw.hw_tso)
+-			qmem_free(pf->dev, sq->tso_hdrs);
+-		kfree(sq->sg);
+-		qmem_free(pf->dev, sq->timestamps);
+-	}
++	otx2_free_sq_res(pf);
+ 
+ 	/* Free SQB pointers */
+ 	otx2_free_aura_ptr(pf, AURA_NIX_SQ);
+@@ -1467,12 +1530,7 @@ static void otx2_free_hw_resources(struct otx2_nic *pf)
+ 	/* Free RQ buffer pointers*/
+ 	otx2_free_aura_ptr(pf, AURA_NIX_RQ);
+ 
+-	/* Disable CQs*/
+-	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_CQ, false);
+-	for (qidx = 0; qidx < qset->cq_cnt; qidx++) {
+-		cq = &qset->cq[qidx];
+-		qmem_free(pf->dev, cq->cqe);
+-	}
++	otx2_free_cq_res(pf);
+ 
+ 	otx2_mbox_lock(mbox);
+ 	/* Reset NIX LF */
+-- 
+2.31.1
+

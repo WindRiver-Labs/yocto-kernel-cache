@@ -1,0 +1,351 @@
+From 61dbc698075e431a12dbcb274ea1bf5a0a73d4a7 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 23 Jan 2020 12:13:38 +0530
+Subject: [PATCH 451/767] octeontx2-pf: Restore RSS and pause frame config
+ settings
+
+commit 90365b030af9c47cb6bb74716b17a2a5e752b4de from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Currently upon ifconfig DOWN/UP the RSS and pause frame
+config done via ethtool is lost and reverted to default.
+This patch fixes this to restore these settings.
+
+Also made changes in RSS hash option setting to reject
+configuration to select which select only one of TCP/UDP
+sport and dport. Few other changes fixing issues related
+dealing with errors.
+
+Change-Id: I72883db2f7ff345a81607c21eb85e72f79bcdac5
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/22140
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 50 ++++++++---
+ .../marvell/octeontx2/nic/otx2_common.h       |  3 +
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 82 ++++++++++++-------
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  7 ++
+ .../marvell/octeontx2/nic/otx2_txrx.c         |  5 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |  4 +
+ 6 files changed, 106 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 0df9d6501ebd..d2888156c538 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -221,6 +221,25 @@ int otx2_hw_set_mtu(struct otx2_nic *pfvf, int mtu)
+ 	return err;
+ }
+ 
++int otx2_config_pause_frm(struct otx2_nic *pfvf)
++{
++	struct cgx_pause_frm_cfg *req;
++	int err;
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_cgx_cfg_pause_frm(&pfvf->mbox);
++	if (!req)
++		return -ENOMEM;
++
++	req->rx_pause = !!(pfvf->flags & OTX2_FLAG_RX_PAUSE_ENABLED);
++	req->tx_pause = !!(pfvf->flags & OTX2_FLAG_TX_PAUSE_ENABLED);
++	req->set = 1;
++
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
++}
++
+ int otx2_set_flowkey_cfg(struct otx2_nic *pfvf)
+ {
+ 	struct otx2_rss_info *rss = &pfvf->hw.rss_info;
+@@ -309,29 +328,36 @@ int otx2_rss_init(struct otx2_nic *pfvf)
+ 	struct otx2_rss_info *rss = &pfvf->hw.rss_info;
+ 	int idx, ret = 0;
+ 
+-	/* Enable RSS */
+-	rss->enable = true;
+ 	rss->rss_size = sizeof(rss->ind_tbl);
+ 
+-	/* Init RSS key here */
+-	netdev_rss_key_fill(rss->key, sizeof(rss->key));
++	/* Init RSS key if it is not setup already */
++	if (!rss->enable)
++		netdev_rss_key_fill(rss->key, sizeof(rss->key));
+ 	otx2_set_rss_key(pfvf);
+ 
+-	/* Default indirection table */
+-	for (idx = 0; idx < rss->rss_size; idx++)
+-		rss->ind_tbl[idx] =
+-			ethtool_rxfh_indir_default(idx, pfvf->hw.rx_queues);
+-
++	if (!netif_is_rxfh_configured(pfvf->netdev)) {
++		/* Default indirection table */
++		for (idx = 0; idx < rss->rss_size; idx++)
++			rss->ind_tbl[idx] =
++				ethtool_rxfh_indir_default(idx,
++							   pfvf->hw.rx_queues);
++	}
+ 	ret = otx2_set_rss_table(pfvf);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Default flowkey or hash config to be used for generating flow tag */
+-	rss->flowkey_cfg = NIX_FLOW_KEY_TYPE_IPV4 | NIX_FLOW_KEY_TYPE_IPV6 |
++	/* Flowkey or hash config to be used for generating flow tag */
++	rss->flowkey_cfg = rss->enable ? rss->flowkey_cfg :
++			   NIX_FLOW_KEY_TYPE_IPV4 | NIX_FLOW_KEY_TYPE_IPV6 |
+ 			   NIX_FLOW_KEY_TYPE_TCP | NIX_FLOW_KEY_TYPE_UDP |
+ 			   NIX_FLOW_KEY_TYPE_SCTP;
+ 
+-	return otx2_set_flowkey_cfg(pfvf);
++	ret = otx2_set_flowkey_cfg(pfvf);
++	if (ret)
++		return ret;
++
++	rss->enable = true;
++	return 0;
+ }
+ 
+ void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 8fbf9c3d3b29..f5c3d6fc8692 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -263,6 +263,8 @@ struct otx2_nic {
+ #define OTX2_FLAG_RX_VLAN_SUPPORT		BIT_ULL(6)
+ #define OTX2_FLAG_VF_VLAN_SUPPORT		BIT_ULL(7)
+ #define OTX2_FLAG_PF_SHUTDOWN			BIT_ULL(8)
++#define OTX2_FLAG_RX_PAUSE_ENABLED		BIT_ULL(9)
++#define OTX2_FLAG_TX_PAUSE_ENABLED		BIT_ULL(10)
+ 	u64			flags;
+ 
+ 	struct otx2_qset	qset;
+@@ -690,6 +692,7 @@ int otx2_hw_set_mtu(struct otx2_nic *pfvf, int mtu);
+ void otx2_tx_timeout(struct net_device *netdev);
+ void otx2_get_mac_from_af(struct net_device *netdev);
+ void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx);
++int otx2_config_pause_frm(struct otx2_nic *pfvf);
+ 
+ /* RVU block related APIs */
+ int otx2_attach_npa_nix(struct otx2_nic *pfvf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index acd6e690a371..5707fa193884 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -355,14 +355,16 @@ static int otx2_set_channels(struct net_device *dev,
+ 	if (if_up)
+ 		otx2_dev_stop(dev);
+ 
++	err = otx2_set_real_num_queues(dev, channel->tx_count,
++				       channel->rx_count);
++	if (err)
++		goto fail;
++
+ 	pfvf->hw.rx_queues = channel->rx_count;
+ 	pfvf->hw.tx_queues = channel->tx_count;
+-	err = otx2_set_real_num_queues(dev, pfvf->hw.tx_queues,
+-				       pfvf->hw.rx_queues);
+ 	pfvf->qset.cq_cnt = pfvf->hw.tx_queues +  pfvf->hw.rx_queues;
+-	if (err)
+-		return err;
+ 
++fail:
+ 	if (if_up)
+ 		otx2_dev_open(dev);
+ 
+@@ -394,20 +396,21 @@ static int otx2_set_pauseparam(struct net_device *netdev,
+ 			       struct ethtool_pauseparam *pause)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+-	struct cgx_pause_frm_cfg *req;
+ 
+ 	if (pause->autoneg)
+ 		return -EOPNOTSUPP;
+ 
+-	req = otx2_mbox_alloc_msg_cgx_cfg_pause_frm(&pfvf->mbox);
+-	if (!req)
+-		return -EAGAIN;
++	if (pause->rx_pause)
++		pfvf->flags |= OTX2_FLAG_RX_PAUSE_ENABLED;
++	else
++		pfvf->flags &= ~OTX2_FLAG_RX_PAUSE_ENABLED;
+ 
+-	req->set = 1;
+-	req->rx_pause = pause->rx_pause;
+-	req->tx_pause = pause->tx_pause;
++	if (pause->tx_pause)
++		pfvf->flags |= OTX2_FLAG_TX_PAUSE_ENABLED;
++	else
++		pfvf->flags &= ~OTX2_FLAG_TX_PAUSE_ENABLED;
+ 
+-	return otx2_sync_mbox_msg(&pfvf->mbox);
++	return otx2_config_pause_frm(pfvf);
+ }
+ 
+ static void otx2_get_ringparam(struct net_device *netdev,
+@@ -594,11 +597,14 @@ static int otx2_set_rss_hash_opts(struct otx2_nic *pfvf,
+ 				  struct ethtool_rxnfc *nfc)
+ {
+ 	struct otx2_rss_info *rss = &pfvf->hw.rss_info;
+-	u32 rss_cfg = rss->flowkey_cfg;
+ 	u32 rxh_l4 = RXH_L4_B_0_1 | RXH_L4_B_2_3;
++	u32 rss_cfg = rss->flowkey_cfg;
+ 
+-	if (!rss->enable)
+-		netdev_err(pfvf->netdev, "RSS is disabled, cmd ignored\n");
++	if (!rss->enable) {
++		netdev_err(pfvf->netdev,
++			   "RSS is disabled, cannot change settings\n");
++		return -EIO;
++	}
+ 
+ 	/* Mimimum is IPv4 and IPv6, SIP/DIP */
+ 	if (!(nfc->data & RXH_IP_SRC) || !(nfc->data & RXH_IP_DST))
+@@ -610,32 +616,44 @@ static int otx2_set_rss_hash_opts(struct otx2_nic *pfvf,
+ 		/* Different config for v4 and v6 is not supported.
+ 		 * Both of them have to be either 4-tuple or 2-tuple.
+ 		 */
+-		if ((nfc->data & rxh_l4) == rxh_l4)
+-			rss_cfg |= NIX_FLOW_KEY_TYPE_TCP;
+-		else
++		switch (nfc->data & rxh_l4) {
++		case 0:
+ 			rss_cfg &= ~NIX_FLOW_KEY_TYPE_TCP;
++			break;
++		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
++			rss_cfg |= NIX_FLOW_KEY_TYPE_TCP;
++			break;
++		default:
++			return -EINVAL;
++		}
+ 		break;
+ 	case UDP_V4_FLOW:
+ 	case UDP_V6_FLOW:
+-		if ((nfc->data & rxh_l4) == rxh_l4)
+-			rss_cfg |= NIX_FLOW_KEY_TYPE_UDP;
+-		else
++		switch (nfc->data & rxh_l4) {
++		case 0:
+ 			rss_cfg &= ~NIX_FLOW_KEY_TYPE_UDP;
++			break;
++		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
++			rss_cfg |= NIX_FLOW_KEY_TYPE_UDP;
++			break;
++		default:
++			return -EINVAL;
++		}
+ 		break;
+ 	case SCTP_V4_FLOW:
+ 	case SCTP_V6_FLOW:
+-		if ((nfc->data & rxh_l4) == rxh_l4)
+-			rss_cfg |= NIX_FLOW_KEY_TYPE_SCTP;
+-		else
++		switch (nfc->data & rxh_l4) {
++		case 0:
+ 			rss_cfg &= ~NIX_FLOW_KEY_TYPE_SCTP;
++			break;
++		case (RXH_L4_B_0_1 | RXH_L4_B_2_3):
++			rss_cfg |= NIX_FLOW_KEY_TYPE_SCTP;
++			break;
++		default:
++			return -EINVAL;
++		}
+ 		break;
+-	case AH_ESP_V4_FLOW:
+-	case AH_V4_FLOW:
+-	case ESP_V4_FLOW:
+ 	case IPV4_FLOW:
+-	case AH_ESP_V6_FLOW:
+-	case AH_V6_FLOW:
+-	case ESP_V6_FLOW:
+ 	case IPV6_FLOW:
+ 		rss_cfg = NIX_FLOW_KEY_TYPE_IPV4 | NIX_FLOW_KEY_TYPE_IPV6;
+ 		break;
+@@ -882,12 +900,14 @@ static int otx2_set_rxfh(struct net_device *dev, const u32 *indir,
+ 			 const u8 *hkey, const u8 hfunc)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(dev);
+-	struct otx2_rss_info *rss = &pfvf->hw.rss_info;
++	struct otx2_rss_info *rss;
+ 	int idx;
+ 
+ 	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP)
+ 		return -EOPNOTSUPP;
+ 
++	rss = &pfvf->hw.rss_info;
++
+ 	if (!rss->enable) {
+ 		netdev_err(dev, "RSS is disabled, cannot change settings\n");
+ 		return -EIO;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 1024ffbfff68..90b71db0fb04 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1656,6 +1656,9 @@ int otx2_open(struct net_device *netdev)
+ 		otx2_config_hw_rx_tstamp(pf, true);
+ 	}
+ 
++	/* Restore pause frame settings */
++	otx2_config_pause_frm(pf);
++
+ 	/* Set NPC parsing mode, skip LBKs */
+ 	if (!is_otx2_lbkvf(pf->pdev)) {
+ 		otx2_set_npc_parse_mode(pf, false);
+@@ -2478,6 +2481,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	/* Enable link notifications */
+ 	otx2_cgx_config_linkevents(pf, true);
+ 
++	/* Enable pause frames by default */
++	pf->flags |= OTX2_FLAG_RX_PAUSE_ENABLED;
++	pf->flags |= OTX2_FLAG_TX_PAUSE_ENABLED;
++
+ 	return 0;
+ 
+ err_unreg_netdev:
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 74a9c82c415d..a500ae19f0e4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -326,18 +326,19 @@ static inline int otx2_rx_napi_handler(struct otx2_nic *pfvf,
+ 	while (likely(processed_cqe < budget)) {
+ 		cqe = (struct nix_cqe_rx_s *)CQE_ADDR(cq, cq->cq_head);
+ 		if (cqe->hdr.cqe_type == NIX_XQE_TYPE_INVALID ||
+-		    !cqe->sg.subdc) {
++		    !cqe->sg.seg_addr) {
+ 			if (!processed_cqe)
+ 				return 0;
+ 			break;
+ 		}
++
+ 		cq->cq_head++;
+ 		cq->cq_head &= (cq->cqe_cnt - 1);
+ 
+ 		otx2_rcv_pkt_handler(pfvf, napi, cq, cqe);
+ 
+ 		cqe->hdr.cqe_type = NIX_XQE_TYPE_INVALID;
+-		cqe->sg.subdc = NIX_SUBDC_NOP;
++		cqe->sg.seg_addr = 0x00;
+ 		processed_cqe++;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 218ce0382adb..f8072161827d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -636,6 +636,10 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	otx2vf_set_ethtool_ops(netdev);
+ 
++	/* Enable pause frames by default */
++	vf->flags |= OTX2_FLAG_RX_PAUSE_ENABLED;
++	vf->flags |= OTX2_FLAG_TX_PAUSE_ENABLED;
++
+ 	return 0;
+ 
+ err_detach_rsrc:
+-- 
+2.31.1
+

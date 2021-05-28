@@ -1,0 +1,246 @@
+From b9d1c25a5a4af482343e110a31e81fb78acfc558 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Wed, 1 Apr 2020 19:38:11 +0530
+Subject: [PATCH 532/767] octeontx2-af: Synchronize mcam rule list ops
+
+commit 3ea49719afda6bc17f0d5fc3aa02129a861c2c58 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+MCAM rules list maintained for all the mcam rules
+installed is not gaurded by locks currently.
+Hence prevent concurrent reading and writing
+to rules list using mutex.
+
+Change-Id: Ia859662f74d3ed35867822ec2101aa89db655254
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/26652
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/af/rvu_debugfs.c        |  9 +-
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 89 ++++++++++---------
+ 2 files changed, 51 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+index 63de2b4c75e1..84aaa62efe73 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+@@ -1581,8 +1581,13 @@ static int rvu_dbg_npc_mcam_show_rules(struct seq_file *s, void *unused)
+ 	u16 target;
+ 	u64 hits;
+ 
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return 0;
++
+ 	mcam = &rvu->hw->mcam;
+ 
++	mutex_lock(&mcam->lock);
+ 	list_for_each_entry(iter, &mcam->mcam_rules, list) {
+ 		pf = (iter->owner >> RVU_PFVF_PF_SHIFT) & RVU_PFVF_PF_MASK;
+ 		seq_printf(s, "\n\tPF%d ", pf);
+@@ -1617,12 +1622,10 @@ static int rvu_dbg_npc_mcam_show_rules(struct seq_file *s, void *unused)
+ 			continue;
+ 		seq_printf(s, "\tcounter: %d\n", iter->cntr);
+ 
+-		blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+-		if (blkaddr < 0)
+-			return 0;
+ 		hits = rvu_read64(rvu, blkaddr, NPC_AF_MATCH_STATX(iter->cntr));
+ 		seq_printf(s, "\thits: %lld\n", hits);
+ 	}
++	mutex_unlock(&mcam->lock);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 987d69a9e47c..86e1d8f6674a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -728,10 +728,14 @@ static struct rvu_npc_mcam_rule *rvu_mcam_find_rule(struct npc_mcam *mcam,
+ {
+ 	struct rvu_npc_mcam_rule *iter;
+ 
++	mutex_lock(&mcam->lock);
+ 	list_for_each_entry(iter, &mcam->mcam_rules, list) {
+-		if (iter->entry == entry)
++		if (iter->entry == entry) {
++			mutex_unlock(&mcam->lock);
+ 			return iter;
++		}
+ 	}
++	mutex_unlock(&mcam->lock);
+ 
+ 	return NULL;
+ }
+@@ -742,6 +746,7 @@ static void rvu_mcam_add_rule(struct npc_mcam *mcam,
+ 	struct list_head *head = &mcam->mcam_rules;
+ 	struct rvu_npc_mcam_rule *iter;
+ 
++	mutex_lock(&mcam->lock);
+ 	list_for_each_entry(iter, &mcam->mcam_rules, list) {
+ 		if (iter->entry > rule->entry)
+ 			break;
+@@ -749,6 +754,7 @@ static void rvu_mcam_add_rule(struct npc_mcam *mcam,
+ 	}
+ 
+ 	list_add(&rule->list, head);
++	mutex_unlock(&mcam->lock);
+ }
+ 
+ static void rvu_mcam_remove_counter_from_rule(struct rvu *rvu, u16 pcifunc,
+@@ -1080,17 +1086,11 @@ int rvu_mbox_handler_npc_install_flow(struct rvu *rvu,
+ 				req, rsp, enable, pf_set_vfs_mac);
+ }
+ 
+-static int npc_delete_flow(struct rvu *rvu, u16 entry, u16 pcifunc)
++static int npc_delete_flow(struct rvu *rvu, struct rvu_npc_mcam_rule *rule,
++			   u16 pcifunc)
+ {
+ 	struct npc_mcam_ena_dis_entry_req dis_req = { 0 };
+-	struct npc_mcam *mcam = &rvu->hw->mcam;
+-	struct rvu_npc_mcam_rule *rule;
+ 	struct msg_rsp dis_rsp;
+-	int err;
+-
+-	rule = rvu_mcam_find_rule(mcam, entry);
+-	if (!rule)
+-		return -ENOENT;
+ 
+ 	if (rule->default_rule)
+ 		return 0;
+@@ -1099,15 +1099,12 @@ static int npc_delete_flow(struct rvu *rvu, u16 entry, u16 pcifunc)
+ 		rvu_mcam_remove_counter_from_rule(rvu, pcifunc, rule);
+ 
+ 	dis_req.hdr.pcifunc = pcifunc;
+-	dis_req.entry = entry;
+-	err = rvu_mbox_handler_npc_mcam_dis_entry(rvu, &dis_req, &dis_rsp);
+-	if (err)
+-		return err;
++	dis_req.entry = rule->entry;
+ 
+ 	list_del(&rule->list);
+ 	kfree(rule);
+ 
+-	return 0;
++	return rvu_mbox_handler_npc_mcam_dis_entry(rvu, &dis_req, &dis_rsp);
+ }
+ 
+ int rvu_mbox_handler_npc_delete_flow(struct rvu *rvu,
+@@ -1117,32 +1114,34 @@ int rvu_mbox_handler_npc_delete_flow(struct rvu *rvu,
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct rvu_npc_mcam_rule *iter, *tmp;
+ 	u16 pcifunc = req->hdr.pcifunc;
+-	int err;
+-
+-	if (req->end) {
+-		list_for_each_entry_safe(iter, tmp, &mcam->mcam_rules, list) {
+-			if (iter->owner == pcifunc &&
+-			    iter->entry >= req->start &&
+-			    iter->entry <= req->end) {
+-				err = npc_delete_flow(rvu, iter->entry,
+-						      pcifunc);
+-				if (err)
+-					return err;
+-			}
+-		}
+-		return 0;
+-	}
++	struct list_head del_list;
+ 
+-	if (!req->all)
+-		return npc_delete_flow(rvu, req->entry, pcifunc);
++	INIT_LIST_HEAD(&del_list);
+ 
++	mutex_lock(&mcam->lock);
+ 	list_for_each_entry_safe(iter, tmp, &mcam->mcam_rules, list) {
+ 		if (iter->owner == pcifunc) {
+-			err = npc_delete_flow(rvu, iter->entry, pcifunc);
+-			if (err)
+-				return err;
++			/* All rules */
++			if (req->all) {
++				list_move_tail(&iter->list, &del_list);
++			/* Range of rules */
++			} else if (req->end && iter->entry >= req->start &&
++				   iter->entry <= req->end) {
++				list_move_tail(&iter->list, &del_list);
++			/* single rule */
++			} else if (req->entry == iter->entry) {
++				list_move_tail(&iter->list, &del_list);
++				break;
++			}
+ 		}
+ 	}
++	mutex_unlock(&mcam->lock);
++
++	list_for_each_entry_safe(iter, tmp, &del_list, list) {
++		if (npc_delete_flow(rvu, iter, pcifunc))
++			dev_err(rvu->dev, "rule deletion failed for entry:%d",
++				iter->entry);
++	}
+ 
+ 	return 0;
+ }
+@@ -1156,6 +1155,7 @@ static int npc_update_dmac_value(struct rvu *rvu, int npcblkaddr,
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct npc_mcam_read_entry_rsp wrsp;
+ 	struct msg_rsp rsp;
++	int err;
+ 
+ 	ether_addr_copy(rule->packet.dmac, pfvf->mac_addr);
+ 
+@@ -1170,17 +1170,19 @@ static int npc_update_dmac_value(struct rvu *rvu, int npcblkaddr,
+ 	write_req.hdr.pcifunc = rule->owner;
+ 	write_req.entry = rule->entry;
+ 
+-	return rvu_mbox_handler_npc_mcam_write_entry(rvu, &write_req, &rsp);
++	mutex_unlock(&mcam->lock);
++	err = rvu_mbox_handler_npc_mcam_write_entry(rvu, &write_req, &rsp);
++	mutex_lock(&mcam->lock);
++
++	return err;
+ }
+ 
+ void npc_mcam_enable_flows(struct rvu *rvu, u16 target)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, target);
+-	struct npc_mcam_ena_dis_entry_req ena_req = { 0 };
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct rvu_npc_mcam_rule *rule;
+-	int blkaddr, bank, err;
+-	struct msg_rsp rsp;
++	int blkaddr, bank;
+ 	u64 def_action;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+@@ -1189,6 +1191,7 @@ void npc_mcam_enable_flows(struct rvu *rvu, u16 target)
+ 		return;
+ 	}
+ 
++	mutex_lock(&mcam->lock);
+ 	list_for_each_entry(rule, &mcam->mcam_rules, list) {
+ 		if (rule->intf == NIX_INTF_RX &&
+ 		    rule->rx_action.pf_func == target && !rule->enable) {
+@@ -1213,13 +1216,11 @@ void npc_mcam_enable_flows(struct rvu *rvu, u16 target)
+ 					    NPC_AF_MCAMEX_BANKX_ACTION
+ 					    (rule->entry, bank), def_action);
+ 			}
+-			ena_req.hdr.pcifunc = rule->owner;
+-			ena_req.entry = rule->entry;
+-			err = rvu_mbox_handler_npc_mcam_ena_entry(rvu, &ena_req,
+-								  &rsp);
+-			if (err)
+-				continue;
++
++			npc_enable_mcam_entry(rvu, mcam, blkaddr,
++					      rule->entry, true);
+ 			rule->enable = true;
+ 		}
+ 	}
++	mutex_unlock(&mcam->lock);
+ }
+-- 
+2.31.1
+

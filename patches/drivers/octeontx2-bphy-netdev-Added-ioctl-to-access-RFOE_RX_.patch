@@ -1,0 +1,169 @@
+From bb9231429424c2f759cbc017035393a1fc96bd1e Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Tue, 2 Jun 2020 18:12:49 +0530
+Subject: [PATCH 573/767] octeontx2-bphy-netdev: Added ioctl to access
+ RFOE_RX_IND registers
+
+commit e3f8daef6a9e861f85e0b2d09c02ca53a413c684 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+1. Added ioctl to read/write RFOE()_RX_IND_* registers from ODP
+application. This will fix the RFOE()_RX_IND_* register access
+corruption when both driver and ODP application tries to
+read/write using RFOE_RX_INDIRECT_INDEX register without any
+synchronization in place.
+2. Removed unnecessary spinlock in irq handler.
+
+Change-Id: I7ae16f64d6851c234af88fe723783f52c64c3ab0
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/29368
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        | 64 ++++++++++++++++---
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        | 13 ++++
+ 2 files changed, 68 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index f5ccf662d6af..254d5befbdaf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -611,16 +611,12 @@ static void otx2_rfoe_rx_napi_schedule(int rfoe_num, u32 status)
+ /* GPINT(1) interrupt handler routine */
+ static irqreturn_t otx2_rfoe_intr_handler(int irq, void *dev_id)
+ {
+-	struct otx2_rfoe_cdev_priv *cdev = (struct otx2_rfoe_cdev_priv *)dev_id;
+ 	struct otx2_rfoe_drv_ctx *drv_ctx;
+ 	struct otx2_rfoe_ndev_priv *priv;
+ 	struct net_device *netdev;
+ 	u32 intr_mask, status;
+-	unsigned long flags;
+ 	int rfoe_num, i;
+ 
+-	spin_lock_irqsave(&cdev->lock, flags);
+-
+ 	/* clear interrupt status */
+ 	status = readq(bphy_reg_base + PSM_INT_GP_SUM_W1C(1)) & 0xFFFFFFFF;
+ 	writeq(status, bphy_reg_base + PSM_INT_GP_SUM_W1C(1));
+@@ -646,8 +642,6 @@ static irqreturn_t otx2_rfoe_intr_handler(int irq, void *dev_id)
+ 		}
+ 	}
+ 
+-	spin_unlock_irqrestore(&cdev->lock, flags);
+-
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -1300,7 +1294,7 @@ static long otx2_rfoe_cdev_ioctl(struct file *filp, unsigned int cmd,
+ 				 unsigned long arg)
+ {
+ 	struct otx2_rfoe_cdev_priv *cdev = filp->private_data;
+-	int ret = -1;
++	int ret;
+ 
+ 	if (!cdev) {
+ 		pr_warn("ioctl: device not opened\n");
+@@ -1371,14 +1365,66 @@ static long otx2_rfoe_cdev_ioctl(struct file *filp, unsigned int cmd,
+ 		ret = 0;
+ 		goto out;
+ 	}
++	case OTX2_RFOE_IOCTL_RX_IND_CFG:
++	{
++		struct otx2_rfoe_drv_ctx *drv_ctx = NULL;
++		struct otx2_rfoe_ndev_priv *priv;
++		struct otx2_rfoe_rx_ind_cfg cfg;
++		struct net_device *netdev;
++		unsigned long flags;
++		int idx;
++
++		if (!cdev->odp_intf_cfg) {
++			dev_err(cdev->dev, "odp interface cfg is not done\n");
++			ret = -EBUSY;
++			goto out;
++		}
++		if (copy_from_user(&cfg, (void __user *)arg,
++				   sizeof(struct otx2_rfoe_rx_ind_cfg))) {
++			dev_err(cdev->dev, "copy from user fault\n");
++			ret = -EFAULT;
++			goto out;
++		}
++		for (idx = 0; idx < RFOE_MAX_INTF; idx++) {
++			drv_ctx = &rfoe_drv_ctx[idx];
++			if (!(drv_ctx->valid &&
++			      drv_ctx->rfoe_num == cfg.rfoe_num))
++				break;
++		}
++		if (idx >= RFOE_MAX_INTF) {
++			dev_err(cdev->dev, "valid drv_ctx not found\n");
++			ret = -EINVAL;
++			goto out;
++		}
++		netdev = drv_ctx->netdev;
++		priv = netdev_priv(netdev);
++		spin_lock_irqsave(&priv->rfoe_common->rx_lock, flags);
++		writeq(cfg.rx_ind_idx, (priv->rfoe_reg_base +
++		       RFOEX_RX_INDIRECT_INDEX_OFFSET(cfg.rfoe_num)));
++		if (cfg.dir == OTX2_RFOE_RX_IND_READ)
++			cfg.regval = readq(priv->rfoe_reg_base + cfg.regoff);
++		else
++			writeq(cfg.regval, priv->rfoe_reg_base + cfg.regoff);
++		spin_unlock_irqrestore(&priv->rfoe_common->rx_lock, flags);
++		if (copy_to_user((void __user *)(unsigned long)arg, &cfg,
++				 sizeof(struct otx2_rfoe_rx_ind_cfg))) {
++			dev_err(cdev->dev, "copy to user fault\n");
++			ret = -EFAULT;
++			goto out;
++		}
++		ret = 0;
++		goto out;
++	}
+ 	default:
++	{
+ 		dev_info(cdev->dev, "ioctl: no match\n");
+-		return 0;
++		ret = -EINVAL;
++	}
+ 	}
+ 
+ out:
+ 	mutex_unlock(&cdev->mutex_lock);
+-	return 0;
++	return ret;
+ }
+ 
+ static int otx2_rfoe_cdev_open(struct inode *inode, struct file *filp)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index 2c0dd1424dc7..15e72f1d9726 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -30,6 +30,8 @@
+ #define OTX2_RFOE_IOCTL_ODP_INTF_CFG	_IOW(OTX2_RFOE_IOCTL_BASE, 0x01, \
+ 					     struct bphy_netdev_comm_intf_cfg)
+ #define OTX2_RFOE_IOCTL_ODP_DEINIT      _IO(OTX2_RFOE_IOCTL_BASE, 0x02)
++#define OTX2_RFOE_IOCTL_RX_IND_CFG	_IOWR(OTX2_RFOE_IOCTL_BASE, 0x03, \
++					      struct otx2_rfoe_rx_ind_cfg)
+ 
+ //#define ASIM		/* ASIM environment */
+ 
+@@ -91,6 +93,17 @@ struct otx2_rfoe_drv_ctx {
+ 	int				tx_gpint_bit;
+ };
+ 
++/* rfoe rx ind register configuration */
++struct otx2_rfoe_rx_ind_cfg {
++	u8			rfoe_num; /* rfoe idx */
++	u16			rx_ind_idx; /* RFOE(0..2)_RX_INDIRECT_INDEX */
++	u64			regoff; /* RFOE(0..2)_RX_IND_* reg offset */
++	u64			regval; /* input when write, output when read */
++#define OTX2_RFOE_RX_IND_READ	0
++#define OTX2_RFOE_RX_IND_WRITE	1
++	u8			dir; /* register access dir (read/write) */
++};
++
+ /* rx flow table configuration */
+ struct rx_ft_cfg {
+ 	enum bphy_netdev_packet_type	pkt_type;	/* pkt_type for psw */
+-- 
+2.31.1
+

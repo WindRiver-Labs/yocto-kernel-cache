@@ -1,0 +1,407 @@
+From bd8b1d473447f60bf852ba6d4e5273876859a615 Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Thu, 29 Aug 2019 17:46:55 +0530
+Subject: [PATCH 363/767] coresight: tmc: Fixes for Marvell OcteonTx CN9xxx ETR
+ HW issues.
+
+commit 23a0e5dde140f37c47db1c5a31f2569524c19769 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+1. For each HW issue, corresponding driver option will be enabled
+   as listed below.
+
+- Buffer size multiplier used is 8 byte instead of 4 bytes
+  Driver option CORESIGHT_OPTS_BUFFSIZE_8BX handles this.
+
+- Non secure trace buffer not supported
+  Driver option CORESIGHT_OPTS_SECURE_BUFF handles this.
+  Driver uses SMC calls for managing secure trace buffer.
+
+- Control registers not reset upon cpu reset
+  Driver option CORESIGHT_OPTS_RESET_CTL_REG handles this.
+
+2. SMC call for secure buffer allocation do have the option of
+   requesting LLC locked buffer. This can be enabled using
+   "cache-lock" property in the DTS.
+
+3. We do make an assumption that secure trace buffer is equally partitioned
+   among all the cpus. This will keep the buffer allocation simplified
+   in secure world. Hence we expect, arm-buffer-size DTS attribute value
+   be same for all the ETR nodes.
+
+Change-Id: I4a6acaf0dc38fb48c27204674458e173e25f83c0
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/16636
+[Kevin: Adjust the code according to the changes made by commit
+75f4e3619fe2]
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../devicetree/bindings/arm/coresight.txt     |  4 +
+ .../hwtracing/coresight/coresight-tmc-etr.c   | 72 ++++++++++++++-
+ drivers/hwtracing/coresight/coresight-tmc.c   | 19 ++++
+ drivers/hwtracing/coresight/coresight-tmc.h   | 87 ++++++++++++++++++-
+ 4 files changed, 178 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/arm/coresight.txt b/Documentation/devicetree/bindings/arm/coresight.txt
+index 8a88ddebc1a2..248acd840d11 100644
+--- a/Documentation/devicetree/bindings/arm/coresight.txt
++++ b/Documentation/devicetree/bindings/arm/coresight.txt
+@@ -99,6 +99,10 @@ its hardware characteristcs.
+ 	* arm,scatter-gather: boolean. Indicates that the TMC-ETR can safely
+ 	  use the SG mode on this system.
+ 
++	* cache-lock: Enables cache locking for the allocated trace buffer.
++	  As of now, this is supported only for secure buffer allocations
++	  on Marvell OcteonTx2 platform.
++
+ * Optional property for CATU :
+ 	* interrupts : Exactly one SPI may be listed for reporting the address
+ 	  error
+diff --git a/drivers/hwtracing/coresight/coresight-tmc-etr.c b/drivers/hwtracing/coresight/coresight-tmc-etr.c
+index 9f293b9dce8c..3fe7967efa51 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc-etr.c
++++ b/drivers/hwtracing/coresight/coresight-tmc-etr.c
+@@ -16,6 +16,7 @@
+ #include <linux/vmalloc.h>
+ #include "coresight-catu.h"
+ #include "coresight-etm-perf.h"
++#include <linux/arm-smccc.h>
+ #include "coresight-priv.h"
+ #include "coresight-tmc.h"
+ 
+@@ -590,6 +591,9 @@ static int tmc_etr_alloc_flat_buf(struct tmc_drvdata *drvdata,
+ 				  void **pages)
+ {
+ 	struct etr_flat_buf *flat_buf;
++	dma_addr_t s_paddr = 0;
++	int buff_sec_mapped = 0;
++	int ret;
+ 
+ 	/* We cannot reuse existing pages for flat buf */
+ 	if (pages)
+@@ -606,12 +610,44 @@ static int tmc_etr_alloc_flat_buf(struct tmc_drvdata *drvdata,
+ 		return -ENOMEM;
+ 	}
+ 
++	if (!(drvdata->etr_options & CORESIGHT_OPTS_SECURE_BUFF))
++		goto skip_secure_buffer;
++
++	/* Register driver allocated dma buffer for necessary
++	 * mapping in the secure world
++	 */
++	if (tmc_register_drvbuf(drvdata, flat_buf->daddr, etr_buf->size)) {
++		ret = -ENOMEM;
++		goto err;
++	}
++	buff_sec_mapped = 1;
++
++	/* Allocate secure trace buffer */
++	if (tmc_alloc_secbuf(drvdata, etr_buf->size, &s_paddr)) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++skip_secure_buffer:
+ 	flat_buf->size = etr_buf->size;
+ 	flat_buf->dev = drvdata->dev;
+ 	etr_buf->hwaddr = flat_buf->daddr;
++	etr_buf->s_paddr= s_paddr;
+ 	etr_buf->mode = ETR_MODE_FLAT;
+ 	etr_buf->private = flat_buf;
+ 	return 0;
++
++err:
++	kfree(flat_buf);
++	dma_free_coherent(drvdata->dev, etr_buf->size, flat_buf->vaddr,
++			  flat_buf->daddr);
++	if (buff_sec_mapped)
++		tmc_unregister_drvbuf(drvdata, flat_buf->daddr,
++				      etr_buf->size);
++	if (s_paddr)
++		tmc_free_secbuf(drvdata, s_paddr, etr_buf->size);
++
++	return ret;
+ }
+ 
+ static void tmc_etr_free_flat_buf(struct etr_buf *etr_buf)
+@@ -937,10 +973,17 @@ static void __tmc_etr_enable_hw(struct tmc_drvdata *drvdata)
+ 
+ 	CS_UNLOCK(drvdata->base);
+ 
++	if (drvdata->etr_options & CORESIGHT_OPTS_RESET_CTL_REG)
++		tmc_disable_hw(drvdata);
++
+ 	/* Wait for TMCSReady bit to be set */
+ 	tmc_wait_for_tmcready(drvdata);
+ 
+ 	writel_relaxed(etr_buf->size / 4, drvdata->base + TMC_RSZ);
++	if (drvdata && CORESIGHT_OPTS_BUFFSIZE_8BX)
++		writel_relaxed(etr_buf->size / 8, drvdata->base + TMC_RSZ);
++	else
++		writel_relaxed(etr_buf->size / 4, drvdata->base + TMC_RSZ);
+ 	writel_relaxed(TMC_MODE_CIRCULAR_BUFFER, drvdata->base + TMC_MODE);
+ 
+ 	axictl = readl_relaxed(drvdata->base + TMC_AXICTL);
+@@ -957,7 +1000,10 @@ static void __tmc_etr_enable_hw(struct tmc_drvdata *drvdata)
+ 		axictl |= TMC_AXICTL_SCT_GAT_MODE;
+ 
+ 	writel_relaxed(axictl, drvdata->base + TMC_AXICTL);
+-	tmc_write_dba(drvdata, etr_buf->hwaddr);
++	if (drvdata->etr_options & CORESIGHT_OPTS_SECURE_BUFF)
++		tmc_write_dba(drvdata, etr_buf->s_paddr);
++	else
++		tmc_write_dba(drvdata, etr_buf->hwaddr);
+ 	/*
+ 	 * If the TMC pointers must be programmed before the session,
+ 	 * we have to set it properly (i.e, RRP/RWP to base address and
+@@ -965,7 +1011,10 @@ static void __tmc_etr_enable_hw(struct tmc_drvdata *drvdata)
+ 	 */
+ 	if (tmc_etr_has_cap(drvdata, TMC_ETR_SAVE_RESTORE)) {
+ 		tmc_write_rrp(drvdata, etr_buf->hwaddr);
+-		tmc_write_rwp(drvdata, etr_buf->hwaddr);
++		if (drvdata->etr_options & CORESIGHT_OPTS_SECURE_BUFF)
++			tmc_write_rwp(drvdata, etr_buf->s_paddr);
++		else
++			tmc_write_rwp(drvdata, etr_buf->hwaddr);
+ 		sts = readl_relaxed(drvdata->base + TMC_STS) & ~TMC_STS_FULL;
+ 		writel_relaxed(sts, drvdata->base + TMC_STS);
+ 	}
+@@ -1696,3 +1745,22 @@ int tmc_read_unprepare_etr(struct tmc_drvdata *drvdata)
+ 
+ 	return 0;
+ }
++
++int tmc_copy_secure_buffer(struct tmc_drvdata *drvdata,
++					 char *bufp, size_t len)
++{
++	struct arm_smccc_res res;
++	uint64_t offset;
++	char *vaddr;
++	struct etr_buf *etr_buf = drvdata->etr_buf;
++
++	tmc_etr_buf_get_data(etr_buf, 0, 0, &vaddr);
++	offset = bufp - vaddr;
++
++	arm_smccc_smc(OCTEONTX_TRC_COPY_TO_DRVBUF, etr_buf->hwaddr + offset,
++		      etr_buf->s_paddr + offset, len, 0, 0, 0, 0, &res);
++	if (res.a0 != SMCCC_RET_SUCCESS)
++		return -EFAULT;
++
++	return 0;
++}
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.c b/drivers/hwtracing/coresight/coresight-tmc.c
+index aec92d839473..17759762abdc 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.c
++++ b/drivers/hwtracing/coresight/coresight-tmc.c
+@@ -151,6 +151,10 @@ static ssize_t tmc_read(struct file *file, char __user *data, size_t len,
+ 	if (actual <= 0)
+ 		return 0;
+ 
++	if ((drvdata->etr_options & CORESIGHT_OPTS_SECURE_BUFF) &&
++		tmc_copy_secure_buffer(drvdata, bufp, len))
++		return -EFAULT;
++
+ 	if (copy_to_user(data, bufp, actual)) {
+ 		dev_dbg(drvdata->dev, "%s: copy_to_user failed\n", __func__);
+ 		return -EFAULT;
+@@ -419,11 +423,21 @@ static int tmc_probe(struct amba_device *adev, const struct amba_id *id)
+ 
+ 	spin_lock_init(&drvdata->spinlock);
+ 
++	drvdata->cpu = pdata ? pdata->cpu : 0;
++
++	/* Enable options for Silicon issues */
++	if (id->id == OCTEONTX_CN9XXX_ETR)
++		drvdata->etr_options = CORESIGHT_OPTS_BUFFSIZE_8BX |
++					CORESIGHT_OPTS_SECURE_BUFF |
++					CORESIGHT_OPTS_RESET_CTL_REG;
++
+ 	devid = readl_relaxed(drvdata->base + CORESIGHT_DEVID);
+ 	drvdata->config_type = BMVAL(devid, 6, 7);
+ 	drvdata->memwidth = tmc_get_memwidth(devid);
+ 	/* This device is not associated with a session */
+ 	drvdata->pid = -1;
++	drvdata->formatter_en = !(readl_relaxed(drvdata->base + TMC_FFSR) &
++		TMC_FFSR_FT_NOT_PRESENT);
+ 
+ 	if (drvdata->config_type == TMC_CONFIG_TYPE_ETR) {
+ 		if (np)
+@@ -432,6 +446,11 @@ static int tmc_probe(struct amba_device *adev, const struct amba_id *id)
+ 						   &drvdata->size);
+ 		if (ret)
+ 			drvdata->size = SZ_1M;
++
++		/* Cache locked buffer */
++		if (np)
++			drvdata->cache_lock_en = of_property_read_bool(np,
++						   "cache-lock");
+ 	} else {
+ 		drvdata->size = readl_relaxed(drvdata->base + TMC_RSZ) * 4;
+ 	}
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.h b/drivers/hwtracing/coresight/coresight-tmc.h
+index 7a85452fd6dc..b66c82d271fa 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.h
++++ b/drivers/hwtracing/coresight/coresight-tmc.h
+@@ -12,6 +12,7 @@
+ #include <linux/miscdevice.h>
+ #include <linux/mutex.h>
+ #include <linux/refcount.h>
++#include <linux/arm-smccc.h>
+ 
+ #define TMC_RSZ			0x004
+ #define TMC_STS			0x00c
+@@ -73,6 +74,9 @@
+ #define TMC_AXICTL_AXCACHE_OS	(0xf << 2)
+ #define TMC_AXICTL_ARCACHE_OS	(0xf << 16)
+ 
++/* TMC_FFSR - 0x300 */
++#define TMC_FFSR_FT_NOT_PRESENT	BIT(4)
++
+ /* TMC_FFCR - 0x304 */
+ #define TMC_FFCR_FLUSHMAN_BIT	6
+ #define TMC_FFCR_EN_FMT		BIT(0)
+@@ -133,6 +137,26 @@ enum tmc_mem_intf_width {
+ /* Marvell OcteonTx CN9xxx device */
+ #define OCTEONTX_CN9XXX_ETR		0x000cc213
+ 
++/* Marvell OcteonTx CN9xxx HW issues */
++#define CORESIGHT_OPTS_BUFFSIZE_8BX	(0x1U << 0) /* 8 byte size multiplier */
++#define CORESIGHT_OPTS_SECURE_BUFF	(0x1U << 1) /* Trace buffer is Secure */
++#define CORESIGHT_OPTS_RESET_CTL_REG	(0x1U << 2) /* Reset CTL on reset */
++
++/* SMC call ids for managing the secure trace buffer */
++
++/* Args: x1 - size, x2 - cpu, x3 - llc lock flag
++ * Returns: x0 - status, x1 - secure buffer address
++ */
++#define OCTEONTX_TRC_ALLOC_SBUF		0xc2000c05
++/* Args: x1 - non secure buffer address, x2 - size */
++#define OCTEONTX_TRC_REGISTER_DRVBUF	0xc2000c06
++/* Args: x1 - dst(non secure), x2 - src(secure), x3 - size */
++#define OCTEONTX_TRC_COPY_TO_DRVBUF	0xc2000c07
++/* Args: x1 - secure buffer address, x2 - size */
++#define OCTEONTX_TRC_FREE_SBUF		0xc2000c08
++/* Args: x1 - non secure buffer address, x2 - size */
++#define OCTEONTX_TRC_UNREGISTER_DRVBUF	0xc2000c09
++
+ enum etr_mode {
+ 	ETR_MODE_FLAT,		/* Uses contiguous flat buffer */
+ 	ETR_MODE_ETR_SG,	/* Uses in-built TMC ETR SG mechanism */
+@@ -148,6 +172,7 @@ struct etr_buf_operations;
+  * @full	: Trace data overflow
+  * @size	: Size of the buffer.
+  * @hwaddr	: Address to be programmed in the TMC:DBA{LO,HI}
++ * @s_paddr	: Secure trace buffer
+  * @offset	: Offset of the trace data in the buffer for consumption.
+  * @len		: Available trace data @buf (may round up to the beginning).
+  * @ops		: ETR buffer operations for the mode.
+@@ -159,6 +184,7 @@ struct etr_buf {
+ 	bool				full;
+ 	ssize_t				size;
+ 	dma_addr_t			hwaddr;
++	dma_addr_t			s_paddr;
+ 	unsigned long			offset;
+ 	s64				len;
+ 	const struct etr_buf_operations	*ops;
+@@ -171,13 +197,14 @@ struct etr_buf {
+  * @dev:	the device entity associated to this component.
+  * @csdev:	component vitals needed by the framework.
+  * @miscdev:	specifics to handle "/dev/xyz.tmc" entry.
+- * @spinlock:	only one at a time pls.
+- * @pid:	Process ID of the process being monitored by the session
++ * @spinlock:	only one at a time pls.  * @pid:	Process ID of the process being monitored by the session
+  *		that is using this component.
+  * @buf:	Snapshot of the trace data for ETF/ETB.
+  * @etr_buf:	details of buffer used in TMC-ETR
+  * @len:	size of the available trace for ETF/ETB.
+  * @size:	trace buffer size for this TMC (common for all modes).
++ * @formatter_en: Formatter enable/disable status
++ * @cache_lock_en: Cache lock status
+  * @mode:	how this TMC is being used.
+  * @config_type: TMC variant, must be of type @tmc_config_type.
+  * @memwidth:	width of the memory interface databus, in bytes.
+@@ -188,6 +215,8 @@ struct etr_buf {
+  * @idr_mutex:	Access serialisation for idr.
+  * @perf_data:	PERF buffer for ETR.
+  * @sysfs_data:	SYSFS buffer for ETR.
++ * @etr_options: Bitmask of options to manage Silicon issues
++ * @cpu:	CPU id this component is associated with
+  */
+ struct tmc_drvdata {
+ 	void __iomem		*base;
+@@ -201,6 +230,8 @@ struct tmc_drvdata {
+ 		char		*buf;		/* TMC ETB */
+ 		struct etr_buf	*etr_buf;	/* TMC ETR */
+ 	};
++	bool			formatter_en;
++	bool			cache_lock_en;
+ 	u32			len;
+ 	u32			size;
+ 	u32			mode;
+@@ -212,6 +243,8 @@ struct tmc_drvdata {
+ 	struct mutex		idr_mutex;
+ 	struct etr_buf		*sysfs_buf;
+ 	void			*perf_data;
++	u32			etr_options;
++	int			cpu;
+ };
+ 
+ struct etr_buf_operations {
+@@ -329,4 +362,54 @@ tmc_sg_table_buf_size(struct tmc_sg_table *sg_table)
+ 
+ struct coresight_device *tmc_etr_get_catu_device(struct tmc_drvdata *drvdata);
+ 
++static inline int tmc_alloc_secbuf(struct tmc_drvdata *drvdata,
++				   size_t len, dma_addr_t *s_paddr)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_TRC_ALLOC_SBUF, len, drvdata->cpu,
++		      drvdata->cache_lock_en, 0, 0, 0, 0, &res);
++	if (res.a0 != SMCCC_RET_SUCCESS)
++		return -EFAULT;
++
++	*s_paddr = res.a1;
++	return 0;
++}
++
++static inline int tmc_free_secbuf(struct tmc_drvdata *drvdata,
++				  dma_addr_t s_paddr, size_t len)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_TRC_FREE_SBUF, s_paddr, len,
++		      0, 0, 0, 0, 0, &res);
++	return 0;
++}
++
++static inline int tmc_register_drvbuf(struct tmc_drvdata *drvdata,
++				      dma_addr_t paddr, size_t len)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_TRC_REGISTER_DRVBUF, paddr, len,
++		      0, 0, 0, 0, 0, &res);
++	if (res.a0 != SMCCC_RET_SUCCESS)
++		return -EFAULT;
++
++	return 0;
++}
++
++static inline int tmc_unregister_drvbuf(struct tmc_drvdata *drvdata,
++					dma_addr_t paddr, size_t len)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(OCTEONTX_TRC_UNREGISTER_DRVBUF, paddr, len,
++		      0, 0, 0, 0, 0, &res);
++	return 0;
++
++}
++
++int tmc_copy_secure_buffer(struct tmc_drvdata *drvdata,
++					 char *bufp, size_t len);
+ #endif
+-- 
+2.31.1
+

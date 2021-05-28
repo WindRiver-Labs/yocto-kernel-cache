@@ -1,0 +1,372 @@
+From ff2712934101a063a63919ef3c0744bdb32fd4bf Mon Sep 17 00:00:00 2001
+From: Aaron Williams <awilliams@marvell.com>
+Date: Tue, 11 Feb 2020 20:12:42 -0800
+Subject: [PATCH 493/767] mmc: octeontx2: Use flags for hardware differences
+
+commit 1b161f6c43bb06efc51b9714bd1afee3e1a73b4a from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Instead of hard-coding the code to look for various SoCs and versions
+it is better to use flags.  This makes it much easier to put all of
+the flag initialization in one place, in the probe function, as well
+as make it easier to add noew SoCs witouth having to make
+modifications all over the place.  This patch also moves the
+hardware maximum speed based on chip revision, etc. to
+the probe function as well.
+
+This patch also cleans up the timing support for HS200 and HS400 and
+fixes a rounding error when calculating the tap value.
+
+This patch also allows the device tree to override the default delays
+for HS200 and HS400 modes.
+
+This also adds support for the CNF95XXMM and LOKI SoCs.
+
+Change-Id: Ia3457d56dd4cb38a3fb33bdb08d4e5d611f5c314
+Signed-off-by: Aaron Williams <awilliams@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/23690
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ drivers/mmc/host/cavium-octeon.c   |  1 +
+ drivers/mmc/host/cavium-thunderx.c | 38 +++++++++++++++-
+ drivers/mmc/host/cavium.c          | 73 ++++++++++++++++++++----------
+ drivers/mmc/host/cavium.h          | 46 ++++++-------------
+ 4 files changed, 101 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/mmc/host/cavium-octeon.c b/drivers/mmc/host/cavium-octeon.c
+index 302c052b8d93..f7f737250435 100644
+--- a/drivers/mmc/host/cavium-octeon.c
++++ b/drivers/mmc/host/cavium-octeon.c
+@@ -172,6 +172,7 @@ static int octeon_mmc_probe(struct platform_device *pdev)
+ 		host->dmar_fixup_done = octeon_mmc_dmar_fixup_done;
+ 	}
+ 
++	host->max_freq = MHZ_52;
+ 	host->sys_freq = octeon_get_io_clock_rate();
+ 
+ 	if (of_device_is_compatible(node, "cavium,octeon-7890-mmc")) {
+diff --git a/drivers/mmc/host/cavium-thunderx.c b/drivers/mmc/host/cavium-thunderx.c
+index ac6347f91734..b94f1d007d1a 100644
+--- a/drivers/mmc/host/cavium-thunderx.c
++++ b/drivers/mmc/host/cavium-thunderx.c
+@@ -69,10 +69,10 @@ static void thunder_calibrate_mmc(struct cvm_mmc_host *host)
+ 		return;
+ 
+ 	/* set _DEBUG[CLK_ON]=1 as workaround for clock issue */
+-	if (is_mmc_otx2_A0(host) || is_mmc_95xx(host))
++	if (host->cond_clock_glitch)
+ 		writeq(1, host->base + MIO_EMM_DEBUG(host));
+ 
+-	if (is_mmc_otx2_A0(host) || is_mmc_otx2_C0(host)) {
++	if (!host->calibrate_glitch) {
+ 		/*
+ 		 * Operation of up to 100 MHz may be achieved by skipping the
+ 		 * steps that establish the tap delays and instead assuming
+@@ -175,6 +175,8 @@ static int thunder_mmc_probe(struct pci_dev *pdev,
+ 	struct device_node *child_node;
+ 	struct cvm_mmc_host *host;
+ 	int ret, i = 0;
++	u8 chip_id;
++	u8 rev;
+ 
+ 	host = devm_kzalloc(dev, sizeof(*host), GFP_KERNEL);
+ 	if (!host)
+@@ -225,6 +227,38 @@ static int thunder_mmc_probe(struct pci_dev *pdev,
+ 	if (ret)
+ 		goto error;
+ 
++	rev = pdev->revision;
++	chip_id = (pdev->subsystem_device >> 8) & 0xff;
++	switch (chip_id) {
++	case PCI_SUBSYS_DEVID_96XX:
++		if (rev == REV_ID_0) {
++			host->calibrate_glitch = true;
++			host->cond_clock_glitch = true;
++			host->max_freq = MHZ_100;
++		} else if (rev == REV_ID_2) {
++			host->tap_requires_noclk = true;
++			host->max_freq = MHZ_112_5;
++		} else if (rev > REV_ID_2) {
++			host->tap_requires_noclk = true;
++			host->max_freq = MHZ_200;
++		}
++		break;
++	case PCI_SUBSYS_DEVID_95XXMM:
++	case PCI_SUBSYS_DEVID_98XX:
++		host->tap_requires_noclk = true;
++		host->max_freq = MHZ_200;
++		break;
++	case PCI_SUBSYS_DEVID_95XX:
++		if (rev == REV_ID_0)
++			host->cond_clock_glitch = true;
++		host->max_freq = MHZ_150;
++		break;
++	case PCI_SUBSYS_DEVID_LOKI:
++		host->max_freq = MHZ_150;
++		break;
++	default:
++		break;
++	}
+ 	/*
+ 	 * Clear out any pending interrupts that may be left over from
+ 	 * bootloader. Writing 1 to the bits clears them.
+diff --git a/drivers/mmc/host/cavium.c b/drivers/mmc/host/cavium.c
+index f528d85266fa..8293478dd479 100644
+--- a/drivers/mmc/host/cavium.c
++++ b/drivers/mmc/host/cavium.c
+@@ -152,7 +152,7 @@ static void cvm_mmc_clk_config(struct cvm_mmc_host *host, bool flag)
+ {
+ 	u64 emm_debug;
+ 
+-	if (!is_mmc_otx2_C0(host))
++	if (!host->tap_requires_noclk)
+ 		return;
+ 
+ 	/* Turn off the clock */
+@@ -208,7 +208,7 @@ static int tout(struct cvm_mmc_slot *slot, int ps, int hint)
+ 	if (!tap_ps)
+ 		return hint;
+ 
+-	taps = min((int)(ps * clk_scale) / (tap_ps * 100), 63);
++	taps = min_t(int, DIV_ROUND_UP(ps * clk_scale, (tap_ps * 100)), 63);
+ 
+ 	/* when modparam is adjusted, re-announce timing */
+ 	if (old_scale != clk_scale) {
+@@ -228,6 +228,7 @@ static int cvm_mmc_configure_delay(struct cvm_mmc_slot *slot)
+ {
+ 	struct cvm_mmc_host *host = slot->host;
+ 	struct mmc_host *mmc = slot->mmc;
++	const char *mode;
+ 
+ 	pr_debug("slot%d.configure_delay\n", slot->bus_id);
+ 
+@@ -251,48 +252,66 @@ static int cvm_mmc_configure_delay(struct cvm_mmc_slot *slot)
+ 		 * Typically 3.0 ns at frequencies <= 52 MHz SDR.
+ 		 * Typically 2.5 ns at frequencies <= 52 MHz DDR.
+ 		 * Typically 0.8 ns at frequencies > 52 MHz SDR.
+-		 * Typically 0.4 ns at frequencies > 52 MHz DDR.
++		 * Typically 0.8 ns at frequencies > 52 MHz DDR.
++		 *
++		 * Note that in DDR cases typically the data hold time is
++		 * half of the command hold time.
+ 		 */
+ 		switch (mmc->ios.timing) {
+-		case MMC_TIMING_LEGACY:
+ 		default:
++		case MMC_TIMING_LEGACY:
+ 			if (mmc->card && mmc_card_mmc(mmc->card))
+ 				cout = tout(slot, 5000, 39);
+ 			else
+ 				cout = tout(slot, 8000, 63);
++			dout = cout;
++			mode = "legacy";
+ 			break;
+ 		case MMC_TIMING_UHS_SDR12:
+ 			cout = tout(slot, 3000, 39);
++			dout = cout;
++			mode = "SDR 12";
+ 			break;
+ 		case MMC_TIMING_MMC_HS:
+ 			cout = tout(slot, 2500, 32);
++			dout = cout;
++			mode = "MMC HS";
+ 			break;
+ 		case MMC_TIMING_SD_HS:
+ 		case MMC_TIMING_UHS_SDR25:
+ 		case MMC_TIMING_UHS_SDR50:
+ 			cout = tout(slot, 2000, 26);
++			dout = cout;
++			mode = "SD HS/25/50";
+ 			break;
+ 		case MMC_TIMING_UHS_DDR50:
+ 		case MMC_TIMING_MMC_DDR52:
++			mode = "SD DDR50/MMC DDR52";
+ 			cout = tout(slot, 1500, 20);
++			dout = cout / 2;
++			if (ddr_cmd_taps)
++				cout = cout / 2;
+ 			break;
+ 		case MMC_TIMING_UHS_SDR104:
++			cout = tout(slot, 800, 10);
++			dout = cout;
++			mode = "SD UHS104";
++			break;
+ 		case MMC_TIMING_MMC_HS200:
++			mode = "MMC HS200";
++			cout = tout(slot, slot->cmd_out_hs200_dly, 10);
++			dout = tout(slot, slot->data_out_hs200_dly, 10);
++			break;
+ 		case MMC_TIMING_MMC_HS400:
+-			cout = tout(slot, 800, 10);
++			mode = "MMC HS400";
++			cout = tout(slot, slot->cmd_out_hs400_dly, 10);
++			dout = tout(slot, slot->data_out_hs400_dly, 10);
+ 			break;
+ 		}
+ 
+-		if (!is_mmc_95xx(host)) {
+-			if (!cvm_is_mmc_timing_ddr(slot))
+-				dout = cout;
+-			else if (ddr_cmd_taps)
+-				cout = dout = cout / 2;
+-			else
+-				dout = cout / 2;
+-		} else
+-			dout = tout(slot, 800, 10);
+-
++		dev_dbg(host->dev,
++			"%s: command in tap: %d, command out tap: %d, data in tap: %d, data out tap: %d\n",
++			mode, cin, cout, din, dout);
+ 		slot->taps =
+ 			FIELD_PREP(MIO_EMM_TIMING_CMD_IN, cin) |
+ 			FIELD_PREP(MIO_EMM_TIMING_CMD_OUT, cout) |
+@@ -1718,16 +1737,10 @@ static u32 max_supported_frequency(struct cvm_mmc_host *host)
+ 	/* Default maximum freqeuncey is 52000000 for chip prior to 9X */
+ 	u32 max_frequency = MHZ_52;
+ 
+-	if (is_mmc_otx2(host)) {
++	if (is_mmc_otx2(host))
+ 		/* Default max frequency is 200MHz for 9X chips */
+-		max_frequency = MHZ_200;
++		max_frequency = host->max_freq;
+ 
+-		/* Erratum is only applicable pass A0 */
+-		if (is_mmc_otx2_A0(host))
+-			max_frequency = MHZ_100;
+-		else if	(is_mmc_otx2_C0(host))
+-			max_frequency = MHZ_150;
+-	}
+ 	return max_frequency;
+ }
+ 
+@@ -2051,7 +2064,7 @@ static int cvm_mmc_of_parse(struct device *dev, struct cvm_mmc_slot *slot)
+ 	}
+ 
+ 	ret = mmc_regulator_get_supply(mmc);
+-	if (ret)
++	if (ret == -EPROBE_DEFER)
+ 		return ret;
+ 	/*
+ 	 * Legacy Octeon firmware has no regulator entry, fall-back to
+@@ -2077,6 +2090,18 @@ static int cvm_mmc_of_parse(struct device *dev, struct cvm_mmc_slot *slot)
+ 			mmc->caps |= MMC_CAP_4_BIT_DATA;
+ 	}
+ 
++	slot->cmd_out_hs200_dly = PS_800;
++	slot->data_out_hs200_dly = PS_800;
++	of_property_read_u32(node, "marvell,cmd-out-hs200-dly",
++			     &slot->cmd_out_hs200_dly);
++	of_property_read_u32(node, "marvell,data-out-hs200-dly",
++			     &slot->data_out_hs200_dly);
++	slot->cmd_out_hs400_dly = PS_800;
++	slot->data_out_hs400_dly = PS_400;
++	of_property_read_u32(node, "marvell,cmd-out-hs400-dly",
++			     &slot->cmd_out_hs400_dly);
++	of_property_read_u32(node, "marvell,data-out-hs400-dly",
++			     &slot->data_out_hs400_dly);
+ 	max_frequency = max_supported_frequency(slot->host);
+ 
+ 	/* Set maximum and minimum frequency */
+diff --git a/drivers/mmc/host/cavium.h b/drivers/mmc/host/cavium.h
+index 1b72359b0ede..65ac8680ad2d 100644
+--- a/drivers/mmc/host/cavium.h
++++ b/drivers/mmc/host/cavium.h
+@@ -28,7 +28,11 @@
+ /* Subsystem Device ID */
+ #define PCI_SUBSYS_DEVID_8XXX	0xA
+ #define PCI_SUBSYS_DEVID_9XXX	0xB
++#define PCI_SUBSYS_DEVID_98XX	0xB1
++#define PCI_SUBSYS_DEVID_96XX	0xB2
+ #define PCI_SUBSYS_DEVID_95XX	0xB3
++#define PCI_SUBSYS_DEVID_LOKI	0xB4
++#define PCI_SUBSYS_DEVID_95XXMM	0xB5
+ 
+ /* Chip revision Id */
+ #define REV_ID_0 0
+@@ -38,7 +42,9 @@
+ #define MHZ_26  (26000000)
+ #define MHZ_52  (52000000)
+ #define MHZ_100 (100000000)
++#define MHZ_112_5 (112500000)
+ #define MHZ_150 (150000000)
++#define MHZ_167 (167000000)
+ #define MHZ_200 (200000000)
+ 
+ /* octtx2: emmc interface io current drive strength */
+@@ -57,6 +63,7 @@
+ #define PS_10000		(10 * 1000)
+ #define PS_5000			(5000)
+ #define PS_2500			(2500)
++#define PS_800			(800)
+ #define PS_400			(400)
+ #define MAX_NO_OF_TAPS		64
+ 
+@@ -116,13 +123,16 @@ struct cvm_mmc_host {
+ 	int last_slot;
+ 	struct clk *clk;
+ 	int sys_freq;
+-
++	int max_freq;
+ 	bool use_sg;
+ 	bool has_ciu3;
+ 	bool powered;
+ 	bool use_vqmmc; /* must disable slots over switch */
+ 	bool big_dma_addr;
+ 	bool need_irq_handler_lock;
++	bool tap_requires_noclk;
++	bool calibrate_glitch;
++	bool cond_clock_glitch;
+ 	spinlock_t irq_handler_lock;
+ 	struct semaphore mmc_serializer;
+ 
+@@ -171,6 +181,10 @@ struct cvm_mmc_slot {
+ 	u64 want_switch;
+ 	u32 hs400_tuning_block;		/* Block number used for tuning */
+ 	bool hs400_tuning_block_present;
++	u32 cmd_out_hs200_dly;		/* Normally 800ps */
++	u32 data_out_hs200_dly;		/* Normally 800ps */
++	u32 cmd_out_hs400_dly;		/* Normally 800ps */
++	u32 data_out_hs400_dly;		/* Normally 400ps */
+ };
+ 
+ struct cvm_mmc_cr_type {
+@@ -329,34 +343,4 @@ static inline bool is_mmc_otx2(struct cvm_mmc_host *host)
+ #endif
+ }
+ 
+-static inline bool is_mmc_otx2_A0(struct cvm_mmc_host *host)
+-{
+-#ifdef CONFIG_ARM64
+-	struct pci_dev *pdev = host->pdev;
+-	u32 chip_id = (pdev->subsystem_device >> 8) & 0xFF;
+-
+-	return (pdev->revision == 0x00) &&
+-		(chip_id == MRVL_OCTEONTX2_96XX_PARTNUM);
+-#else
+-	return false;
+-#endif
+-}
+-
+-static inline bool is_mmc_otx2_C0(struct cvm_mmc_host *host)
+-{
+-	struct pci_dev *pdev = host->pdev;
+-	u32 chip_id = (pdev->subsystem_device >> 12) & 0xF;
+-
+-	return (pdev->revision == REV_ID_2) &&
+-		(chip_id == PCI_SUBSYS_DEVID_9XXX);
+-}
+-
+-static inline bool is_mmc_95xx(struct cvm_mmc_host *host)
+-{
+-	struct pci_dev *pdev = host->pdev;
+-	u32 chip_id = (pdev->subsystem_device >> 8) & 0xFF;
+-
+-	return (chip_id == PCI_SUBSYS_DEVID_95XX);
+-}
+-
+ #endif
+-- 
+2.31.1
+

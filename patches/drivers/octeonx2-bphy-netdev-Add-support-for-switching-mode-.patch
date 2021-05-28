@@ -1,0 +1,209 @@
+From 255ead07454c62fa673029223b80bf53a3109f60 Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Tue, 23 Jun 2020 14:19:07 +0530
+Subject: [PATCH 585/767] octeonx2-bphy-netdev: Add support for switching mode
+ from RFOE to CPRI
+
+commit 8a189bb049a40e6eacd6fece70f43533e3f23a24 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+This patch adds support for switching the mode from RFOE to CPRI.
+The rfoe netdev interfaces are unregistered and cpri netdev
+interfaces are registered. The reverse switching is not possible
+because of HW limitations.
+
+Change-Id: I29a040812ebfb4f428a40590c029719ad070e5b2
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/31331
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/bphy/otx2_bphy.h        |  5 ++++
+ .../marvell/octeontx2/bphy/otx2_bphy_main.c   | 28 ++++++++++++++++++
+ .../marvell/octeontx2/bphy/otx2_cpri.c        | 29 +++++++++++++++++++
+ .../marvell/octeontx2/bphy/otx2_cpri.h        |  2 ++
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        | 28 ++++++++++++++++++
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        |  2 ++
+ 6 files changed, 94 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
+index f5b4b7a9b4c5..1ad0182f45d9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
+@@ -45,9 +45,13 @@ extern void __iomem *cpri_reg_base;
+ #define OTX2_RFOE_IOCTL_PTP_OFFSET	_IO(OTX2_RFOE_IOCTL_BASE, 0x04)
+ #define OTX2_RFOE_IOCTL_SEC_BCN_OFFSET	_IOW(OTX2_RFOE_IOCTL_BASE, 0x05, \
+ 					     struct bcn_sec_offset_cfg)
++#define OTX2_RFOE_IOCTL_MODE_CPRI	_IOW(OTX2_RFOE_IOCTL_BASE, 0x06, \
++					     int)
+ 
+ //#define ASIM		/* ASIM environment */
+ 
++#define OTX2_BPHY_MHAB_INST		3
++
+ /* char driver private data */
+ struct otx2_bphy_cdev_priv {
+ 	struct device			*dev;
+@@ -58,6 +62,7 @@ struct otx2_bphy_cdev_priv {
+ 	int				irq;
+ 	struct mutex			mutex_lock;	/* mutex */
+ 	spinlock_t			lock;		/* irq lock */
++	u8				mhab_mode[OTX2_BPHY_MHAB_INST];
+ };
+ 
+ /* iova to kernel virtual addr */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+index 3fa6afe74cdc..7a32295efc75 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+@@ -125,6 +125,9 @@ static long otx2_bphy_cdev_ioctl(struct file *filp, unsigned int cmd,
+ 			goto out;
+ 		}
+ 
++		for (idx = 0; idx < OTX2_BPHY_MHAB_INST; idx++)
++			cdev->mhab_mode[idx] = intf_cfg[idx].if_type;
++
+ 		ret = otx2_rfoe_parse_and_init_intf(cdev, intf_cfg);
+ 		if (ret < 0) {
+ 			dev_err(cdev->dev, "odp <-> netdev parse error\n");
+@@ -310,6 +313,31 @@ static long otx2_bphy_cdev_ioctl(struct file *filp, unsigned int cmd,
+ 		ret = 0;
+ 		goto out;
+ 	}
++	case OTX2_RFOE_IOCTL_MODE_CPRI:
++	{
++		int id = 0;
++
++		if (!cdev->odp_intf_cfg) {
++			dev_info(cdev->dev, "odp interface cfg is not done\n");
++			ret = -EBUSY;
++			goto out;
++		}
++
++		if (copy_from_user(&id, (void __user *)arg, sizeof(int))) {
++			dev_err(cdev->dev, "copy from user fault\n");
++			ret = -EFAULT;
++			goto out;
++		}
++
++		if (cdev->mhab_mode[id] == IF_TYPE_ETHERNET) {
++			otx2_rfoe_disable_intf(id);
++			otx2_cpri_enable_intf(id);
++			cdev->mhab_mode[id] = IF_TYPE_CPRI;
++		}
++
++		ret = 0;
++		goto out;
++	}
+ 	default:
+ 	{
+ 		dev_info(cdev->dev, "ioctl: no match\n");
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
+index 0c8bac936005..0cf89d618162 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
+@@ -74,6 +74,35 @@ struct net_device *otx2_cpri_get_netdev(int mhab_id, int lmac_id)
+ 	return netdev;
+ }
+ 
++void otx2_cpri_enable_intf(int cpri_num)
++{
++	struct otx2_cpri_drv_ctx *drv_ctx;
++	struct otx2_cpri_ndev_priv *priv;
++	struct net_device *netdev;
++	int idx, ret;
++
++	for (idx = 0; idx < OTX2_BPHY_CPRI_MAX_INTF; idx++) {
++		drv_ctx = &cpri_drv_ctx[idx];
++		if (drv_ctx->cpri_num == cpri_num && drv_ctx->valid) {
++			netdev = drv_ctx->netdev;
++			priv = netdev_priv(netdev);
++			ret = register_netdev(netdev);
++			if (ret < 0) {
++				pr_err("failed to register net device %s\n",
++				       netdev->name);
++				free_netdev(netdev);
++				return;
++			}
++			pr_info("net device %s registered\n",
++				netdev->name);
++			netif_carrier_off(netdev);
++			netif_stop_queue(netdev);
++			set_bit(CPRI_INTF_DOWN, &priv->state);
++			drv_ctx->netdev_registered = 1;
++		}
++	}
++}
++
+ void otx2_bphy_cpri_cleanup(void)
+ {
+ 	struct otx2_cpri_drv_ctx *drv_ctx = NULL;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
+index 895433c3e745..a03381103ce2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
+@@ -126,6 +126,8 @@ void otx2_cpri_update_stats(struct otx2_cpri_ndev_priv *priv);
+ 
+ void otx2_bphy_cpri_cleanup(void);
+ 
++void otx2_cpri_enable_intf(int cpri_num);
++
+ /* ethtool */
+ void otx2_cpri_set_ethtool_ops(struct net_device *netdev);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index cc63f2eafbc6..6a6c9f3ff1b1 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -100,6 +100,34 @@
+ /* global driver ctx */
+ struct otx2_rfoe_drv_ctx rfoe_drv_ctx[RFOE_MAX_INTF];
+ 
++void otx2_rfoe_disable_intf(int rfoe_num)
++{
++	struct otx2_rfoe_drv_ctx *drv_ctx;
++	struct otx2_rfoe_ndev_priv *priv;
++	struct net_device *netdev;
++	struct rx_ft_cfg *ft_cfg;
++	int idx, pkt_type;
++
++	for (idx = 0; idx < RFOE_MAX_INTF; idx++) {
++		drv_ctx = &rfoe_drv_ctx[idx];
++		if (drv_ctx->rfoe_num == rfoe_num && drv_ctx->valid) {
++			netdev = drv_ctx->netdev;
++			priv = netdev_priv(netdev);
++			unregister_netdev(netdev);
++			for (pkt_type = 0; pkt_type < PACKET_TYPE_MAX;
++			     pkt_type++) {
++				if (!(priv->pkt_type_mask & (1U << pkt_type)))
++					continue;
++				ft_cfg = &priv->rx_ft_cfg[pkt_type];
++				netif_napi_del(&ft_cfg->napi);
++			}
++			kfree(priv->rfoe_common);
++			free_netdev(netdev);
++			drv_ctx->valid = 0;
++		}
++	}
++}
++
+ void otx2_bphy_rfoe_cleanup(void)
+ {
+ 	struct otx2_rfoe_drv_ctx *drv_ctx = NULL;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index bcc3241db41d..35eb283c8f91 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -263,6 +263,8 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 
+ void otx2_bphy_rfoe_cleanup(void);
+ 
++void otx2_rfoe_disable_intf(int rfoe_num);
++
+ /* ethtool */
+ void otx2_rfoe_set_ethtool_ops(struct net_device *netdev);
+ 
+-- 
+2.31.1
+

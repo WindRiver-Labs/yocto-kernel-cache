@@ -1,0 +1,134 @@
+From 5d94f704de5f3de651f27592e242d5677b85759d Mon Sep 17 00:00:00 2001
+From: Pavan Nikhilesh <pbhagavatula@marvell.com>
+Date: Tue, 29 Jan 2019 11:55:04 +0530
+Subject: [PATCH 016/767] octeontx2-af: add mbox to configure thresholds per
+ HWGRP
+
+commit 7a3290fdf43ee8e43784a39b2d4547ae71ba7549 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Add mbox to configure per queue XAQ/TAQ/IAQ thresholds that helps in
+prioritizing each HWGRP differently.
+
+Change-Id: I84360ccb994e13cf5c2f07755c32883052f86700
+Signed-off-by: Pavan Nikhilesh <pbhagavatula@marvell.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  | 12 ++++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  3 ++
+ .../ethernet/marvell/octeontx2/af/rvu_sso.c   | 48 +++++++++++++++++++
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 306c3782bd1f..c8623dcf1bea 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -165,6 +165,7 @@ M(SSO_GRP_SET_PRIORITY,	0x605, sso_grp_set_priority,			\
+ M(SSO_GRP_GET_PRIORITY,	0x606, sso_grp_get_priority,			\
+ 				sso_info_req, sso_grp_priority)	\
+ M(SSO_WS_CACHE_INV,	0x607, sso_ws_cache_inv, msg_req, msg_rsp)	\
++M(SSO_GRP_QOS_CONFIG,	0x608, sso_grp_qos_config, sso_grp_qos_cfg, msg_rsp)\
+ /* TIM mbox IDs (range 0x800 - 0x9FF) */				\
+ /* CPT mbox IDs (range 0xA00 - 0xBFF) */				\
+ /* NPC mbox IDs (range 0x6000 - 0x7FFF) */				\
+@@ -684,7 +685,8 @@ enum sso_af_status {
+ 	SSO_AF_ERR_PARAM	= -501,
+ 	SSO_AF_ERR_LF_INVALID	= -502,
+ 	SSO_AF_ERR_AF_LF_ALLOC	= -503,
+-	SSO_AF_INVAL_NPA_PF_FUNC = -504,
++	SSO_AF_ERR_GRP_EBUSY	= -504,
++	SSO_AF_INVAL_NPA_PF_FUNC = -505,
+ };
+ 
+ struct sso_lf_alloc_req {
+@@ -751,6 +753,14 @@ struct ssow_lf_free_req {
+ 	u16 hws;
+ };
+ 
++struct sso_grp_qos_cfg {
++	struct mbox_msghdr hdr;
++	u16 grp;
++	u32 xaq_limit;
++	u16 taq_thr;
++	u16 iaq_thr;
++};
++
+ /* NPC mbox message structs */
+ 
+ #define NPC_MCAM_ENTRY_INVALID	0xFFFF
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 045f6ccf4292..8a620fbd887d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -421,6 +421,9 @@ int rvu_mbox_handler_sso_hw_setconfig(struct rvu *rvu,
+ 				      struct msg_rsp *rsp);
+ int rvu_mbox_handler_sso_ws_cache_inv(struct rvu *rvu, struct msg_req *req,
+ 				      struct msg_rsp *rsp);
++int rvu_mbox_handler_sso_grp_qos_config(struct rvu *rvu,
++					struct sso_grp_qos_cfg *req,
++					struct msg_rsp *rsp);
+ 
+ /* NPA APIs */
+ int rvu_npa_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c
+index e6a51cdd5d81..a73251f7bbff 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c
+@@ -281,6 +281,54 @@ int rvu_mbox_handler_sso_grp_get_priority(struct rvu *rvu,
+ 	return 0;
+ }
+ 
++int rvu_mbox_handler_sso_grp_qos_config(struct rvu *rvu,
++					struct sso_grp_qos_cfg *req,
++					struct msg_rsp *rsp)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	u64 regval, grp_rsvd;
++	int lf, blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_SSO, pcifunc);
++	if (blkaddr < 0)
++		return SSO_AF_ERR_LF_INVALID;
++
++	lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, req->grp);
++	if (lf < 0)
++		return SSO_AF_ERR_LF_INVALID;
++
++	/* Check if GGRP has been active. */
++	regval = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_WA_PC(lf));
++	if (regval)
++		return SSO_AF_ERR_GRP_EBUSY;
++
++	/* Configure XAQ threhold */
++	rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_LIMIT(lf), req->xaq_limit);
++
++	/* Configure TAQ threhold */
++	regval = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_TAQ_THR(lf));
++	grp_rsvd = regval & SSO_HWGRP_TAQ_RSVD_THR_MASK;
++	if (req->taq_thr < grp_rsvd)
++		req->taq_thr = grp_rsvd;
++
++	regval = req->taq_thr & SSO_HWGRP_TAQ_MAX_THR_MASK;
++	regval = (regval << SSO_HWGRP_TAQ_MAX_THR_SHIFT) | grp_rsvd;
++	rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_TAQ_THR(lf), regval);
++
++	/* Configure IAQ threhold */
++	regval = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_IAQ_THR(lf));
++	grp_rsvd = regval & SSO_HWGRP_IAQ_RSVD_THR_MASK;
++	if (req->iaq_thr < grp_rsvd + 4)
++		req->iaq_thr = grp_rsvd + 4;
++
++	regval = req->iaq_thr & SSO_HWGRP_IAQ_MAX_THR_MASK;
++	regval = (regval << SSO_HWGRP_IAQ_MAX_THR_SHIFT) | grp_rsvd;
++	rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_IAQ_THR(lf), regval);
++
++	return 0;
++}
++
+ int rvu_mbox_handler_sso_lf_alloc(struct rvu *rvu, struct sso_lf_alloc_req *req,
+ 				  struct sso_lf_alloc_rsp *rsp)
+ {
+-- 
+2.31.1
+

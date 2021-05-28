@@ -1,0 +1,424 @@
+From 9a12b3f55537547aac67b150a4ff3110f79bec15 Mon Sep 17 00:00:00 2001
+From: hariprasad <hkelam@marvell.com>
+Date: Mon, 28 Oct 2019 14:39:09 +0530
+Subject: [PATCH 384/767] octeontx2-pf: Support to enable EDSA/Higig2 pkts
+ parsing
+
+commit e768cc7824fd22df72cdef19f517697408bd33d3 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+When switch headers like EDSA, Higig2 etc are present in ingress
+or egress pkts the pkt parsing done by NPC needs to take additional
+headers into account. KPU profile handles these using specific PKINDs
+(the iKPU index) to start parsing pkts differently.
+
+This patch enables user to configure these PKINDs into HW for proper
+pkt parsing. Patch also handles changes to max frame size due to
+additional headers in pkt.
+
+higig2:
+        ethtool --set-priv-flags eth0 higig2 on/off
+edsa:
+        ethtool --set-priv-flags eth0 edsa on/off
+
+Change-Id: If27c198a555b480434a5d56e15f0f7cff3800144
+Signed-off-by: hariprasad <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/17912
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       |   5 +-
+ .../marvell/octeontx2/nic/otx2_common.h       |  21 ++
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 230 +++++++++++++-----
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |   8 +-
+ .../marvell/octeontx2/nic/otx2_txrx.c         |   1 +
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |   5 +-
+ 6 files changed, 206 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 468fb81bbea2..1df44d96db90 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -207,7 +207,10 @@ int otx2_hw_set_mtu(struct otx2_nic *pfvf, int mtu)
+ 	}
+ 
+ 	req->update_smq = true;
+-	req->maxlen = mtu + OTX2_ETH_HLEN;
++	/* Add EDSA/HIGIG2 header len to maxlen */
++	pfvf->max_frs = mtu +  OTX2_ETH_HLEN + pfvf->addl_mtu;
++	req->maxlen = pfvf->max_frs;
++
+ 	err = otx2_sync_mbox_msg(&pfvf->mbox);
+ 	otx2_mbox_unlock(&pfvf->mbox);
+ 	return err;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 28d36b2014f4..dc7c7c45eae9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -227,6 +227,8 @@ struct otx2_nic {
+ 	struct device		*dev;
+ 	struct net_device	*netdev;
+ 	void			*iommu_domain;
++	u16			xtra_hdr;
++	u16			max_frs;
+ 
+ 	struct otx2_qset	qset;
+ 	struct otx2_hw		hw;
+@@ -258,6 +260,7 @@ struct otx2_nic {
+ #define OTX2_UNICAST_FILTER_CAPABLE		1
+ #define OTX2_RX_VLAN_OFFLOAD_CAPABLE		2
+ 	unsigned long           priv_flags;
++
+ 	u16			entry_list[NPC_MAX_NONCONTIG_ENTRIES];
+ 	struct list_head	flows;
+ 	struct workqueue_struct	*flr_wq;
+@@ -270,6 +273,22 @@ struct otx2_nic {
+ 	struct otx2_mac_table	*mac_table;
+ 	struct workqueue_struct	*otx2_ndo_wq;
+ 	struct work_struct	otx2_rx_mode_work;
++
++#define OTX2_PRIV_FLAG_PAM4			BIT(0)
++#define OTX2_PRIV_FLAG_EDSA_HDR			BIT(1)
++#define OTX2_PRIV_FLAG_HIGIG2_HDR		BIT(2)
++#define OTX2_IS_EDSA_ENABLED(flags)		((flags) &              \
++						 OTX2_PRIV_FLAG_EDSA_HDR)
++#define OTX2_IS_HIGIG2_ENABLED(flags)		((flags) &              \
++						 OTX2_PRIV_FLAG_HIGIG2_HDR)
++	u32		        ethtool_flags;
++
++	/* extended DSA and EDSA  header lengths are 8/16 bytes
++	 * so take max length 16 bytes here
++	 */
++#define OTX2_EDSA_HDR_LEN			16
++#define OTX2_HIGIG2_HDR_LEN			16
++	u32			addl_mtu;
+ };
+ 
+ static inline bool is_otx2_lbkvf(struct pci_dev *pdev)
+@@ -644,6 +663,8 @@ int otx2vf_open(struct net_device *netdev);
+ int otx2vf_stop(struct net_device *netdev);
+ int otx2_set_real_num_queues(struct net_device *netdev,
+ 			     int tx_queues, int rx_queues);
++int otx2_set_npc_parse_mode(struct otx2_nic *pfvf);
++
+ /* MCAM filter related APIs */
+ void otx2_do_set_rx_mode(struct work_struct *work);
+ int otx2_add_macfilter(struct net_device *netdev, const u8 *mac);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index 9f5f171fcf67..84a0b34448b1 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -26,8 +26,9 @@
+ #define OTX2_DEFAULT_ACTION	0x1
+ 
+ static const char otx2_priv_flags_strings[][ETH_GSTRING_LEN] = {
+-#define OTX2_PRIV_FLAGS_PAM4 BIT(0)
+ 	"pam4",
++	"edsa",
++	"higig2",
+ };
+ 
+ struct otx2_stat {
+@@ -1214,6 +1215,172 @@ end:	otx2_mbox_unlock(&pfvf->mbox);
+ 	return err;
+ }
+ 
++static u32 otx2_get_priv_flags(struct net_device *netdev)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++	struct cgx_fw_data *rsp;
++
++	rsp = otx2_get_fwdata(pfvf);
++
++	if (IS_ERR(rsp)) {
++		pfvf->ethtool_flags &= ~OTX2_PRIV_FLAG_PAM4;
++	} else {
++		if (rsp->fwdata.phy.mod_type)
++			pfvf->ethtool_flags |= OTX2_PRIV_FLAG_PAM4;
++		else
++			pfvf->ethtool_flags &= ~OTX2_PRIV_FLAG_PAM4;
++	}
++
++	return pfvf->ethtool_flags;
++}
++
++static int otx2_set_phy_mod_type(struct net_device *netdev, bool enable)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++	struct cgx_phy_mod_type *req;
++	struct cgx_fw_data *fwd;
++	int rc = -EAGAIN;
++
++	fwd = otx2_get_fwdata(pfvf);
++	if (IS_ERR(fwd))
++		return -EAGAIN;
++
++	/* ret here if phy does not support this feature */
++	if (!fwd->fwdata.phy.can_change_mod_type)
++		return -EOPNOTSUPP;
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_cgx_set_phy_mod_type(&pfvf->mbox);
++	if (!req)
++		goto end;
++
++	req->mod = enable;
++
++	if (!otx2_sync_mbox_msg(&pfvf->mbox))
++		rc = 0;
++end:
++	otx2_mbox_unlock(&pfvf->mbox);
++	return rc;
++}
++
++int otx2_set_npc_parse_mode(struct otx2_nic *pfvf)
++{
++	struct npc_set_pkind *req;
++	int rc = -EAGAIN;
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_npc_set_pkind(&pfvf->mbox);
++	if (!req)
++		goto end;
++
++	if (OTX2_IS_HIGIG2_ENABLED(pfvf->ethtool_flags))
++		req->mode = OTX2_PRIV_FLAGS_HIGIG;
++	else if (OTX2_IS_EDSA_ENABLED(pfvf->ethtool_flags))
++		req->mode = OTX2_PRIV_FLAGS_EDSA;
++	else
++		req->mode = OTX2_PRIV_FLAGS_DEFAULT;
++
++	req->dir  = PKIND_RX;
++
++	/* req AF to change pkind on both the dir */
++	if (req->mode == OTX2_PRIV_FLAGS_HIGIG)
++		req->dir |= PKIND_TX;
++
++	if (!otx2_sync_mbox_msg(&pfvf->mbox))
++		rc = 0;
++end:
++	otx2_mbox_unlock(&pfvf->mbox);
++	return rc;
++}
++
++static int otx2_enable_addl_header(struct net_device *netdev, int bitpos,
++				   u32 len, bool enable)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++	bool if_up = netif_running(netdev);
++
++	if (enable) {
++		pfvf->ethtool_flags |= BIT(bitpos);
++	} else {
++		pfvf->ethtool_flags &= ~BIT(bitpos);
++		len = 0;
++	}
++
++	if (if_up)
++		otx2_stop(netdev);
++
++	/* Update max FRS so that additional hdrs are considered */
++	pfvf->addl_mtu = len;
++
++	/* Incase HIGIG2 mode is set packet will have 16 bytes of
++	 * extra header at start of packet which stack does not need.
++	 */
++	if (OTX2_IS_HIGIG2_ENABLED(pfvf->ethtool_flags))
++		pfvf->xtra_hdr = 16;
++	else
++		pfvf->xtra_hdr = 0;
++
++	/* NPC parse mode will be updated here */
++	if (if_up)
++		otx2_open(netdev);
++
++	return 0;
++}
++
++static int otx2_set_priv_flags(struct net_device *netdev, u32 new_flags)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++	bool enable = false;
++	int bitnr, rc = 0;
++	u32 chg_flags;
++
++	/* Get latest PAM4 settings */
++	otx2_get_priv_flags(netdev);
++
++	chg_flags =  new_flags ^ pfvf->ethtool_flags;
++	if (!chg_flags)
++		return 0;
++
++	/* Some are mutually exclusive, so allow only change at a time */
++	if (hweight32(chg_flags) != 1)
++		return -EINVAL;
++
++	bitnr = ffs(chg_flags) - 1;
++	if (new_flags & BIT(bitnr))
++		enable = true;
++
++	switch (BIT(bitnr)) {
++	case OTX2_PRIV_FLAG_PAM4:
++		rc = otx2_set_phy_mod_type(netdev, enable);
++		break;
++	case OTX2_PRIV_FLAG_EDSA_HDR:
++		/* HIGIG & EDSA  are mutual exclusive */
++		if (enable && OTX2_IS_HIGIG2_ENABLED(pfvf->ethtool_flags))
++			return -EINVAL;
++		return otx2_enable_addl_header(netdev, bitnr,
++					       OTX2_EDSA_HDR_LEN, enable);
++		break;
++	case OTX2_PRIV_FLAG_HIGIG2_HDR:
++		if (enable && OTX2_IS_EDSA_ENABLED(pfvf->ethtool_flags))
++			return -EINVAL;
++		return otx2_enable_addl_header(netdev, bitnr,
++					       OTX2_HIGIG2_HDR_LEN, enable);
++		break;
++	default:
++		break;
++	}
++
++	/* save the change */
++	if (!rc) {
++		if (enable)
++			pfvf->ethtool_flags |= BIT(bitnr);
++		else
++			pfvf->ethtool_flags &= ~BIT(bitnr);
++	}
++
++	return rc;
++}
++
+ static struct ethtool_ops otx2_ethtool_ops = {
+ 	.get_link		= otx2_get_link,
+ 	.get_drvinfo		= otx2_get_drvinfo,
+@@ -1243,69 +1410,12 @@ static struct ethtool_ops otx2_ethtool_ops = {
+ 	.set_fecparam		= otx2_set_fecparam,
+ 	.get_module_info	= otx2_get_module_info,
+ 	.get_module_eeprom	= otx2_get_module_eeprom,
++	.get_priv_flags		= otx2_get_priv_flags,
++	.set_priv_flags		= otx2_set_priv_flags,
+ };
+ 
+-static int otx2_set_priv_flags(struct net_device *netdev, u32 priv_flags)
+-{
+-	struct otx2_nic *pfvf = netdev_priv(netdev);
+-	struct cgx_phy_mod_type *req, *rsp;
+-	int rc = 0;
+-
+-	otx2_mbox_lock(&pfvf->mbox);
+-	req = otx2_mbox_alloc_msg_cgx_set_phy_mod_type(&pfvf->mbox);
+-	if (!req) {
+-		rc = -EAGAIN;
+-		goto end;
+-	}
+-	req->mod = priv_flags & OTX2_PRIV_FLAGS_PAM4;
+-	rc = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (rc)
+-		goto end;
+-
+-	rsp = (struct cgx_phy_mod_type *)otx2_mbox_get_rsp(&pfvf->mbox.mbox, 0,
+-							   &req->hdr);
+-	if (IS_ERR(rsp)) {
+-		rc = PTR_ERR(rsp);
+-		goto end;
+-	}
+-	if (rsp->hdr.rc) {
+-		rc = rsp->hdr.rc;
+-		goto end;
+-	}
+-
+-end:	otx2_mbox_unlock(&pfvf->mbox);
+-	return rc;
+-}
+-
+-static u32 otx2_get_priv_flags(struct net_device *netdev)
+-{
+-	struct otx2_nic *pfvf = netdev_priv(netdev);
+-	struct cgx_fw_data *rsp;
+-	u32 priv_flags = 0;
+-
+-	rsp = otx2_get_fwdata(pfvf);
+-
+-	if (IS_ERR(rsp))
+-		return 0;
+-
+-	if (rsp->fwdata.phy.mod_type)
+-		priv_flags |= OTX2_PRIV_FLAGS_PAM4;
+-
+-	return priv_flags;
+-}
+-
+ void otx2_set_ethtool_ops(struct net_device *netdev)
+ {
+-	struct otx2_nic *pfvf = netdev_priv(netdev);
+-	struct cgx_fw_data *rsp;
+-
+-	rsp = otx2_get_fwdata(pfvf);
+-
+-	if (!IS_ERR(rsp) && rsp->fwdata.phy.can_change_mod_type) {
+-		otx2_ethtool_ops.set_priv_flags = otx2_set_priv_flags;
+-		otx2_ethtool_ops.get_priv_flags = otx2_get_priv_flags;
+-	}
+-
+ 	netdev->ethtool_ops = &otx2_ethtool_ops;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index c82786e1cfed..e685245e0ddf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1477,7 +1477,8 @@ static netdev_tx_t otx2_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	struct netdev_queue *txq = netdev_get_tx_queue(netdev, qidx);
+ 
+ 	/* Check for minimum and maximum packet length */
+-	if (skb->len <= ETH_HLEN || (skb->len > netdev->mtu + OTX2_ETH_HLEN)) {
++	if (skb->len <= ETH_HLEN ||
++	    (!skb_shinfo(skb)->gso_size && skb->len > pf->max_frs)) {
+ 		dev_kfree_skb(skb);
+ 		return NETDEV_TX_OK;
+ 	}
+@@ -1644,6 +1645,11 @@ int otx2_open(struct net_device *netdev)
+ 		otx2_config_hw_rx_tstamp(pf, true);
+ 	}
+ 
++	/* Set NPC parsing mode */
++	err = otx2_set_npc_parse_mode(pf);
++	if (err)
++		goto err_free_cints;
++
+ 	err = otx2_rxtx_enable(pf, true);
+ 	if (err)
+ 		goto err_free_cints;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 37885d9eeea8..75a8789efd32 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -345,6 +345,7 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 				 */
+ 				if (parse->laptr)
+ 					otx2_set_rxtstamp(pfvf, skb);
++				skb_pull(skb, pfvf->xtra_hdr);
+ 			} else {
+ 				otx2_skb_add_frag(pfvf, skb, *iova, len);
+ 			}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 2317bfe5a605..6bc5487581c1 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -400,8 +400,9 @@ static netdev_tx_t otx2vf_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	struct otx2_snd_queue *sq;
+ 	struct netdev_queue *txq;
+ 
+-	/* Check for minimum packet length */
+-	if (skb->len <= ETH_HLEN) {
++	/* Check for minimum and maximum packet length */
++	if (skb->len <= ETH_HLEN ||
++	    (!skb_shinfo(skb)->gso_size && skb->len > vf->max_frs)) {
+ 		dev_kfree_skb(skb);
+ 		return NETDEV_TX_OK;
+ 	}
+-- 
+2.31.1
+

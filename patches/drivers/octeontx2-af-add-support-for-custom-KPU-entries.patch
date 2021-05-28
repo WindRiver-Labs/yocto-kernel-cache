@@ -1,0 +1,686 @@
+From 9a9c0c70d937cfde0aed87bfe14128f9688c2b46 Mon Sep 17 00:00:00 2001
+From: Stanislaw Kardach <skardach@marvell.com>
+Date: Mon, 3 Feb 2020 17:20:07 +0100
+Subject: [PATCH 474/767] octeontx2-af: add support for custom KPU entries
+
+commit 1c9f7fde52aa0c9315f00bef0cc7add7cce51238 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Add ability to load a set of custom KPU entries via firmware APIs. This
+allows for flexible support for custom protocol parsing.
+
+New module parameter is added: kpu_profile. It specifies the name of the
+firmware binary containing the KPU entries and compatible MKEX profile.
+
+AF driver will attempt to load the profile from the firmware file and
+verify if it can fit hardware capabilities. If not, it will revert to
+the built-in profile.
+
+Next it will replace the first KPU_MAX_CST_LT (2) entries in each KPU
+in default profile with entries read from the firmware image.
+The built-in profile should always contain KPU_MAX_CSR_LT first no-match
+entries and AF driver will disable those in the KPU unless custom
+profile is loaded.
+
+Similarly with MKEX profile, the order of load priority is as follows:
+
+1. Profile in loaded KPU profile.
+2. Profile defined by mkex_profile parameter.
+3. Built-in MKEX profile.
+
+Firmware image contains also a list of default protocol overrides to
+allow for custom protocols to be used there.
+
+Change-Id: I5e25485c9ac40edce4bf342740c712688fb4f266
+Signed-off-by: Stanislaw Kardach <skardach@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/17297
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Kevin Hao <kexin.hao@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |  40 +++++-
+ .../marvell/octeontx2/af/npc_profile.h        |  90 +++++++++++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |   6 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   4 +
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 130 +++++++++++++++++-
+ 5 files changed, 263 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index 64a9f9e9f81f..2da1af8e06c7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -159,7 +159,7 @@ struct npc_kpu_profile_cam {
+ 	u16 dp1_mask;
+ 	u16 dp2;
+ 	u16 dp2_mask;
+-};
++} __packed;
+ 
+ struct npc_kpu_profile_action {
+ 	u8 errlev;
+@@ -179,7 +179,7 @@ struct npc_kpu_profile_action {
+ 	u8 mask;
+ 	u8 right;
+ 	u8 shift;
+-};
++} __packed;
+ 
+ struct npc_kpu_profile {
+ 	int cam_entries;
+@@ -364,6 +364,15 @@ struct npc_mcam_kex {
+ 	u64 intf_ld_flags[NPC_MAX_INTF][NPC_MAX_LD][NPC_MAX_LFL];
+ } __packed;
+ 
++struct npc_kpu_fwdata {
++	int	entries;
++	/* What follows is:
++	 * struct npc_kpu_profile_cam[entries];
++	 * struct npc_kpu_profile_action[entries];
++	 */
++	u8	data[0];
++} __packed;
++
+ struct npc_lt_def {
+ 	u8	ltype_mask;
+ 	u8	ltype_match;
+@@ -397,6 +406,33 @@ struct npc_lt_def_cfg {
+ 	struct npc_lt_def	pck_iip4;
+ } __packed;
+ 
++/* Loadable KPU profile firmware data */
++struct npc_kpu_profile_fwdata {
++#define KPU_SIGN	0x00666f727075706b
++#define KPU_NAME_LEN	32
++/** Maximum number of custom KPU entries supported by the built-in profile. */
++#define KPU_MAX_CST_ENT	2
++	/* KPU Profle Header */
++	u64	signature; /* "kpuprof\0" (8 bytes/ASCII characters) */
++	u8	name[KPU_NAME_LEN]; /* KPU Profile name */
++	u64	version; /* KPU profile version */
++	u8	kpus;
++	u8	reserved[7];
++
++	/* Default MKEX profile to be used with this KPU profile. May be
++	 * overridden with mkex_profile module parameter. Format is same as for
++	 * the MKEX profile to streamline processing.
++	 */
++	struct npc_mcam_kex	mkex;
++	/* LTYPE values for specific HW offloaded protocols. */
++	struct npc_lt_def_cfg	lt_def;
++	/* Dynamically sized data:
++	 *  Custom KPU CAM and ACTION configuration entries.
++	 * struct npc_kpu_fwdata kpu[kpus];
++	 */
++	u8	data[0];
++} __packed;
++
+ struct rvu_npc_mcam_rule {
+ 	struct flow_msg packet;
+ 	struct flow_msg mask;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h b/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
+index 7837daa3300d..f02181ab039a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
+@@ -11,7 +11,10 @@
+ #ifndef NPC_PROFILE_H
+ #define NPC_PROFILE_H
+ 
+-#define NPC_KPU_PROFILE_VER    0x0000000100050000
++#define NPC_KPU_PROFILE_VER	0x0000000100050000
++#define NPC_KPU_VER_MAJ(ver)	(u16)(((ver) >> 32) & 0xFFFF)
++#define NPC_KPU_VER_MIN(ver)	(u16)(((ver) >> 16) & 0xFFFF)
++#define NPC_KPU_VER_PATCH(ver)	(u16)((ver) & 0xFFFF)
+ 
+ #define NPC_IH_W		0x8000
+ #define NPC_IH_UTAG		0x2000
+@@ -424,6 +427,27 @@ enum NPC_ERRLEV_E {
+ 	NPC_ERRLEV_ENUM_LAST = 16,
+ };
+ 
++#define NPC_KPU_NOP_CAM		\
++	{			\
++		NPC_S_NA, 0xff,	\
++		0x0000,		\
++		0x0000,		\
++		0x0000,		\
++		0x0000,		\
++		0x0000,		\
++		0x0000,		\
++	}
++
++#define NPC_KPU_NOP_ACTION			\
++	{					\
++		NPC_ERRLEV_RE, NPC_EC_NOERR,	\
++		0, 0, 0, 0, 0,			\
++		NPC_S_NA, 0, 0,			\
++		NPC_LID_LA, NPC_LT_NA,		\
++		0,				\
++		0, 0, 0, 0,			\
++	}
++
+ static struct npc_kpu_profile_action ikpu_action_entries[] = {
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+@@ -1004,6 +1028,8 @@ static struct npc_kpu_profile_action ikpu_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU1_ETHER, 0xff,
+ 		NPC_ETYPE_IP,
+@@ -1673,6 +1699,8 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu2_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU2_CTAG, 0xff,
+ 		NPC_ETYPE_IP,
+@@ -2801,6 +2829,8 @@ static struct npc_kpu_profile_cam kpu2_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu3_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU3_CTAG, 0xff,
+ 		NPC_ETYPE_IP,
+@@ -3920,6 +3950,8 @@ static struct npc_kpu_profile_cam kpu3_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu4_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU4_MPLS, 0xff,
+ 		NPC_MPLS_S,
+@@ -4013,6 +4045,8 @@ static struct npc_kpu_profile_cam kpu4_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu5_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU5_IP, 0xff,
+ 		0x0000,
+@@ -4583,6 +4617,8 @@ static struct npc_kpu_profile_cam kpu5_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu6_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU6_IP6_EXT, 0xff,
+ 		0x0000,
+@@ -4928,6 +4964,8 @@ static struct npc_kpu_profile_cam kpu6_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu7_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU7_IP6_EXT, 0xff,
+ 		0x0000,
+@@ -5147,6 +5185,8 @@ static struct npc_kpu_profile_cam kpu7_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu8_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU8_TCP, 0xff,
+ 		0x0000,
+@@ -5879,6 +5919,8 @@ static struct npc_kpu_profile_cam kpu8_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu9_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU9_TU_MPLS_IN_GRE, 0xff,
+ 		NPC_MPLS_S,
+@@ -6341,6 +6383,8 @@ static struct npc_kpu_profile_cam kpu9_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu10_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU10_TU_MPLS, 0xff,
+ 		NPC_MPLS_S,
+@@ -6506,6 +6550,8 @@ static struct npc_kpu_profile_cam kpu10_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu11_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU11_TU_ETHER, 0xff,
+ 		NPC_ETYPE_IP,
+@@ -6815,6 +6861,8 @@ static struct npc_kpu_profile_cam kpu11_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu12_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU12_TU_IP, 0xff,
+ 		NPC_IPNH_TCP,
+@@ -7070,6 +7118,8 @@ static struct npc_kpu_profile_cam kpu12_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu13_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU13_TU_IP6_EXT, 0xff,
+ 		0x0000,
+@@ -7082,6 +7132,8 @@ static struct npc_kpu_profile_cam kpu13_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu14_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU14_TU_IP6_EXT, 0xff,
+ 		0x0000,
+@@ -7094,6 +7146,8 @@ static struct npc_kpu_profile_cam kpu14_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu15_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU15_TU_TCP, 0xff,
+ 		0x0000,
+@@ -7295,6 +7349,8 @@ static struct npc_kpu_profile_cam kpu15_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_cam kpu16_cam_entries[] = {
++	NPC_KPU_NOP_CAM,
++	NPC_KPU_NOP_CAM,
+ 	{
+ 		NPC_S_KPU16_TCP_DATA, 0xff,
+ 		0x0000,
+@@ -7352,6 +7408,8 @@ static struct npc_kpu_profile_cam kpu16_cam_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu1_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 0, 6, 3, 0,
+@@ -7969,6 +8027,8 @@ static struct npc_kpu_profile_action kpu1_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu2_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 0, 6, 2, 0,
+@@ -8972,6 +9032,8 @@ static struct npc_kpu_profile_action kpu2_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu3_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 0, 6, 1, 0,
+@@ -9967,6 +10029,8 @@ static struct npc_kpu_profile_action kpu3_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu4_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 0,
+@@ -10050,6 +10114,8 @@ static struct npc_kpu_profile_action kpu4_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu5_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_LC, NPC_EC_IP_TTL_0,
+ 		0, 0, 0, 0, 1,
+@@ -10557,6 +10623,8 @@ static struct npc_kpu_profile_action kpu5_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu6_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 1,
+@@ -10864,6 +10932,8 @@ static struct npc_kpu_profile_action kpu6_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu7_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 1,
+@@ -11059,6 +11129,8 @@ static struct npc_kpu_profile_action kpu7_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu8_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_LD, NPC_EC_TCP_FLAGS_FIN_ONLY,
+ 		0, 0, 0, 0, 1,
+@@ -11710,6 +11782,8 @@ static struct npc_kpu_profile_action kpu8_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu9_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 0,
+@@ -12121,6 +12195,8 @@ static struct npc_kpu_profile_action kpu9_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu10_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 0, 6, 1, 0,
+@@ -12268,6 +12344,8 @@ static struct npc_kpu_profile_action kpu10_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu11_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 0, 6, 0, 0,
+@@ -12543,6 +12621,8 @@ static struct npc_kpu_profile_action kpu11_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu12_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		2, 12, 0, 2, 0,
+@@ -12770,6 +12850,8 @@ static struct npc_kpu_profile_action kpu12_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu13_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 1,
+@@ -12781,6 +12863,8 @@ static struct npc_kpu_profile_action kpu13_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu14_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 1,
+@@ -12792,6 +12876,8 @@ static struct npc_kpu_profile_action kpu14_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu15_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_LG, NPC_EC_TCP_FLAGS_FIN_ONLY,
+ 		0, 0, 0, 0, 1,
+@@ -12971,6 +13057,8 @@ static struct npc_kpu_profile_action kpu15_action_entries[] = {
+ };
+ 
+ static struct npc_kpu_profile_action kpu16_action_entries[] = {
++	NPC_KPU_NOP_ACTION,
++	NPC_KPU_NOP_ACTION,
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 1,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 9418b61ef862..33de5da3d4ce 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -57,6 +57,10 @@ static char *mkex_profile; /* MKEX profile name */
+ module_param(mkex_profile, charp, 0000);
+ MODULE_PARM_DESC(mkex_profile, "MKEX profile name string");
+ 
++static char *kpu_profile; /* KPU profile name */
++module_param(kpu_profile, charp, 0000);
++MODULE_PARM_DESC(kpu_profile, "KPU profile name string");
++
+ static void rvu_setup_hw_capabilities(struct rvu *rvu)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
+@@ -2758,6 +2762,8 @@ static void rvu_update_module_params(struct rvu *rvu)
+ 
+ 	strscpy(rvu->mkex_pfl_name,
+ 		mkex_profile ? mkex_profile : default_pfl_name, MKEX_NAME_LEN);
++	strscpy(rvu->kpu_pfl_name,
++		kpu_profile ? kpu_profile : default_pfl_name, KPU_NAME_LEN);
+ }
+ 
+ static int rvu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 344af21be5a5..b0383074f6d3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -15,6 +15,7 @@
+ #include "rvu_struct.h"
+ #include "common.h"
+ #include "mbox.h"
++#include "npc.h"
+ #include "rvu_validation.h"
+ 
+ /* PCI device IDs */
+@@ -463,9 +464,12 @@ struct rvu {
+ 	struct mutex		cgx_cfg_lock; /* serialize cgx configuration */
+ 
+ 	char mkex_pfl_name[MKEX_NAME_LEN]; /* Configured MKEX profile name */
++	char kpu_pfl_name[KPU_NAME_LEN]; /* Configured KPU profile name */
+ 
+ 	/* Firmware data */
+ 	struct rvu_fwdata	*fwdata;
++	void			*kpu_fwdata;
++	size_t			kpu_fwdata_sz;
+ 
+ 	/* NPC KPU data */
+ 	struct npc_kpu_profile_adapter kpu;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 3800c364c44b..eda1fb53529b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -11,6 +11,8 @@
+ #include <linux/bitfield.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
++#include <linux/firmware.h>
++#include <linux/stddef.h>
+ 
+ #include "rvu_struct.h"
+ #include "rvu_reg.h"
+@@ -939,11 +941,13 @@ static void npc_load_mkex_profile(struct rvu *rvu, int blkaddr,
+ 	u64 prfl_sz;
+ 
+ 	/* Order of precedence (high to low):
+-	 * 1. Via mkex_profile, loaded from ATF.
+-	 * 2. Built-in KEX profile from npc_mkex_default.
++	 * 1. Embedded in custom KPU profile firmware via kpu_profile param.
++	 * 2. Via mkex_profile, loaded from ATF if KPU profile wasn't loaded.
++	 * 3. Built-in KEX profile from npc_mkex_default.
+ 	 */
+ 	/* If user not selected mkex profile */
+-	if (!strncmp(mkex_profile, def_pfl_name, MKEX_NAME_LEN))
++	if (rvu->kpu_fwdata_sz ||
++	    !strncmp(mkex_profile, def_pfl_name, MKEX_NAME_LEN))
+ 		goto program_mkex;
+ 
+ 	if (!rvu->fwdata)
+@@ -1057,6 +1061,7 @@ static void npc_program_kpu_profile(struct rvu *rvu, int blkaddr, int kpu,
+ 				    struct npc_kpu_profile *profile)
+ {
+ 	int entry, num_entries, max_entries;
++	u64 entry_mask;
+ 
+ 	if (profile->cam_entries != profile->action_entries) {
+ 		dev_err(rvu->dev,
+@@ -1080,8 +1085,12 @@ static void npc_program_kpu_profile(struct rvu *rvu, int blkaddr, int kpu,
+ 
+ 	/* Enable all programmed entries */
+ 	num_entries = min_t(int, profile->action_entries, profile->cam_entries);
++	entry_mask = enable_mask(num_entries);
++	/* Disable first KPU_MAX_CST_ENT entries for built-in profile */
++	if (!rvu->kpu.custom)
++		entry_mask |= GENMASK_ULL(KPU_MAX_CST_ENT - 1, 0);
+ 	rvu_write64(rvu, blkaddr,
+-		    NPC_AF_KPUX_ENTRY_DISX(kpu, 0), enable_mask(num_entries));
++		    NPC_AF_KPUX_ENTRY_DISX(kpu, 0), entry_mask);
+ 	if (num_entries > 64) {
+ 		rvu_write64(rvu, blkaddr,
+ 			    NPC_AF_KPUX_ENTRY_DISX(kpu, 1),
+@@ -1107,10 +1116,122 @@ static int npc_prepare_default_kpu(struct npc_kpu_profile_adapter *profile)
+ 	return 0;
+ }
+ 
++static int npc_apply_custom_kpu(struct rvu *rvu,
++				struct npc_kpu_profile_adapter *profile)
++{
++	size_t hdr_sz = sizeof(struct npc_kpu_profile_fwdata), offset = 0;
++	struct npc_kpu_profile_fwdata *fw = rvu->kpu_fwdata;
++	struct npc_kpu_profile_action *action;
++	struct npc_kpu_profile_cam *cam;
++	struct npc_kpu_fwdata *fw_kpu;
++	int entries;
++	u16 kpu, entry;
++
++	if (rvu->kpu_fwdata_sz < hdr_sz) {
++		dev_warn(rvu->dev, "Invalid KPU profile size\n");
++		return -EINVAL;
++	}
++	if (le64_to_cpu(fw->signature) != KPU_SIGN) {
++		dev_warn(rvu->dev, "Invalid KPU profile signature %llx\n",
++			 fw->signature);
++		return -EINVAL;
++	}
++	profile->custom = 1;
++	profile->name = fw->name;
++	profile->version = le64_to_cpu(fw->version);
++	profile->mkex = &fw->mkex;
++
++	/* Verify if the using known profile structure */
++	if (NPC_KPU_VER_MAJ(profile->version) >
++	    NPC_KPU_VER_MAJ(NPC_KPU_PROFILE_VER)) {
++		dev_warn(rvu->dev, "Not supported Major version: %d > %d\n",
++			 NPC_KPU_VER_MAJ(profile->version),
++			 NPC_KPU_VER_MAJ(NPC_KPU_PROFILE_VER));
++		return -EINVAL;
++	}
++	/* Verify if profile fits the HW */
++	if (fw->kpus > profile->kpus) {
++		dev_warn(rvu->dev, "Not enough KPUs: %d > %d\n", fw->kpus,
++			 profile->kpus);
++		return -EINVAL;
++	}
++	/* Update adapter structure and ensure endianness where needed. */
++	profile->lt_def = &fw->lt_def;
++
++	for (kpu = 0; kpu < fw->kpus; kpu++) {
++		fw_kpu = (struct npc_kpu_fwdata *)(fw->data + offset);
++		if (fw_kpu->entries > KPU_MAX_CST_ENT)
++			dev_warn(rvu->dev,
++				 "Too many custom entries on KPU%d: %d > %d\n",
++				 kpu, fw_kpu->entries, KPU_MAX_CST_ENT);
++		entries = min(fw_kpu->entries, KPU_MAX_CST_ENT);
++		cam = (struct npc_kpu_profile_cam *)fw_kpu->data;
++		offset += sizeof(*fw_kpu) + fw_kpu->entries * sizeof(*cam);
++		action = (struct npc_kpu_profile_action *)(fw->data + offset);
++		offset += fw_kpu->entries * sizeof(*action);
++		if (rvu->kpu_fwdata_sz < hdr_sz + offset) {
++			dev_warn(rvu->dev,
++				 "Profile size mismatch on KPU%i parsing.\n",
++				 kpu + 1);
++			return -EINVAL;
++		}
++		/* Fix endianness and update */
++		for (entry = 0; entry < entries; entry++) {
++			cam[entry].dp0 = le16_to_cpu(cam[entry].dp0);
++			cam[entry].dp0_mask = le16_to_cpu(cam[entry].dp0_mask);
++			cam[entry].dp1 = le16_to_cpu(cam[entry].dp1);
++			cam[entry].dp1_mask = le16_to_cpu(cam[entry].dp1_mask);
++			cam[entry].dp2 = le16_to_cpu(cam[entry].dp2);
++			cam[entry].dp2_mask = le16_to_cpu(cam[entry].dp2_mask);
++			profile->kpu[kpu].cam[entry] = cam[entry];
++			profile->kpu[kpu].action[entry] = action[entry];
++		}
++	}
++
++	return 0;
++}
++
+ static void npc_load_kpu_profile(struct rvu *rvu)
+ {
+ 	struct npc_kpu_profile_adapter *profile = &rvu->kpu;
++	const char *kpu_profile = rvu->kpu_pfl_name;
++	const struct firmware *fw = NULL;
++
++	/* If user not specified profile customization */
++	if (!strncmp(kpu_profile, def_pfl_name, KPU_NAME_LEN))
++		goto revert_to_default;
++	/* First prepare default KPU, then we'll customize top entries. */
++	npc_prepare_default_kpu(profile);
++
++	dev_info(rvu->dev, "Loading KPU profile from firmware: %s\n",
++		 kpu_profile);
++	if (!request_firmware(&fw, kpu_profile, rvu->dev)) {
++		rvu->kpu_fwdata = kzalloc(fw->size, GFP_KERNEL);
++		if (rvu->kpu_fwdata) {
++			memcpy(rvu->kpu_fwdata, fw->data, fw->size);
++			rvu->kpu_fwdata_sz = fw->size;
++		}
++	}
++	release_firmware(fw);
++
++	/* Apply profile customization if firmware was loaded. */
++	if (!rvu->kpu_fwdata_sz || npc_apply_custom_kpu(rvu, profile)) {
++		dev_warn(rvu->dev,
++			 "Can't load KPU profile %s. Using default.\n",
++			 kpu_profile);
++		kfree(rvu->kpu_fwdata);
++		rvu->kpu_fwdata = NULL;
++		goto revert_to_default;
++	}
++
++	dev_info(rvu->dev, "Using custom profile '%s', version %d.%d.%d\n",
++		 profile->name, NPC_KPU_VER_MAJ(profile->version),
++		 NPC_KPU_VER_MIN(profile->version),
++		 NPC_KPU_VER_PATCH(profile->version));
++
++	return;
+ 
++revert_to_default:
+ 	npc_prepare_default_kpu(profile);
+ }
+ 
+@@ -1395,6 +1516,7 @@ void rvu_npc_freemem(struct rvu *rvu)
+ 
+ 	kfree(pkind->rsrc.bmap);
+ 	kfree(mcam->counters.bmap);
++	kfree(rvu->kpu_fwdata);
+ 	mutex_destroy(&mcam->lock);
+ }
+ 
+-- 
+2.31.1
+
