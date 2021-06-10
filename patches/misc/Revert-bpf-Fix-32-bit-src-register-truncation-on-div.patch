@@ -1,0 +1,100 @@
+From c84d0a471f27fc66d1b6267867fad1127193efc7 Mon Sep 17 00:00:00 2001
+From: Ovidiu Panait <ovidiu.panait@windriver.com>
+Date: Mon, 7 Jun 2021 11:01:25 +0000
+Subject: [PATCH 2/3] Revert "bpf: Fix 32 bit src register truncation on
+ div/mod"
+
+This reverts commit ee13a698f128a32d2a86c1d0c9052e6dda511d13.
+
+Revert this patchset as it introduced the following test_verifier kernel oops:
+$ ./test_verifier
+ #0/u add+sub+mul OK
+ #0/p add+sub+mul OK
+ #1/u DIV32 by 0, zero check 1 OK
+BPF interpreter: unknown opcode 56
+------------[ cut here ]------------
+kernel BUG at kernel/bpf/core.c:1395!
+invalid opcode: 0000 [#1] PREEMPT SMP PTI
+CPU: 0 PID: 306 Comm: test_verifier Not tainted 4.18.45-yocto-standard #1
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1ubuntu1 04/01/2014
+RIP: 0010:___bpf_prog_run+0xf32/0xf40
+Code: 57 f9 ff ff 0f b6 43 01 83 e0 0f 49 8d 54 c5 00 48 8b 02 48 0f c8 48 89 02 e9 3d f9 ff ff 48 c7 c7 48 09 8e b0 e8 d1 92 f6 ff <0f> 0b 66 66 2e 0f 1f 84 00 00 00 00 00 90 0f 1f 44 00 00 55 48 89
+RSP: 0018:ffffab6640b03cf8 EFLAGS: 00010246
+RAX: 0000000000000022 RBX: ffffab66406e1050 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: ffffffffb08e266e RDI: 00000000ffffffff
+RBP: ffffab6640b03d18 R08: 00000000000001f1 R09: 0000000000000007
+R10: 0000000000000000 R11: 0000000000000000 R12: 0000000000000000
+R13: ffffab6640b03d48 R14: ffffffffb061d040 R15: ffff88e379173700
+FS:  00007fe1ddff8100(0000) GS:ffff88e37fc00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 000055bd0b28fff8 CR3: 0000000134130006 CR4: 0000000000160ef0
+Call Trace:
+ __bpf_prog_run32+0x42/0x60
+ ? fd_install+0x25/0x30
+ ? ktime_get+0x3c/0xa0
+ ? preempt_count_add+0x5e/0xd0
+ bpf_test_run+0x9c/0x110
+ bpf_prog_test_run_skb+0x17a/0x2a0
+ __se_sys_bpf+0xdbb/0x1540
+ __x64_sys_bpf+0x1a/0x20
+ do_syscall_64+0x4d/0x110
+ entry_SYSCALL_64_after_hwframe+0x44/0xa9
+RIP: 0033:0x7fe1de103389
+...
+
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+---
+ kernel/bpf/verifier.c | 28 +++++++++++++++-------------
+ 1 file changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 1391cbb30840..8a8d78a9e0d8 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -5933,28 +5933,30 @@ static int fixup_bpf_calls(struct bpf_verifier_env *env)
+ 		    insn->code == (BPF_ALU | BPF_MOD | BPF_X) ||
+ 		    insn->code == (BPF_ALU | BPF_DIV | BPF_X)) {
+ 			bool is64 = BPF_CLASS(insn->code) == BPF_ALU64;
+-			bool isdiv = BPF_OP(insn->code) == BPF_DIV;
+-			struct bpf_insn *patchlet;
+-			struct bpf_insn chk_and_div[] = {
++			struct bpf_insn mask_and_div[] = {
++				BPF_MOV32_REG(insn->src_reg, insn->src_reg),
+ 				/* Rx div 0 -> 0 */
+-				BPF_RAW_INSN((is64 ? BPF_JMP : BPF_JMP32) |
+-					     BPF_JNE | BPF_K, insn->src_reg,
+-					     0, 2, 0),
++				BPF_JMP_IMM(BPF_JNE, insn->src_reg, 0, 2),
+ 				BPF_ALU32_REG(BPF_XOR, insn->dst_reg, insn->dst_reg),
+ 				BPF_JMP_IMM(BPF_JA, 0, 0, 1),
+ 				*insn,
+ 			};
+-			struct bpf_insn chk_and_mod[] = {
++			struct bpf_insn mask_and_mod[] = {
++				BPF_MOV32_REG(insn->src_reg, insn->src_reg),
+ 				/* Rx mod 0 -> Rx */
+-				BPF_RAW_INSN((is64 ? BPF_JMP : BPF_JMP32) |
+-					     BPF_JEQ | BPF_K, insn->src_reg,
+-					     0, 1, 0),
++				BPF_JMP_IMM(BPF_JEQ, insn->src_reg, 0, 1),
+ 				*insn,
+ 			};
++			struct bpf_insn *patchlet;
+ 
+-			patchlet = isdiv ? chk_and_div : chk_and_mod;
+-			cnt = isdiv ? ARRAY_SIZE(chk_and_div) :
+-				      ARRAY_SIZE(chk_and_mod);
++			if (insn->code == (BPF_ALU64 | BPF_DIV | BPF_X) ||
++			    insn->code == (BPF_ALU | BPF_DIV | BPF_X)) {
++				patchlet = mask_and_div + (is64 ? 1 : 0);
++				cnt = ARRAY_SIZE(mask_and_div) - (is64 ? 1 : 0);
++			} else {
++				patchlet = mask_and_mod + (is64 ? 1 : 0);
++				cnt = ARRAY_SIZE(mask_and_mod) - (is64 ? 1 : 0);
++			}
+ 
+ 			new_prog = bpf_patch_insn_data(env, i + delta, patchlet, cnt);
+ 			if (!new_prog)
+-- 
+2.31.1
+
