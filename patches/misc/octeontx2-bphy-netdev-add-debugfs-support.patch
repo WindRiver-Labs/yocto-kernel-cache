@@ -1,0 +1,838 @@
+From 5b454246705e66d12bc7b3ffa269c4c5afabe3eb Mon Sep 17 00:00:00 2001
+From: Baha Mesleh <baha.mesleh@nokia.com>
+Date: Mon, 12 Jul 2021 10:42:20 +0530
+Subject: [PATCH 12/13] octeontx2-bphy-netdev: add debugfs support
+
+commit c24b91d99dacac280a62603641f81251d0a438a8 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Add debugfs support to dump the information such as
+last tx jiffies, last rx jiffies, psm queue space etc.
+
+Change-Id: I7913d76ae886bf81854078c35817f1684aa3d171
+Signed-off-by: Baha Mesleh <baha.mesleh@nokia.com>
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/57306
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/bphy/Makefile  |   2 +-
+ .../octeontx2/bphy/otx2_bphy_debugfs.c        | 165 ++++++++++++++++
+ .../octeontx2/bphy/otx2_bphy_debugfs.h        |  31 +++
+ .../marvell/octeontx2/bphy/otx2_bphy_main.c   |   5 +
+ .../marvell/octeontx2/bphy/otx2_cpri.c        |  97 +++++++++
+ .../marvell/octeontx2/bphy/otx2_cpri.h        |   5 +
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        | 186 ++++++++++++++++--
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        |   9 +
+ 8 files changed, 484 insertions(+), 16 deletions(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.c
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.h
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile b/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile
+index 2877230405b0..8cadc0ec9113 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/Makefile
+@@ -8,4 +8,4 @@ obj-$(CONFIG_OCTEONTX2_BPHY_RFOE_NETDEV) += octeontx2_bphy_netdev.o
+ #EXTRA_CFLAGS += -DDEBUG
+ 
+ octeontx2_bphy_netdev-y := otx2_bphy_main.o otx2_rfoe.o otx2_rfoe_ethtool.o otx2_rfoe_ptp.o \
+-				otx2_cpri.o otx2_cpri_ethtool.o
++				otx2_cpri.o otx2_cpri_ethtool.o otx2_bphy_debugfs.o
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.c
+new file mode 100644
+index 000000000000..a2d03352c89d
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 BPHY RFOE/CPRI Ethernet Driver
++ *
++ * Copyright (C) 2021 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/debugfs.h>
++
++#include "otx2_bphy_debugfs.h"
++#include "otx2_bphy.h"
++
++#define OTX2_BPHY_DEBUGFS_MODE 0400
++
++struct otx2_bphy_debugfs_reader_info {
++	atomic_t			refcnt;
++	size_t				buffer_size;
++	void				*priv;
++	otx2_bphy_debugfs_reader	reader;
++	struct dentry			*entry;
++	char				buffer[1];
++};
++
++static struct dentry *otx2_bphy_debugfs;
++
++static int otx2_bphy_debugfs_open(struct inode *inode, struct file *file);
++
++static int otx2_bphy_debugfs_release(struct inode *inode, struct file *file);
++
++static ssize_t otx2_bphy_debugfs_read(struct file *file, char __user *buffer,
++				      size_t count, loff_t *offset);
++
++static const struct file_operations otx2_bphy_debugfs_foper = {
++	.owner		= THIS_MODULE,
++	.open		= otx2_bphy_debugfs_open,
++	.release	= otx2_bphy_debugfs_release,
++	.read		= otx2_bphy_debugfs_read,
++};
++
++void __init otx2_bphy_debugfs_init(void)
++{
++	otx2_bphy_debugfs = debugfs_create_dir(DRV_NAME, NULL);
++	if (!otx2_bphy_debugfs)
++		pr_info("%s: debugfs is not enabled\n", DRV_NAME);
++}
++
++void *otx2_bphy_debugfs_add_file(const char *name,
++				 size_t buffer_size,
++				 void *priv,
++				 otx2_bphy_debugfs_reader reader)
++{
++	struct otx2_bphy_debugfs_reader_info *info = NULL;
++	size_t total_size = 0;
++
++	if (!otx2_bphy_debugfs) {
++		pr_info("%s: debugfs not enabled, ignoring %s\n", DRV_NAME,
++			name);
++		goto out;
++	}
++
++	total_size = buffer_size +
++		offsetof(struct otx2_bphy_debugfs_reader_info,
++			 buffer);
++
++	info = kzalloc(total_size, GFP_KERNEL);
++
++	if (!info)
++		goto out;
++
++	info->buffer_size = buffer_size;
++	info->priv = priv;
++	info->reader = reader;
++
++	atomic_set(&info->refcnt, 0);
++
++	info->entry = debugfs_create_file(name, OTX2_BPHY_DEBUGFS_MODE,
++					  otx2_bphy_debugfs, info,
++					  &otx2_bphy_debugfs_foper);
++
++	if (!info->entry) {
++		pr_err("%s: debugfs failed to add file %s\n", DRV_NAME, name);
++		kfree(info);
++		info = NULL;
++		goto out;
++	}
++
++	pr_info("%s: debugfs created successfully for %s\n", DRV_NAME, name);
++
++out:
++	return info;
++}
++
++void otx2_bphy_debugfs_remove_file(void *entry)
++{
++	struct otx2_bphy_debugfs_reader_info *info = entry;
++
++	debugfs_remove(info->entry);
++
++	kfree(info);
++}
++
++void __exit otx2_bphy_debugfs_exit(void)
++{
++	debugfs_remove_recursive(otx2_bphy_debugfs);
++}
++
++static int otx2_bphy_debugfs_open(struct inode *inode, struct file *file)
++{
++	struct otx2_bphy_debugfs_reader_info *info = NULL;
++
++	info = inode->i_private;
++
++	if (!atomic_cmpxchg(&info->refcnt, 0, 1)) {
++		file->private_data = info;
++		return 0;
++	}
++
++	return -EBUSY;
++}
++
++static int otx2_bphy_debugfs_release(struct inode *inode, struct file *file)
++{
++	struct otx2_bphy_debugfs_reader_info *info = NULL;
++
++	info = inode->i_private;
++
++	atomic_cmpxchg(&info->refcnt, 1, 0);
++
++	return 0;
++}
++
++static ssize_t otx2_bphy_debugfs_read(struct file *file, char __user *buffer,
++				      size_t count, loff_t *offset)
++{
++	struct otx2_bphy_debugfs_reader_info *info = NULL;
++	ssize_t retval = 0;
++
++	info = file->private_data;
++
++	if (!(*offset))
++		info->reader(&info->buffer[0], info->buffer_size, info->priv);
++
++	if (*offset >= info->buffer_size)
++		goto out;
++
++	if (*offset + count > info->buffer_size)
++		count = info->buffer_size - *offset;
++
++	if (copy_to_user((void __user *)buffer, info->buffer + *offset,
++			 count)) {
++		retval = -EFAULT;
++		goto out;
++	}
++
++	*offset += count;
++	retval = count;
++
++out:
++	return retval;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.h
+new file mode 100644
+index 000000000000..099290565bfa
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_debugfs.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Marvell OcteonTx2 BPHY RFOE/CPRI Ethernet Driver
++ *
++ * Copyright (C) 2021 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/fs.h>
++#include <linux/debugfs.h>
++
++#ifndef _OTX2_BPHY_DEBUGFS_H_
++#define _OTX2_BPHY_DEBUGFS_H_
++
++typedef void (*otx2_bphy_debugfs_reader)(char *buffer, size_t buffer_size,
++					 void *priv);
++
++void otx2_bphy_debugfs_init(void);
++
++void *otx2_bphy_debugfs_add_file(const char *name,
++				 size_t buffer_size,
++				 void *priv,
++				 otx2_bphy_debugfs_reader reader);
++
++void otx2_bphy_debugfs_remove_file(void *entry);
++
++void otx2_bphy_debugfs_exit(void);
++
++#endif
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+index f485ed825bc5..7cea0110424c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+@@ -18,6 +18,7 @@
+ #include "otx2_bphy.h"
+ #include "otx2_rfoe.h"
+ #include "otx2_cpri.h"
++#include "otx2_bphy_debugfs.h"
+ 
+ MODULE_AUTHOR("Marvell International Ltd.");
+ MODULE_DESCRIPTION(DRV_STRING);
+@@ -777,11 +778,15 @@ static int __init otx2_bphy_init(void)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	otx2_bphy_debugfs_init();
++
+ 	return 0;
+ }
+ 
+ static void __exit otx2_bphy_exit(void)
+ {
++	otx2_bphy_debugfs_exit();
++
+ 	platform_driver_unregister(&otx2_bphy_driver);
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
+index 2035031cb3d2..0e575034b25b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "otx2_cpri.h"
++#include "otx2_bphy_debugfs.h"
+ 
+ /*	Theory of Operation
+  *
+@@ -57,6 +58,13 @@
+ /* global driver ctx */
+ struct otx2_cpri_drv_ctx cpri_drv_ctx[OTX2_BPHY_CPRI_MAX_INTF];
+ 
++/* debugfs */
++static void otx2_cpri_debugfs_reader(char *buffer, size_t count, void *priv);
++static const char *otx2_cpri_debugfs_get_formatter(void);
++static size_t otx2_cpri_debugfs_get_buffer_size(void);
++static void otx2_cpri_debugfs_create(struct otx2_cpri_drv_ctx *ctx);
++static void otx2_cpri_debugfs_remove(struct otx2_cpri_drv_ctx *ctx);
++
+ static struct net_device *otx2_cpri_get_netdev(int mhab_id, int lmac_id)
+ {
+ 	struct net_device *netdev = NULL;
+@@ -101,6 +109,7 @@ void otx2_bphy_cpri_cleanup(void)
+ 	for (i = 0; i < OTX2_BPHY_CPRI_MAX_INTF; i++) {
+ 		drv_ctx = &cpri_drv_ctx[i];
+ 		if (drv_ctx->valid) {
++			otx2_cpri_debugfs_remove(drv_ctx);
+ 			netdev = drv_ctx->netdev;
+ 			priv = netdev_priv(netdev);
+ 			unregister_netdev(netdev);
+@@ -155,6 +164,7 @@ static int otx2_cpri_process_rx_pkts(struct otx2_cpri_ndev_priv *priv,
+ 			pr_err("CPRI Rx netdev not found, cpri%d lmac%d\n",
+ 			       wqe->mhab_id, wqe->lane_id);
+ 			priv->stats.rx_dropped++;
++			priv->last_rx_dropped_jiffies = jiffies;
+ 			processed_pkts++;
+ 			continue;
+ 		}
+@@ -165,6 +175,7 @@ static int otx2_cpri_process_rx_pkts(struct otx2_cpri_ndev_priv *priv,
+ 				  wqe->mhab_id, wqe->lane_id,
+ 				  ul_cfg->sw_rd_ptr);
+ 			priv2->stats.rx_dropped++;
++			priv2->last_rx_dropped_jiffies = jiffies;
+ 			processed_pkts++;
+ 			continue;
+ 		}
+@@ -174,6 +185,7 @@ static int otx2_cpri_process_rx_pkts(struct otx2_cpri_ndev_priv *priv,
+ 				  netdev->name, priv2->cpri_num,
+ 				  priv2->lmac_id);
+ 			priv2->stats.rx_dropped++;
++			priv2->last_rx_dropped_jiffies = jiffies;
+ 			processed_pkts++;
+ 			continue;
+ 		}
+@@ -194,6 +206,7 @@ static int otx2_cpri_process_rx_pkts(struct otx2_cpri_ndev_priv *priv,
+ 			netif_err(priv2, rx_err, netdev,
+ 				  "CPRI Rx: alloc skb failed\n");
+ 			priv->stats.rx_dropped++;
++			priv->last_rx_dropped_jiffies = jiffies;
+ 			processed_pkts++;
+ 			continue;
+ 		}
+@@ -208,6 +221,8 @@ static int otx2_cpri_process_rx_pkts(struct otx2_cpri_ndev_priv *priv,
+ 		ul_cfg->sw_rd_ptr++;
+ 		if (ul_cfg->sw_rd_ptr == ul_cfg->num_entries)
+ 			ul_cfg->sw_rd_ptr = 0;
++
++		priv2->last_rx_jiffies = jiffies;
+ 	}
+ 
+ 	if (processed_pkts)
+@@ -354,12 +369,14 @@ static netdev_tx_t otx2_cpri_eth_start_xmit(struct sk_buff *skb,
+ 			  netdev->name, priv->cpri_num, priv->lmac_id);
+ 		/* update stats */
+ 		priv->stats.tx_dropped++;
++		priv->last_tx_dropped_jiffies = jiffies;
+ 		goto exit;
+ 	}
+ 
+ 	if (unlikely(!netif_carrier_ok(netdev))) {
+ 		/* update stats */
+ 		priv->stats.tx_dropped++;
++		priv->last_tx_dropped_jiffies = jiffies;
+ 		goto exit;
+ 	}
+ 
+@@ -411,6 +428,8 @@ static netdev_tx_t otx2_cpri_eth_start_xmit(struct sk_buff *skb,
+ 	dl_cfg->sw_wr_ptr++;
+ 	if (dl_cfg->sw_wr_ptr == dl_cfg->num_entries)
+ 		dl_cfg->sw_wr_ptr = 0;
++
++	priv->last_tx_jiffies = jiffies;
+ exit:
+ 	dev_kfree_skb_any(skb);
+ 	spin_unlock_irqrestore(&dl_cfg->lock, flags);
+@@ -608,6 +627,9 @@ int otx2_cpri_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 			drv_ctx->lmac_id = priv->lmac_id;
+ 			drv_ctx->valid = 1;
+ 			drv_ctx->netdev = netdev;
++
++			/* create debugfs entry */
++			otx2_cpri_debugfs_create(drv_ctx);
+ 		}
+ 	}
+ 
+@@ -617,6 +639,7 @@ int otx2_cpri_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 	for (i = 0; i < OTX2_BPHY_CPRI_MAX_INTF; i++) {
+ 		drv_ctx = &cpri_drv_ctx[i];
+ 		if (drv_ctx->valid) {
++			otx2_cpri_debugfs_remove(drv_ctx);
+ 			netdev = drv_ctx->netdev;
+ 			priv = netdev_priv(netdev);
+ 			unregister_netdev(netdev);
+@@ -630,3 +653,77 @@ int otx2_cpri_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 	}
+ 	return ret;
+ }
++
++static void otx2_cpri_debugfs_reader(char *buffer, size_t count, void *priv)
++{
++	struct otx2_cpri_drv_ctx *ctx;
++	struct otx2_cpri_ndev_priv *netdev;
++	u8 queue_stopped, state_up;
++	const char *formatter;
++
++	ctx = priv;
++	netdev = netdev_priv(ctx->netdev);
++	queue_stopped = netif_queue_stopped(ctx->netdev);
++	state_up = netdev->link_state;
++	formatter = otx2_cpri_debugfs_get_formatter();
++
++	snprintf(buffer, count, formatter,
++		 queue_stopped,
++		 state_up,
++		 netdev->last_tx_jiffies,
++		 netdev->last_tx_dropped_jiffies,
++		 netdev->last_rx_jiffies,
++		 netdev->last_rx_dropped_jiffies,
++		 jiffies);
++}
++
++static const char *otx2_cpri_debugfs_get_formatter(void)
++{
++	static const char *buffer_format = "queue-stopped: %u\n"
++					   "state-up: %u\n"
++					   "last-tx-jiffies: %lu\n"
++					   "last-tx-dropped-jiffies: %lu\n"
++					   "last-rx-jiffies: %lu\n"
++					   "last-rx-dropped-jiffies: %lu\n"
++					   "current-jiffies: %lu\n";
++
++	return buffer_format;
++}
++
++static size_t otx2_cpri_debugfs_get_buffer_size(void)
++{
++	static size_t buffer_size;
++
++	if (!buffer_size) {
++		const char *formatter = otx2_cpri_debugfs_get_formatter();
++		u8 max_boolean = 1;
++		unsigned long max_jiffies = (unsigned long)-1;
++
++		buffer_size = snprintf(NULL, 0, formatter,
++				       max_boolean,
++				       max_boolean,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies);
++		++buffer_size;
++	}
++
++	return buffer_size;
++}
++
++static void otx2_cpri_debugfs_create(struct otx2_cpri_drv_ctx *ctx)
++{
++	size_t buffer_size = otx2_cpri_debugfs_get_buffer_size();
++
++	ctx->debugfs = otx2_bphy_debugfs_add_file(ctx->netdev->name,
++						  buffer_size, ctx,
++						  otx2_cpri_debugfs_reader);
++}
++
++static void otx2_cpri_debugfs_remove(struct otx2_cpri_drv_ctx *ctx)
++{
++	if (ctx->debugfs)
++		otx2_bphy_debugfs_remove_file(ctx->debugfs);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
+index 1aadf5c0a647..5a011f7bc9ee 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_cpri.h
+@@ -46,6 +46,7 @@ struct otx2_cpri_drv_ctx {
+ 	u8				cpri_num;
+ 	u8				lmac_id;
+ 	int				valid;
++	void				*debugfs;
+ 	struct net_device               *netdev;
+ };
+ 
+@@ -123,6 +124,10 @@ struct otx2_cpri_ndev_priv {
+ 	spinlock_t			lock;
+ 	int				if_type;
+ 	u8				link_state;
++	unsigned long			last_tx_jiffies;
++	unsigned long			last_rx_jiffies;
++	unsigned long			last_tx_dropped_jiffies;
++	unsigned long			last_rx_dropped_jiffies;
+ };
+ 
+ int otx2_cpri_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index f1d6a19bda32..86405a278eae 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "otx2_rfoe.h"
++#include "otx2_bphy_debugfs.h"
+ 
+ /*	                      Theory of Operation
+  *
+@@ -100,6 +101,13 @@
+ /* global driver ctx */
+ struct otx2_rfoe_drv_ctx rfoe_drv_ctx[RFOE_MAX_INTF];
+ 
++/* debugfs */
++static void otx2_rfoe_debugfs_reader(char *buffer, size_t count, void *priv);
++static const char *otx2_rfoe_debugfs_get_formatter(void);
++static size_t otx2_rfoe_debugfs_get_buffer_size(void);
++static void otx2_rfoe_debugfs_create(struct otx2_rfoe_drv_ctx *ctx);
++static void otx2_rfoe_debugfs_remove(struct otx2_rfoe_drv_ctx *ctx);
++
+ void otx2_rfoe_disable_intf(int rfoe_num)
+ {
+ 	struct otx2_rfoe_drv_ctx *drv_ctx;
+@@ -128,6 +136,7 @@ void otx2_bphy_rfoe_cleanup(void)
+ 	for (i = 0; i < RFOE_MAX_INTF; i++) {
+ 		drv_ctx = &rfoe_drv_ctx[i];
+ 		if (drv_ctx->valid) {
++			otx2_rfoe_debugfs_remove(drv_ctx);
+ 			netdev = drv_ctx->netdev;
+ 			priv = netdev_priv(netdev);
+ 			--(priv->ptp_cfg->refcnt);
+@@ -273,6 +282,8 @@ static void otx2_rfoe_ptp_submit_work(struct work_struct *work)
+ 	netif_dbg(priv, tx_queued, priv->netdev,
+ 		  "submitting ptp tx skb %pS\n", skb);
+ 
++	priv->last_tx_ptp_jiffies = jiffies;
++
+ 	/* get the tx job entry */
+ 	job_entry = (struct tx_job_entry *)
+ 				&job_cfg->job_entries[job_cfg->q_idx];
+@@ -561,12 +572,16 @@ static void otx2_rfoe_process_rx_pkt(struct otx2_rfoe_ndev_priv *priv,
+ 			  netdev->name, priv2->rfoe_num,
+ 			  priv2->lmac_id);
+ 		/* update stats */
+-		if (pkt_type == PACKET_TYPE_PTP)
++		if (pkt_type == PACKET_TYPE_PTP) {
+ 			priv2->stats.ptp_rx_dropped++;
+-		else if (pkt_type == PACKET_TYPE_ECPRI)
++			priv2->last_rx_ptp_dropped_jiffies = jiffies;
++		} else if (pkt_type == PACKET_TYPE_ECPRI) {
+ 			priv2->stats.ecpri_rx_dropped++;
+-		else
++			priv2->last_rx_dropped_jiffies = jiffies;
++		} else {
+ 			priv2->stats.rx_dropped++;
++			priv2->last_rx_dropped_jiffies = jiffies;
++		}
+ 		return;
+ 	}
+ 
+@@ -588,12 +603,16 @@ static void otx2_rfoe_process_rx_pkt(struct otx2_rfoe_ndev_priv *priv,
+ 	netif_receive_skb(skb);
+ 
+ 	/* update stats */
+-	if (pkt_type == PACKET_TYPE_PTP)
++	if (pkt_type == PACKET_TYPE_PTP) {
+ 		priv2->stats.ptp_rx_packets++;
+-	else if (pkt_type == PACKET_TYPE_ECPRI)
++		priv2->last_rx_ptp_jiffies = jiffies;
++	} else if (pkt_type == PACKET_TYPE_ECPRI) {
+ 		priv2->stats.ecpri_rx_packets++;
+-	else
++		priv2->last_rx_jiffies = jiffies;
++	} else {
+ 		priv2->stats.rx_packets++;
++		priv2->last_rx_jiffies = jiffies;
++	}
+ 	priv2->stats.rx_bytes += skb->len;
+ }
+ 
+@@ -868,6 +887,7 @@ static netdev_tx_t otx2_rfoe_eth_start_xmit(struct sk_buff *skb,
+ 			  netdev->name, priv->rfoe_num, priv->lmac_id);
+ 		/* update stats */
+ 		priv->stats.tx_dropped++;
++		priv->last_tx_dropped_jiffies = jiffies;
+ 		goto exit;
+ 	}
+ 
+@@ -877,12 +897,16 @@ static netdev_tx_t otx2_rfoe_eth_start_xmit(struct sk_buff *skb,
+ 			  netdev->name, priv->rfoe_num,
+ 			  priv->lmac_id);
+ 		/* update stats */
+-		if (pkt_type == PACKET_TYPE_ECPRI)
++		if (pkt_type == PACKET_TYPE_ECPRI) {
+ 			priv->stats.ecpri_tx_dropped++;
+-		else if (pkt_type == PACKET_TYPE_PTP)
++			priv->last_tx_dropped_jiffies = jiffies;
++		} else if (pkt_type == PACKET_TYPE_PTP) {
+ 			priv->stats.ptp_tx_dropped++;
+-		else
++			priv->last_tx_ptp_dropped_jiffies = jiffies;
++		} else {
+ 			priv->stats.tx_dropped++;
++			priv->last_tx_dropped_jiffies = jiffies;
++		}
+ 
+ 		goto exit;
+ 	}
+@@ -893,12 +917,16 @@ static netdev_tx_t otx2_rfoe_eth_start_xmit(struct sk_buff *skb,
+ 			  netdev->name, priv->rfoe_num,
+ 			  priv->lmac_id);
+ 		/* update stats */
+-		if (pkt_type == PACKET_TYPE_ECPRI)
++		if (pkt_type == PACKET_TYPE_ECPRI) {
+ 			priv->stats.ecpri_tx_dropped++;
+-		else if (pkt_type == PACKET_TYPE_PTP)
++			priv->last_tx_dropped_jiffies = jiffies;
++		} else if (pkt_type == PACKET_TYPE_PTP) {
+ 			priv->stats.ptp_tx_dropped++;
+-		else
++			priv->last_tx_ptp_dropped_jiffies = jiffies;
++		} else {
+ 			priv->stats.tx_dropped++;
++			priv->last_tx_dropped_jiffies = jiffies;
++		}
+ 
+ 		goto exit;
+ 	}
+@@ -927,6 +955,8 @@ static netdev_tx_t otx2_rfoe_eth_start_xmit(struct sk_buff *skb,
+ 		else
+ 			priv->stats.tx_dropped++;
+ 
++		priv->last_tx_dropped_jiffies = jiffies;
++
+ 		mod_timer(&priv->tx_timer, jiffies + msecs_to_jiffies(100));
+ 		spin_unlock_irqrestore(&job_cfg->lock, flags);
+ 		return NETDEV_TX_OK;
+@@ -958,12 +988,14 @@ static netdev_tx_t otx2_rfoe_eth_start_xmit(struct sk_buff *skb,
+ 				netif_err(priv, tx_err, netdev,
+ 					  "ptp list full, dropping pkt\n");
+ 				priv->stats.ptp_tx_dropped++;
++				priv->last_tx_ptp_dropped_jiffies = jiffies;
+ 				goto exit;
+ 			}
+ 			/* allocate and add ptp req to queue */
+ 			ts_skb = kmalloc(sizeof(*ts_skb), GFP_ATOMIC);
+ 			if (!ts_skb) {
+ 				priv->stats.ptp_tx_dropped++;
++				priv->last_tx_ptp_dropped_jiffies = jiffies;
+ 				goto exit;
+ 			}
+ 			ts_skb->skb = skb;
+@@ -1022,12 +1054,16 @@ static netdev_tx_t otx2_rfoe_eth_start_xmit(struct sk_buff *skb,
+ 	       priv->psm_reg_base + PSM_QUEUE_CMD_HI(psm_queue_id));
+ 
+ 	/* update stats */
+-	if (pkt_type == PACKET_TYPE_ECPRI)
++	if (pkt_type == PACKET_TYPE_ECPRI) {
+ 		priv->stats.ecpri_tx_packets++;
+-	else if (pkt_type == PACKET_TYPE_PTP)
++		priv->last_tx_jiffies = jiffies;
++	} else if (pkt_type == PACKET_TYPE_PTP) {
+ 		priv->stats.ptp_tx_packets++;
+-	else
++		priv->last_tx_ptp_jiffies = jiffies;
++	} else {
+ 		priv->stats.tx_packets++;
++		priv->last_tx_jiffies = jiffies;
++	}
+ 	priv->stats.tx_bytes += skb->len;
+ 
+ 	/* increment queue index */
+@@ -1459,6 +1495,9 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 			drv_ctx->valid = 1;
+ 			drv_ctx->netdev = netdev;
+ 			drv_ctx->ft_cfg = &priv->rx_ft_cfg[0];
++
++			/* create debugfs entry */
++			otx2_rfoe_debugfs_create(drv_ctx);
+ 		}
+ 	}
+ 
+@@ -1468,6 +1507,7 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 	for (i = 0; i < RFOE_MAX_INTF; i++) {
+ 		drv_ctx = &rfoe_drv_ctx[i];
+ 		if (drv_ctx->valid) {
++			otx2_rfoe_debugfs_remove(drv_ctx);
+ 			netdev = drv_ctx->netdev;
+ 			priv = netdev_priv(netdev);
+ 			otx2_rfoe_ptp_destroy(priv);
+@@ -1490,3 +1530,119 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 
+ 	return ret;
+ }
++
++static void otx2_rfoe_debugfs_reader(char *buffer, size_t count, void *priv)
++{
++	struct otx2_rfoe_drv_ctx *ctx;
++	struct otx2_rfoe_ndev_priv *netdev;
++	u8 ptp_tx_in_progress;
++	unsigned int queued_ptp_reqs;
++	u8 queue_stopped, state_up;
++	u16 other_tx_psm_space, ptp_tx_psm_space, queue_id;
++	u64 regval;
++	const char *formatter;
++
++	ctx = priv;
++	netdev = netdev_priv(ctx->netdev);
++	ptp_tx_in_progress = test_bit(PTP_TX_IN_PROGRESS, &netdev->state);
++	queued_ptp_reqs = netdev->ptp_skb_list.count;
++	queue_stopped = netif_queue_stopped(ctx->netdev);
++	state_up = netdev->link_state;
++	formatter = otx2_rfoe_debugfs_get_formatter();
++
++	/* other tx psm space */
++	queue_id = netdev->rfoe_common->tx_oth_job_cfg.psm_queue_id;
++	regval = readq(netdev->psm_reg_base + PSM_QUEUE_SPACE(queue_id));
++	other_tx_psm_space = regval & 0x7FFF;
++
++	/* ptp tx psm space */
++	queue_id = netdev->tx_ptp_job_cfg.psm_queue_id;
++	regval = readq(netdev->psm_reg_base + PSM_QUEUE_SPACE(queue_id));
++	ptp_tx_psm_space = regval & 0x7FFF;
++
++	snprintf(buffer, count, formatter,
++		 ptp_tx_in_progress,
++		 queued_ptp_reqs,
++		 queue_stopped,
++		 state_up,
++		 netdev->last_tx_jiffies,
++		 netdev->last_tx_dropped_jiffies,
++		 netdev->last_tx_ptp_jiffies,
++		 netdev->last_tx_ptp_dropped_jiffies,
++		 netdev->last_rx_jiffies,
++		 netdev->last_rx_dropped_jiffies,
++		 netdev->last_rx_ptp_jiffies,
++		 netdev->last_rx_ptp_dropped_jiffies,
++		 jiffies,
++		 other_tx_psm_space,
++		 ptp_tx_psm_space);
++}
++
++static const char *otx2_rfoe_debugfs_get_formatter(void)
++{
++	static const char *buffer_format = "ptp-tx-in-progress: %u\n"
++					   "queued-ptp-reqs: %u\n"
++					   "queue-stopped: %u\n"
++					   "state-up: %u\n"
++					   "last-tx-jiffies: %lu\n"
++					   "last-tx-dropped-jiffies: %lu\n"
++					   "last-tx-ptp-jiffies: %lu\n"
++					   "last-tx-ptp-dropped-jiffies: %lu\n"
++					   "last-rx-jiffies: %lu\n"
++					   "last-rx-dropped-jiffies: %lu\n"
++					   "last-rx-ptp-jiffies: %lu\n"
++					   "last-rx-ptp-dropped-jiffies: %lu\n"
++					   "current-jiffies: %lu\n"
++					   "other-tx-psm-space: %u\n"
++					   "ptp-tx-psm-space: %u\n";
++
++	return buffer_format;
++}
++
++static size_t otx2_rfoe_debugfs_get_buffer_size(void)
++{
++	static size_t buffer_size;
++
++	if (!buffer_size) {
++		const char *formatter = otx2_rfoe_debugfs_get_formatter();
++		u8 max_boolean = 1;
++		int max_ptp_req_count = max_ptp_req;
++		unsigned long max_jiffies = (unsigned long)-1;
++		u16 max_psm_space = (u16)-1;
++
++		buffer_size = snprintf(NULL, 0, formatter,
++				       max_boolean,
++				       max_ptp_req_count,
++				       max_boolean,
++				       max_boolean,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_jiffies,
++				       max_psm_space,
++				       max_psm_space);
++		++buffer_size;
++	}
++
++	return buffer_size;
++}
++
++static void otx2_rfoe_debugfs_create(struct otx2_rfoe_drv_ctx *ctx)
++{
++	size_t buffer_size = otx2_rfoe_debugfs_get_buffer_size();
++
++	ctx->debugfs = otx2_bphy_debugfs_add_file(ctx->netdev->name,
++						  buffer_size, ctx,
++						  otx2_rfoe_debugfs_reader);
++}
++
++static void otx2_rfoe_debugfs_remove(struct otx2_rfoe_drv_ctx *ctx)
++{
++	if (ctx->debugfs)
++		otx2_bphy_debugfs_remove_file(ctx->debugfs);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index 4c8d7e52d5b5..f321b25ecfdb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -100,6 +100,7 @@ struct otx2_rfoe_drv_ctx {
+ 	struct net_device               *netdev;
+ 	struct rx_ft_cfg		*ft_cfg;
+ 	int				tx_gpint_bit;
++	void				*debugfs;
+ };
+ 
+ extern struct otx2_rfoe_drv_ctx rfoe_drv_ctx[RFOE_MAX_INTF];
+@@ -297,6 +298,14 @@ struct otx2_rfoe_ndev_priv {
+ 	s32				sec_bcn_offset;
+ 	int				if_type;
+ 	u8				link_state;
++	unsigned long			last_tx_jiffies;
++	unsigned long			last_tx_ptp_jiffies;
++	unsigned long			last_rx_jiffies;
++	unsigned long			last_rx_ptp_jiffies;
++	unsigned long			last_tx_dropped_jiffies;
++	unsigned long			last_tx_ptp_dropped_jiffies;
++	unsigned long			last_rx_dropped_jiffies;
++	unsigned long			last_rx_ptp_dropped_jiffies;
+ };
+ 
+ void otx2_rfoe_rx_napi_schedule(int rfoe_num, u32 status);
+-- 
+2.31.1
+

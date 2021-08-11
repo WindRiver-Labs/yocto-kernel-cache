@@ -1,0 +1,190 @@
+From 9600546a5b2ef1df09403be0912fe3cb2c16cd22 Mon Sep 17 00:00:00 2001
+From: Harman Kalra <hkalra@marvell.com>
+Date: Thu, 1 Jul 2021 19:19:49 +0530
+Subject: [PATCH 04/13] soc: marvell: hw_access: add hw context reading support
+
+commit b6b837d5e0c50d98b42f1ce2c84dd25e33cb3f0f from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Enhancing the capability of csr_access driver to get the
+(RQ/SQ/CQ/AURA/POOL) context by sending a request to admin
+queue. Adding a new IOCTL which the user will use to get
+the required context.
+
+Change-Id: I7a15ad6fe884e8e129a63d940f77893695221763
+Signed-off-by: Harman Kalra <hkalra@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/55869
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/soc/marvell/hw-access/Makefile       |  1 +
+ drivers/soc/marvell/hw-access/hw_rw_access.c | 87 ++++++++++++++++++--
+ 2 files changed, 82 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/soc/marvell/hw-access/Makefile b/drivers/soc/marvell/hw-access/Makefile
+index 865e3ec2f0d1..de7855a7f6a8 100644
+--- a/drivers/soc/marvell/hw-access/Makefile
++++ b/drivers/soc/marvell/hw-access/Makefile
+@@ -4,6 +4,7 @@
+ #
+ 
+ ccflags-y += -I$(src)
++ccflags-y += -I$(srctree)/drivers/net/ethernet/marvell/octeontx2/af
+ obj-$(CONFIG_HW_CSR_ACCESS) := hw_access.o
+ 
+ hw_access-y := hw_rw_access.o
+diff --git a/drivers/soc/marvell/hw-access/hw_rw_access.c b/drivers/soc/marvell/hw-access/hw_rw_access.c
+index 9e61fbeab263..10dcb1e84372 100644
+--- a/drivers/soc/marvell/hw-access/hw_rw_access.c
++++ b/drivers/soc/marvell/hw-access/hw_rw_access.c
+@@ -16,10 +16,19 @@
+ #include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/uaccess.h>
++#include <linux/pci.h>
++#include <linux/stddef.h>
++
++#include "rvu_struct.h"
++#include "rvu.h"
++#include "mbox.h"
+ 
+ #define DEVICE_NAME			"hw_access"
+ #define CLASS_NAME			"hw_access_class"
+ 
++/* PCI device IDs */
++#define	PCI_DEVID_OCTEONTX2_RVU_AF	0xA065
++
+ /* Smallest start physical address of all HW devices */
+ #define REG_PHYS_BASEADDR		0x802000000000
+ /* Last physical address - First phsycial address + 1 will be the
+@@ -36,27 +45,50 @@ struct hw_reg_cfg {
+ 	u64	regval; /* Register value to be read or to write */
+ };
+ 
++struct hw_ctx_cfg {
++	u16	blkaddr;
++	u16	pcifunc;
++	u16	qidx;
++	u8	ctype;
++	u8	op;
++};
++
+ #define HW_ACCESS_TYPE			120
+ 
+ #define HW_ACCESS_CSR_READ_IOCTL	_IO(HW_ACCESS_TYPE, 1)
+ #define HW_ACCESS_CSR_WRITE_IOCTL	_IO(HW_ACCESS_TYPE, 2)
++#define HW_ACCESS_CTX_READ_IOCTL	_IO(HW_ACCESS_TYPE, 3)
++
++struct hw_priv_data {
++	void __iomem *reg_base;
++	struct rvu *rvu;
++};
+ 
+ static struct class *hw_reg_class;
+ static int major_no;
+ 
+ static int hw_access_open(struct inode *inode, struct file *filp)
+ {
+-	void __iomem *reg_base = NULL;
++	struct hw_priv_data *priv_data = NULL;
++	struct pci_dev *pdev;
+ 	int err;
+ 
+-	reg_base = ioremap(REG_PHYS_BASEADDR, REG_SPACE_MAPSIZE);
+-	if (!reg_base) {
++	priv_data = kzalloc(sizeof(*priv_data), GFP_KERNEL);
++	if (!priv_data)
++		return -ENOMEM;
++
++	priv_data->reg_base = ioremap(REG_PHYS_BASEADDR, REG_SPACE_MAPSIZE);
++	if (!priv_data->reg_base) {
+ 		pr_err("Unable to map Physical Base Address\n");
+ 		err = -ENOMEM;
+ 		return err;
+ 	}
+ 
+-	filp->private_data = reg_base;
++	pdev = pci_get_device(PCI_VENDOR_ID_CAVIUM, PCI_DEVID_OCTEONTX2_RVU_AF,
++			      NULL);
++	priv_data->rvu = pci_get_drvdata(pdev);
++
++	filp->private_data = priv_data;
+ 
+ 	return 0;
+ }
+@@ -128,10 +160,45 @@ hw_access_csr_write(void __iomem *regbase, unsigned long arg)
+ 	return 0;
+ }
+ 
++static int
++hw_access_ctx_read(struct rvu *rvu, unsigned long arg)
++{
++	struct nix_aq_enq_req aq_req;
++	struct nix_aq_enq_rsp rsp;
++	struct hw_ctx_cfg ctx_cfg;
++
++	if (copy_from_user(&ctx_cfg, (struct hw_ctx_cfg *)arg,
++			   sizeof(struct hw_ctx_cfg))) {
++		pr_err("Write Fault in copy from user\n");
++		return -EFAULT;
++	}
++
++	memset(&aq_req, 0, sizeof(struct nix_aq_enq_req));
++	aq_req.hdr.pcifunc = ctx_cfg.pcifunc;
++	aq_req.ctype = ctx_cfg.ctype;
++	aq_req.op = ctx_cfg.op;
++	aq_req.qidx = ctx_cfg.qidx;
++
++	if (rvu_mbox_handler_nix_aq_enq(rvu, &aq_req, &rsp)) {
++		pr_err("Failed to read the context\n");
++		return -EINVAL;
++	}
++
++	if (copy_to_user((struct nix_aq_enq_rsp *)arg,
++			 &rsp, sizeof(struct nix_aq_enq_rsp))) {
++		pr_err("Fault in copy to user\n");
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
+ static long hw_access_ioctl(struct file *filp, unsigned int cmd,
+ 			   unsigned long arg)
+ {
+-	void __iomem *regbase = filp->private_data;
++	struct hw_priv_data *priv_data = filp->private_data;
++	void __iomem *regbase = priv_data->reg_base;
++	struct rvu *rvu = priv_data->rvu;
+ 
+ 	switch (cmd) {
+ 	case HW_ACCESS_CSR_READ_IOCTL:
+@@ -140,6 +207,9 @@ static long hw_access_ioctl(struct file *filp, unsigned int cmd,
+ 	case HW_ACCESS_CSR_WRITE_IOCTL:
+ 		return hw_access_csr_write(regbase, arg);
+ 
++	case HW_ACCESS_CTX_READ_IOCTL:
++		return hw_access_ctx_read(rvu, arg);
++
+ 	default:
+ 		pr_info("Invalid IOCTL: %d\n", cmd);
+ 
+@@ -149,8 +219,13 @@ static long hw_access_ioctl(struct file *filp, unsigned int cmd,
+ 
+ static int hw_access_release(struct inode *inode, struct file *filp)
+ {
+-	iounmap(filp->private_data);
++	struct hw_priv_data *priv_data = filp->private_data;
++	void __iomem *regbase = priv_data->reg_base;
++
++	iounmap(regbase);
+ 	filp->private_data = NULL;
++	kfree(priv_data);
++	priv_data = NULL;
+ 
+ 	return 0;
+ }
+-- 
+2.31.1
+
