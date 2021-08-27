@@ -1,0 +1,185 @@
+From dfef968db0eda2fec19644e2eb0a2270b6eae323 Mon Sep 17 00:00:00 2001
+From: Richard Gong <richard.gong@intel.com>
+Date: Tue, 20 Jul 2021 09:07:34 -0500
+Subject: [PATCH 6/9] HSD #18016094374-2: crypto: intel_fcs: extend to support
+ new FPGA attestation features
+
+commit 89bb314a3d8a7eb4f807ef5adf1f3e2209b7417f from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+Support FPGA attestation get_certificate and certificate_reload
+features.
+
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/crypto/intel_fcs.c           | 82 ++++++++++++++++++++++++++++
+ include/uapi/linux/intel_fcs-ioctl.h | 32 +++++++++++
+ 2 files changed, 114 insertions(+)
+
+diff --git a/drivers/crypto/intel_fcs.c b/drivers/crypto/intel_fcs.c
+index 6c8649218601..3eb073140a42 100644
+--- a/drivers/crypto/intel_fcs.c
++++ b/drivers/crypto/intel_fcs.c
+@@ -38,6 +38,7 @@
+ #define SUBKEY_RSP_MAX_SZ	820
+ #define MEASUREMENT_CMD_MAX_SZ	4092
+ #define MEASUREMENT_RSP_MAX_SZ	4092
++#define CERTIFICATE_RSP_MAX_SZ	4096
+ 
+ #define SIGMA_SESSION_ID_ONE	0x1
+ #define SIGMA_UNKNOWN_SESSION	0xffffffff
+@@ -915,6 +916,87 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 		fcs_close_services(priv, s_buf, d_buf);
+ 		break;
+ 
++	case INTEL_FCS_DEV_ATTESTATION_GET_CERTIFICATE:
++		if (copy_from_user(data, (void __user *)arg, sizeof(*data))) {
++			dev_err(dev, "failure on copy_from_user\n");
++			return -EFAULT;
++		}
++
++		if (data->com_paras.certificate.rsp_data_sz > CERTIFICATE_RSP_MAX_SZ) {
++			dev_err(dev, "Invalid certificate RSP size %d\n",
++				data->com_paras.certificate.rsp_data_sz);
++			return -EFAULT;
++		}
++
++		d_buf = stratix10_svc_allocate_memory(priv->chan,
++						      CERTIFICATE_RSP_MAX_SZ);
++		if (!d_buf) {
++			dev_err(dev, "failed allocate certificate RSP buf\n");
++			return -ENOMEM;
++		}
++
++		msg->command = COMMAND_FCS_ATTESTATION_CERTIFICATE;
++		msg->payload = NULL;
++		msg->payload_length = 0;
++		msg->payload_output = d_buf;
++		msg->payload_length_output = CERTIFICATE_RSP_MAX_SZ;
++		msg->arg[0] = data->com_paras.certificate.c_request & 0x000f;
++		priv->client.receive_cb = fcs_attestation_callback;
++
++		ret = fcs_request_service(priv, (void *)msg,
++					  10 * FCS_REQUEST_TIMEOUT);
++		if (!ret && !priv->status) {
++			if (priv->size > CERTIFICATE_RSP_MAX_SZ) {
++				dev_err(dev,
++					"returned size is incorrect\n");
++				fcs_close_services(priv, NULL, d_buf);
++				return -EFAULT;
++			}
++
++			memcpy(data->com_paras.certificate.rsp_data,
++			       priv->kbuf, priv->size);
++			data->com_paras.certificate.rsp_data_sz = priv->size;
++			data->status = priv->status;
++		} else {
++			data->com_paras.certificate.rsp_data = NULL;
++			data->com_paras.certificate.rsp_data_sz = 0;
++			data->status = priv->status;
++		}
++
++		if (copy_to_user((void __user *)arg, data, sizeof(*data))) {
++			dev_err(dev, "failure on copy_to_user\n");
++			fcs_close_services(priv, NULL, d_buf);
++			ret = -EFAULT;
++		}
++
++		fcs_close_services(priv, NULL, d_buf);
++		break;
++
++	case INTEL_FCS_DEV_ATTESTATION_CERTIFICATE_RELOAD:
++		if (copy_from_user(data, (void __user *)arg, sizeof(*data))) {
++			dev_err(dev, "failure on copy_from_user\n");
++			return -EFAULT;
++		}
++
++		msg->command = COMMAND_FCS_ATTESTATION_CERTIFICATE_RELOAD;
++		msg->arg[0] = data->com_paras.c_reload.c_request & 0x000f;
++		priv->client.receive_cb = fcs_vab_callback;
++		ret = fcs_request_service(priv, (void *)msg,
++					  10 * FCS_REQUEST_TIMEOUT);
++		if (ret) {
++			dev_err(dev, "failed to send the request,ret=%d\n",
++				ret);
++			return -EFAULT;
++		}
++
++		data->status = priv->status;
++		if (copy_to_user((void __user *)arg, data, sizeof(*data))) {
++			dev_err(dev, "failure on copy_to_user\n");
++			ret = -EFAULT;
++		}
++
++		break;
++
+ 	default:
+ 		dev_warn(dev, "shouldn't be here [0x%x]\n", cmd);
+ 		break;
+diff --git a/include/uapi/linux/intel_fcs-ioctl.h b/include/uapi/linux/intel_fcs-ioctl.h
+index 9bb14b555d77..7fa2503f4ecb 100644
+--- a/include/uapi/linux/intel_fcs-ioctl.h
++++ b/include/uapi/linux/intel_fcs-ioctl.h
+@@ -186,6 +186,26 @@ struct fcs_attestation_measuerments {
+ 	uint32_t rsp_data_sz;
+ };
+ 
++/**
++ * struct fcs_attestation_certificate
++ * @c_request: certificate request
++ * @rsp_data: response data of the request certificate
++ * @rsp_data_sz: size of response data of the request certificate
++ */
++struct fcs_attestation_certificate {
++	int c_request;
++	char *rsp_data;
++	uint32_t rsp_data_sz;
++};
++
++/**
++ * fcs_attestation_certificate_reload
++ * @c_request: certificate request
++ */
++struct fcs_attestation_certificate_reload {
++	int c_request;
++};
++
+ /**
+  * struct intel_fcs_dev_ioct: common structure passed to Linux
+  *	kernel driver for all commands.
+@@ -219,6 +239,8 @@ struct intel_fcs_dev_ioctl {
+ 		struct fcs_attestation_chipid	c_id;
+ 		struct fcs_attestation_subkey	subkey;
+ 		struct fcs_attestation_measuerments	measurement;
++		struct fcs_attestation_certificate	certificate;
++		struct fcs_attestation_certificate_reload	c_reload;
+ 	} com_paras;
+ };
+ 
+@@ -260,6 +282,8 @@ enum intel_fcs_command_code {
+ 	INTEL_FCS_DEV_CHIP_ID_CMD,
+ 	INTEL_FCS_DEV_ATTESTATION_SUBKEY_CMD,
+ 	INTEL_FCS_DEV_ATTESTATION_MEASUREMENT_CMD,
++	INTEL_FCS_DEV_ATTESTATION_GET_CERTIFICATE_CMD,
++	INTEL_FCS_DEV_ATTESTATION_CERTIFICATE_RELOAD_CMD,
+ };
+ 
+ #define INTEL_FCS_DEV_VERSION_REQUEST \
+@@ -309,5 +333,13 @@ enum intel_fcs_command_code {
+ #define INTEL_FCS_DEV_ATTESTATION_MEASUREMENT \
+ 	_IOWR(INTEL_FCS_IOCTL, \
+ 	      INTEL_FCS_DEV_ATTESTATION_MEASUREMENT_CMD, struct intel_fcs_dev_ioctl)
++
++#define INTEL_FCS_DEV_ATTESTATION_GET_CERTIFICATE \
++	_IOWR(INTEL_FCS_IOCTL, \
++	      INTEL_FCS_DEV_ATTESTATION_GET_CERTIFICATE_CMD, struct intel_fcs_dev_ioctl)
++
++#define INTEL_FCS_DEV_ATTESTATION_CERTIFICATE_RELOAD \
++	_IOWR(INTEL_FCS_IOCTL, \
++	      INTEL_FCS_DEV_ATTESTATION_CERTIFICATE_RELOAD_CMD, struct intel_fcs_dev_ioctl)
+ #endif
+ 
+-- 
+2.31.1
+
