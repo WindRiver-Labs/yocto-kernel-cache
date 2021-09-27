@@ -1,0 +1,178 @@
+From a3e8cef4d491d148871cf509e035e6bdd845ab06 Mon Sep 17 00:00:00 2001
+From: Richard Gong <richard.gong@intel.com>
+Date: Tue, 6 Jul 2021 14:19:36 -0500
+Subject: [PATCH 26/42] crypto: intel_fcs: update for verifying SHA2 signature
+
+commit ca37638815f518504d1d31bc2ea7a02e7e2e6e87 from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+Update to support verifying SHA2 signature.
+
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Signed-off-by: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/crypto/intel_fcs.c           | 85 ++++++++++++++++++++++++++++
+ include/uapi/linux/intel_fcs-ioctl.h | 30 ++++++++++
+ 2 files changed, 115 insertions(+)
+
+diff --git a/drivers/crypto/intel_fcs.c b/drivers/crypto/intel_fcs.c
+index a3495ad7374b..c0234c232614 100644
+--- a/drivers/crypto/intel_fcs.c
++++ b/drivers/crypto/intel_fcs.c
+@@ -1902,6 +1902,91 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 
+ 		 break;
+ 
++	case INTEL_FCS_DEV_CRYPTO_ECDSA_SHA2_DATA_VERIFY:
++		 if (copy_from_user(data, (void __user *)arg, sizeof(*data))) {
++			 dev_err(dev, "failure on copy_from_user\n");
++			 return -EFAULT;
++		 }
++
++		 sid = data->com_paras.ecdsa_sha2_data.sid;
++		 cid = data->com_paras.ecdsa_sha2_data.cid;
++		 kuid = data->com_paras.ecdsa_sha2_data.kuid;
++		 in_sz = data->com_paras.ecdsa_sha2_data.src_size;
++		 out_sz = data->com_paras.ecdsa_sha2_data.dst_size;
++		 ud_sz = data->com_paras.ecdsa_sha2_data.userdata_sz;
++
++		 msg->command = COMMAND_FCS_CRYPTO_ECDSA_SHA2_VERIFY_INIT;
++		 msg->arg[0] = sid;
++		 msg->arg[1] = cid;
++		 msg->arg[2] = kuid;
++		 msg->arg[3] = CRYPTO_ECC_PARAM_SZ;
++		 msg->arg[4] = data->com_paras.ecdsa_sha2_data.ecc_algorithm & 0xF;
++		 priv->client.receive_cb = fcs_vab_callback;
++
++		 ret = fcs_request_service(priv, (void *)msg,
++					   FCS_REQUEST_TIMEOUT);
++		 if (ret || priv->status) {
++			 dev_err(dev, "failed to send the cmd=%d,ret=%d, status=%d\n",
++				 COMMAND_FCS_CRYPTO_ECDSA_SHA2_VERIFY_INIT,
++				 ret, priv->status);
++			 return -EFAULT;
++		 }
++
++		 s_buf = stratix10_svc_allocate_memory(priv->chan, in_sz);
++		 if (!s_buf) {
++			 dev_err(dev, "failed allocate source buf\n");
++			 return -ENOMEM;
++		 }
++
++		 d_buf = stratix10_svc_allocate_memory(priv->chan, out_sz);
++		 if (!d_buf) {
++			 dev_err(dev, "failed allocate destation buf\n");
++			 fcs_close_services(priv, s_buf, NULL);
++			 return -ENOMEM;
++		 }
++
++		 memcpy(s_buf, data->com_paras.ecdsa_sha2_data.src,
++			data->com_paras.ecdsa_sha2_data.src_size);
++
++		 msg->command = COMMAND_FCS_CRYPTO_ECDSA_SHA2_VERIFY_FINALIZE;
++		 msg->arg[0] = sid;
++		 msg->arg[1] = cid;
++		 msg->arg[2] = ud_sz;
++		 msg->payload = s_buf;
++		 msg->payload_length = in_sz;
++		 msg->payload_output = d_buf;
++		 msg->payload_length_output = out_sz;
++		 priv->client.receive_cb = fcs_attestation_callback;
++
++		 ret = fcs_request_service(priv, (void *)msg,
++					   10 * FCS_REQUEST_TIMEOUT);
++		 if (!ret && !priv->status) {
++			 if (priv->size > out_sz) {
++				 dev_err(dev, "returned size %d is incorrect\n",
++					 priv->size);
++				 fcs_close_services(priv, s_buf, d_buf);
++				 return -EFAULT;
++			 }
++
++			 memcpy(data->com_paras.ecdsa_sha2_data.dst,
++				priv->kbuf, priv->size);
++			 data->com_paras.ecdsa_sha2_data.dst_size = priv->size;
++		 } else {
++			 data->com_paras.ecdsa_sha2_data.dst = NULL;
++			 data->com_paras.ecdsa_sha2_data.dst_size = 0;
++		 }
++
++		 data->status = priv->status;
++
++		 if (copy_to_user((void __user *)arg, data, sizeof(*data))) {
++			 dev_err(dev, "failure on copy_to_user\n");
++			 fcs_close_services(priv, s_buf, d_buf);
++			 ret = -EFAULT;
++		 }
++
++		 fcs_close_services(priv, s_buf, d_buf);
++		 break;
++
+ 	default:
+ 		dev_warn(dev, "shouldn't be here [0x%x]\n", cmd);
+ 		break;
+diff --git a/include/uapi/linux/intel_fcs-ioctl.h b/include/uapi/linux/intel_fcs-ioctl.h
+index 22736d84eb30..827a360324e5 100644
+--- a/include/uapi/linux/intel_fcs-ioctl.h
++++ b/include/uapi/linux/intel_fcs-ioctl.h
+@@ -327,6 +327,30 @@ struct fcs_ecdsa_data {
+ 	int ecc_algorithm;
+ };
+ 
++/**
++ * struct fcs_ecdsa_sha2_data
++ * @sid: session ID
++ * @cid: context ID
++ * @kuid: key UID
++ * @src: pointer of source
++ * @src_size: size of source
++ * @dst: pointer of destination
++ * @dst_size: size of destination
++ * @ecc_algorithm: ECC algorithm
++ * @userdata_sz: size of user data
++ */
++struct fcs_ecdsa_sha2_data {
++       uint32_t sid;
++       uint32_t cid;
++       uint32_t kuid;
++       void *src;
++       uint32_t src_size;
++       void *dst;
++       uint32_t dst_size;
++       int ecc_algorithm;
++       uint32_t userdata_sz;
++};
++
+ /**
+  * struct intel_fcs_dev_ioct: common structure passed to Linux
+  *	kernel driver for all commands.
+@@ -369,6 +393,7 @@ struct intel_fcs_dev_ioctl {
+ 		struct fcs_aes_crypt		a_crypt;
+ 		struct fcs_sha2_mac_data	s_mac_data;
+ 		struct fcs_ecdsa_data		ecdsa_data;
++		struct fcs_ecdsa_sha2_data	ecdsa_sha2_data;
+ 	} com_paras;
+ };
+ 
+@@ -427,6 +452,7 @@ enum intel_fcs_command_code {
+ 	INTEL_FCS_DEV_CRYPTO_ECDSA_HASH_SIGNING_CMD,
+ 	INTEL_FCS_DEV_CRYPTO_ECDSA_SHA2_DATA_SIGNING_CMD,
+ 	INTEL_FCS_DEV_CRYPTO_ECDSA_HASH_VERIFY_CMD,
++	INTEL_FCS_DEV_CRYPTO_ECDSA_SHA2_DATA_VERIFY_CMD,
+ };
+ 
+ #define INTEL_FCS_DEV_VERSION_REQUEST \
+@@ -537,5 +563,9 @@ enum intel_fcs_command_code {
+ 	_IOWR(INTEL_FCS_IOCTL, \
+ 	      INTEL_FCS_DEV_CRYPTO_ECDSA_HASH_VERIFY_CMD, struct intel_fcs_dev_ioctl)
+ 
++#define INTEL_FCS_DEV_CRYPTO_ECDSA_SHA2_DATA_VERIFY \
++	_IOWR(INTEL_FCS_IOCTL, \
++	      INTEL_FCS_DEV_CRYPTO_ECDSA_SHA2_DATA_VERIFY_CMD, struct intel_fcs_dev_ioctl)
++
+ #endif
+ 
+-- 
+2.31.1
+
