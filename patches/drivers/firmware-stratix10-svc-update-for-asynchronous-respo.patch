@@ -1,0 +1,148 @@
+From 3489608cb6dae976d79043377b4527a10ad95108 Mon Sep 17 00:00:00 2001
+From: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Date: Thu, 26 Aug 2021 02:17:43 +0800
+Subject: [PATCH 31/42] firmware: stratix10-svc: update for asynchronous
+ response with service completed
+
+commit 4359b92a4029ee2ec681dbd4d2d2f8ddff188205 from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+This patch extends the service completed smc call to support asynchronous mode.
+
+In normal mode, ATF will poll the response data and retry until timeout if
+no response data in fifo.
+
+In asynchronous mode (set a3 to 0x00004F4E when trigger service completed
+smc call), ATF will read the response and immediately response to SMC call.
+It returns OK, ERROR, NO RESPONSE (did not receive any response) or BUSY
+(received response header but still in progress waiting for response data).
+Asynchronous mode eliminates the long smc responsewaiting time during huge
+response data size (example: response of random number generation) which
+will cause watchdog timeout or CPU stall at host (Linux) and it allows
+host to control the retry and timeout.
+
+Signed-off-by: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/firmware/stratix10-svc.c              | 26 +++++++++++++++++++
+ include/linux/firmware/intel/stratix10-smc.h  |  8 +++++-
+ .../firmware/intel/stratix10-svc-client.h     |  2 ++
+ 3 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/firmware/stratix10-svc.c b/drivers/firmware/stratix10-svc.c
+index a8cfc6ed56f8..44d1f3949a02 100644
+--- a/drivers/firmware/stratix10-svc.c
++++ b/drivers/firmware/stratix10-svc.c
+@@ -369,6 +369,7 @@ static void svc_thread_recv_status_ok(struct stratix10_svc_data *p_data,
+ 	case COMMAND_FCS_RANDOM_NUMBER_GEN:
+ 	case COMMAND_FCS_GET_PROVISION_DATA:
+ 	case COMMAND_POLL_SERVICE_STATUS:
++	case COMMAND_POLL_SERVICE_STATUS_ASYNC:
+ 	case COMMAND_FCS_GET_ROM_PATCH_SHA384:
+ 		cb_data->status = BIT(SVC_STATUS_OK);
+ 		cb_data->kaddr1 = &res.a1;
+@@ -804,9 +805,11 @@ static int svc_normal_to_secure_thread(void *data)
+ 			break;
+ 		/* for polling */
+ 		case COMMAND_POLL_SERVICE_STATUS:
++		case COMMAND_POLL_SERVICE_STATUS_ASYNC:
+ 			a0 = INTEL_SIP_SMC_SERVICE_COMPLETED;
+ 			a1 = (unsigned long)pdata->paddr;
+ 			a2 = (unsigned long)pdata->size;
++			a3 = pdata->arg[0];
+ 			break;
+ 		case COMMAND_FIRMWARE_VERSION:
+ 			a0 = INTEL_SIP_SMC_FIRMWARE_VERSION;
+@@ -864,6 +867,14 @@ static int svc_normal_to_secure_thread(void *data)
+ 				svc_thread_cmd_config_status(ctrl,
+ 							     pdata, cbdata);
+ 				break;
++			case COMMAND_POLL_SERVICE_STATUS_ASYNC:
++				cbdata->status = BIT(SVC_STATUS_BUSY);
++				cbdata->kaddr1 = NULL;
++				cbdata->kaddr2 = NULL;
++				cbdata->kaddr3 = NULL;
++				pdata->chan->scl->receive_cb(pdata->chan->scl,
++							     cbdata);
++				break;
+ 			default:
+ 				pr_warn("it shouldn't happen\n");
+ 				break;
+@@ -930,6 +941,21 @@ static int svc_normal_to_secure_thread(void *data)
+ 			cbdata->kaddr3 = (res.a3) ? &res.a3 : NULL;
+ 			pdata->chan->scl->receive_cb(pdata->chan->scl, cbdata);
+ 			break;
++		case INTEL_SIP_SMC_STATUS_NO_RESPONSE:
++			switch (pdata->command) {
++			case COMMAND_POLL_SERVICE_STATUS_ASYNC:
++				cbdata->status = BIT(SVC_STATUS_NO_RESPONSE);
++				cbdata->kaddr1 = NULL;
++				cbdata->kaddr2 = NULL;
++				cbdata->kaddr3 = NULL;
++				pdata->chan->scl->receive_cb(pdata->chan->scl,
++							     cbdata);
++				break;
++			default:
++				pr_warn("it shouldn't receive no response\n");
++				break;
++			}
++			break;
+ 		default:
+ 			pr_warn("Secure firmware doesn't support...\n");
+ 
+diff --git a/include/linux/firmware/intel/stratix10-smc.h b/include/linux/firmware/intel/stratix10-smc.h
+index 9884af94f743..351279b1a48d 100644
+--- a/include/linux/firmware/intel/stratix10-smc.h
++++ b/include/linux/firmware/intel/stratix10-smc.h
+@@ -62,6 +62,10 @@
+  * INTEL_SIP_SMC_STATUS_REJECTED:
+  * Secure monitor software reject the service client's request.
+  *
++ * INTEL_SIP_SMC_STATUS_NO_RESPONSE:
++ * Secure monitor software doesn't recieve any response for the
++ * service client's request yet.
++ *
+  * INTEL_SIP_SMC_STATUS_ERROR:
+  * There is error during the process of service request.
+  *
+@@ -75,6 +79,7 @@
+ #define INTEL_SIP_SMC_STATUS_OK				0x0
+ #define INTEL_SIP_SMC_STATUS_BUSY			0x1
+ #define INTEL_SIP_SMC_STATUS_REJECTED			0x2
++#define INTEL_SIP_SMC_STATUS_NO_RESPONSE		0x3
+ #define INTEL_SIP_SMC_STATUS_ERROR			0x4
+ #define INTEL_SIP_SMC_RSU_ERROR				0x7
+ #define INTEL_SIP_SMC_STATUS_NOT_SUPPORTED		0x8
+@@ -438,7 +443,8 @@ INTEL_SIP_SMC_FAST_CALL_VAL(INTEL_SIP_SMC_FUNCID_FPGA_CONFIG_COMPLETED_WRITE)
+  * a1: this register is optional. If used, it is the physical address for
+  *     secure firmware to put output data
+  * a2: this register is optional. If used, it is the size of output data
+- * a3-a7: not used
++ * a3: this register is optional. Set to 0x00004F4E for asynchronous mode
++ * a4-a7: not used
+  *
+  * Return status:
+  * a0: INTEL_SIP_SMC_STATUS_OK, INTEL_SIP_SMC_STATUS_ERROR,
+diff --git a/include/linux/firmware/intel/stratix10-svc-client.h b/include/linux/firmware/intel/stratix10-svc-client.h
+index 7d7c91ab4eb0..99d4fc559437 100644
+--- a/include/linux/firmware/intel/stratix10-svc-client.h
++++ b/include/linux/firmware/intel/stratix10-svc-client.h
+@@ -53,6 +53,7 @@
+ #define SVC_STATUS_ERROR		5
+ #define SVC_STATUS_NO_SUPPORT		6
+ #define SVC_STATUS_INVALID_PARAM	7
++#define SVC_STATUS_NO_RESPONSE		8
+ /**
+  * Flag bit for COMMAND_RECONFIG
+  *
+@@ -255,6 +256,7 @@ enum stratix10_svc_command_code {
+ 	COMMAND_FCS_ATTESTATION_CERTIFICATE_RELOAD,
+ 	/* for general status poll */
+ 	COMMAND_POLL_SERVICE_STATUS = 40,
++	COMMAND_POLL_SERVICE_STATUS_ASYNC,
+ 	COMMAND_FIRMWARE_VERSION,
+ 	/* for HWMON */
+ 	COMMAND_HWMON_READTEMP,
+-- 
+2.31.1
+

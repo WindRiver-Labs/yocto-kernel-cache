@@ -1,0 +1,202 @@
+From 8a70eef31902621ee175ef08d784cf0b4288a8f1 Mon Sep 17 00:00:00 2001
+From: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Date: Thu, 26 Aug 2021 02:25:07 +0800
+Subject: [PATCH 33/42] crypto: intel_fcs: update for RNG extension
+
+commit 4cade920e5229d693fd7eab549e78bcff8256edd from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+Update to support RNG extension.
+
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Signed-off-by: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/crypto/intel_fcs.c           | 88 +++++++++++++++++++++++++++-
+ include/uapi/linux/intel_fcs-ioctl.h | 20 +++++++
+ 2 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/intel_fcs.c b/drivers/crypto/intel_fcs.c
+index 01858f46ba58..7ab462d4a308 100644
+--- a/drivers/crypto/intel_fcs.c
++++ b/drivers/crypto/intel_fcs.c
+@@ -6,6 +6,7 @@
+ #include <linux/arm-smccc.h>
+ #include <linux/bitfield.h>
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include <linux/fs.h>
+ #include <linux/kobject.h>
+@@ -24,11 +25,14 @@
+ #include <uapi/linux/intel_fcs-ioctl.h>
+ 
+ #define RANDOM_NUMBER_SIZE	32
++#define RANDOM_NUMBER_EXT_SIZE	4080
++#define RANDOM_NUMBER_EXT_OFFSET 12
+ #define FILE_NAME_SIZE		32
+ #define PS_BUF_SIZE		64
+ #define SHA384_SIZE		48
+-#define INVALID_STATUS		0xffffffff
+-#define INVALID_ID		0xffffffff
++#define INVALID_STATUS		0xFFFFFFFF
++#define INVALID_ID		0xFFFFFFFF
++#define ASYNC_POLL_SERVICE	0x00004F4E
+ 
+ #define DEC_MIN_SZ		72
+ #define DEC_MAX_SZ		32712
+@@ -88,6 +92,11 @@ static void fcs_data_callback(struct stratix10_svc_client *client,
+ 		priv->kbuf = data->kaddr2;
+ 		priv->size = (data->kaddr3) ?
+ 			*((unsigned int *)data->kaddr3) : 0;
++	} else if ((data->status == BIT(SVC_STATUS_BUSY)) ||
++		   (data->status == BIT(SVC_STATUS_NO_RESPONSE))) {
++		priv->status = 0;
++		priv->kbuf = NULL;
++		priv->size = 0;
+ 	} else {
+ 		dev_err(client->dev, "rejected, invalid param\n");
+ 		priv->status = -EINVAL;
+@@ -237,6 +246,7 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 	unsigned int buf_sz, in_sz, out_sz;
+ 	int ret = 0;
+ 	int i;
++	int timeout;
+ 
+ 	priv = container_of(file->private_data, struct intel_fcs_priv, miscdev);
+ 	dev = priv->client.dev;
+@@ -2141,6 +2151,80 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 		fcs_close_services(priv, s_buf, d_buf);
+ 		break;
+ 
++	case INTEL_FCS_DEV_RANDOM_NUMBER_GEN_EXT:
++		if (copy_from_user(data, (void __user *)arg, sizeof(*data))) {
++			dev_err(dev, "failure on copy_from_user\n");
++			return -EFAULT;
++		}
++
++		sid = data->com_paras.rn_gen_ext.sid;
++		cid = data->com_paras.rn_gen_ext.cid;
++		out_sz = data->com_paras.rn_gen_ext.rng_sz;
++		buf_sz = RANDOM_NUMBER_EXT_SIZE + RANDOM_NUMBER_EXT_OFFSET;
++
++		d_buf = stratix10_svc_allocate_memory(priv->chan, buf_sz);
++		if (!d_buf) {
++			dev_err(dev, "failed to allocate RNG_EXT output buf\n");
++			return -ENOMEM;
++		}
++
++		msg->command = COMMAND_FCS_RANDOM_NUMBER_GEN_EXT;
++		msg->arg[0] = sid;
++		msg->arg[1] = cid;
++		msg->arg[2] = out_sz;
++		priv->client.receive_cb = fcs_attestation_callback;
++
++		ret = fcs_request_service(priv, (void *)msg,
++					  FCS_REQUEST_TIMEOUT);
++		dev_dbg(dev, "request service ret=%d\n", ret);
++
++		if (!ret && !priv->status) {
++			/* to query the complete status */
++			msg->arg[0] = ASYNC_POLL_SERVICE;
++			msg->payload = d_buf;
++			msg->payload_length = buf_sz;
++			msg->command = COMMAND_POLL_SERVICE_STATUS_ASYNC;
++			priv->client.receive_cb = fcs_data_callback;
++
++			timeout = 100;
++			while (timeout != 0) {
++				ret = fcs_request_service(priv, (void *)msg,
++							  FCS_REQUEST_TIMEOUT);
++				dev_dbg(dev, "request service ret=%d\n", ret);
++
++				if (!ret && !priv->status) {
++					if (priv->size == out_sz + RANDOM_NUMBER_EXT_OFFSET) {
++						memcpy(data->com_paras.rn_gen_ext.rng_data,
++						       priv->kbuf + RANDOM_NUMBER_EXT_OFFSET,
++						       out_sz);
++						data->com_paras.rn_gen_ext.rng_sz = out_sz;
++						break;
++					}
++				} else {
++					data->com_paras.rn_gen_ext.rng_data = NULL;
++					data->com_paras.rn_gen_ext.rng_sz = 0;
++					break;
++				}
++				timeout--;
++				mdelay(500);
++			}
++		}
++
++		if (priv->status == 0 && timeout == 0) {
++			data->status = -ETIMEDOUT;
++		} else {
++			data->status = priv->status;
++		}
++
++		if (copy_to_user((void __user *)arg, data, sizeof(*data))) {
++			dev_err(dev, "failure on copy_to_user\n");
++			fcs_close_services(priv, NULL, d_buf);
++			return -EFAULT;
++		}
++
++		fcs_close_services(priv, NULL, d_buf);
++		break;
++
+ 	default:
+ 		dev_warn(dev, "shouldn't be here [0x%x]\n", cmd);
+ 		break;
+diff --git a/include/uapi/linux/intel_fcs-ioctl.h b/include/uapi/linux/intel_fcs-ioctl.h
+index 4db34d85419c..684a2c1d8105 100644
+--- a/include/uapi/linux/intel_fcs-ioctl.h
++++ b/include/uapi/linux/intel_fcs-ioctl.h
+@@ -351,6 +351,20 @@ struct fcs_ecdsa_sha2_data {
+        uint32_t userdata_sz;
+ };
+ 
++/**
++ * struct fcs_random_number_gen_ext
++ * @sid: session ID
++ * @cid: context ID
++ * @rng_data: random data
++ * @rng_sz: size of random data
++ */
++struct fcs_random_number_gen_ext {
++       uint32_t sid;
++       uint32_t cid;
++       void *rng_data;
++       uint32_t rng_sz;
++};
++
+ /**
+  * struct intel_fcs_dev_ioct: common structure passed to Linux
+  *	kernel driver for all commands.
+@@ -394,6 +408,7 @@ struct intel_fcs_dev_ioctl {
+ 		struct fcs_sha2_mac_data	s_mac_data;
+ 		struct fcs_ecdsa_data		ecdsa_data;
+ 		struct fcs_ecdsa_sha2_data	ecdsa_sha2_data;
++		struct fcs_random_number_gen_ext	rn_gen_ext;
+ 	} com_paras;
+ };
+ 
+@@ -455,6 +470,7 @@ enum intel_fcs_command_code {
+ 	INTEL_FCS_DEV_CRYPTO_ECDSA_SHA2_DATA_VERIFY_CMD,
+ 	INTEL_FCS_DEV_CRYPTO_ECDSA_GET_PUBLIC_KEY_CMD,
+ 	INTEL_FCS_DEV_CRYPTO_ECDH_REQUEST_CMD,
++	INTEL_FCS_DEV_RANDOM_NUMBER_GEN_EXT_CMD,
+ };
+ 
+ #define INTEL_FCS_DEV_VERSION_REQUEST \
+@@ -577,5 +593,9 @@ enum intel_fcs_command_code {
+ 	_IOWR(INTEL_FCS_IOCTL, \
+ 	      INTEL_FCS_DEV_CRYPTO_ECDH_REQUEST_CMD, struct intel_fcs_dev_ioctl)
+ 
++#define INTEL_FCS_DEV_RANDOM_NUMBER_GEN_EXT \
++	_IOWR(INTEL_FCS_IOCTL, \
++	      INTEL_FCS_DEV_RANDOM_NUMBER_GEN_EXT_CMD, struct intel_fcs_dev_ioctl)
++
+ #endif
+ 
+-- 
+2.31.1
+

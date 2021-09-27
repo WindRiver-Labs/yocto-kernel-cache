@@ -1,0 +1,264 @@
+From b4187b027b5d1954001f9186b6b94fa5e2299235 Mon Sep 17 00:00:00 2001
+From: Richard Gong <richard.gong@intel.com>
+Date: Mon, 28 Jun 2021 20:15:40 -0500
+Subject: [PATCH 12/42] crypto: intel_fcs: update for AES encrypt and decrypt
+
+commit ffed64947a358c34038456f016e5bb64d4bc5513 from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+Update to support AES encrypt and decrypt.
+
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Signed-off-by: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/crypto/intel_fcs.c           | 139 +++++++++++++++++++++++++++
+ include/uapi/linux/intel_fcs-ioctl.h |  45 +++++++++
+ 2 files changed, 184 insertions(+)
+
+diff --git a/drivers/crypto/intel_fcs.c b/drivers/crypto/intel_fcs.c
+index 52a6ea866131..b9191c1feea7 100644
+--- a/drivers/crypto/intel_fcs.c
++++ b/drivers/crypto/intel_fcs.c
+@@ -44,6 +44,8 @@
+ #define CRYPTO_EXPORTED_KEY_OBJECT_MAX_SZ 364
+ #define CRYPTO_GET_KEY_INFO_MAX_SZ 144
+ 
++#define AES_CRYPT_CMD_MAX_SZ	SZ_4M /* set 4 Mb for now */
++
+ #define SIGMA_SESSION_ID_ONE	0x1
+ #define SIGMA_UNKNOWN_SESSION	0xffffffff
+ 
+@@ -220,9 +222,12 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 	char filename[FILE_NAME_SIZE];
+ 	size_t tsz, rsz, datasz;
+ 	uint32_t sid;
++	uint32_t kuid;
++	uint32_t cid;
+ 	void *s_buf;
+ 	void *d_buf;
+ 	void *ps_buf;
++	void *iv_field_buf;
+ 	unsigned int buf_sz;
+ 	int ret = 0;
+ 	int i;
+@@ -1337,6 +1342,140 @@ static long fcs_ioctl(struct file *file, unsigned int cmd,
+ 		 fcs_close_services(priv, NULL, d_buf);
+ 		 break;
+ 
++	case INTEL_FCS_DEV_CRYPTO_AES_CRYPT:
++		 if (copy_from_user(data, (void __user *)arg, sizeof(*data))) {
++			 dev_err(dev, "failure on copy_from_user\n");
++			 return -EFAULT;
++		 }
++
++		 iv_field_buf = stratix10_svc_allocate_memory(priv->chan, 28);
++		 if (!iv_field_buf) {
++			 dev_err(dev, "failed allocate iv_field buf\n");
++			 return -ENOMEM;
++		 }
++
++		 sid = data->com_paras.a_crypt.sid;
++		 cid = data->com_paras.a_crypt.cid;
++		 kuid = data->com_paras.a_crypt.kuid;
++
++		 memcpy(iv_field_buf, &data->com_paras.a_crypt.cpara.bmode, 1);
++		 memcpy(iv_field_buf + 1, &data->com_paras.a_crypt.cpara.aes_mode, 1);
++		 memcpy(iv_field_buf + 12, data->com_paras.a_crypt.cpara.iv_field, 16);
++
++		 msg->command = COMMAND_FCS_CRYPTO_AES_CRYPT_INIT;
++		 msg->payload = iv_field_buf;
++		 msg->payload_length = data->com_paras.a_crypt.cpara_size;
++		 msg->payload_output = NULL;
++		 msg->payload_length_output = 0;
++		 msg->arg[0] = sid;
++		 msg->arg[1] = cid;
++		 msg->arg[2] = kuid;
++
++		 priv->client.receive_cb = fcs_vab_callback;
++
++		 ret = fcs_request_service(priv, (void *)msg,
++					   FCS_REQUEST_TIMEOUT);
++		 if (ret || priv->status) {
++			 dev_err(dev, "failed to send the cmd=%d,ret=%d\n",
++				 COMMAND_FCS_CRYPTO_AES_CRYPT_INIT,
++				 ret);
++			 fcs_close_services(priv, iv_field_buf, NULL);
++			 return -EFAULT;
++		 }
++
++		 fcs_close_services(priv, iv_field_buf, NULL);
++
++		 s_buf = stratix10_svc_allocate_memory(priv->chan,
++				data->com_paras.a_crypt.src_size);
++		 if (!s_buf) {
++			 dev_err(dev, "failed allocate source buf\n");
++			 return -ENOMEM;
++		 }
++
++		 d_buf = stratix10_svc_allocate_memory(priv->chan,
++				data->com_paras.a_crypt.dst_size);
++		 if (!d_buf) {
++			 dev_err(dev, "failed allocate destation buf\n");
++			 fcs_close_services(priv, s_buf, NULL);
++			 return -ENOMEM;
++		 }
++
++		 ret = copy_from_user(s_buf,
++				     data->com_paras.a_crypt.src,
++				     data->com_paras.a_crypt.src_size);
++
++		 if (ret) {
++			dev_err(dev, "failure on copy_from_user\n");
++			fcs_close_services(priv, s_buf, d_buf);
++			return -EFAULT;
++		 }
++
++		 msg->command = COMMAND_FCS_CRYPTO_AES_CRYPT_FINALIZE;
++		 msg->arg[0] = sid;
++		 msg->arg[1] = cid;
++		 msg->payload = s_buf;
++		 msg->payload_length = data->com_paras.a_crypt.src_size;
++		 msg->payload_output = d_buf;
++		 msg->payload_length_output = data->com_paras.a_crypt.dst_size;
++		 priv->client.receive_cb = fcs_attestation_callback;
++
++		 ps_buf = stratix10_svc_allocate_memory(priv->chan, PS_BUF_SIZE);
++		 if (!ps_buf) {
++			dev_err(dev, "failed to allocate p-status buf\n");
++			fcs_close_services(priv, s_buf, d_buf);
++			return -ENOMEM;
++		 }
++
++		 ret = fcs_request_service(priv, (void *)msg,
++					   FCS_REQUEST_TIMEOUT);
++		 if (!ret && !priv->status) {
++			/* to query the complete status */
++			msg->payload = ps_buf;
++			msg->payload_length = PS_BUF_SIZE;
++			msg->command = COMMAND_POLL_SERVICE_STATUS;
++			priv->client.receive_cb = fcs_data_callback;
++
++			ret = fcs_request_service(priv, (void *)msg,
++						  FCS_COMPLETED_TIMEOUT);
++			dev_dbg(dev, "request service ret=%d\n", ret);
++			if (!ret && !priv->status) {
++				if (!priv->kbuf || priv->size != 16) {
++					dev_err(dev, "unregconize response\n");
++					fcs_close_services(priv, s_buf, d_buf);
++					fcs_close_services(priv, ps_buf, NULL);
++					return -EFAULT;
++				}
++
++				data->com_paras.a_crypt.dst_size =
++					((u32 *)priv->kbuf)[3];
++
++				ret = copy_to_user(
++					data->com_paras.a_crypt.dst, d_buf,
++					data->com_paras.a_crypt.dst_size);
++
++				if (ret) {
++					dev_err(dev, "failure on copy_to_user\n");
++					fcs_close_services(priv, s_buf, d_buf);
++					fcs_close_services(priv, ps_buf, NULL);
++					return -EFAULT;
++				}
++			}
++		 } else {
++			data->com_paras.a_crypt.dst = NULL;
++			data->com_paras.a_crypt.dst_size = 0;
++		 }
++
++		 data->status = priv->status;
++
++		 if (copy_to_user((void __user *)arg, data, sizeof(*data))) {
++			dev_err(dev, "failure on copy_to_user\n");
++			ret = -EFAULT;
++		 }
++
++		 fcs_close_services(priv, s_buf, d_buf);
++		 fcs_close_services(priv, ps_buf, NULL);
++		 break;
++
+ 	default:
+ 		dev_warn(dev, "shouldn't be here [0x%x]\n", cmd);
+ 		break;
+diff --git a/include/uapi/linux/intel_fcs-ioctl.h b/include/uapi/linux/intel_fcs-ioctl.h
+index 4994c77a15d5..2367b8061fd3 100644
+--- a/include/uapi/linux/intel_fcs-ioctl.h
++++ b/include/uapi/linux/intel_fcs-ioctl.h
+@@ -241,6 +241,45 @@ struct fcs_crypto_key_object {
+ 	uint32_t obj_data_sz;
+ };
+ 
++/**
++ * struct fcs_acs_crypt_parameter
++ * @bmode: block mode
++ * @aes_mode: encrypt or decrypt
++ * 	0	encrypt
++ * 	1	decrypt
++ * @resv: reserved
++ * @iv: 128-bit IV field
++ */
++struct fcs_acs_crypt_parameter {
++	char bmode;
++	char aes_mode;
++	char resv[10];
++	char iv_field[16];
++};
++
++/**
++ * struct fcs_aes_crypt
++ * @sid: session ID
++ * @cid: context ID
++ * @kuid: key UID
++ * @src: source
++ * @src_size: size of source
++ * @dst: destination
++ * @dst_size: size of destination
++ * @cpara: crypto parameter
++ */
++struct fcs_aes_crypt {
++	uint32_t sid;
++	uint32_t cid;
++	uint32_t kuid;
++	void *src;
++	uint32_t src_size;
++	void *dst;
++	uint32_t dst_size;
++	int cpara_size;
++	struct fcs_acs_crypt_parameter cpara;
++};
++
+ /**
+  * struct intel_fcs_dev_ioct: common structure passed to Linux
+  *	kernel driver for all commands.
+@@ -280,6 +319,7 @@ struct intel_fcs_dev_ioctl {
+ 		struct fcs_crypto_service_session	s_session;
+ 		struct fcs_crypto_key_import		k_import;
+ 		struct fcs_crypto_key_object		k_object;
++		struct fcs_aes_crypt		a_crypt;
+ 	} com_paras;
+ };
+ 
+@@ -332,6 +372,7 @@ enum intel_fcs_command_code {
+ 	INTEL_FCS_DEV_CRYPTO_EXPORT_KEY_CMD,
+ 	INTEL_FCS_DEV_CRYPTO_REMOVE_KEY_CMD,
+ 	INTEL_FCS_DEV_CRYPTO_GET_KEY_INFO_CMD,
++	INTEL_FCS_DEV_CRYPTO_AES_CRYPT_CMD,
+ };
+ 
+ #define INTEL_FCS_DEV_VERSION_REQUEST \
+@@ -418,5 +459,9 @@ enum intel_fcs_command_code {
+ 	_IOWR(INTEL_FCS_IOCTL, \
+ 	      INTEL_FCS_DEV_CRYPTO_GET_KEY_INFO_CMD, struct intel_fcs_dev_ioctl)
+ 
++#define INTEL_FCS_DEV_CRYPTO_AES_CRYPT \
++	_IOWR(INTEL_FCS_IOCTL, \
++	      INTEL_FCS_DEV_CRYPTO_AES_CRYPT_CMD, struct intel_fcs_dev_ioctl)
++
+ #endif
+ 
+-- 
+2.31.1
+
