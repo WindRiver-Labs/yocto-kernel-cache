@@ -1,0 +1,435 @@
+From d931ed95fd32fd5730ab22d99ed9fe5afddd21a6 Mon Sep 17 00:00:00 2001
+From: Saurabh Sengar <saurabh.singh@xilinx.com>
+Date: Thu, 13 Feb 2020 21:28:16 +0530
+Subject: [PATCH 1206/1852] net: xilinx: Add Support for CB/FRER feature of PL
+ TSN IP
+
+commit cf9c46a7a61a26998e8f06b81ca52ad0f166fa6e from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch adds support for the CB (Frame Replication and Elimi
+nation for Reliablity) feature of the PL TSN IP.
+
+Signed-off-by: Saurabh Sengar <saurabh.singh@xilinx.com>
+Signed-off-by: Syed Syed <syed.syed@xilinx.com>
+Signed-off-by: Priyadarshini Babu <priyadarshini.babu@xilinx.com>
+Signed-off-by: Ravali Potineni <ravali.potineni@xilinx.com>
+Signed-off-by: Pranavi Somisetty <pranavi.somisetty@xilinx.com>
+State: not-upstreamable
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/net/ethernet/xilinx/Kconfig           |   7 +
+ drivers/net/ethernet/xilinx/Makefile          |   1 +
+ drivers/net/ethernet/xilinx/xilinx_tsn_cb.c   | 177 ++++++++++++++++++
+ .../net/ethernet/xilinx/xilinx_tsn_switch.c   |  73 +++++++-
+ .../net/ethernet/xilinx/xilinx_tsn_switch.h   |  70 +++++++
+ 5 files changed, 326 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/net/ethernet/xilinx/xilinx_tsn_cb.c
+
+diff --git a/drivers/net/ethernet/xilinx/Kconfig b/drivers/net/ethernet/xilinx/Kconfig
+index bd8b2a452d80..3ee7b0a05073 100644
+--- a/drivers/net/ethernet/xilinx/Kconfig
++++ b/drivers/net/ethernet/xilinx/Kconfig
+@@ -87,4 +87,11 @@ config XILINX_TSN_QCI
+ 	---help---
+ 	  Enable TSN QCI protocol.
+ 
++config XILINX_TSN_CB
++	bool "Support CB protocol in TSN"
++	depends on XILINX_TSN_SWITCH
++	default y
++	---help---
++	  Enable TSN CB protocol support.
++
+ endif # NET_VENDOR_XILINX
+diff --git a/drivers/net/ethernet/xilinx/Makefile b/drivers/net/ethernet/xilinx/Makefile
+index fbd19ad3e01f..f8a4b1f5bd8d 100644
+--- a/drivers/net/ethernet/xilinx/Makefile
++++ b/drivers/net/ethernet/xilinx/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_XILINX_TSN) += xilinx_tsn_ep.o
+ obj-$(CONFIG_XILINX_TSN_PTP) += xilinx_tsn_ptp_xmit.o xilinx_tsn_ptp_clock.o
+ obj-$(CONFIG_XILINX_TSN_QBV) += xilinx_tsn_shaper.o
+ obj-$(CONFIG_XILINX_TSN_QCI) += xilinx_tsn_qci.o
++obj-$(CONFIG_XILINX_TSN_CB) += xilinx_tsn_cb.o
+ obj-$(CONFIG_XILINX_TSN_SWITCH) += xilinx_tsn_switch.o
+ xilinx_emac-objs := xilinx_axienet_main.o xilinx_axienet_mdio.o xilinx_axienet_dma.o
+ obj-$(CONFIG_XILINX_AXI_EMAC) += xilinx_emac.o
+diff --git a/drivers/net/ethernet/xilinx/xilinx_tsn_cb.c b/drivers/net/ethernet/xilinx/xilinx_tsn_cb.c
+new file mode 100644
+index 000000000000..4902a536c8e0
+--- /dev/null
++++ b/drivers/net/ethernet/xilinx/xilinx_tsn_cb.c
+@@ -0,0 +1,177 @@
++/*
++ * Xilinx FPGA Xilinx TSN QCI Controller module.
++ *
++ * Copyright (c) 2017 Xilinx Pvt., Ltd
++ *
++ * Author: Saurabh Sengar <saurabhs@xilinx.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++#include "xilinx_tsn_switch.h"
++
++#define IN_PORTID_MASK				0x3
++#define IN_PORTID_SHIFT				24
++#define MAX_SEQID_MASK				0x0000FFFF
++
++#define SEQ_REC_HIST_LEN_MASK			0x000000FF
++#define SEQ_REC_HIST_LEN_SHIFT			16
++#define SPLIT_STREAM_INPORTID_SHIFT		12
++#define SPLIT_STREAM_INPORTID_MASK		0x3
++#define SPLIT_STREAM_VLANID_MASK		0x00000FFF
++
++#define GATE_ID_SHIFT				24
++#define MEMBER_ID_SHIFT				8
++#define SEQ_RESET_SHIFT				7
++#define REC_TIMEOUT_SHIFT			6
++#define GATE_STATE_SHIFT			5
++#define FRER_VALID_SHIFT			4
++#define WR_OP_TYPE_SHIFT			2
++#define OP_TYPE_SHIFT				1
++#define WR_OP_TYPE_MASK				0x3
++#define FRER_EN_CONTROL_MASK			0x1
++
++/**
++ * frer_control - Configure thr control for frer
++ * @data:	Value to be programmed
++ */
++void frer_control(struct frer_ctrl data)
++{
++	u32 mask = 0;
++
++	mask = data.gate_id << GATE_ID_SHIFT;
++	mask |= data.memb_id << MEMBER_ID_SHIFT;
++	mask |= data.seq_reset << SEQ_RESET_SHIFT;
++	mask |= data.gate_state << GATE_STATE_SHIFT;
++	mask |= data.rcvry_tmout << REC_TIMEOUT_SHIFT;
++	mask |= data.frer_valid << FRER_VALID_SHIFT;
++	mask |= (data.wr_op_type & WR_OP_TYPE_MASK) << WR_OP_TYPE_SHIFT;
++	mask |= data.op_type << OP_TYPE_SHIFT;
++	mask |= FRER_EN_CONTROL_MASK;
++
++	axienet_iow(&lp, FRER_CONTROL_OFFSET, mask);
++
++	/* wait for write to complete */
++	while ((axienet_ior(&lp, FRER_CONTROL_OFFSET) & FRER_EN_CONTROL_MASK))
++		;
++}
++
++/**
++ * get_ingress_filter_config -  Get Ingress Filter Configuration
++ * @data:	Value returned
++ */
++void get_ingress_filter_config(struct in_fltr *data)
++{
++	u32 reg_val = 0;
++
++	reg_val = axienet_ior(&lp, INGRESS_FILTER_OFFSET);
++
++	data->max_seq_id = reg_val & MAX_SEQID_MASK;
++	data->in_port_id = (reg_val >> IN_PORTID_SHIFT) & IN_PORTID_MASK;
++}
++
++/**
++ * config_stream_filter -  Configure Ingress Filter Configuration
++ * @data:	Value to be programmed
++ */
++void config_ingress_filter(struct in_fltr data)
++{
++	u32 mask = 0;
++
++	mask = ((data.in_port_id & IN_PORTID_MASK) << IN_PORTID_SHIFT) |
++					(data.max_seq_id & MAX_SEQID_MASK);
++	axienet_iow(&lp, INGRESS_FILTER_OFFSET, mask);
++}
++
++/**
++ * get_member_reg -  Read frer member Configuration registers value
++ * @data:	Value returned
++ */
++void get_member_reg(struct frer_memb_config *data)
++{
++	u32 conf_r1 = 0;
++
++	conf_r1 = axienet_ior(&lp, FRER_CONFIG_REG1);
++	data->rem_ticks = axienet_ior(&lp, FRER_CONFIG_REG2);
++
++	data->seq_rec_hist_len = (conf_r1 >> SEQ_REC_HIST_LEN_SHIFT)
++						& SEQ_REC_HIST_LEN_MASK;
++	data->split_strm_egport_id = (conf_r1 >> SPLIT_STREAM_INPORTID_SHIFT)
++						& SPLIT_STREAM_INPORTID_MASK;
++	data->split_strm_vlan_id = conf_r1 & SPLIT_STREAM_VLANID_MASK;
++}
++
++/**
++ * program_member_reg -  configure frer member Configuration registers
++ * @data:	Value to be programmed
++ */
++void program_member_reg(struct frer_memb_config data)
++{
++	u32 conf_r1 = 0;
++
++	conf_r1 = (data.seq_rec_hist_len & SEQ_REC_HIST_LEN_MASK)
++						<< SEQ_REC_HIST_LEN_SHIFT;
++	conf_r1 = conf_r1 | ((data.split_strm_egport_id
++					& SPLIT_STREAM_INPORTID_MASK)
++					<< SPLIT_STREAM_INPORTID_SHIFT);
++	conf_r1 = conf_r1 | (data.split_strm_vlan_id
++					& SPLIT_STREAM_VLANID_MASK);
++
++	axienet_iow(&lp, FRER_CONFIG_REG1, conf_r1);
++	axienet_iow(&lp, FRER_CONFIG_REG2, data.rem_ticks);
++}
++
++/**
++ * get_frer_static_counter -  get frer static counters value
++ * @data:	return value, containing counter value
++ */
++void get_frer_static_counter(struct frer_static_counter *data)
++{
++	int offset = (data->num) * 8;
++
++	data->frer_fr_count.lsb = axienet_ior(&lp, TOTAL_FRER_FRAMES_OFFSET +
++									offset);
++	data->frer_fr_count.msb = axienet_ior(&lp, TOTAL_FRER_FRAMES_OFFSET +
++								offset + 0x4);
++
++	data->disc_frames_in_portid.lsb = axienet_ior(&lp,
++						      FRER_DISCARD_INGS_FLTR_OFFSET + offset);
++	data->disc_frames_in_portid.msb = axienet_ior(&lp,
++						      FRER_DISCARD_INGS_FLTR_OFFSET + offset + 0x4);
++
++	data->pass_frames_ind_recv.lsb = axienet_ior(&lp,
++						     FRER_PASS_FRAMES_INDV_OFFSET + offset);
++	data->pass_frames_ind_recv.msb = axienet_ior(&lp,
++						     FRER_PASS_FRAMES_INDV_OFFSET + offset + 0x4);
++
++	data->disc_frames_ind_recv.lsb = axienet_ior(&lp,
++						     FRER_DISCARD_FRAMES_INDV_OFFSET + offset);
++	data->disc_frames_ind_recv.msb = axienet_ior(&lp,
++						     FRER_DISCARD_FRAMES_INDV_OFFSET + offset + 0x4);
++
++	data->pass_frames_seq_recv.lsb = axienet_ior(&lp,
++						     FRER_PASS_FRAMES_SEQ_OFFSET + offset);
++	data->pass_frames_seq_recv.msb = axienet_ior(&lp,
++						     FRER_PASS_FRAMES_SEQ_OFFSET + offset + 0x4);
++
++	data->disc_frames_seq_recv.lsb = axienet_ior(&lp,
++						     FRER_DISCARD_FRAMES_SEQ_OFFSET + offset);
++	data->disc_frames_seq_recv.msb = axienet_ior(&lp,
++						     FRER_DISCARD_FRAMES_SEQ_OFFSET + offset + 0x4);
++
++	data->rogue_frames_seq_recv.lsb = axienet_ior(&lp,
++						      FRER_ROGUE_FRAMES_SEQ_OFFSET + offset);
++	data->rogue_frames_seq_recv.msb = axienet_ior(&lp,
++						      FRER_ROGUE_FRAMES_SEQ_OFFSET + offset + 0x4);
++
++	data->seq_recv_rst.lsb = axienet_ior(&lp,
++					     SEQ_RECV_RESETS_OFFSET + offset);
++	data->seq_recv_rst.msb = axienet_ior(&lp,
++					     SEQ_RECV_RESETS_OFFSET + offset + 0x4);
++}
+diff --git a/drivers/net/ethernet/xilinx/xilinx_tsn_switch.c b/drivers/net/ethernet/xilinx/xilinx_tsn_switch.c
+index 472b470e9152..cccaaa76cf7a 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_tsn_switch.c
++++ b/drivers/net/ethernet/xilinx/xilinx_tsn_switch.c
+@@ -442,7 +442,7 @@ static void add_delete_cam_entry(struct cam_struct data, u8 add)
+ 
+ 	port_action = port_action | (data.fwd_port << SDL_CAM_PORT_LIST_SHIFT);
+ 
+-#if IS_ENABLED(CONFIG_XILINX_TSN_QCI)
++#if IS_ENABLED(CONFIG_XILINX_TSN_QCI) || IS_ENABLED(CONFIG_XILINX_TSN_CB)
+ 	port_action = port_action | (data.gate_id << SDL_GATEID_SHIFT);
+ #endif
+ 
+@@ -474,9 +474,11 @@ static long switch_ioctl(struct file *file, unsigned int cmd,
+ {
+ 	long retval = 0;
+ 	struct switch_data data;
+-
+ #if IS_ENABLED(CONFIG_XILINX_TSN_QCI)
+ 	struct qci qci_data;
++#endif
++#if IS_ENABLED(CONFIG_XILINX_TSN_CB)
++	struct cb cb_data;
+ #endif
+ 	switch (cmd) {
+ 	case GET_STATUS_SWITCH:
+@@ -619,6 +621,73 @@ static long switch_ioctl(struct file *file, unsigned int cmd,
+ 			goto end;
+ 		}
+ 		break;
++#endif
++#if IS_ENABLED(CONFIG_XILINX_TSN_CB)
++	case CONFIG_MEMBER_MEM:
++		if (copy_from_user(&cb_data, (char __user *)arg,
++				   sizeof(cb_data))) {
++			pr_err("Copy from user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		program_member_reg(cb_data.frer_memb_config_data);
++		break;
++
++	case CONFIG_INGRESS_FLTR:
++		if (copy_from_user(&cb_data, (char __user *)arg,
++				   sizeof(cb_data))) {
++			pr_err("Copy from user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		config_ingress_filter(cb_data.in_fltr_data);
++		break;
++
++	case FRER_CONTROL:
++		if (copy_from_user(&cb_data, (char __user *)arg,
++				   sizeof(cb_data))) {
++			pr_err("Copy from user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		frer_control(cb_data.frer_ctrl_data);
++		break;
++
++	case GET_STATIC_FRER_COUNTER:
++		if (copy_from_user(&cb_data, (char __user *)arg,
++				   sizeof(cb_data))) {
++			pr_err("Copy from user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		get_frer_static_counter(&cb_data.frer_counter_data);
++		if (copy_to_user((char __user *)arg, &cb_data,
++				 sizeof(cb_data))) {
++			pr_err("Copy to user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		break;
++
++	case GET_MEMBER_REG:
++		get_member_reg(&cb_data.frer_memb_config_data);
++		if (copy_to_user((char __user *)arg, &cb_data,
++				 sizeof(cb_data))) {
++			pr_err("Copy to user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		break;
++
++	case GET_INGRESS_FLTR:
++		get_ingress_filter_config(&cb_data.in_fltr_data);
++		if (copy_to_user((char __user *)arg, &cb_data,
++				 sizeof(cb_data))) {
++			pr_err("Copy to user failed\n");
++			retval = -EINVAL;
++			goto end;
++		}
++		break;
+ #endif
+ 	}
+ end:
+diff --git a/drivers/net/ethernet/xilinx/xilinx_tsn_switch.h b/drivers/net/ethernet/xilinx/xilinx_tsn_switch.h
+index 85d890471992..9e5e21aea127 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_tsn_switch.h
++++ b/drivers/net/ethernet/xilinx/xilinx_tsn_switch.h
+@@ -132,6 +132,21 @@
+ #define FLTR_STDU_ERR_OFFSET			0x3000
+ #define METER_ERR_OFFSET			0x3800
+ 
++/* CB */
++#define FRER_CONTROL_OFFSET			0x1300
++#define INGRESS_FILTER_OFFSET			0x1304
++#define FRER_CONFIG_REG1			0x1308
++#define FRER_CONFIG_REG2			0x130C
++
++/* FRER Statistics Counters */
++#define TOTAL_FRER_FRAMES_OFFSET		0x4000
++#define FRER_DISCARD_INGS_FLTR_OFFSET		0x4800
++#define FRER_PASS_FRAMES_INDV_OFFSET		0x5000
++#define FRER_DISCARD_FRAMES_INDV_OFFSET		0x5800
++#define FRER_PASS_FRAMES_SEQ_OFFSET		0x6000
++#define FRER_DISCARD_FRAMES_SEQ_OFFSET		0x6800
++#define FRER_ROGUE_FRAMES_SEQ_OFFSET		0x7000
++#define SEQ_RECV_RESETS_OFFSET			0x7800
+ 
+ /* 64 bit counter*/
+ struct static_cntr {
+@@ -182,6 +197,53 @@ struct qci {
+ 
+ /************* QCI Structures end *************/
+ 
++/*********** CB Structures **************/
++struct frer_ctrl {
++	u8 gate_id;
++	u8 memb_id;
++	bool seq_reset;
++	bool gate_state;
++	bool rcvry_tmout;
++	bool frer_valid;
++	u8 wr_op_type;
++	bool op_type;
++};
++
++struct in_fltr {
++	u8 in_port_id;
++	u16 max_seq_id;
++};
++
++struct frer_memb_config {
++	u8 seq_rec_hist_len;
++	u8 split_strm_egport_id;
++	u16 split_strm_vlan_id;
++	u32 rem_ticks;
++};
++
++/* FRER Static counter*/
++struct frer_static_counter {
++	struct static_cntr frer_fr_count;
++	struct static_cntr disc_frames_in_portid;
++	struct static_cntr pass_frames_seq_recv;
++	struct static_cntr disc_frames_seq_recv;
++	struct static_cntr rogue_frames_seq_recv;
++	struct static_cntr pass_frames_ind_recv;
++	struct static_cntr disc_frames_ind_recv;
++	struct static_cntr seq_recv_rst;
++	unsigned char num;
++};
++
++/* CB Core stuctures */
++struct cb {
++	struct frer_ctrl frer_ctrl_data;
++	struct in_fltr in_fltr_data;
++	struct frer_memb_config frer_memb_config_data;
++	struct frer_static_counter frer_counter_data;
++};
++
++/************* CB Structures end *************/
++
+ /********* Switch Structures Starts ***********/
+ struct thershold {
+ 	u16 t1;
+@@ -291,4 +353,12 @@ void program_meter_reg(struct meter_config data);
+ void get_psfp_static_counter(struct psfp_static_counter *data);
+ void get_meter_reg(struct meter_config *data);
+ void get_stream_filter_config(struct stream_filter *data);
++
++/********* cb function declararions ********/
++void frer_control(struct frer_ctrl data);
++void get_ingress_filter_config(struct in_fltr *data);
++void config_ingress_filter(struct in_fltr data);
++void get_member_reg(struct frer_memb_config *data);
++void program_member_reg(struct frer_memb_config data);
++void get_frer_static_counter(struct frer_static_counter *data);
+ #endif /* XILINX_TSN_SWITCH_H */
+-- 
+2.31.1
+

@@ -1,0 +1,250 @@
+From 8605fa97f7be49d2a91a8c90ce0da6dd610f4cd2 Mon Sep 17 00:00:00 2001
+From: Wendy Liang <wendy.liang@xilinx.com>
+Date: Thu, 11 Jun 2020 11:41:52 -0700
+Subject: [PATCH 1378/1852] misc: ai-engine: Add FPGA bridge to AI engine
+ partition
+
+commit 332761b3ea9419a93dbbb515654a768b942f377d from
+https://github.com/Xilinx/linux-xlnx.git
+
+Add FPGA bridge support to AI engine partition.
+
+The SHIM row of AI engine partition is the bridge between AI engine
+partition and the FPGA parts. When PL or AI engine partition is got
+programmed, the bridge should be disabled first.
+
+Signed-off-by: Wendy Liang <wendy.liang@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/Kconfig                          |  1 +
+ drivers/misc/xilinx-ai-engine/Makefile        |  3 +-
+ .../misc/xilinx-ai-engine/ai-engine-fpga.c    | 88 +++++++++++++++++++
+ .../xilinx-ai-engine/ai-engine-internal.h     | 18 ++++
+ .../misc/xilinx-ai-engine/ai-engine-part.c    |  7 ++
+ include/uapi/linux/xlnx-ai-engine.h           |  2 +
+ 6 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/misc/xilinx-ai-engine/ai-engine-fpga.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index e3dc3055f364..101ae354ecc5 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -517,6 +517,7 @@ config XILINX_TRAFGEN
+ config XILINX_AIE
+ 	tristate "Xilinx AI engine"
+ 	depends on ARM64 || COMPILE_TEST
++	select FPGA_BRIDGE
+ 	help
+ 	  This option enables support for the Xilinx AI engine driver.
+ 	  One Xilinx AI engine device can have multiple partitions (groups of
+diff --git a/drivers/misc/xilinx-ai-engine/Makefile b/drivers/misc/xilinx-ai-engine/Makefile
+index 6a55e5472d4e..82025f0ff21d 100644
+--- a/drivers/misc/xilinx-ai-engine/Makefile
++++ b/drivers/misc/xilinx-ai-engine/Makefile
+@@ -5,5 +5,6 @@
+ 
+ obj-$(CONFIG_XILINX_AIE)	+= xilinx-aie.o
+ 
+-xilinx-aie-$(CONFIG_XILINX_AIE) := ai-engine-dev.o ai-engine-part.o \
++xilinx-aie-$(CONFIG_XILINX_AIE) := ai-engine-dev.o ai-engine-fpga.o \
++				   ai-engine-part.o \
+ 				   ai-engine-res.o ai-engine-v1.o
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-fpga.c b/drivers/misc/xilinx-ai-engine/ai-engine-fpga.c
+new file mode 100644
+index 000000000000..7816c92134fe
+--- /dev/null
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-fpga.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx AI Engine driver FPGA region implementation
++ *
++ * Copyright (C) 2020 Xilinx, Inc.
++ */
++
++#include "ai-engine-internal.h"
++
++static int aie_fpga_bridge_enable_set(struct fpga_bridge *bridge, bool enable)
++{
++	struct aie_partition *apart = bridge->priv;
++
++	/*
++	 * TBD:
++	 * "Enable" should enable the SHIM tile configuration.
++	 * "Disable" should should disable SHIM DMAs, and wait
++	 * until SHIM DMA stops, and disable SHIM
++	 * to PL streams within partition.
++	 */
++	mutex_lock_interruptible(&apart->mlock);
++	if (enable)
++		apart->status |= XAIE_PART_STATUS_BRIDGE_ENABLED;
++	else
++		apart->status &= ~XAIE_PART_STATUS_BRIDGE_ENABLED;
++	mutex_unlock(&apart->mlock);
++	return 0;
++}
++
++static int aie_fpga_bridge_enable_show(struct fpga_bridge *bridge)
++{
++	struct aie_partition *apart = bridge->priv;
++	int ret;
++
++	mutex_lock_interruptible(&apart->mlock);
++	if (apart->status & XAIE_PART_STATUS_BRIDGE_ENABLED)
++		ret = 1;
++	else
++		ret = 0;
++	mutex_unlock(&apart->mlock);
++	return ret;
++}
++
++static const struct fpga_bridge_ops aie_fpga_bridge_ops = {
++	.enable_set = aie_fpga_bridge_enable_set,
++	.enable_show = aie_fpga_bridge_enable_show,
++};
++
++/**
++ * aie_fpga_create_bridge() - Create FPGA bridge for AI engine partition
++ * @apart: AI engine partition
++ * @return: 0 for success, negative value for failure
++ *
++ * This function will create FPGA bridge for AI engine partition.
++ * FPGA bridge is the presentation of SHIM row of the AI engine partition.
++ * FPGA bridge connects AI engine partition with other FPGA regions.
++ */
++int aie_fpga_create_bridge(struct aie_partition *apart)
++{
++	struct fpga_bridge *br;
++	int ret;
++
++	snprintf(apart->br.name, sizeof(apart->br.name) - 1,
++		 "xlnx-aie-bridge-%u-%u", apart->range.start.col, 0);
++	br = devm_fpga_bridge_create(&apart->dev, apart->br.name,
++				     &aie_fpga_bridge_ops, apart);
++	if (!br)
++		return -ENOMEM;
++	ret = fpga_bridge_register(br);
++	if (ret) {
++		dev_err(&apart->dev, "Failed to register bridge.\n");
++		return ret;
++	}
++	apart->br.br = br;
++	return 0;
++}
++
++/**
++ * aie_fpga_free_bridge() - Free AI engine partition FPGA bridge
++ * @apart: AI engine partition
++ *
++ * This function will free the FPGA bridge for AI engine partition.
++ */
++void aie_fpga_free_bridge(struct aie_partition *apart)
++{
++	if (!WARN_ON(!apart->br.br))
++		fpga_bridge_unregister(apart->br.br);
++}
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index 27ba76c4241c..13ec9cb8cc51 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -11,6 +11,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/cdev.h>
+ #include <linux/device.h>
++#include <linux/fpga/fpga-bridge.h>
+ #include <linux/io.h>
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+@@ -36,6 +37,8 @@ enum aie_tile_type {
+ #define AIE_REGS_ATTR_PERM_MASK		GENMASK(15, \
+ 						AIE_REGS_ATTR_PERM_SHIFT)
+ 
++#define AIE_PART_STATUS_BRIDGE_DISABLED	0x1U
++
+ /**
+  * struct aie_tile_regs - contiguous range of AI engine register
+  *			  within an AI engine tile
+@@ -111,10 +114,21 @@ struct aie_device {
+ 	int version;
+ };
+ 
++/**
++ * struct aie_part_bridge - AI engine FPGA bridge
++ * @name: name of the FPGA bridge
++ * @br: pointer to FPGA bridge
++ */
++struct aie_part_bridge {
++	char name[32];
++	struct fpga_bridge *br;
++};
++
+ /**
+  * struct aie_partition - AI engine partition structure
+  * @node: list node
+  * @adev: pointer to AI device instance
++ * @br: AI engine FPGA bridge
+  * @range: range of partition
+  * @mlock: protection for AI engine partition operations
+  * @dev: device for the AI engine partition
+@@ -124,6 +138,7 @@ struct aie_device {
+  */
+ struct aie_partition {
+ 	struct list_head node;
++	struct aie_part_bridge br;
+ 	struct aie_device *adev;
+ 	struct aie_range range;
+ 	struct mutex mlock; /* protection for AI engine partition operations */
+@@ -204,5 +219,8 @@ struct aie_partition *of_aie_part_probe(struct aie_device *adev,
+ 					struct device_node *nc);
+ void aie_part_remove(struct aie_partition *apart);
+ 
++int aie_fpga_create_bridge(struct aie_partition *apart);
++void aie_fpga_free_bridge(struct aie_partition *apart);
++
+ int aiev1_device_init(struct aie_device *adev);
+ #endif /* AIE_INTERNAL_H */
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-part.c b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+index c67fcbdb59e0..c8e3a9d23726 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-part.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+@@ -403,6 +403,7 @@ static void aie_part_release_device(struct device *dev)
+ 				apart->range.size.col);
+ 	list_del(&apart->node);
+ 	mutex_unlock(&adev->mlock);
++	aie_fpga_free_bridge(apart);
+ 	put_device(apart->dev.parent);
+ }
+ 
+@@ -532,8 +533,14 @@ of_aie_part_probe(struct aie_device *adev, struct device_node *nc)
+ 
+ 	of_node_get(nc);
+ 	apart->dev.of_node = nc;
++	apart->dev.driver = adev->dev.parent->driver;
+ 	apart->partition_id = partition_id;
+ 
++	/* Create FPGA bridge for AI engine partition */
++	ret = aie_fpga_create_bridge(apart);
++	if (ret < 0)
++		dev_warn(&apart->dev, "failed to create fpga region.\n");
++
+ 	dev_info(&adev->dev,
+ 		 "AI engine part(%u,%u),(%u,%u), id %u is probed successfully.\n",
+ 		 range.start.col, range.start.row,
+diff --git a/include/uapi/linux/xlnx-ai-engine.h b/include/uapi/linux/xlnx-ai-engine.h
+index a0fdf21db5d6..a274d1fdde3a 100644
+--- a/include/uapi/linux/xlnx-ai-engine.h
++++ b/include/uapi/linux/xlnx-ai-engine.h
+@@ -15,6 +15,8 @@ enum aie_reg_op {
+ 
+ /* AI engine partition is in use */
+ #define XAIE_PART_STATUS_INUSE		(1U << 0)
++/* AI engine partition bridge is enabled */
++#define XAIE_PART_STATUS_BRIDGE_ENABLED	(1U << 1)
+ 
+ /**
+  * struct aie_location - AIE location information
+-- 
+2.31.1
+

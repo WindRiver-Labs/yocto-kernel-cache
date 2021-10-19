@@ -1,0 +1,588 @@
+From 9996e6a0b664e61c1b4398da6e540890af1567f9 Mon Sep 17 00:00:00 2001
+From: Wendy Liang <wendy.liang@xilinx.com>
+Date: Wed, 24 Jun 2020 12:36:32 -0700
+Subject: [PATCH 1402/1852] misc: xilinx-ai-engine: export AI engine program
+ and data memory to userspace
+
+commit 8db2ea07657a2dfc112df57384484d269bca7a23 from
+https://github.com/Xilinx/linux-xlnx.git
+
+There is no concern to have userspace to directly access AI engine program
+and data memories. It will be much faster to directly copy data to and
+from these memories from userspace.
+
+We choose to use DMA buf for the data and program memory because of the
+DMA buf features. DMA buf can share the DMA memory between applications
+and different devices, which can benefit on how to share data with AI
+engine device in future.
+
+There is one DMA buf per type of memory in an AI engine partition. e.g.
+There is one DMA buf for all the tile core program memories in an AI engine
+partition. There is another DMA buf for all the tile data memories in an
+AI engine partition.
+
+Signed-off-by: Wendy Liang <wendy.liang@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/xilinx-ai-engine/Makefile        |   2 +-
+ .../xilinx-ai-engine/ai-engine-internal.h     |  26 ++
+ drivers/misc/xilinx-ai-engine/ai-engine-mem.c | 266 ++++++++++++++++++
+ .../misc/xilinx-ai-engine/ai-engine-part.c    |  48 +++-
+ drivers/misc/xilinx-ai-engine/ai-engine-v1.c  |  36 +++
+ include/uapi/linux/xlnx-ai-engine.h           |  45 +++
+ 6 files changed, 421 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/misc/xilinx-ai-engine/ai-engine-mem.c
+
+diff --git a/drivers/misc/xilinx-ai-engine/Makefile b/drivers/misc/xilinx-ai-engine/Makefile
+index 82025f0ff21d..87a3fc85a866 100644
+--- a/drivers/misc/xilinx-ai-engine/Makefile
++++ b/drivers/misc/xilinx-ai-engine/Makefile
+@@ -6,5 +6,5 @@
+ obj-$(CONFIG_XILINX_AIE)	+= xilinx-aie.o
+ 
+ xilinx-aie-$(CONFIG_XILINX_AIE) := ai-engine-dev.o ai-engine-fpga.o \
+-				   ai-engine-part.o \
++				   ai-engine-mem.o ai-engine-part.o \
+ 				   ai-engine-res.o ai-engine-v1.o
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index ce7417356453..f23ccf837da3 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -56,15 +56,37 @@ struct aie_tile_regs {
+ struct aie_device;
+ struct aie_partition;
+ 
++/**
++ * struct aie_part_mem - AI engine partition memory information structure
++ * @apart: AI engine partition
++ * @mem: memory information of a type of memory
++ * @size: size of the total memories in the partition
++ *
++ * This structure is to keep the information of a type of memory in a
++ * partition. The memory information will be stored in @mem property.
++ * The following information will be keep:
++ *  * memory start address offset within a tile
++ *  * memory size
++ *  * what tiles contain this type of memory
++ */
++struct aie_part_mem {
++	struct aie_partition *apart;
++	struct aie_mem mem;
++	size_t size;
++};
++
+ /**
+  * struct aie_tile_operations - AI engine device operations
+  * @get_tile_type: get type of tile based on tile operation
++ * @get_mem_info: get different types of memories information
+  *
+  * Different AI engine device version has its own device
+  * operation.
+  */
+ struct aie_tile_operations {
+ 	u32 (*get_tile_type)(struct aie_location *loc);
++	unsigned int (*get_mem_info)(struct aie_range *range,
++				     struct aie_part_mem *pmem);
+ };
+ 
+ /**
+@@ -128,6 +150,7 @@ struct aie_part_bridge {
+  * struct aie_partition - AI engine partition structure
+  * @node: list node
+  * @adev: pointer to AI device instance
++ * @pmems: pointer to partition memories types
+  * @br: AI engine FPGA bridge
+  * @range: range of partition
+  * @mlock: protection for AI engine partition operations
+@@ -140,6 +163,7 @@ struct aie_partition {
+ 	struct list_head node;
+ 	struct aie_part_bridge br;
+ 	struct aie_device *adev;
++	struct aie_part_mem *pmems;
+ 	struct aie_range range;
+ 	struct mutex mlock; /* protection for AI engine partition operations */
+ 	struct device dev;
+@@ -222,5 +246,7 @@ void aie_part_remove(struct aie_partition *apart);
+ int aie_fpga_create_bridge(struct aie_partition *apart);
+ void aie_fpga_free_bridge(struct aie_partition *apart);
+ 
++int aie_mem_get_info(struct aie_partition *apart, unsigned long arg);
++
+ int aiev1_device_init(struct aie_device *adev);
+ #endif /* AIE_INTERNAL_H */
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-mem.c b/drivers/misc/xilinx-ai-engine/ai-engine-mem.c
+new file mode 100644
+index 000000000000..776112a32a91
+--- /dev/null
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-mem.c
+@@ -0,0 +1,266 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx AI Engine device memory implementation
++ *
++ * Copyright (C) 2020 Xilinx, Inc.
++ */
++
++#include <linux/dma-buf.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/xlnx-ai-engine.h>
++
++#include "ai-engine-internal.h"
++
++#define aie_cal_reg_goffset(adev, loc, regoff) ({ \
++	struct aie_device *_adev = (adev); \
++	struct aie_location *_loc = &(loc); \
++	(_loc->col << _adev->col_shift) + \
++	(_loc->row << _adev->row_shift) + (regoff); \
++	})
++
++#define aie_cal_reg_pa(adev, loc, regoff) ({ \
++	struct aie_device *__adev = (adev); \
++	__adev->res->start + aie_cal_reg_goffset(__adev, loc, regoff); \
++	})
++
++static struct sg_table *
++aie_mem_map_dma_buf(struct dma_buf_attachment *attachment,
++		    enum dma_data_direction direction)
++{
++	/*
++	 * TODO: It is mandatory by DMA buf operation. It is used return
++	 * scatterlist table of an attachment. We don't have the implementation
++	 * for now. And thus it has empty implementation.
++	 */
++	(void)attachment;
++	(void)direction;
++	dev_warn(attachment->dev,
++		 "AI engine memory map dma buf is not implemented.\n");
++	return NULL;
++}
++
++static void aie_mem_unmap_dma_buf(struct dma_buf_attachment *attachment,
++				  struct sg_table *table,
++				  enum dma_data_direction direction)
++{
++	/*
++	 * TODO: It is mandatory by DMA buf operation. It is used deallocate
++	 * scatterlist table of an attachment. We don't have the implementation
++	 * for now. And thus it has empty implementation.
++	 */
++	(void)attachment;
++	(void)table;
++	(void)direction;
++	dev_warn(attachment->dev,
++		 "AI engine memory unmap dma buf is not implemented.\n");
++}
++
++static int aie_mem_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
++{
++	struct aie_part_mem *pmem = dmabuf->priv;
++	struct aie_mem *mem = &pmem->mem;
++	struct aie_partition *apart = pmem->apart;
++	struct aie_location loc;
++	unsigned long addr = vma->vm_start;
++	unsigned long offset = vma->vm_pgoff * PAGE_SIZE, moffset = 0;
++	unsigned long remainder = vma->vm_end - addr;
++	size_t msize = mem->size;
++
++	if (remainder + offset > pmem->size)
++		return -EINVAL;
++
++	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
++	for (loc.col = mem->range.start.col;
++	     loc.col < mem->range.start.col + mem->range.size.col; loc.col++) {
++		for (loc.row = mem->range.start.row;
++		     loc.row < mem->range.start.row + mem->range.size.row;
++		     loc.row++) {
++			unsigned long toffset, len;
++			phys_addr_t mempa;
++			int ret;
++
++			remainder = vma->vm_end - addr;
++			if (!remainder)
++				return 0;
++
++			if (moffset + msize < offset) {
++				moffset += msize;
++				continue;
++			}
++			/*
++			 * calculate offset within the tile memory.
++			 * offset is the offset to vma->start.
++			 * moffset is the tile memory start offset to
++			 * vma->start.
++			 */
++			toffset = offset - moffset;
++			len = msize - toffset;
++			if (len > remainder)
++				len = remainder;
++			mempa = aie_cal_reg_pa(apart->adev, loc,
++					       toffset + mem->offset);
++
++			ret = remap_pfn_range(vma, addr, mempa >> PAGE_SHIFT,
++					      len, vma->vm_page_prot);
++			if (ret) {
++				dev_err(&apart->dev,
++					"failed to mmap (%u,%u)memory, remap failed, 0x%llx, 0x%lx.\n",
++					loc.col, loc.row, mempa, len);
++				return ret;
++			}
++			addr += len;
++			offset += len;
++			moffset += msize;
++		}
++	}
++	return 0;
++}
++
++static void aie_mem_dmabuf_release(struct dma_buf *dmabuf)
++{
++	(void)dmabuf;
++}
++
++static const struct dma_buf_ops aie_mem_dma_buf_ops = {
++	.map_dma_buf = aie_mem_map_dma_buf,
++	.unmap_dma_buf = aie_mem_unmap_dma_buf,
++	.mmap = aie_mem_mmap,
++	.release = aie_mem_dmabuf_release,
++};
++
++/**
++ * aie_mem_create_dmabuf() - creates DMA buffer for AI engine partition
++ *			     memories
++ * @apart: AI engine partition
++ * @pmem: pointer to the partition memory information
++ * @mem: pointer to where it store the memory information and DMA buf file
++ *	 descriptor for user.
++ * @return: 0 for success, negative value for failure
++ *
++ * This function will create DMA buffer for the AI engine partition memory
++ * and will store the DMA buffer file descriptor and memory information in
++ * @mem.
++ */
++static int aie_mem_create_dmabuf(struct aie_partition *apart,
++				 struct aie_part_mem *pmem,
++				 struct aie_mem *mem)
++{
++	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
++	struct dma_buf *dmabuf;
++	int ret;
++
++	if (!PAGE_ALIGNED(pmem->mem.size)) {
++		dev_warn(&apart->dev,
++			 "no dmabuf for mem(0x%zx, 0x%zx), not aligned with page size.\n",
++			 pmem->mem.offset, pmem->mem.size);
++		return -EINVAL;
++	}
++	exp_info.ops = &aie_mem_dma_buf_ops;
++	exp_info.size = pmem->size;
++	exp_info.flags = O_RDWR;
++	exp_info.priv = pmem;
++
++	dmabuf = dma_buf_export(&exp_info);
++	if (IS_ERR(dmabuf))
++		return PTR_ERR(dmabuf);
++
++	ret = dma_buf_fd(dmabuf, O_CLOEXEC);
++	if (ret < 0) {
++		dev_err(&apart->dev,
++			"dmabuf creation failed, failed to get fd.\n");
++		dma_buf_put(dmabuf);
++		return ret;
++	}
++	memcpy(mem, &pmem->mem, sizeof(*mem));
++	mem->fd = ret;
++
++	return 0;
++}
++
++/**
++ * aie_mem_get_info() - get AI engine memories information
++ * @apart: AI engine partition
++ * @arg: argument from user to enquire AI engine partition memory information
++ * @return: 0 for success, and negative value for failure
++ *
++ * This function will get the memories information for the specified AI engine
++ * partition. It will create DMA buf file descriptors for the memories and
++ * return the DMA buf file descriptors to users.
++ * It will create a DMA buffer per type of memories.
++ * e.g. There will be a DMA buffer for all the tile program memories in the
++ * partition, and another DMA buffer for all the tile data memories in the
++ * partition.
++ * User can first pass num_mems as 0 in the @arg to enquire for how many types
++ * of memories in this AI engine partition. And then, user can allocate memory
++ * to keep the information for different types of memories, and then use the
++ * same enqury with non-zero num_mems and none NULL pointer to ask for the
++ * details of the information of all the types of memories in the AI engine
++ * partition.
++ */
++int aie_mem_get_info(struct aie_partition *apart, unsigned long arg)
++{
++	struct aie_mem_args margs;
++	struct aie_mem *mems;
++	unsigned int num_mems, i;
++	int ret;
++
++	if (copy_from_user(&margs, (void __user *)arg, sizeof(margs)))
++		return -EFAULT;
++
++	num_mems = apart->adev->ops->get_mem_info(&apart->range, NULL);
++	if (num_mems <= 0)
++		return -EINVAL;
++
++	if (!margs.num_mems) {
++		struct aie_mem_args __user *umargs_ptr = (void __user *)arg;
++
++		/* This enquiry is to get the number of types of memories. */
++		if (copy_to_user((void __user *)&umargs_ptr->num_mems,
++				 &num_mems, sizeof(num_mems)))
++			return -EFAULT;
++		return 0;
++	}
++
++	if (num_mems != margs.num_mems) {
++		dev_err(&apart->dev,
++			"failed to get mem info, invalid num of mems %d,%d.\n",
++			num_mems, margs.num_mems);
++		return -EINVAL;
++	}
++	if (!margs.mems) {
++		dev_err(&apart->dev,
++			"failed to get mem info, mems pointer is NULL.\n");
++		return -EINVAL;
++	}
++
++	mems = kcalloc(num_mems, sizeof(*mems), GFP_KERNEL);
++	if (!mems)
++		return -ENOMEM;
++
++	/*
++	 * Create DMA buffer for the memories.
++	 * Each type of memory in the partition has its own DMA buf.
++	 */
++	for (i = 0; i < num_mems; i++) {
++		ret = aie_mem_create_dmabuf(apart, &apart->pmems[i], &mems[i]);
++		if (ret)
++			break;
++	}
++	if (!ret) {
++		if (copy_to_user((void __user *)margs.mems, mems,
++				 num_mems * sizeof(mems[0])))
++			ret = -EFAULT;
++	}
++
++	if (ret) {
++		for (i = 0; i < num_mems; i++) {
++			if (mems[i].fd)
++				put_unused_fd(mems[i].fd);
++		}
++	}
++
++	kfree(mems);
++	return ret;
++}
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-part.c b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+index 6564491673fd..4ee33a94c314 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-part.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+@@ -388,6 +388,8 @@ static long aie_part_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 		mutex_unlock(&apart->mlock);
+ 		break;
+ 	}
++	case AIE_GET_MEM_IOCTL:
++		return aie_mem_get_info(apart, arg);
+ 	default:
+ 		dev_err(&apart->dev, "Invalid ioctl command %u.\n", cmd);
+ 		ret = -EINVAL;
+@@ -433,6 +435,41 @@ static void aie_part_release_device(struct device *dev)
+ 	put_device(apart->dev.parent);
+ }
+ 
++/**
++ * aie_part_create_mems_info() - creates array to store the AI engine partition
++ *				 different memories types information
++ * @apart: AI engine partition
++ * @return: 0 for success, negative value for failure
++ *
++ * This function will create array to store the information of different
++ * memories types in the partition. This array is stored in @apart->pmems.
++ */
++static int aie_part_create_mems_info(struct aie_partition *apart)
++{
++	unsigned int i, num_mems;
++
++	num_mems = apart->adev->ops->get_mem_info(&apart->range, NULL);
++	if (!num_mems)
++		return 0;
++
++	apart->pmems = devm_kcalloc(&apart->dev, num_mems,
++				    sizeof(struct aie_part_mem),
++				    GFP_KERNEL);
++	if (!apart->pmems)
++		return -ENOMEM;
++
++	apart->adev->ops->get_mem_info(&apart->range, apart->pmems);
++	for (i = 0; i < num_mems; i++) {
++		struct aie_mem *mem = &apart->pmems[i].mem;
++
++		apart->pmems[i].apart = apart;
++		apart->pmems[i].size = mem->size *
++				       mem->range.size.col *
++				       mem->range.size.row;
++	}
++	return 0;
++}
++
+ /**
+  * aie_create_partition() - create AI engine partition instance
+  * @adev: AI engine device
+@@ -503,12 +540,21 @@ static struct aie_partition *aie_create_partition(struct aie_device *adev,
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	ret = mutex_lock_interruptible(&adev->mlock);
++	/*
++	 * Create array to keep the information of the different types of tile
++	 * memories information of the AI engine partition.
++	 */
++	ret = aie_part_create_mems_info(apart);
+ 	if (ret) {
+ 		put_device(dev);
+ 		return ERR_PTR(ret);
+ 	}
+ 
++	ret = mutex_lock_interruptible(&adev->mlock);
++	if (ret) {
++		put_device(dev);
++		return ERR_PTR(ret);
++	}
+ 	list_add_tail(&apart->node, &adev->partitions);
+ 	mutex_unlock(&adev->mlock);
+ 	get_device(&adev->dev);
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-v1.c b/drivers/misc/xilinx-ai-engine/ai-engine-v1.c
+index 92ba7cdac79b..5517328996bb 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-v1.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-v1.c
+@@ -9,10 +9,14 @@
+ 
+ #include "ai-engine-internal.h"
+ 
++#define KBYTES(n)	((n) * 1024)
++
+ #define AIE_ARRAY_SHIFT		30U
+ #define AIE_COL_SHIFT		23U
+ #define AIE_ROW_SHIFT		18U
+ 
++#define NUM_MEMS_PER_TILE	2U
++
+ static const struct aie_tile_regs aiev1_kernel_regs[] = {
+ 	/* SHIM AXI MM Config */
+ 	{.attribute = AIE_TILE_TYPE_SHIMNOC << AIE_REGS_ATTR_TILE_TYPE_SHIFT,
+@@ -62,8 +66,40 @@ static u32 aiev1_get_tile_type(struct aie_location *loc)
+ 	return AIE_TILE_TYPE_SHIMNOC;
+ }
+ 
++static unsigned int aiev1_get_mem_info(struct aie_range *range,
++				       struct aie_part_mem *pmem)
++{
++	unsigned int i;
++
++	if (range->start.row + range->size.row <= 1) {
++		/* SHIM row only, no memories in this range */
++		return 0;
++	}
++	if (!pmem)
++		return NUM_MEMS_PER_TILE;
++
++	for (i = 0; i < NUM_MEMS_PER_TILE; i++) {
++		struct aie_mem *mem = &pmem[i].mem;
++
++		memcpy(&mem->range, range, sizeof(*range));
++		if (!mem->range.start.row) {
++			mem->range.start.row = 1;
++			mem->range.size.row--;
++		}
++	}
++	/* Setup tile data memory information */
++	pmem[0].mem.offset = 0;
++	pmem[0].mem.size = KBYTES(32);
++	/* Setup program memory information */
++	pmem[1].mem.offset = 0x20000;
++	pmem[1].mem.size = KBYTES(16);
++
++	return NUM_MEMS_PER_TILE;
++}
++
+ static const struct aie_tile_operations aiev1_ops = {
+ 	.get_tile_type = aiev1_get_tile_type,
++	.get_mem_info = aiev1_get_mem_info,
+ };
+ 
+ /**
+diff --git a/include/uapi/linux/xlnx-ai-engine.h b/include/uapi/linux/xlnx-ai-engine.h
+index 4fc068425989..e82d4348fd5f 100644
+--- a/include/uapi/linux/xlnx-ai-engine.h
++++ b/include/uapi/linux/xlnx-ai-engine.h
+@@ -38,6 +38,32 @@ struct aie_range {
+ 	struct aie_location size;
+ };
+ 
++/**
++ * struct aie_mem - AIE memory information
++ * @range: range of tiles of the memory
++ * @offset: register offset within a tile of the memory
++ * @size: of a the memory in one tile
++ * @fd: file descriptor of the memory
++ */
++struct aie_mem {
++	struct aie_range range;
++	size_t offset;
++	size_t size;
++	int fd;
++};
++
++/**
++ * struct aie_mem_args - AIE memory enquiry arguments
++ * @num_mems: number of "struct aie_mem" elements
++ *	      e.g. two memory information elements, one for tile core memory,
++ *	      and the other for tile data memory.
++ * @mems: array of AI engine memory information elements
++ */
++struct aie_mem_args {
++	unsigned int num_mems;
++	struct aie_mem *mems;
++};
++
+ /**
+  * struct aie_reg_args - AIE access register arguments
+  * @op: if this request is to read, write or poll register
+@@ -106,4 +132,23 @@ struct aie_partition_req {
+ /* AI engine partition IOCTL operations */
+ #define AIE_REG_IOCTL			_IOWR(AIE_IOCTL_BASE, 0x8, \
+ 					      struct aie_reg_args)
++/**
++ * DOC: AIE_GET_MEM_IOCTL - enquire information of memories in the AI engine
++ *			    partition
++ * This ioctl is used to get the information of all the different types of
++ * memories in the AI engine partition. Application can get the memories
++ * information in two steps:
++ * 1. passing 0 as @num_mems in struct aie_mem_args to enquire the number of
++ *    different memories in the partition, the value will be returned in
++ *    @num_mems.
++ * 2. passing the number of memories in @num_mems and valid pointer as @mems of
++ *    struct aie_mem_args to store the details information of different
++ *    memories. The driver will create DMA buf for each type of memories, and
++ *    will return the memory addressing information along with the DMA buf file
++ *    descriptors in @mems.
++ * After getting the memories information, user can use mmap() with the DMA buf
++ * file descriptor to enable access the memories from userspace.
++ */
++#define AIE_GET_MEM_IOCTL		_IOWR(AIE_IOCTL_BASE, 0x9, \
++					      struct aie_mem_args)
+ #endif
+-- 
+2.31.1
+

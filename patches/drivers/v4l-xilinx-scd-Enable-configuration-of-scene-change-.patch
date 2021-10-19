@@ -1,0 +1,234 @@
+From 704ca404b493ef3f7b1dc45ff92db67a4ef49b71 Mon Sep 17 00:00:00 2001
+From: Dylan Yip <dylan.yip@xilinx.com>
+Date: Mon, 26 Aug 2019 15:25:58 -0700
+Subject: [PATCH 0661/1852] v4l: xilinx: scd: Enable configuration of scene
+ change threshold
+
+commit 013cea623ad4c4d864a4e197e9b231c2a99c42ab from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch allows a user application to alter the scd threshold value
+through ioctl VIDIOC_S_CTRL.
+
+This patch also fixes deinitialization process if error occurs in
+xscd_chan_init().
+
+Signed-off-by: Dylan Yip <dylan.yip@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ .../xilinx/xilinx-scenechange-channel.c       | 84 +++++++++++++++++--
+ .../platform/xilinx/xilinx-scenechange.h      |  6 ++
+ include/uapi/linux/xilinx-v4l2-controls.h     | 13 +++
+ 3 files changed, 96 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/xilinx/xilinx-scenechange-channel.c b/drivers/media/platform/xilinx/xilinx-scenechange-channel.c
+index 852191ac6500..39833f753274 100644
+--- a/drivers/media/platform/xilinx/xilinx-scenechange-channel.c
++++ b/drivers/media/platform/xilinx/xilinx-scenechange-channel.c
+@@ -26,7 +26,6 @@
+ #define XSCD_V_SUBSAMPLING		16
+ #define XSCD_BYTE_ALIGN			16
+ #define MULTIPLICATION_FACTOR		100
+-#define SCENE_CHANGE_THRESHOLD		0.5
+ 
+ #define XSCD_SCENE_CHANGE		1
+ #define XSCD_NO_SCENE_CHANGE		0
+@@ -175,6 +174,25 @@ static void xscd_chan_configure_params(struct xscd_chan *chan)
+ /* -----------------------------------------------------------------------------
+  * V4L2 Subdevice Operations
+  */
++
++static int xscd_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	int ret = 0;
++	struct xscd_chan *chan = container_of(ctrl->handler, struct xscd_chan,
++					      ctrl_handler);
++
++	switch (ctrl->id) {
++	case V4L2_CID_XILINX_SCD_THRESHOLD:
++		chan->threshold = ctrl->val;
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
+ static int xscd_s_stream(struct v4l2_subdev *subdev, int enable)
+ {
+ 	struct xscd_chan *chan = to_xscd_chan(subdev);
+@@ -232,6 +250,23 @@ static int xscd_close(struct v4l2_subdev *subdev, struct v4l2_subdev_fh *fh)
+ 	return 0;
+ }
+ 
++static const struct v4l2_ctrl_ops xscd_ctrl_ops = {
++	.s_ctrl	= xscd_s_ctrl
++};
++
++static const struct v4l2_ctrl_config xscd_ctrls[] = {
++	{
++		.ops = &xscd_ctrl_ops,
++		.id = V4L2_CID_XILINX_SCD_THRESHOLD,
++		.name = "Threshold Value",
++		.type = V4L2_CTRL_TYPE_INTEGER,
++		.min = 0,
++		.max = 100,
++		.step = 1,
++		.def = 50,
++	}
++};
++
+ static const struct v4l2_subdev_core_ops xscd_core_ops = {
+ 	.subscribe_event = xscd_subscribe_event,
+ 	.unsubscribe_event = xscd_unsubscribe_event
+@@ -270,15 +305,14 @@ static const struct media_entity_operations xscd_media_ops = {
+ void xscd_chan_event_notify(struct xscd_chan *chan)
+ {
+ 	u32 *eventdata;
+-	u32 sad, scd_threshold;
++	u32 sad;
+ 
+ 	sad = xscd_read(chan->iomem, XSCD_SAD_OFFSET);
+ 	sad = (sad * XSCD_V_SUBSAMPLING * MULTIPLICATION_FACTOR) /
+ 	       (chan->format.width * chan->format.height);
+ 	eventdata = (u32 *)&chan->event.u.data;
+-	scd_threshold = SCENE_CHANGE_THRESHOLD * MULTIPLICATION_FACTOR;
+ 
+-	if (sad > scd_threshold)
++	if (sad > chan->threshold)
+ 		eventdata[0] = XSCD_SCENE_CHANGE;
+ 	else
+ 		eventdata[0] = XSCD_NO_SCENE_CHANGE;
+@@ -302,6 +336,7 @@ int xscd_chan_init(struct xscd_device *xscd, unsigned int chan_id,
+ 	struct v4l2_subdev *subdev;
+ 	unsigned int num_pads;
+ 	int ret;
++	unsigned int i;
+ 
+ 	mutex_init(&chan->lock);
+ 	chan->xscd = xscd;
+@@ -334,19 +369,54 @@ int xscd_chan_init(struct xscd_device *xscd, unsigned int chan_id,
+ 
+ 	ret = media_entity_pads_init(&subdev->entity, num_pads, chan->pads);
+ 	if (ret < 0)
+-		goto error;
++		goto media_init_error;
+ 
+ 	subdev->entity.ops = &xscd_media_ops;
++
++	/* Initialize V4L2 Control Handler */
++	v4l2_ctrl_handler_init(&chan->ctrl_handler, ARRAY_SIZE(xscd_ctrls));
++
++	for (i = 0; i < ARRAY_SIZE(xscd_ctrls); i++) {
++		struct v4l2_ctrl *ctrl;
++
++		dev_dbg(chan->xscd->dev, "%d ctrl = 0x%x\n", i,
++			xscd_ctrls[i].id);
++		ctrl = v4l2_ctrl_new_custom(&chan->ctrl_handler, &xscd_ctrls[i],
++					    NULL);
++		if (!ctrl) {
++			dev_err(chan->xscd->dev, "Failed for %s ctrl\n",
++				xscd_ctrls[i].name);
++			goto ctrl_handler_error;
++		}
++	}
++
++	if (chan->ctrl_handler.error) {
++		dev_err(chan->xscd->dev, "failed to add controls\n");
++		ret = chan->ctrl_handler.error;
++		goto ctrl_handler_error;
++	}
++
++	subdev->ctrl_handler = &chan->ctrl_handler;
++
++	ret = v4l2_ctrl_handler_setup(&chan->ctrl_handler);
++	if (ret < 0) {
++		dev_err(chan->xscd->dev, "failed to set controls\n");
++		goto ctrl_handler_error;
++	}
++
+ 	ret = v4l2_async_register_subdev(subdev);
+ 	if (ret < 0) {
+ 		dev_err(chan->xscd->dev, "failed to register subdev\n");
+-		goto error;
++		goto ctrl_handler_error;
+ 	}
+ 
+ 	dev_info(chan->xscd->dev, "Scene change detection channel found!\n");
+ 	return 0;
+ 
+-error:
++ctrl_handler_error:
++	v4l2_ctrl_handler_free(&chan->ctrl_handler);
++media_init_error:
+ 	media_entity_cleanup(&subdev->entity);
++	mutex_destroy(&chan->lock);
+ 	return ret;
+ }
+diff --git a/drivers/media/platform/xilinx/xilinx-scenechange.h b/drivers/media/platform/xilinx/xilinx-scenechange.h
+index 1573bf825217..9749a7784bbb 100644
+--- a/drivers/media/platform/xilinx/xilinx-scenechange.h
++++ b/drivers/media/platform/xilinx/xilinx-scenechange.h
+@@ -18,7 +18,9 @@
+ #include <linux/mutex.h>
+ #include <linux/spinlock.h>
+ #include <linux/wait.h>
++#include <linux/xilinx-v4l2-controls.h>
+ 
++#include <media/v4l2-ctrls.h>
+ #include <media/v4l2-subdev.h>
+ 
+ struct clk;
+@@ -137,9 +139,11 @@ static inline struct xscd_dma_chan *to_xscd_dma_chan(struct dma_chan *chan)
+ /**
+  * struct xscd_chan - Video Stream structure
+  * @id: scene change channel ID
++ * @threshold: scene change detection threshold
+  * @iomem: I/O memory address of the channel registers
+  * @xscd: SCD device
+  * @subdev: V4L2 subdevice
++ * @ctrl_handler: V4L2 control handler
+  * @pads: media pads
+  * @format: active V4L2 media bus format for the pad
+  * @event: scene change event
+@@ -148,9 +152,11 @@ static inline struct xscd_dma_chan *to_xscd_dma_chan(struct dma_chan *chan)
+  */
+ struct xscd_chan {
+ 	int id;
++	int threshold;
+ 	void __iomem *iomem;
+ 	struct xscd_device *xscd;
+ 	struct v4l2_subdev subdev;
++	struct v4l2_ctrl_handler ctrl_handler;
+ 	struct media_pad pads[2];
+ 	struct v4l2_mbus_framefmt format;
+ 	struct v4l2_event event;
+diff --git a/include/uapi/linux/xilinx-v4l2-controls.h b/include/uapi/linux/xilinx-v4l2-controls.h
+index 974c1100f6ef..23d1574c6d55 100644
+--- a/include/uapi/linux/xilinx-v4l2-controls.h
++++ b/include/uapi/linux/xilinx-v4l2-controls.h
+@@ -219,4 +219,17 @@
+ 
+ /* Control value to start DMA */
+ #define XVIP_START_DMA			BIT(3)
++
++/*
++ * Xilinx SCD
++ */
++
++/* Base ID */
++#define V4L2_CID_XILINX_SCD			(V4L2_CID_USER_BASE + 0xc140)
++
++/*
++ * SCD Threshold
++ * User can pass percentage as an integer to tune threshold value
++ */
++#define V4L2_CID_XILINX_SCD_THRESHOLD		(V4L2_CID_XILINX_SCD + 1)
+ #endif /* __UAPI_XILINX_V4L2_CONTROLS_H__ */
+-- 
+2.31.1
+

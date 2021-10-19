@@ -1,0 +1,139 @@
+From 0c016d48ae9a3bced426315fc61c76a1f03b3241 Mon Sep 17 00:00:00 2001
+From: Sai Krishna Potthuri <lakshmi.sai.krishna.potthuri@xilinx.com>
+Date: Fri, 14 Feb 2020 16:47:31 +0530
+Subject: [PATCH 1213/1852] mtd: cadence-quadspi: Fix the issue in unaligned
+ byte count read
+
+commit 75d37d9e80af7439d81b78a1cc7ae74922235008 from
+https://github.com/Xilinx/linux-xlnx.git
+
+For DMA operations with unaligned byte count, aligned bytes will be
+read using DMA and remaining bytes will be read in STIG mode.
+In ISR, STIG operation is getting initiated for remaining bytes
+before DMA operation completion was handled hence getting timeout.
+This patch fixes the issue by initiating the STIG operation after
+handling DMA operation complete.
+Also taken care of SDR request and DDR request with unaligned byte count.
+
+Signed-off-by: Sai Krishna Potthuri <lakshmi.sai.krishna.potthuri@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/mtd/spi-nor/cadence-quadspi.c | 58 ++++++++++++++++++++-------
+ 1 file changed, 43 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/mtd/spi-nor/cadence-quadspi.c b/drivers/mtd/spi-nor/cadence-quadspi.c
+index 1f91e8bf3fa1..a574f7bfec7d 100644
+--- a/drivers/mtd/spi-nor/cadence-quadspi.c
++++ b/drivers/mtd/spi-nor/cadence-quadspi.c
+@@ -299,6 +299,7 @@ struct cqspi_driver_platdata {
+ #define CQSPI_IRQ_STATUS_MASK		0x1FFFF
+ #define CQSPI_MIO_NODE_ID_12		0x14108027
+ #define CQSPI_READ_ID			0x9F
++#define CQSPI_FAST_READ                 0x0C
+ #define CQSPI_READ_ID_LEN		6
+ #define TERA_MACRO			1000000000000l
+ 
+@@ -428,7 +429,18 @@ static void process_dma_irq(struct cqspi_st *cqspi)
+ 		cqspi->rxbuf += cqspi->bytes_to_dma;
+ 		writel(cqspi->addr + cqspi->bytes_to_dma,
+ 		       cqspi->iobase + CQSPI_REG_CMDADDRESS);
+-		opcode = (u8)readl(cqspi->iobase + CQSPI_REG_RD_INSTR);
++		if (cqspi->edge_mode == CQSPI_EDGE_MODE_DDR) {
++			opcode = (u8)readl(cqspi->iobase + CQSPI_REG_RD_INSTR);
++			dummy_cycles = (readl(cqspi->iobase +
++					CQSPI_REG_RD_INSTR) >>
++					CQSPI_REG_RD_INSTR_DUMMY_LSB) &
++					CQSPI_REG_RD_INSTR_DUMMY_MASK;
++		} else {
++			opcode = CQSPI_FAST_READ;
++			dummy_cycles = 8;
++			writel((dummy_cycles << CQSPI_REG_RD_INSTR_DUMMY_LSB) |
++				opcode, cqspi->iobase + CQSPI_REG_RD_INSTR);
++		}
+ 		addr_bytes = readl(cqspi->iobase + CQSPI_REG_SIZE) &
+ 				CQSPI_REG_SIZE_ADDRESS_MASK;
+ 		reg = opcode << CQSPI_REG_CMDCTRL_OPCODE_LSB;
+@@ -436,14 +448,17 @@ static void process_dma_irq(struct cqspi_st *cqspi)
+ 		reg |= (0x1 << CQSPI_REG_CMDCTRL_ADDR_EN_LSB);
+ 		reg |= (addr_bytes & CQSPI_REG_CMDCTRL_ADD_BYTES_MASK) <<
+ 			CQSPI_REG_CMDCTRL_ADD_BYTES_LSB;
+-		dummy_cycles = (readl(cqspi->iobase + CQSPI_REG_RD_INSTR) >>
+-			CQSPI_REG_RD_INSTR_DUMMY_LSB) &
+-			CQSPI_REG_RD_INSTR_DUMMY_MASK;
+ 		reg |= (dummy_cycles & CQSPI_REG_CMDCTRL_DUMMY_BYTES_MASK) <<
+ 			CQSPI_REG_CMDCTRL_DUMMY_BYTES_LSB;
++		cqspi->unalined_byte_cnt = false;
++		if (cqspi->edge_mode == CQSPI_EDGE_MODE_DDR &&
++		    ((rem % 2) != 0)) {
++			cqspi->unalined_byte_cnt = true;
++		}
+ 		/* 0 means 1 byte. */
+-		reg |= (((rem - 1) & CQSPI_REG_CMDCTRL_RD_BYTES_MASK)
+-			<< CQSPI_REG_CMDCTRL_RD_BYTES_LSB);
++		reg |= (((rem - 1 + cqspi->unalined_byte_cnt) &
++			CQSPI_REG_CMDCTRL_RD_BYTES_MASK) <<
++			CQSPI_REG_CMDCTRL_RD_BYTES_LSB);
+ 		cqspi_exec_flash_cmd(cqspi, reg);
+ 		data = readl(cqspi->iobase + CQSPI_REG_CMDREADDATALOWER);
+ 
+@@ -460,20 +475,21 @@ static irqreturn_t cqspi_irq_handler(int this_irq, void *dev)
+ 
+ 	/* Read interrupt status */
+ 	irq_status = readl(cqspi->iobase + CQSPI_REG_IRQSTATUS);
++	irq_status &= CQSPI_IRQ_MASK_RD | CQSPI_IRQ_MASK_WR;
+ 
+ 	/* Clear interrupt */
+-	writel(irq_status, cqspi->iobase + CQSPI_REG_IRQSTATUS);
++	if (irq_status)
++		writel(irq_status, cqspi->iobase + CQSPI_REG_IRQSTATUS);
+ 
+-	if (cqspi->read_dma) {
+-		dma_status = readl(cqspi->iobase + CQSPI_REG_DMA_DTS_I_STS);
+-		writel(dma_status, cqspi->iobase + CQSPI_REG_DMA_DTS_I_STS);
+-		if (dma_status)
+-			process_dma_irq(cqspi);
+-	}
++	/* Read DMA interrupt status */
++	dma_status = readl(cqspi->iobase + CQSPI_REG_DMA_DTS_I_STS);
++	dma_status &= CQSPI_REG_DMA_DST_I_EN_DONE;
+ 
+-	irq_status &= CQSPI_IRQ_MASK_RD | CQSPI_IRQ_MASK_WR;
++	/* Clear DMA interrupt */
++	if (dma_status)
++		writel(dma_status, cqspi->iobase + CQSPI_REG_DMA_DTS_I_STS);
+ 
+-	if (irq_status || (cqspi->read_dma && dma_status))
++	if (irq_status || dma_status)
+ 		complete(&cqspi->transfer_complete);
+ 
+ 	return IRQ_HANDLED;
+@@ -1582,6 +1598,7 @@ static void cqspi_controller_init(struct cqspi_st *cqspi)
+ 
+ 	/* Disable all interrupts. */
+ 	writel(0, cqspi->iobase + CQSPI_REG_IRQMASK);
++	writel(0, cqspi->iobase + CQSPI_REG_DMA_DST_I_DIS);
+ 
+ 	/* Configure the SRAM split to 1:1 . */
+ 	writel(cqspi->fifo_depth / 2, cqspi->iobase + CQSPI_REG_SRAMPARTITION);
+@@ -1762,6 +1779,17 @@ static int cqspi_versal_indirect_read_dma(struct spi_nor *nor, u_char *rxbuf,
+ 		goto failrd;
+ 	}
+ 
++	/* Check indirect done status */
++	ret = cqspi_wait_for_bit(reg_base + CQSPI_REG_INDIRECTRD,
++				 CQSPI_REG_INDIRECTRD_DONE_MASK, 0);
++	if (ret) {
++		dev_err(nor->dev,
++			"Indirect read completion error (%i)\n", ret);
++		goto failrd;
++	}
++
++	process_dma_irq(cqspi);
++
+ 	return 0;
+ 
+ failrd:
+-- 
+2.31.1
+

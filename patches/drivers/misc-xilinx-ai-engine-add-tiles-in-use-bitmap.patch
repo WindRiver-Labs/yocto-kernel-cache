@@ -1,0 +1,296 @@
+From 4d95d6ed0f733afa65f6575de0d44b0904f7c19e Mon Sep 17 00:00:00 2001
+From: Wendy Liang <wendy.liang@xilinx.com>
+Date: Thu, 10 Sep 2020 17:52:26 -0700
+Subject: [PATCH 1588/1852] misc: xilinx-ai-engine: add tiles in use bitmap
+
+commit 3448d3bdaeae961fca858f3cf3c38b7bb4c8e3ef from
+https://github.com/Xilinx/linux-xlnx.git
+
+As the clock state bitmap itself is not enough to indicate what tiles
+are in use. In AIE architecture, to enable a tile, all the tiles below
+need to be enabled. When releasing tiles, some tiles are not in use
+cannot be released because clock state bitmap was not tracking the
+requested tiles. And thus, add another bitmap to track the tiles in
+use.
+
+Signed-off-by: Wendy Liang <wendy.liang@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/xilinx-ai-engine/ai-engine-aie.c | 151 ++++++++++++------
+ .../misc/xilinx-ai-engine/ai-engine-clock.c   |  14 +-
+ .../xilinx-ai-engine/ai-engine-internal.h     |   2 +
+ 3 files changed, 109 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-aie.c b/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
+index b85bf1e61bb6..eccb205cbc2c 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
+@@ -626,6 +626,13 @@ static int aie_init_part_clk_state(struct aie_partition *apart)
+ 		return ret;
+ 	}
+ 
++	ret = aie_resource_initialize(&apart->tiles_inuse, num_tiles);
++	if (ret) {
++		dev_err(&apart->dev,
++			"failed to initialize tiles in use resource.\n");
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -693,65 +700,55 @@ static int aie_scan_part_clocks(struct aie_partition *apart)
+ 		}
+ 	}
+ 
++	/*
++	 * Set the tiles in use bitmap.
++	 * In case of scanning, tiles which are powered on are considered as
++	 * tiles in use.
++	 */
++	bitmap_copy(apart->tiles_inuse.bitmap, apart->cores_clk_state.bitmap,
++		    apart->tiles_inuse.total);
++
+ 	return 0;
+ }
+ 
+-static int aie_set_part_clocks(struct aie_partition *apart)
++/* aie_set_col_clocks() - set clocks of a range of tiles of a column
++ * @apart: AI engine partition
++ * @range: range of tiles of a column
++ * @enable: true to enable the clock, false to disable
++ * @return: 0 for success, negative value of errors.
++ */
++static int aie_set_col_clocks(struct aie_partition *apart,
++			      struct aie_range *range, bool enable)
+ {
+-	struct aie_device *adev = apart->adev;
+-	struct aie_range *range = &apart->range;
+-	struct aie_location loc;
+-	u32 n;
++	struct aie_location ploc;
++	u32 startbit;
+ 
+ 	/*
+-	 * The tiles below the highest tile whose clock is on, need to have the
+-	 * clock on. The first for loop is to scan the clock states bitmap to
+-	 * see which tiles are required to be clocked on, and update the bitmap
+-	 * to make sure the tiles below are also required to be clocked on.
++	 * check if the range is of single colum. only single column is allowed.
++	 * check if the start row is tile row, only tile rows are allowed.
+ 	 */
+-	for (loc.col = range->start.col;
+-	     loc.col < range->start.col + range->size.col;
+-	     loc.col++) {
+-		u32 startbit = loc.col * (range->size.row - 1), topbitn = 0;
+-
+-		for (loc.row = range->start.row + 1;
+-		     loc.row < range->start.row + range->size.row;
+-		     loc.row++) {
+-			u32 bit = startbit + loc.row - 1;
++	if (range->size.col != 1 || range->start.row < 1)
++		return -EINVAL;
+ 
+-			if (aie_resource_testbit(&apart->cores_clk_state, bit))
+-				topbitn = bit + 1;
+-		}
+-		if (topbitn) {
+-			aie_resource_set(&apart->cores_clk_state, startbit,
+-					 topbitn - startbit);
+-		}
+-	}
++	ploc.col = range->start.col;
++	for (ploc.row = range->start.row - 1;
++	     ploc.row < range->start.row + range->size.row - 1;
++	     ploc.row++) {
++		struct aie_device *adev = apart->adev;
+ 
+-	/*
+-	 * This second for loop is to scan the clock states bitmap and set
+-	 * AI engine registers to ungate the clock of the tiles which are
+-	 * required to be clocked on.
+-	 */
+-	for (n = 0; n < apart->cores_clk_state.total;) {
+-		bool clk_on = aie_resource_testbit(&apart->cores_clk_state, n);
+-
+-		/* Calculate location of the tile below */
+-		loc.col = n / (range->size.row - 1);
+-		loc.row = n % (range->size.row - 1);
+-		if (loc.row == 0) {
++		if (!ploc.row) {
+ 			void __iomem *va;
+ 			u32 val = 0;
+ 
+ 			/*
+-			 * Configure SHIM clock registers to gate or ungate
+-			 * next tile.
++			 * Configure SHIM clock registers to gate or
++			 * ungate next tile.
+ 			 */
+-			if (clk_on)
++			if (enable)
+ 				val = AIE_SHIMPL_CLKCNTR_COLBUF_MASK |
+ 				      AIE_SHIMPL_CLKCNTR_NEXTCLK_MASK;
+ 			va = adev->base +
+-			     aie_cal_regoff(adev, loc,
++			     aie_cal_regoff(adev, ploc,
+ 					    AIE_SHIMPL_CLKCNTR_REGOFF);
+ 			iowrite32(val, va);
+ 		} else {
+@@ -759,23 +756,77 @@ static int aie_set_part_clocks(struct aie_partition *apart)
+ 			u32 val = 0;
+ 
+ 			/*
+-			 * Configure core tile clock registers to gate or
+-			 * ungate next tile.
++			 * Configure core tile clock registers to gate
++			 * or ungate next tile.
+ 			 */
+-			if (clk_on)
++			if (enable)
+ 				val = AIE_TILE_CLKCNTR_COLBUF_MASK |
+ 				      AIE_TILE_CLKCNTR_NEXTCLK_MASK;
+ 			va = adev->base +
+-			     aie_cal_regoff(adev, loc,
++			     aie_cal_regoff(adev, ploc,
+ 					    AIE_TILE_CORE_CLKCNTR_REGOFF);
+ 			iowrite32(val, va);
+ 		}
+ 
+ 		/* If the tile clock is not on, jump to next column */
+-		if (!clk_on)
+-			n = (loc.col + 1) * (range->size.row - 1);
+-		else
+-			n++;
++		if (!enable)
++			break;
++	}
++
++	/* Update clock state bitmap */
++	startbit = range->start.col * (apart->range.size.row - 1) +
++		   range->start.row - 1;
++	if (enable)
++		aie_resource_set(&apart->cores_clk_state, startbit,
++				 range->size.row);
++	else
++		aie_resource_clear(&apart->cores_clk_state, startbit,
++				   range->size.row);
++
++	return 0;
++}
++
++static int aie_set_part_clocks(struct aie_partition *apart)
++{
++	struct aie_range *range = &apart->range, lrange;
++	struct aie_location loc;
++
++	/*
++	 * The tiles below the highest tile whose clock is on, need to have the
++	 * clock on. The first for loop is to scan the clock states bitmap to
++	 * see which tiles are required to be clocked on, and update the bitmap
++	 * to make sure the tiles below are also required to be clocked on.
++	 */
++	for (loc.col = range->start.col;
++	     loc.col < range->start.col + range->size.col;
++	     loc.col++) {
++		u32 startbit, inuse_toprow = 0, clk_toprow = 0;
++
++		startbit = loc.col * (range->size.row - 1);
++
++		for (loc.row = range->start.row + 1;
++		     loc.row < range->start.row + range->size.row;
++		     loc.row++) {
++			u32 bit = startbit + loc.row - 1;
++
++			if (aie_resource_testbit(&apart->tiles_inuse, bit))
++				inuse_toprow = loc.row;
++			if (aie_resource_testbit(&apart->cores_clk_state, bit))
++				clk_toprow = loc.row;
++		}
++
++		/* Update clock states of a column */
++		lrange.start.col = loc.col;
++		lrange.size.col = 1;
++		if (inuse_toprow < clk_toprow) {
++			lrange.start.row = inuse_toprow + 1;
++			lrange.size.row = clk_toprow - inuse_toprow;
++			aie_set_col_clocks(apart, &lrange, false);
++		} else  if (inuse_toprow > clk_toprow) {
++			lrange.start.row = clk_toprow + 1;
++			lrange.size.row = inuse_toprow - clk_toprow;
++			aie_set_col_clocks(apart, &lrange, true);
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-clock.c b/drivers/misc/xilinx-ai-engine/ai-engine-clock.c
+index a0e0f135d1c8..d490ad5806a3 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-clock.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-clock.c
+@@ -70,8 +70,8 @@ static int aie_part_request_tiles(struct aie_partition *apart, int num_tiles,
+ 				  struct aie_location *locs)
+ {
+ 	if (num_tiles == 0) {
+-		aie_resource_set(&apart->cores_clk_state, 0,
+-				 apart->cores_clk_state.total);
++		aie_resource_set(&apart->tiles_inuse, 0,
++				 apart->tiles_inuse.total);
+ 	} else {
+ 		u32 n;
+ 
+@@ -82,8 +82,7 @@ static int aie_part_request_tiles(struct aie_partition *apart, int num_tiles,
+ 			int bit = aie_part_get_clk_state_bit(apart, &locs[n]);
+ 
+ 			if (bit >= 0)
+-				aie_resource_set(&apart->cores_clk_state,
+-						 bit, 1);
++				aie_resource_set(&apart->tiles_inuse, bit, 1);
+ 		}
+ 	}
+ 
+@@ -103,8 +102,8 @@ static int aie_part_release_tiles(struct aie_partition *apart, int num_tiles,
+ 				  struct aie_location *locs)
+ {
+ 	if (num_tiles == 0) {
+-		aie_resource_clear(&apart->cores_clk_state, 0,
+-				   apart->cores_clk_state.total);
++		aie_resource_clear(&apart->tiles_inuse, 0,
++				   apart->tiles_inuse.total);
+ 	} else {
+ 		u32 n;
+ 
+@@ -115,8 +114,7 @@ static int aie_part_release_tiles(struct aie_partition *apart, int num_tiles,
+ 			int bit = aie_part_get_clk_state_bit(apart, &locs[n]);
+ 
+ 			if (bit >= 0)
+-				aie_resource_clear(&apart->cores_clk_state,
+-						   bit, 1);
++				aie_resource_clear(&apart->tiles_inuse, bit, 1);
+ 		}
+ 	}
+ 
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index 33990e609706..483201eb95e9 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -368,6 +368,7 @@ struct aie_part_bridge {
+  * @mlock: protection for AI engine partition operations
+  * @dev: device for the AI engine partition
+  * @cores_clk_state: bitmap to indicate the power state of core modules
++ * @tiles_inuse: bitmap to indicate if a tile is in use
+  * @error_cb: error callback
+  * @core_event_status: core module event bitmap
+  * @mem_event_status: memory module event bitmap
+@@ -389,6 +390,7 @@ struct aie_partition {
+ 	struct mutex mlock; /* protection for AI engine partition operations */
+ 	struct device dev;
+ 	struct aie_resource cores_clk_state;
++	struct aie_resource tiles_inuse;
+ 	struct aie_error_cb error_cb;
+ 	struct aie_resource core_event_status;
+ 	struct aie_resource mem_event_status;
+-- 
+2.31.1
+

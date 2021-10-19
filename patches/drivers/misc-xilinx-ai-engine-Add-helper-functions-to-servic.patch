@@ -1,0 +1,699 @@
+From bbe4b62789e802bb78ecf41fe46e2cd62af478a7 Mon Sep 17 00:00:00 2001
+From: Nishad Saraf <nishad.saraf@xilinx.com>
+Date: Wed, 9 Sep 2020 23:46:20 -0700
+Subject: [PATCH 1582/1852] misc: xilinx-ai-engine: Add helper functions to
+ service interrupt controllers and event registers
+
+commit 755c4dd341bdbf3ce9fbaebf0785cd2641e7e4a9 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Add helper functions to service interrupt controller registers and event
+registers. While at it, restricting userspace access to group error enables
+registers.
+
+Signed-off-by: Nishad Saraf <nishad.saraf@xilinx.com>
+Reviewed-by: Wendy Liang <wendy.liang@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/xilinx-ai-engine/Makefile        |   1 +
+ drivers/misc/xilinx-ai-engine/ai-engine-aie.c | 121 +++++++
+ .../xilinx-ai-engine/ai-engine-internal.h     |  87 +++++
+ .../xilinx-ai-engine/ai-engine-interrupt.c    | 327 ++++++++++++++++++
+ include/linux/xlnx-ai-engine.h                |  36 ++
+ 5 files changed, 572 insertions(+)
+ create mode 100644 drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+
+diff --git a/drivers/misc/xilinx-ai-engine/Makefile b/drivers/misc/xilinx-ai-engine/Makefile
+index 98121bf175e2..3b6891fd42ab 100644
+--- a/drivers/misc/xilinx-ai-engine/Makefile
++++ b/drivers/misc/xilinx-ai-engine/Makefile
+@@ -10,6 +10,7 @@ xilinx-aie-$(CONFIG_XILINX_AIE) := ai-engine-aie.o \
+ 				   ai-engine-dev.o \
+ 				   ai-engine-dma.o \
+ 				   ai-engine-fpga.o \
++				   ai-engine-interrupt.o \
+ 				   ai-engine-mem.o \
+ 				   ai-engine-part.o \
+ 				   ai-engine-res.o \
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-aie.c b/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
+index a28d3722eb45..916b2edb0b41 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
+@@ -33,7 +33,10 @@
+ #define AIE_SHIMPL_CLKCNTR_REGOFF		0x00036040U
+ #define AIE_SHIMPL_COLRESET_REGOFF		0x00036048U
+ #define AIE_SHIMPL_RESET_REGOFF			0x0003604cU
++#define AIE_SHIMPL_GROUP_ERROR_REGOFF		0x0003450cU
+ #define AIE_TILE_CORE_CLKCNTR_REGOFF		0x00036040U
++#define AIE_TILE_CORE_GROUP_ERROR_REGOFF	0x00034510U
++#define AIE_TILE_MEM_GROUP_ERROR_REGOFF		0x00014514U
+ 
+ /*
+  * Register masks
+@@ -93,11 +96,27 @@ static const struct aie_tile_regs aie_kernel_regs[] = {
+ 	 .soff = AIE_SHIMPL_CLKCNTR_REGOFF,
+ 	 .eoff = AIE_SHIMPL_CLKCNTR_REGOFF,
+ 	},
++	/* SHIM group error enable */
++	{.attribute = (AIE_TILE_TYPE_SHIMPL | AIE_TILE_TYPE_SHIMNOC) <<
++		      AIE_REGS_ATTR_TILE_TYPE_SHIFT,
++	 .soff = AIE_SHIMPL_GROUP_ERROR_REGOFF,
++	 .eoff = AIE_SHIMPL_GROUP_ERROR_REGOFF,
++	},
+ 	/* Tile clock control */
+ 	{.attribute = AIE_TILE_TYPE_TILE << AIE_REGS_ATTR_TILE_TYPE_SHIFT,
+ 	 .soff = AIE_TILE_CORE_CLKCNTR_REGOFF,
+ 	 .eoff = AIE_TILE_CORE_CLKCNTR_REGOFF,
+ 	},
++	/* Tile group error for core module */
++	{.attribute = AIE_TILE_TYPE_TILE << AIE_REGS_ATTR_TILE_TYPE_SHIFT,
++	 .soff = AIE_TILE_CORE_GROUP_ERROR_REGOFF,
++	 .eoff = AIE_TILE_CORE_GROUP_ERROR_REGOFF,
++	},
++	/* Tile group error for memory module */
++	{.attribute = AIE_TILE_TYPE_TILE << AIE_REGS_ATTR_TILE_TYPE_SHIFT,
++	 .soff = AIE_TILE_MEM_GROUP_ERROR_REGOFF,
++	 .eoff = AIE_TILE_MEM_GROUP_ERROR_REGOFF,
++	},
+ };
+ 
+ static const struct aie_single_reg_field aie_col_rst = {
+@@ -128,6 +147,103 @@ static const struct aie_dma_attr aie_shimdma = {
+ 	.bd_len = 0x14U,
+ };
+ 
++static const struct aie_event_attr aie_pl_event = {
++	.bc_event = {
++		.mask = GENMASK(6, 0),
++		.regoff = 0x0U,
++	},
++	.group_error = {
++		.mask = GENMASK(10, 0),
++		.regoff = 0xcU,
++	},
++	.bc_regoff = 0x34010U,
++	.status_regoff = 0x34200U,
++	.group_regoff = 0x34500U,
++	.base_error_event = 62U,
++	.num_broadcasts = 16U,
++	.base_bc_event = 107U,
++	.num_events = 128U,
++};
++
++static const struct aie_event_attr aie_mem_event = {
++	.bc_event = {
++		.mask = GENMASK(6, 0),
++		.regoff = 0x0U,
++	},
++	.group_error = {
++		.mask = GENMASK(13, 0),
++		.regoff = 0x14U,
++	},
++	.bc_regoff = 0x14010U,
++	.status_regoff = 0x14200U,
++	.group_regoff = 0x14500U,
++	.base_error_event = 87U,
++	.num_broadcasts = 16U,
++	.base_bc_event = 107U,
++	.num_events = 128U,
++};
++
++static const struct aie_event_attr aie_core_event = {
++	.bc_event = {
++		.mask = GENMASK(6, 0),
++		.regoff = 0x0U,
++	},
++	.group_error = {
++		.mask = GENMASK(21, 0),
++		.regoff = 0x10U,
++	},
++	.bc_regoff = 0x34010U,
++	.status_regoff = 0x34200U,
++	.group_regoff = 0x34500U,
++	.base_error_event = 48U,
++	.num_broadcasts = 16U,
++	.base_bc_event = 107U,
++	.num_events = 128U,
++};
++
++static const struct aie_l1_intr_ctrl_attr aie_l1_intr_ctrl = {
++	.swa_status = {
++		.mask = GENMASK(19, 0),
++		.regoff = 0xcU,
++	},
++	.swb_status = {
++		.mask = GENMASK(19, 0),
++		.regoff = 0x3cU,
++	},
++	.swa_event = {
++		.mask = GENMASK(6, 0),
++		.regoff = 0x14U,
++	},
++	.swb_event = {
++		.mask = GENMASK(6, 0),
++		.regoff = 0x44U,
++	},
++	.regoff = 0x35000U,
++	.event_lsb = 8,
++	.num_broadcasts = 0x14U,
++};
++
++static const struct aie_l2_intr_ctrl_attr aie_l2_intr_ctrl = {
++	.mask = {
++		.mask = GENMASK(15, 0),
++		.regoff = 0x0U,
++	},
++	.enable = {
++		.mask = GENMASK(15, 0),
++		.regoff = 0x4U,
++	},
++	.disable = {
++		.mask = GENMASK(15, 0),
++		.regoff = 0x8U,
++	},
++	.status = {
++		.mask = GENMASK(15, 0),
++		.regoff = 0xcU,
++	},
++	.regoff = 0x15000U,
++	.num_broadcasts = 0x10U,
++};
++
+ static u32 aie_get_tile_type(struct aie_location *loc)
+ {
+ 	if (loc->row)
+@@ -424,6 +540,11 @@ int aie_device_init(struct aie_device *adev)
+ 	adev->col_rst = &aie_col_rst;
+ 	adev->col_clkbuf = &aie_col_clkbuf;
+ 	adev->shim_dma = &aie_shimdma;
++	adev->pl_events = &aie_pl_event;
++	adev->mem_events = &aie_mem_event;
++	adev->core_events = &aie_core_event;
++	adev->l1_ctrl = &aie_l1_intr_ctrl;
++	adev->l2_ctrl = &aie_l2_intr_ctrl;
+ 
+ 	/* Get the columns resource */
+ 	/* Get number of columns from AI engine memory resource */
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index 36e5794d9cb9..3a6ba23d0059 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -47,6 +47,14 @@
+ #define VERSAL_ES1_REV_ID		0x0
+ #define VERSAL_ES2_REV_ID		0x1
+ 
++/*
++ * enum aie_shim_switch_type - identifies different switches in shim tile.
++ */
++enum aie_shim_switch_type {
++	AIE_SHIM_SWITCH_A,
++	AIE_SHIM_SWITCH_B
++};
++
+ /**
+  * struct aie_tile_regs - contiguous range of AI engine register
+  *			  within an AI engine tile
+@@ -156,6 +164,75 @@ struct aie_resource {
+ 	u32 total;
+ };
+ 
++/**
++ * struct aie_event_attr - AI Engine event attributes structure.
++ * @bc_event: broadcast event attribute to capture event mask value and
++ *	      register offset from @bc_regoff.
++ * @group_error: group error attribute to capture error group mask value and
++ *		 register offset value from @group_regoff.
++ * @bc_regoff: base broadcast register offset.
++ * @status_regoff: base status register offset.
++ * @group_regoff: base group error register offset.
++ * @base_error_event: event ID of first error event in a group error.
++ * @num_broadcasts: total number of broadcast events.
++ * @base_bc_event: broadcast 0 vent ID
++ * @num_events: total number of events.
++ */
++struct aie_event_attr {
++	struct aie_single_reg_field bc_event;
++	struct aie_single_reg_field group_error;
++	u32 bc_regoff;
++	u32 status_regoff;
++	u32 group_regoff;
++	u32 base_error_event;
++	u32 num_broadcasts;
++	u32 base_bc_event;
++	u32 num_events;
++};
++
++/**
++ * struct aie_l1_intr_ctrl_attr - AI engine level 1 interrupt controller
++ *				  attributes structure.
++ * @mask: level 1 interrupt controller mask attribute.
++ * @swa_status: switch A level 1 interrupt controller status attribute.
++ * @swb_status: switch A level 1 interrupt controller status attribute.
++ * @swa_event: switch A level 1 interrupt controller event attribute.
++ * @swb_event: switch A level 1 interrupt controller event attribute.
++ * @regoff: base level 1 interrupt controller register offset.
++ * @event_lsb: lsb of IRQ event within IRQ event switch register.
++ * @num_broadcasts: total number of broadcast signals to level 1 interrupt
++ *		    controller.
++ */
++struct aie_l1_intr_ctrl_attr {
++	struct aie_single_reg_field swa_status;
++	struct aie_single_reg_field swb_status;
++	struct aie_single_reg_field swa_event;
++	struct aie_single_reg_field swb_event;
++	u32 regoff;
++	u32 event_lsb;
++	u32 num_broadcasts;
++};
++
++/**
++ * struct aie_l2_intr_ctrl_attr - AI engine level 2 interrupt controller
++ *				  attributes structure.
++ * @mask: level 2 interrupt controller mask attribute.
++ * @enable: level 2 interrupt controller enable attribute.
++ * @disable: level 2 interrupt controller disable attribute.
++ * @status: level 2 interrupt controller status attribute.
++ * @regoff: level 2 interrupt controller register offset.
++ * @num_broadcasts: total number of broadcast signals to level 2 interrupt
++ *		    controller.
++ */
++struct aie_l2_intr_ctrl_attr {
++	struct aie_single_reg_field mask;
++	struct aie_single_reg_field enable;
++	struct aie_single_reg_field disable;
++	struct aie_single_reg_field status;
++	u32 regoff;
++	u32 num_broadcasts;
++};
++
+ /**
+  * struct aie_device - AI engine device structure
+  * @partitions: list of partitions requested
+@@ -170,6 +247,11 @@ struct aie_resource {
+  * @col_rst: column reset attribute
+  * @col_clkbuf: column clock buffer attribute
+  * @shim_dma: SHIM DMA attribute
++ * @pl_events: pl module event attribute
++ * @mem_events: memory module event attribute
++ * @core_events: core module event attribute
++ * @l1_ctrl: level 1 interrupt controller attribute
++ * @l2_ctrl: level 2 interrupt controller attribute
+  * @size: size of the AI engine address space
+  * @array_shift: array address shift
+  * @col_shift: column address shift
+@@ -193,6 +275,11 @@ struct aie_device {
+ 	const struct aie_single_reg_field *col_rst;
+ 	const struct aie_single_reg_field *col_clkbuf;
+ 	const struct aie_dma_attr *shim_dma;
++	const struct aie_event_attr *pl_events;
++	const struct aie_event_attr *mem_events;
++	const struct aie_event_attr *core_events;
++	const struct aie_l1_intr_ctrl_attr *l1_ctrl;
++	const struct aie_l2_intr_ctrl_attr *l2_ctrl;
+ 	size_t size;
+ 	struct aie_resource cols_res;
+ 	u32 array_shift;
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c b/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+new file mode 100644
+index 000000000000..8fc940271c76
+--- /dev/null
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+@@ -0,0 +1,327 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx AI Engine device driver
++ *
++ * Copyright (C) 2020 Xilinx, Inc.
++ */
++#include <linux/io.h>
++
++#include "ai-engine-internal.h"
++#include "linux/xlnx-ai-engine.h"
++
++/**
++ * aie_get_broadcast_event() - get event ID being broadcast on given
++ *			       broadcast line.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @module: module type.
++ * @bc_id: broadcast ID.
++ * @return: event ID.
++ */
++static u8 aie_get_broadcast_event(struct aie_partition *apart,
++				  struct aie_location *loc,
++				  enum aie_module_type module, u8 bc_id)
++{
++	const struct aie_event_attr *event_mod;
++	u32 bcoff, regoff;
++
++	if (module == AIE_CORE_MOD)
++		event_mod = apart->adev->core_events;
++	else if (module == AIE_MEM_MOD)
++		event_mod = apart->adev->mem_events;
++	else
++		event_mod = apart->adev->pl_events;
++
++	bcoff = event_mod->bc_regoff + event_mod->bc_event.regoff + bc_id * 4U;
++	regoff = aie_cal_regoff(apart->adev, *loc, bcoff);
++	return ioread32(apart->adev->base + regoff);
++}
++
++/**
++ * aie_read_event_status() - get the status of event status registers.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @module: module type.
++ * @reg: array to store event status register values.
++ */
++static void aie_read_event_status(struct aie_partition *apart,
++				  struct aie_location *loc,
++				  enum aie_module_type module, u32 *reg)
++{
++	const struct aie_event_attr *event_mod;
++	u8 offset;
++
++	if (module == AIE_CORE_MOD)
++		event_mod = apart->adev->core_events;
++	else if (module == AIE_MEM_MOD)
++		event_mod = apart->adev->mem_events;
++	else
++		event_mod = apart->adev->pl_events;
++
++	for (offset = 0; offset < (event_mod->num_events / 32); offset++) {
++		u32 status_off = event_mod->status_regoff + offset * 4U;
++		u32 regoff = aie_cal_regoff(apart->adev, *loc, status_off);
++
++		reg[offset] = ioread32(apart->adev->base + regoff);
++	}
++}
++
++/**
++ * aie_check_group_errors_enabled() - get error events enabled in group error.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @module: module type.
++ * @return: bitmap of enabled error events.
++ */
++static u32 aie_check_group_errors_enabled(struct aie_partition *apart,
++					  struct aie_location *loc,
++					  enum aie_module_type module)
++{
++	const struct aie_event_attr *event_mod;
++	u32 groff, regoff;
++
++	if (module == AIE_CORE_MOD)
++		event_mod = apart->adev->core_events;
++	else if (module == AIE_MEM_MOD)
++		event_mod = apart->adev->mem_events;
++	else
++		event_mod = apart->adev->pl_events;
++
++	groff = event_mod->group_regoff + event_mod->group_error.regoff;
++	regoff = aie_cal_regoff(apart->adev, *loc, groff);
++	return ioread32(apart->adev->base + regoff);
++}
++
++/**
++ * aie_set_error_event() - enable/disable error events in group error.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @module: module type.
++ * @bitmap: error event to enable/disable in group errors.
++ */
++static void aie_set_error_event(struct aie_partition *apart,
++				struct aie_location *loc,
++				enum aie_module_type module, u32 bitmap)
++{
++	const struct aie_event_attr *event_mod;
++	u32 groff, regoff;
++
++	if (module == AIE_CORE_MOD)
++		event_mod = apart->adev->core_events;
++	else if (module == AIE_MEM_MOD)
++		event_mod = apart->adev->mem_events;
++	else
++		event_mod = apart->adev->pl_events;
++
++	groff = event_mod->group_regoff + event_mod->group_error.regoff;
++	regoff = aie_cal_regoff(apart->adev, *loc, groff);
++	iowrite32(bitmap, apart->adev->base + regoff);
++}
++
++/**
++ * aie_get_error_event() - map group error status bit to actual error
++ *			   event number.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @module: module type.
++ * @index: event index within group errors.
++ * @return: true event ID.
++ */
++static u32 aie_get_error_event(struct aie_partition *apart,
++			       struct aie_location *loc,
++			       enum aie_module_type module, u8 index)
++{
++	const struct aie_event_attr *event_mod;
++
++	if (module == AIE_CORE_MOD)
++		event_mod = apart->adev->core_events;
++	else if (module == AIE_MEM_MOD)
++		event_mod = apart->adev->mem_events;
++	else
++		event_mod = apart->adev->pl_events;
++
++	return event_mod->base_error_event + index;
++}
++
++/**
++ * aie_get_bc_event() - get the broadcast event ID.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @module: module type.
++ * @bc_id: broadcast line ID.
++ * @return: broadcast event ID.
++ */
++static u32 aie_get_bc_event(struct aie_partition *apart,
++			    struct aie_location *loc,
++			    enum aie_module_type module, u8 bc_id)
++{
++	const struct aie_event_attr *event_mod;
++
++	if (module == AIE_CORE_MOD)
++		event_mod = apart->adev->core_events;
++	else if (module == AIE_MEM_MOD)
++		event_mod = apart->adev->mem_events;
++	else
++		event_mod = apart->adev->pl_events;
++
++	return event_mod->base_bc_event + bc_id;
++}
++
++/**
++ * aie_get_l1_event() - get event ID being broadcast on level 1 IRQ.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @sw: switch type.
++ * @irq_id: IRQ event ID to be read.
++ * @return: true event ID.
++ */
++static u8 aie_get_l1_event(struct aie_partition *apart,
++			   struct aie_location *loc,
++			   enum aie_shim_switch_type sw, u8 irq_id)
++{
++	const struct aie_l1_intr_ctrl_attr *intr_ctrl = apart->adev->l1_ctrl;
++	u32 l1off, l1mask, regoff, reg_value;
++
++	if (sw == AIE_SHIM_SWITCH_A) {
++		l1off = intr_ctrl->regoff + intr_ctrl->swa_event.regoff;
++		l1mask = intr_ctrl->swa_event.mask;
++	} else {
++		l1off = intr_ctrl->regoff + intr_ctrl->swb_event.regoff;
++		l1mask = intr_ctrl->swb_event.mask;
++	}
++
++	regoff = aie_cal_regoff(apart->adev, *loc, l1off);
++	reg_value = ioread32(apart->adev->base + regoff);
++	reg_value &= l1mask << (irq_id * intr_ctrl->event_lsb);
++	reg_value >>= (irq_id * intr_ctrl->event_lsb);
++	return reg_value;
++}
++
++/**
++ * aie_clear_l1_intr() - clear level 1 interrupt controller status.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @sw: switch type.
++ * @irq_id: IRQ ID to be cleared.
++ */
++static void aie_clear_l1_intr(struct aie_partition *apart,
++			      struct aie_location *loc,
++			      enum aie_shim_switch_type sw, u8 irq_id)
++{
++	const struct aie_l1_intr_ctrl_attr *intr_ctrl = apart->adev->l1_ctrl;
++	u32 l1off, regoff;
++
++	if (sw == AIE_SHIM_SWITCH_A)
++		l1off = intr_ctrl->regoff + intr_ctrl->swa_status.regoff;
++	else
++		l1off = intr_ctrl->regoff + intr_ctrl->swb_status.regoff;
++
++	regoff = aie_cal_regoff(apart->adev, *loc, l1off);
++	iowrite32(BIT(irq_id), apart->adev->base + regoff);
++}
++
++/**
++ * aie_get_l1_status() - get level 1 interrupt controller status value.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @sw: switch type.
++ * @return: status value.
++ */
++static u32 aie_get_l1_status(struct aie_partition *apart,
++			     struct aie_location *loc,
++			     enum aie_shim_switch_type sw)
++{
++	const struct aie_l1_intr_ctrl_attr *intr_ctrl = apart->adev->l1_ctrl;
++	u32 l1off, regoff;
++
++	if (sw == AIE_SHIM_SWITCH_A)
++		l1off = intr_ctrl->regoff + intr_ctrl->swa_status.regoff;
++	else
++		l1off = intr_ctrl->regoff + intr_ctrl->swb_status.regoff;
++
++	regoff = aie_cal_regoff(apart->adev, *loc, l1off);
++	return ioread32(apart->adev->base + regoff);
++}
++
++/**
++ * aie_clear_l2_intr() - clear level 2 interrupt controller status.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @bitmap_irq: IRQ bitmap. IRQ lines corresponding to set bits will be
++ *		cleared.
++ */
++static void aie_clear_l2_intr(struct aie_partition *apart,
++			      struct aie_location *loc, u32 bitmap_irq)
++{
++	const struct aie_l2_intr_ctrl_attr *intr_ctrl = apart->adev->l2_ctrl;
++	u32 l2off = intr_ctrl->regoff + intr_ctrl->status.regoff;
++	u32 regoff = aie_cal_regoff(apart->adev, *loc, l2off);
++
++	iowrite32(bitmap_irq, apart->adev->base + regoff);
++}
++
++/**
++ * aie_get_l2_status() - get level 2 interrupt controller status value.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @return: status value.
++ */
++static u32 aie_get_l2_status(struct aie_partition *apart,
++			     struct aie_location *loc)
++{
++	const struct aie_l2_intr_ctrl_attr *intr_ctrl = apart->adev->l2_ctrl;
++	u32 l2off = intr_ctrl->regoff + intr_ctrl->status.regoff;
++	u32 regoff = aie_cal_regoff(apart->adev, *loc, l2off);
++
++	return ioread32(apart->adev->base + regoff);
++}
++
++/**
++ * aie_get_l2_mask() - get level 2 interrupt controller mask value.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @return: mask value.
++ */
++static u32 aie_get_l2_mask(struct aie_partition *apart,
++			   struct aie_location *loc)
++{
++	const struct aie_l2_intr_ctrl_attr *intr_ctrl = apart->adev->l2_ctrl;
++	u32 l2off = intr_ctrl->regoff + intr_ctrl->mask.regoff;
++	u32 regoff = aie_cal_regoff(apart->adev, *loc, l2off);
++
++	return ioread32(apart->adev->base + regoff);
++}
++
++/**
++ * aie_enable_l2_ctrl() - enable interrupts to level 2 interrupt controller.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @bit_map: bitmap of broadcast lines to enable.
++ */
++static void aie_enable_l2_ctrl(struct aie_partition *apart,
++			       struct aie_location *loc, u32 bit_map)
++{
++	const struct aie_l2_intr_ctrl_attr *intr_ctrl = apart->adev->l2_ctrl;
++	u32 l2off = intr_ctrl->regoff + intr_ctrl->enable.regoff;
++	u32 regoff = aie_cal_regoff(apart->adev, *loc, l2off);
++
++	bit_map &= intr_ctrl->enable.mask;
++	iowrite32(bit_map, apart->adev->base + regoff);
++}
++
++/**
++ * aie_disable_l2_ctrl() - disable interrupts to level 2 interrupt controller.
++ * @apart: AIE partition pointer.
++ * @loc: pointer to tile location.
++ * @bit_map: bitmap of broadcast lines to disable.
++ */
++static void aie_disable_l2_ctrl(struct aie_partition *apart,
++				struct aie_location *loc, u32 bit_map)
++{
++	const struct aie_l2_intr_ctrl_attr *intr_ctrl = apart->adev->l2_ctrl;
++	u32 l2off = intr_ctrl->regoff + intr_ctrl->disable.regoff;
++	u32 regoff = aie_cal_regoff(apart->adev, *loc, l2off);
++
++	bit_map &= intr_ctrl->disable.mask;
++	iowrite32(bit_map, apart->adev->base + regoff);
++}
+diff --git a/include/linux/xlnx-ai-engine.h b/include/linux/xlnx-ai-engine.h
+index 54b49ee6cfad..75442ee162a6 100644
+--- a/include/linux/xlnx-ai-engine.h
++++ b/include/linux/xlnx-ai-engine.h
+@@ -13,6 +13,42 @@
+ #endif
+ #include <uapi/linux/xlnx-ai-engine.h>
+ 
++/**
++ * enum aie_module_type - identifies different hardware modules within a
++ *			  tile type. AIE tile may have memory and core
++ *			  module. While a PL or shim tile may have PL module.
++ * @AIE_MEM_MOD: comprises of the following sub-modules,
++ *			* data memory.
++ *			* tile DMA.
++ *			* lock module.
++ *			* events, event broadcast and event actions.
++ *			* tracing and profiling.
++ * @AIE_CORE_MOD: comprises of the following sub-modules,
++ *			* AIE core.
++ *			* program Memory.
++ *			* events, event broadcast and event actions.
++ *			* tracing and profiling.
++ *			* AXI-MM and AXI-S tile interconnects.
++ * @AIE_PL_MOD: comprises of the following sub-modules,
++ *			* PL interface.
++ *			* AXI-MM and AXI-S tile interconnects.
++ *			* Level 1 interrupt controllers.
++ *			* events, event broadcast and event actions.
++ *			* tracing and profiling.
++ * @AIE_NOC_MOD: comprises of the following sub-modules,
++ *			* interface from NoC Slave Unit (NSU)
++ *			  (bridge to AXI-MM switch)
++ *			* interfaces to NoC NoC Master Unit (NMU)
++ *				* shim DMA & locks
++ *				* NoC stream interface
++ */
++enum aie_module_type {
++	AIE_MEM_MOD,
++	AIE_CORE_MOD,
++	AIE_PL_MOD,
++	AIE_NOC_MOD,
++};
++
+ struct device;
+ 
+ #if IS_ENABLED(CONFIG_XILINX_AIE)
+-- 
+2.31.1
+

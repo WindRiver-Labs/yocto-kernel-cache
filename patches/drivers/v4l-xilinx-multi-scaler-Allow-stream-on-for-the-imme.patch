@@ -1,0 +1,178 @@
+From b14026b1f7551c1e38a65e5641f0c14b575ed9af Mon Sep 17 00:00:00 2001
+From: Suresh Gupta <suresh.gupta@xilinx.com>
+Date: Fri, 5 Oct 2018 19:43:02 +0530
+Subject: [PATCH 0455/1852] v4l: xilinx-multi-scaler: Allow stream on for the
+ immediate next channel
+
+commit 3fe036ea707de2ee392e650b09f649f82717dc3f from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch enables the use case to add one more stream when driver already
+processing streams of some channels.
+Start of new channel requires reset and reprogram of HW IP.
+
+Here the condition is that only next immediate channel
+will able to start and stop the stream.
+
+Example: Channels 0,1,2,3 are streaming, then the user can stream on
+immediate next channel 4.
+
+Limitation: if user adds stream for channel 6 when channels 0,1,2,3
+are running, then driver does not start 6th channel and do not return
+any error. And if any intermediate channel stops the streaming,
+the streaming continues for only channels which fall under a low number
+of stop channel. In this case if channel 0,1,2,3,4 are running and
+channel 3 stops, then the streaming for channels 0,1,2 will continue
+and driver stop processing 4th channel without any error indications.
+
+Signed-off-by: Suresh Gupta <suresh.gupta@xilinx.com>
+Reviewed-by: Satish Kumar Nagireddy <satish.nagireddy.nagireddy@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ .../platform/xilinx/xilinx-multi-scaler.c     | 57 ++++++++++++++++---
+ 1 file changed, 48 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/xilinx/xilinx-multi-scaler.c b/drivers/media/platform/xilinx/xilinx-multi-scaler.c
+index a3bd245d7def..19af13a528a8 100644
+--- a/drivers/media/platform/xilinx/xilinx-multi-scaler.c
++++ b/drivers/media/platform/xilinx/xilinx-multi-scaler.c
+@@ -97,6 +97,11 @@
+ #define XM2MSC_CHAN_OUT		0
+ #define XM2MSC_CHAN_CAP		1
+ 
++#define NUM_STREAM(_x)			\
++	({ typeof(_x) (x) = (_x);	\
++	min(ffz(x->out_streamed_chan),	\
++	    ffz(x->cap_streamed_chan)); })
++
+ /* Xilinx Video Specific Color/Pixel Formats */
+ enum xm2msc_pix_fmt {
+ 	XILINX_M2MSC_FMT_RGBX8		= 10,
+@@ -299,6 +304,7 @@ struct xm2msc_chan_ctx {
+  * @opened_chan: bitmap for all open channel
+  * @out_streamed_chan: bitmap for all out streamed channel
+  * @cap_streamed_chan: bitmap for all capture streamed channel
++ * @running_chan: currently running channels
+  * @v4l2_dev: main struct to for V4L2 device drivers
+  * @dev_mutex: lock for V4L2 device
+  * @mutex: lock for channel ctx
+@@ -321,6 +327,7 @@ struct xm2m_msc_dev {
+ 	u32 opened_chan;
+ 	u32 out_streamed_chan;
+ 	u32 cap_streamed_chan;
++	u32 running_chan;
+ 
+ 	struct v4l2_device v4l2_dev;
+ 
+@@ -541,6 +548,23 @@ static void xm2msc_set_chan_com_params(struct xm2msc_chan_ctx *chan_ctx)
+ 	xm2msc_writereg(base + XM2MSC_LINERATE, line_rate);
+ }
+ 
++static void xm2msc_program_allchan(struct xm2m_msc_dev *xm2msc)
++{
++	u32 chan;
++
++	for (chan = 0; chan < xm2msc->running_chan; chan++) {
++		struct xm2msc_chan_ctx *chan_ctx;
++
++		chan_ctx = &xm2msc->xm2msc_chan[chan];
++
++		xm2msc_set_chan_params(chan_ctx,
++				       V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
++		xm2msc_set_chan_params(chan_ctx,
++				       V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
++		xm2msc_set_chan_com_params(chan_ctx);
++	}
++}
++
+ static void
+ xm2msc_pr_q(struct device *dev, struct xm2msc_q_data *q, int chan,
+ 	    int type, const char *fun_name)
+@@ -659,7 +683,7 @@ xm2msc_pr_allchanreg(struct xm2m_msc_dev *xm2msc)
+ 
+ 	xm2msc_pr_screg(xm2msc->dev, xm2msc->regs);
+ 
+-	for (i = 0; i < xm2msc->max_chan; i++) {
++	for (i = 0; i < xm2msc->running_chan; i++) {
+ 		chan_ctx = &xm2msc->xm2msc_chan[i];
+ 		dev_dbg(dev, "Regs val for channel %d\n", i);
+ 		dev_dbg(dev, "______________________________________________\n");
+@@ -721,13 +745,13 @@ xm2msc_set_chan_stream(struct xm2msc_chan_ctx *ctx, bool state, int type)
+ 	else
+ 		ptr = &ctx->xm2msc_dev->out_streamed_chan;
+ 
+-	mutex_lock(&ctx->xm2msc_dev->mutex);
++	spin_lock(&ctx->xm2msc_dev->lock);
+ 	if (state)
+ 		xm2msc_setbit(ctx->num, ptr);
+ 	else
+ 		xm2msc_clrbit(ctx->num, ptr);
+ 
+-	mutex_unlock(&ctx->xm2msc_dev->mutex);
++	spin_unlock(&ctx->xm2msc_dev->lock);
+ }
+ 
+ static int
+@@ -822,7 +846,7 @@ static int xm2msc_set_bufaddr(struct xm2m_msc_dev *xm2msc)
+ 	dma_addr_t src_luma, dst_luma;
+ 	dma_addr_t src_croma, dst_croma;
+ 
+-	for (chan = 0; chan < xm2msc->max_chan; chan++) {
++	for (chan = 0; chan < xm2msc->running_chan; chan++) {
+ 		chan_ctx = &xm2msc->xm2msc_chan[chan];
+ 		base = chan_ctx->regs;
+ 
+@@ -871,7 +895,7 @@ static void xm2msc_job_finish(struct xm2m_msc_dev *xm2msc)
+ {
+ 	unsigned int chan;
+ 
+-	for (chan = 0; chan < xm2msc->max_chan; chan++) {
++	for (chan = 0; chan < xm2msc->running_chan; chan++) {
+ 		struct xm2msc_chan_ctx *chan_ctx;
+ 
+ 		chan_ctx = &xm2msc->xm2msc_chan[chan];
+@@ -881,9 +905,9 @@ static void xm2msc_job_finish(struct xm2m_msc_dev *xm2msc)
+ 
+ static void xm2msc_job_done(struct xm2m_msc_dev *xm2msc)
+ {
+-	unsigned int chan;
++	u32 chan;
+ 
+-	for (chan = 0; chan < xm2msc->max_chan; chan++) {
++	for (chan = 0; chan < xm2msc->running_chan; chan++) {
+ 		struct xm2msc_chan_ctx *chan_ctx;
+ 		struct vb2_v4l2_buffer *src_vb, *dst_vb;
+ 		unsigned long flags;
+@@ -913,10 +937,25 @@ static void xm2msc_device_run(void *priv)
+ 	struct xm2msc_chan_ctx *chan_ctx = priv;
+ 	struct xm2m_msc_dev *xm2msc = chan_ctx->xm2msc_dev;
+ 	void __iomem *base = xm2msc->regs;
++	unsigned long flags;
+ 	int ret;
+ 
+-	/* TODO program to number of opened chan*/
+-	xm2msc_writereg(base + XM2MSC_NUM_OUTS, xm2msc->max_chan);
++	spin_lock_irqsave(&xm2msc->lock, flags);
++	if (xm2msc->running_chan != NUM_STREAM(xm2msc)) {
++		dev_dbg(xm2msc->dev, "Running chan was %d\n",
++			xm2msc->running_chan);
++		xm2msc->running_chan = NUM_STREAM(xm2msc);
++
++		/* IP need reset for updating of XM2MSC_NUM_OUT */
++		xm2msc_reset(xm2msc);
++		xm2msc_writereg(base + XM2MSC_NUM_OUTS, xm2msc->running_chan);
++		xm2msc_program_allchan(xm2msc);
++	}
++	spin_unlock_irqrestore(&xm2msc->lock, flags);
++
++	dev_dbg(xm2msc->dev, "Running chan = %d\n", xm2msc->running_chan);
++	if (xm2msc->running_chan == 0)
++		return;
+ 
+ 	ret = xm2msc_set_bufaddr(xm2msc);
+ 	if (ret) {
+-- 
+2.31.1
+

@@ -1,0 +1,638 @@
+From b4bc5e41fa04ed0d3170291c0bb4d15d3036e1ce Mon Sep 17 00:00:00 2001
+From: Nishad Saraf <nishad.saraf@xilinx.com>
+Date: Wed, 9 Sep 2020 23:46:23 -0700
+Subject: [PATCH 1585/1852] misc: xilinx-ai-engine: Log error events and
+ classify them into categories
+
+commit 6e5e5cae8d1acb9531858d3bb7a140d60ec19537 from
+https://github.com/Xilinx/linux-xlnx.git
+
+After error interrupts are backtracked to a module, they need to be logged
+into a local event bitmap. Such bitmaps can later be parsed to retrieve all
+information relevant to the error event. In order to provide an abstracted
+view of these error events, this change implements the required backend and
+classifies the default error events into categories.
+
+Signed-off-by: Nishad Saraf <nishad.saraf@xilinx.com>
+Reviewed-by: Wendy Liang <wendy.liang@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/xilinx-ai-engine/ai-engine-aie.c | 276 ++++++++++++++++++
+ .../xilinx-ai-engine/ai-engine-internal.h     |  57 ++++
+ .../xilinx-ai-engine/ai-engine-interrupt.c    |  74 +++++
+ .../misc/xilinx-ai-engine/ai-engine-part.c    |  64 ++++
+ include/linux/xlnx-ai-engine.h                |  15 +
+ 5 files changed, 486 insertions(+)
+
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-aie.c b/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
+index 916b2edb0b41..b85bf1e61bb6 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-aie.c
+@@ -9,6 +9,7 @@
+ #include <linux/firmware/xlnx-zynqmp.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
++#include <linux/xlnx-ai-engine.h>
+ 
+ #include "ai-engine-internal.h"
+ 
+@@ -244,6 +245,278 @@ static const struct aie_l2_intr_ctrl_attr aie_l2_intr_ctrl = {
+ 	.num_broadcasts = 0x10U,
+ };
+ 
++static const struct aie_event_prop aie_core_stream_error_prop[] = {
++	{
++		.event = 54U,
++		.event_str = "CORE: TLAST in WSS words 0-2",
++	},
++	{
++		.event = 57U,
++		.event_str = "CORE: Control packet error",
++	},
++	{
++		.event = 56U,
++		.event_str = "CORE: Stream packet parity error",
++	},
++};
++
++static const struct aie_event_prop aie_core_inst_error_prop[] = {
++	{
++		.event = 59U,
++		.event_str = "CORE: Instruction decompression error",
++	},
++};
++
++static const struct aie_event_prop aie_core_ecc_error_prop[] = {
++	{
++		.event = 64U,
++		.event_str = "CORE: PM ECC error 2-bit",
++	},
++	{
++		.event = 62U,
++		.event_str = "CORE: PM ECC error scrub 2-bit",
++	},
++};
++
++static const struct aie_event_prop aie_core_access_error_prop[] = {
++	{
++		.event = 55U,
++		.event_str = "CORE: PM reg access failure",
++	},
++	{
++		.event = 66U,
++		.event_str = "CORE: DM access to unavailable",
++	},
++	{
++		.event = 65U,
++		.event_str = "CORE: PM address out of range",
++	},
++	{
++		.event = 60U,
++		.event_str = "CORE: DM address out of range",
++	},
++};
++
++static const struct aie_event_prop aie_core_lock_error_prop[] = {
++	{
++		.event = 67U,
++		.event_str = "CORE: Lock access to unavailable",
++	},
++};
++
++static const struct aie_event_prop aie_core_bus_error_prop[] = {
++	{
++		.event = 58U,
++		.event_str = "CORE: AXI-MM slave error",
++	},
++};
++
++static const struct aie_event_prop aie_mem_ecc_error_prop[] = {
++	{
++		.event = 88U,
++		.event_str = "MEM: DM ECC error scrub 2-bit",
++	},
++	{
++		.event = 90U,
++		.event_str = "MEM: DM ECC error 2-bit",
++	},
++};
++
++static const struct aie_event_prop aie_mem_parity_error_prop[] = {
++	{
++		.event = 91U,
++		.event_str = " MEM: DM parity error bank 2",
++	},
++	{
++		.event = 92U,
++		.event_str = " MEM: DM parity error bank 3",
++	},
++	{
++		.event = 93U,
++		.event_str = " MEM: DM parity error bank 4",
++	},
++	{
++		.event = 94U,
++		.event_str = " MEM: DM parity error bank 5",
++	},
++	{
++		.event = 95U,
++		.event_str = " MEM: DM parity error bank 6",
++	},
++	{
++		.event = 96U,
++		.event_str = " MEM: DM parity error bank 7",
++	},
++};
++
++static const struct aie_event_prop aie_mem_dma_error_prop[] = {
++	{
++		.event = 97U,
++		.event_str = " MEM: DMA S2MM 0 error",
++	},
++	{
++		.event = 98U,
++		.event_str = " MEM: DMA S2MM 1 error",
++	},
++	{
++		.event = 99U,
++		.event_str = " MEM: DMA MM2S 0 error",
++	},
++	{
++		.event = 100U,
++		.event_str = " MEM: DMA MM2S 1 error",
++	},
++};
++
++static const struct aie_event_prop aie_shim_bus_error_prop[] = {
++	{
++		.event = 62U,
++		.event_str = "SHIM: AXI-MM slave tile error",
++	},
++};
++
++static const struct aie_event_prop aie_shim_stream_error_prop[] = {
++	{
++		.event = 63U,
++		.event_str = "SHIM: Control packet error",
++	},
++	{
++		.event = 64U,
++		.event_str = "SHIM: AXI-MM decode NSU error",
++	},
++	{
++		.event = 65U,
++		.event_str = "SHIM: AXI-MM slave NSU error",
++	},
++	{
++		.event = 66U,
++		.event_str = "SHIM: AXI-MM unsupported traffic",
++	},
++	{
++		.event = 67U,
++		.event_str = "SHIM: AXI-MM unsecure access in secure mode",
++	},
++	{
++		.event = 68U,
++		.event_str = "SHIM: AXI-MM byte strobe error",
++	},
++};
++
++static const struct aie_event_prop aie_shim_dma_error_prop[] = {
++	{
++		.event = 69U,
++		.event_str = "SHIM: DMA S2MM 0 error",
++	},
++	{
++		.event = 70U,
++		.event_str = "SHIM: DMA S2MM 1 error",
++	},
++	{
++		.event = 71U,
++		.event_str = "SHIM: DMA MM2S 0 error",
++	},
++	{
++		.event = 72U,
++		.event_str = "SHIM: DMA MM2S 1 error",
++	},
++};
++
++static const struct aie_err_category aie_core_err_category[] = {
++	{
++		/* AIE_ERROR_CATEGORY_STREAM */
++		.err_category = AIE_ERROR_CATEGORY_STREAM,
++		.num_events = ARRAY_SIZE(aie_core_stream_error_prop),
++		.prop = aie_core_stream_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_ACCESS */
++		.err_category = AIE_ERROR_CATEGORY_ACCESS,
++		.num_events = ARRAY_SIZE(aie_core_access_error_prop),
++		.prop = aie_core_access_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_BUS */
++		.err_category = AIE_ERROR_CATEGORY_BUS,
++		.num_events = ARRAY_SIZE(aie_core_bus_error_prop),
++		.prop = aie_core_bus_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_INSTRUCTION */
++		.err_category = AIE_ERROR_CATEGORY_INSTRUCTION,
++		.num_events = ARRAY_SIZE(aie_core_inst_error_prop),
++		.prop = aie_core_inst_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_ECC */
++		.err_category = AIE_ERROR_CATEGORY_ECC,
++		.num_events = ARRAY_SIZE(aie_core_ecc_error_prop),
++		.prop = aie_core_ecc_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_LOCK */
++		.err_category = AIE_ERROR_CATEGORY_LOCK,
++		.num_events = ARRAY_SIZE(aie_core_lock_error_prop),
++		.prop = aie_core_lock_error_prop,
++	},
++};
++
++static const struct aie_err_category aie_mem_err_category[] = {
++	{
++		/* AIE_ERROR_CATEGORY_ECC */
++		.err_category = AIE_ERROR_CATEGORY_ECC,
++		.num_events = ARRAY_SIZE(aie_mem_ecc_error_prop),
++		.prop = aie_mem_ecc_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_MEM_PARITY */
++		.err_category = AIE_ERROR_CATEGORY_MEM_PARITY,
++		.num_events = ARRAY_SIZE(aie_mem_parity_error_prop),
++		.prop = aie_mem_parity_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_DMA */
++		.err_category = AIE_ERROR_CATEGORY_DMA,
++		.num_events = ARRAY_SIZE(aie_mem_dma_error_prop),
++		.prop = aie_mem_dma_error_prop,
++	},
++};
++
++static const struct aie_err_category aie_shim_err_category[] = {
++	{
++		/* AIE_ERROR_CATEGORY_BUS */
++		.err_category = AIE_ERROR_CATEGORY_BUS,
++		.num_events = ARRAY_SIZE(aie_shim_bus_error_prop),
++		.prop = aie_shim_bus_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_STREAM */
++		.err_category = AIE_ERROR_CATEGORY_STREAM,
++		.num_events = ARRAY_SIZE(aie_shim_stream_error_prop),
++		.prop = aie_shim_stream_error_prop,
++	},
++	{
++		/* AIE_ERROR_CATEGORY_DMA */
++		.err_category = AIE_ERROR_CATEGORY_DMA,
++		.num_events = ARRAY_SIZE(aie_shim_dma_error_prop),
++		.prop = aie_shim_dma_error_prop,
++	},
++};
++
++static const struct aie_error_attr aie_core_error = {
++	.num_err_categories = ARRAY_SIZE(aie_core_err_category),
++	.err_category = aie_core_err_category,
++};
++
++static const struct aie_error_attr aie_mem_error = {
++	.num_err_categories = ARRAY_SIZE(aie_mem_err_category),
++	.err_category = aie_mem_err_category,
++};
++
++static const struct aie_error_attr aie_shim_error = {
++	.num_err_categories = ARRAY_SIZE(aie_shim_err_category),
++	.err_category = aie_shim_err_category,
++};
++
+ static u32 aie_get_tile_type(struct aie_location *loc)
+ {
+ 	if (loc->row)
+@@ -545,6 +818,9 @@ int aie_device_init(struct aie_device *adev)
+ 	adev->core_events = &aie_core_event;
+ 	adev->l1_ctrl = &aie_l1_intr_ctrl;
+ 	adev->l2_ctrl = &aie_l2_intr_ctrl;
++	adev->core_errors = &aie_core_error;
++	adev->mem_errors = &aie_mem_error;
++	adev->shim_errors = &aie_shim_error;
+ 
+ 	/* Get the columns resource */
+ 	/* Get number of columns from AI engine memory resource */
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index 94064128bb6e..33990e609706 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -236,6 +236,49 @@ struct aie_l2_intr_ctrl_attr {
+ 	u32 num_broadcasts;
+ };
+ 
++/**
++ * struct aie_error_cb - AI engine error callback struct.
++ * @cb: pointer to callback function.
++ * @priv: data to be passed to the callback function.
++ */
++struct aie_error_cb {
++	void (*cb)(void *priv);
++	void *priv;
++};
++
++/**
++ * struct aie_event_prop - AI engine event property.
++ * @event: error event ID.
++ * @event_str: error string.
++ */
++struct aie_event_prop {
++	u32 event;
++	char *event_str;
++};
++
++/**
++ * struct aie_err_category - AI engine errors category.
++ * @err_category: category of error.
++ * @num_events: number of event IDs in a category.
++ * @prop: pointer to an array event properties.
++ */
++struct aie_err_category {
++	u32 err_category;
++	u32 num_events;
++	const struct aie_event_prop *prop;
++};
++
++/**
++ * struct aie_error_attr - AI engine error attribute.
++ * @num_err_categories: number of possible error categories valid for a given
++ *			module.
++ * @err_category: pointer to an array of error categories.
++ */
++struct aie_error_attr {
++	u32 num_err_categories;
++	const struct aie_err_category *err_category;
++};
++
+ /**
+  * struct aie_device - AI engine device structure
+  * @partitions: list of partitions requested
+@@ -255,6 +298,9 @@ struct aie_l2_intr_ctrl_attr {
+  * @core_events: core module event attribute
+  * @l1_ctrl: level 1 interrupt controller attribute
+  * @l2_ctrl: level 2 interrupt controller attribute
++ * @core_errors: core module error attribute
++ * @mem_errors: memory module error attribute
++ * @shim_errors: shim tile error attribute
+  * @size: size of the AI engine address space
+  * @array_shift: array address shift
+  * @col_shift: column address shift
+@@ -285,6 +331,9 @@ struct aie_device {
+ 	const struct aie_event_attr *core_events;
+ 	const struct aie_l1_intr_ctrl_attr *l1_ctrl;
+ 	const struct aie_l2_intr_ctrl_attr *l2_ctrl;
++	const struct aie_error_attr *core_errors;
++	const struct aie_error_attr *mem_errors;
++	const struct aie_error_attr *shim_errors;
+ 	size_t size;
+ 	struct aie_resource cols_res;
+ 	u32 array_shift;
+@@ -319,6 +368,10 @@ struct aie_part_bridge {
+  * @mlock: protection for AI engine partition operations
+  * @dev: device for the AI engine partition
+  * @cores_clk_state: bitmap to indicate the power state of core modules
++ * @error_cb: error callback
++ * @core_event_status: core module event bitmap
++ * @mem_event_status: memory module event bitmap
++ * @pl_event_status: pl module event bitmap
+  * @partition_id: partition id. Partition ID is the identifier
+  *		  of the AI engine partition in the system.
+  * @status: indicate if the partition is in use
+@@ -336,6 +389,10 @@ struct aie_partition {
+ 	struct mutex mlock; /* protection for AI engine partition operations */
+ 	struct device dev;
+ 	struct aie_resource cores_clk_state;
++	struct aie_error_cb error_cb;
++	struct aie_resource core_event_status;
++	struct aie_resource mem_event_status;
++	struct aie_resource pl_event_status;
+ 	u32 partition_id;
+ 	u32 status;
+ 	u32 cntrflag;
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c b/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+index 14344c4930b2..c32c69ce66bf 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+@@ -334,10 +334,83 @@ static void aie_disable_l2_ctrl(struct aie_partition *apart,
+ 	iowrite32(bit_map, apart->adev->base + regoff);
+ }
+ 
++/**
++ * aie_part_set_event_bitmap() - set the status of event in local event
++ *				 bitmap.
++ * @apart: AIE partition pointer.
++ * @loc: tile location.
++ * @module: module type.
++ * @event: event ID to be logged.
++ */
++static void aie_part_set_event_bitmap(struct aie_partition *apart,
++				      struct aie_location loc,
++				      enum aie_module_type module, u8 event)
++{
++	u8 row, col, mod_num_events;
++	struct aie_resource *event_sts;
++	u32 offset;
++
++	if (module == AIE_CORE_MOD) {
++		event_sts = &apart->core_event_status;
++		mod_num_events = apart->adev->core_events->num_events;
++		row = loc.row - apart->range.start.row - 1;
++	} else if (module == AIE_MEM_MOD) {
++		event_sts = &apart->mem_event_status;
++		mod_num_events = apart->adev->mem_events->num_events;
++		row = loc.row - apart->range.start.row - 1;
++	} else {
++		event_sts = &apart->pl_event_status;
++		mod_num_events = apart->adev->pl_events->num_events;
++		row = loc.row;
++	}
++
++	col = loc.col - apart->range.start.col;
++
++	offset = (col + row * apart->range.size.col) * mod_num_events + event;
++	aie_resource_set(event_sts, offset, 1);
++}
++
++/**
++ * aie_check_error_bitmap() - check the status of event in local event bitmap.
++ * @apart: AIE partition pointer.
++ * @loc: tile location.
++ * @module: module type.
++ * @event: event ID to check.
++ * @return: true if event has happened, else false.
++ */
++static bool aie_check_error_bitmap(struct aie_partition *apart,
++				   struct aie_location loc,
++				   enum aie_module_type module, u8 event)
++{
++	struct aie_resource *event_sts;
++	u32 offset;
++	u8 row, col, mod_num_events;
++
++	if (module == AIE_CORE_MOD) {
++		event_sts = &apart->core_event_status;
++		mod_num_events = apart->adev->core_events->num_events;
++		row = loc.row - apart->range.start.row - 1;
++	} else if (module == AIE_MEM_MOD) {
++		event_sts = &apart->mem_event_status;
++		mod_num_events = apart->adev->mem_events->num_events;
++		row = loc.row - apart->range.start.row - 1;
++	} else {
++		event_sts = &apart->pl_event_status;
++		mod_num_events = apart->adev->pl_events->num_events;
++		row = loc.row;
++	}
++
++	col = loc.col - apart->range.start.col;
++
++	offset = (col + row * apart->range.size.col) * mod_num_events + event;
++	return aie_resource_testbit(event_sts, offset);
++}
++
+ /**
+  * aie_tile_backtrack() - if error was asserted on a broadcast line in
+  *			  the given array tile,
+  *				* disable the error from the group errors
++ *				* record the error event in local bitmap
+  * @apart: AIE partition pointer.
+  * @loc: tile location.
+  * @module: module type.
+@@ -371,6 +444,7 @@ static bool aie_tile_backtrack(struct aie_partition *apart,
+ 		if (!(status[eevent / 32] & BIT(eevent % 32)))
+ 			continue;
+ 		grenabled &= ~BIT(n);
++		aie_part_set_event_bitmap(apart, loc, module, eevent);
+ 		ret = true;
+ 		dev_err_ratelimited(&apart->adev->dev,
+ 				    "Asserted tile error event %d at col %d row %d\n",
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-part.c b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+index 78b14960ff48..c1f5ca54c52c 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-part.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+@@ -268,6 +268,58 @@ static int aie_part_access_regs(struct aie_partition *apart, u32 num_reqs,
+ 	return 0;
+ }
+ 
++/**
++ * aie_part_create_event_bitmap() - create event bitmap for all modules in a
++ *				    given partition.
++ * @apart: AI engine partition
++ * @return: 0 for success, and negative value for failure.
++ */
++static int aie_part_create_event_bitmap(struct aie_partition *apart)
++{
++	struct aie_range range = apart->range;
++	u32 bitmap_sz;
++	u32 num_aie_module = range.size.col * (range.size.row - 1);
++	int ret;
++
++	bitmap_sz = num_aie_module * apart->adev->core_events->num_events;
++	ret = aie_resource_initialize(&apart->core_event_status, bitmap_sz);
++	if (ret) {
++		dev_err(&apart->dev,
++			"failed to initialize event status resource.\n");
++		return -ENOMEM;
++	}
++
++	bitmap_sz = num_aie_module * apart->adev->mem_events->num_events;
++	ret = aie_resource_initialize(&apart->mem_event_status, bitmap_sz);
++	if (ret) {
++		dev_err(&apart->dev,
++			"failed to initialize event status resource.\n");
++		return -ENOMEM;
++	}
++
++	bitmap_sz = range.size.col * apart->adev->pl_events->num_events;
++	ret = aie_resource_initialize(&apart->pl_event_status, bitmap_sz);
++	if (ret) {
++		dev_err(&apart->dev,
++			"failed to initialize event status resource.\n");
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++/**
++ * aie_part_release_event_bitmap() - Deallocates event bitmap for all modules
++ *				     in a given partition.
++ * @apart: AI engine partition
++ * @return: 0 for success, and negative value for failure.
++ */
++static void aie_part_release_event_bitmap(struct aie_partition *apart)
++{
++	aie_resource_uninitialize(&apart->core_event_status);
++	aie_resource_uninitialize(&apart->mem_event_status);
++	aie_resource_uninitialize(&apart->pl_event_status);
++}
++
+ static int aie_part_release(struct inode *inode, struct file *filp)
+ {
+ 	struct aie_partition *apart = filp->private_data;
+@@ -466,6 +518,7 @@ static void aie_part_release_device(struct device *dev)
+ 
+ 	aie_resource_put_region(&adev->cols_res, apart->range.start.col,
+ 				apart->range.size.col);
++	aie_part_release_event_bitmap(apart);
+ 	list_del(&apart->node);
+ 	mutex_unlock(&adev->mlock);
+ 	aie_fpga_free_bridge(apart);
+@@ -599,6 +652,17 @@ static struct aie_partition *aie_create_partition(struct aie_device *adev,
+ 		return ERR_PTR(ret);
+ 	}
+ 
++	/*
++	 * Create bitmap to record event status for each module in a
++	 * partition
++	 */
++	ret = aie_part_create_event_bitmap(apart);
++	if (ret < 0) {
++		dev_err(&apart->dev, "Failed to allocate event bitmap.\n");
++		put_device(dev);
++		return ERR_PTR(ret);
++	}
++
+ 	ret = mutex_lock_interruptible(&adev->mlock);
+ 	if (ret) {
+ 		put_device(dev);
+diff --git a/include/linux/xlnx-ai-engine.h b/include/linux/xlnx-ai-engine.h
+index 75442ee162a6..2c4eb2d7bcdf 100644
+--- a/include/linux/xlnx-ai-engine.h
++++ b/include/linux/xlnx-ai-engine.h
+@@ -13,6 +13,21 @@
+ #endif
+ #include <uapi/linux/xlnx-ai-engine.h>
+ 
++/*
++ * Macro to classify errors into categories to provide higher-level error
++ * event abstraction.
++ */
++#define AIE_ERROR_CATEGORY_SATURATION		0U
++#define AIE_ERROR_CATEGORY_FP			1U
++#define AIE_ERROR_CATEGORY_STREAM		2U
++#define AIE_ERROR_CATEGORY_ACCESS		3U
++#define AIE_ERROR_CATEGORY_BUS			4U
++#define AIE_ERROR_CATEGORY_INSTRUCTION		5U
++#define AIE_ERROR_CATEGORY_ECC			6U
++#define AIE_ERROR_CATEGORY_LOCK			7U
++#define AIE_ERROR_CATEGORY_DMA			8U
++#define AIE_ERROR_CATEGORY_MEM_PARITY		9U
++
+ /**
+  * enum aie_module_type - identifies different hardware modules within a
+  *			  tile type. AIE tile may have memory and core
+-- 
+2.31.1
+

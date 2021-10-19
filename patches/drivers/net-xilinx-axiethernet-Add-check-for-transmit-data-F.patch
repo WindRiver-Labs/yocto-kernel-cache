@@ -1,0 +1,173 @@
+From 83efe2344902f47648c9a358f8d667f9d36fd6ef Mon Sep 17 00:00:00 2001
+From: Radhey Shyam Pandey <radhey.shyam.pandey@xilinx.com>
+Date: Tue, 29 Sep 2020 21:59:24 +0530
+Subject: [PATCH 1683/1852] net: xilinx: axiethernet: Add check for transmit
+ data FIFO vacancy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In a scenario when the multiple iperf3 transmit streams are executed there
+is a high probability to overflow the transmit FIFO buffer and generate
+async abort(SError) which might lead to kernel panic.
+
+In the transmit path, add proper locking to ensure updates to TX FIFO
+are atomic and also check transmit data FIFO vacancy before writing to
+the TX FIFO. This is inline with recommended programming sequence for
+transmitting a packet using axistream FIFO and as a side effect it also
+fixes the below iperf3 crash:
+
+[ 283.692957] SError Interrupt on CPU1, code 0xbf000002 – SError
+[ 283.692960] CPU: 1 PID: 515 Comm: udhcpc Not tainted 5.4.0-xilinx-v2020.1 #1
+[ 283.692961] Hardware name: xlnx,zynqmp (DT)
+[ 283.692963] pstate: 80000085 (Nzcv daIf -PAN -UAO)
+[ 283.692964] pc : dma_direct_map_page+0x20/0x130
+[ 283.692966] lr : axienet_start_xmit+0x1ac/0x6b0
+[ 283.692967] sp : ffffffc01000b860
+[ 283.692968] x29: ffffffc01000b860 x28: 0000000000000001
+[ 283.692971] x27: ffffffc0112c5400 x26: ffffff8876f047c0
+[ 283.692974] x25: ffffffc0112c5000 x24: 0000000000000000
+[ 283.692977] x23: ffffff8876f04000 x22: 0000000000000000
+[ 283.692980] x21: ffffffc0112c5400 x20: ffffff8876012700
+[ 283.692983] x19: ffffff887ab48c10 x18: 0000000000000000
+[ 283.692985] x17: 0000000000000000 x16: 0000000000000000
+[ 283.692988] x15: 0000000000000000 x14: 0000000000000000
+[ 283.692991] x13: 0000000000000000 x12: 0000000000000000
+[ 283.692994] x11: 0000000000000000 x10: 0000000000000000
+[ 283.692997] x9 : 0000000000000000 x8 : 0000000000000000
+[ 283.693000] x7 : 0000000000000000 x6 : fffffffeffe00000
+[ 283.693002] x5 : 0000000000000000 x4 : 0000000000000001
+[ 283.693005] x3 : 00000000000005ea x2 : 00000000000000ce
+[ 283.693008] x1 : 0000000021d86040 x0 : ffffff887ab48c10
+[ 283.693012] SError Interrupt on CPU2, code 0xbf000002 – SError
+[ 283.693014] CPU: 2 PID: 622 Comm: iperf3 Not tainted 5.4.0-xilinx-v2020.1 #1
+[ 283.693015] Hardware name: xlnx,zynqmp (DT)
+[ 283.693016] pstate: 80000085 (Nzcv daIf -PAN -UAO)
+[ 283.693018] pc : dma_direct_map_page+0x20/0x130
+[ 283.693019] lr : axienet_start_xmit+0x1ac/0x6b0
+[ 283.693020] sp : ffffffc011d4b4a0
+[ 283.693021] x29: ffffffc011d4b4a0 x28: 0000000000000001
+[ 283.693024] x27: ffffffc01130dd80 x26: ffffff8876f047c0
+
+Signed-off-by: Radhey Shyam Pandey <radhey.shyam.pandey@xilinx.com>
+Reviewed-by: Harini Katakam <harini.katakam@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/net/ethernet/xilinx/xilinx_axienet.h  |  3 +-
+ .../net/ethernet/xilinx/xilinx_axienet_main.c | 38 ++++++++++++++-----
+ 2 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet.h b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+index fa6e22425aee..99edf9d8854e 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet.h
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+@@ -155,6 +155,7 @@
+ 
+ /* AXI Tx Timestamp Stream FIFO Register Definitions */
+ #define XAXIFIFO_TXTS_ISR	0x00000000 /* Interrupt Status Register */
++#define XAXIFIFO_TXTS_TDFV	0x0000000C /* Transmit Data FIFO Vacancy */
+ #define XAXIFIFO_TXTS_TXFD	0x00000010 /* Tx Data Write Port */
+ #define XAXIFIFO_TXTS_TLR	0x00000014 /* Transmit Length Register */
+ #define XAXIFIFO_TXTS_RFO	0x0000001C /* Rx Fifo Occupancy */
+@@ -796,9 +797,9 @@ struct axienet_local {
+ 	u8  ptp_rx_sw_pointer;
+ 	struct sk_buff_head ptp_txq;
+ 	struct work_struct tx_tstamp_work;
+-	spinlock_t ptp_tx_lock;		/* TSN PTP tx lock*/
+ #endif
+ #endif
++	spinlock_t ptp_tx_lock;		/* PTP tx lock*/
+ 	int eth_irq;
+ 
+ 	u32 options;			/* Current options word */
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index 8f4a26383ca9..196f0036b585 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -1011,10 +1011,11 @@ static inline int axienet_check_tx_bd_space(struct axienet_dma_q *q,
+  * @buf:	Pointer to the buf to copy timestamp header
+  * @msg_type:	PTP message type
+  *
+- * Return:	None.
++ * Return: 0, on success
++ *	    NETDEV_TX_BUSY, if timestamp FIFO has no vacancy
+  */
+-static void axienet_create_tsheader(u8 *buf, u8 msg_type,
+-				    struct axienet_dma_q *q)
++static int axienet_create_tsheader(u8 *buf, u8 msg_type,
++				   struct axienet_dma_q *q)
+ {
+ 	struct axienet_local *lp = q->lp;
+ #ifdef CONFIG_AXIENET_HAS_MCDMA
+@@ -1024,6 +1025,7 @@ static void axienet_create_tsheader(u8 *buf, u8 msg_type,
+ #endif
+ 	u64 val;
+ 	u32 tmp;
++	u32 flags;
+ 
+ #ifdef CONFIG_AXIENET_HAS_MCDMA
+ 	cur_p = &q->txq_bd_v[q->tx_bd_tail];
+@@ -1052,9 +1054,19 @@ static void axienet_create_tsheader(u8 *buf, u8 msg_type,
+ 	} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+ 		   lp->axienet_config->mactype == XAXIENET_MRMAC) {
+ 		memcpy(&tmp, buf, XXVENET_TS_HEADER_LEN);
++		/* Check for Transmit Data FIFO Vacancy */
++		spin_lock_irqsave(&lp->ptp_tx_lock, flags);
++		if (!axienet_txts_ior(lp, XAXIFIFO_TXTS_TDFV)) {
++			spin_unlock_irqrestore(&lp->ptp_tx_lock, flags);
++			return NETDEV_TX_BUSY;
++		}
+ 		axienet_txts_iow(lp, XAXIFIFO_TXTS_TXFD, tmp);
+-		axienet_txts_iow(lp, XAXIFIFO_TXTS_TLR, XXVENET_TS_HEADER_LEN);
++		axienet_txts_iow(lp, XAXIFIFO_TXTS_TLR,
++				 XXVENET_TS_HEADER_LEN);
++		spin_unlock_irqrestore(&lp->ptp_tx_lock, flags);
+ 	}
++
++	return 0;
+ }
+ #endif
+ 
+@@ -1179,19 +1191,24 @@ static int axienet_skb_tstsmp(struct sk_buff **__skb, struct axienet_dma_q *q,
+ 			dev_dbg(lp->dev, "tx_tag:[%04x]\n",
+ 				cur_p->ptp_tx_ts_tag);
+ 			if (lp->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_SYNC) {
+-				axienet_create_tsheader(lp->tx_ptpheader,
+-							TX_TS_OP_ONESTEP, q);
++				if (axienet_create_tsheader(lp->tx_ptpheader,
++							    TX_TS_OP_ONESTEP,
++							    q))
++					return NETDEV_TX_BUSY;
+ 			} else {
+-				axienet_create_tsheader(lp->tx_ptpheader,
+-							TX_TS_OP_TWOSTEP, q);
++				if (axienet_create_tsheader(lp->tx_ptpheader,
++							    TX_TS_OP_TWOSTEP,
++							    q))
++					return NETDEV_TX_BUSY;
+ 				skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+ 				cur_p->ptp_tx_skb = (phys_addr_t)skb_get(skb);
+ 			}
+ 	} else if (lp->axienet_config->mactype == XAXIENET_10G_25G ||
+ 		   lp->axienet_config->mactype == XAXIENET_MRMAC) {
+ 			dev_dbg(lp->dev, "tx_tag:NOOP\n");
+-			axienet_create_tsheader(lp->tx_ptpheader,
+-						TX_TS_OP_NOOP, q);
++			if (axienet_create_tsheader(lp->tx_ptpheader,
++						    TX_TS_OP_NOOP, q))
++				return NETDEV_TX_BUSY;
+ 	}
+ 
+ 	return NETDEV_TX_OK;
+@@ -3411,6 +3428,7 @@ static int axienet_probe(struct platform_device *pdev)
+ 			lp->tx_ptpheader = devm_kzalloc(&pdev->dev,
+ 						XXVENET_TS_HEADER_LEN,
+ 						GFP_KERNEL);
++			spin_lock_init(&lp->ptp_tx_lock);
+ 		}
+ 
+ 		of_node_put(np);
+-- 
+2.31.1
+

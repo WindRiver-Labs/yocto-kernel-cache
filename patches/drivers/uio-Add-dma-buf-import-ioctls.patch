@@ -1,0 +1,465 @@
+From f3a38dc8f92d777b660ee81c1f6990fb1425262c Mon Sep 17 00:00:00 2001
+From: Hyun Kwon <hyun.kwon@xilinx.com>
+Date: Mon, 4 Mar 2019 18:13:08 -0800
+Subject: [PATCH 0096/1852] uio: Add dma-buf import ioctls
+
+commit 1e60f9b6ff04672e4bba2190abe2e185fd763195 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Add the dmabuf map / unmap interfaces. This allows the user driver
+to be able to import the external dmabuf and use it from user space.
+
+As noted in the header, this is an experimental feature, so it may
+change or deprecate at any time.
+
+Signed-off-by: Hyun Kwon <hyun.kwon@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: not-upstreamable
+Link: https://lkml.org/lkml/2019/2/23/207
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/uio/Kconfig          |   1 +
+ drivers/uio/Makefile         |   2 +-
+ drivers/uio/uio.c            |  43 +++++++
+ drivers/uio/uio_dmabuf.c     | 210 +++++++++++++++++++++++++++++++++++
+ drivers/uio/uio_dmabuf.h     |  26 +++++
+ include/uapi/linux/uio/uio.h |  65 +++++++++++
+ 6 files changed, 346 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/uio/uio_dmabuf.c
+ create mode 100644 drivers/uio/uio_dmabuf.h
+ create mode 100644 include/uapi/linux/uio/uio.h
+
+diff --git a/drivers/uio/Kconfig b/drivers/uio/Kconfig
+index 202ee81cfc2b..bbefadb0b1da 100644
+--- a/drivers/uio/Kconfig
++++ b/drivers/uio/Kconfig
+@@ -2,6 +2,7 @@
+ menuconfig UIO
+ 	tristate "Userspace I/O drivers"
+ 	depends on MMU
++	select DMA_SHARED_BUFFER
+ 	help
+ 	  Enable this to allow the userspace driver core code to be
+ 	  built.  This code allows userspace programs easy access to
+diff --git a/drivers/uio/Makefile b/drivers/uio/Makefile
+index c285dd2a4539..5da16c73f326 100644
+--- a/drivers/uio/Makefile
++++ b/drivers/uio/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+-obj-$(CONFIG_UIO)	+= uio.o
++obj-$(CONFIG_UIO)	+= uio.o uio_dmabuf.o
+ obj-$(CONFIG_UIO_CIF)	+= uio_cif.o
+ obj-$(CONFIG_UIO_PDRV_GENIRQ)	+= uio_pdrv_genirq.o
+ obj-$(CONFIG_UIO_DMEM_GENIRQ)	+= uio_dmem_genirq.o
+diff --git a/drivers/uio/uio.c b/drivers/uio/uio.c
+index a57698985f9c..61b28d8be7f4 100644
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@ -24,6 +24,12 @@
+ #include <linux/kobject.h>
+ #include <linux/cdev.h>
+ #include <linux/uio_driver.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++
++#include <uapi/linux/uio/uio.h>
++
++#include "uio_dmabuf.h"
+ 
+ #define UIO_MAX_DEVICES		(1U << MINORBITS)
+ 
+@@ -454,6 +460,8 @@ static irqreturn_t uio_interrupt(int irq, void *dev_id)
+ struct uio_listener {
+ 	struct uio_device *dev;
+ 	s32 event_count;
++	struct list_head dbufs;
++	struct mutex dbufs_lock; /* protect @dbufs */
+ };
+ 
+ static int uio_open(struct inode *inode, struct file *filep)
+@@ -500,6 +508,9 @@ static int uio_open(struct inode *inode, struct file *filep)
+ 	if (ret)
+ 		goto err_infoopen;
+ 
++	INIT_LIST_HEAD(&listener->dbufs);
++	mutex_init(&listener->dbufs_lock);
++
+ 	return 0;
+ 
+ err_infoopen:
+@@ -529,6 +540,10 @@ static int uio_release(struct inode *inode, struct file *filep)
+ 	struct uio_listener *listener = filep->private_data;
+ 	struct uio_device *idev = listener->dev;
+ 
++	ret = uio_dmabuf_cleanup(idev, &listener->dbufs, &listener->dbufs_lock);
++	if (ret)
++		dev_err(&idev->dev, "failed to clean up the dma bufs\n");
++
+ 	mutex_lock(&idev->info_lock);
+ 	if (idev->info && idev->info->release)
+ 		ret = idev->info->release(idev->info, inode);
+@@ -652,6 +667,33 @@ static ssize_t uio_write(struct file *filep, const char __user *buf,
+ 	return retval ? retval : sizeof(s32);
+ }
+ 
++static long uio_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
++{
++	struct uio_listener *listener = filep->private_data;
++	struct uio_device *idev = listener->dev;
++	long ret;
++
++	if (!idev->info)
++		return -EIO;
++
++	switch (cmd) {
++	case UIO_IOC_MAP_DMABUF:
++		ret = uio_dmabuf_map(idev, &listener->dbufs,
++				     &listener->dbufs_lock, (void __user *)arg);
++		break;
++	case UIO_IOC_UNMAP_DMABUF:
++		ret = uio_dmabuf_unmap(idev, &listener->dbufs,
++				       &listener->dbufs_lock,
++				       (void __user *)arg);
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
+ static int uio_find_mem_index(struct vm_area_struct *vma)
+ {
+ 	struct uio_device *idev = vma->vm_private_data;
+@@ -821,6 +863,7 @@ static const struct file_operations uio_fops = {
+ 	.write		= uio_write,
+ 	.mmap		= uio_mmap,
+ 	.poll		= uio_poll,
++	.unlocked_ioctl	= uio_ioctl,
+ 	.fasync		= uio_fasync,
+ 	.llseek		= noop_llseek,
+ };
+diff --git a/drivers/uio/uio_dmabuf.c b/drivers/uio/uio_dmabuf.c
+new file mode 100644
+index 000000000000..b18f1469f6c8
+--- /dev/null
++++ b/drivers/uio/uio_dmabuf.c
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2019 Xilinx, Inc.
++ *
++ * Author: Hyun Woo Kwon <hyun.kwon@xilinx.com>
++ *
++ * DMA buf support for UIO device
++ *
++ */
++
++#include <linux/dma-buf.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/uaccess.h>
++#include <linux/uio_driver.h>
++#include <linux/slab.h>
++
++#include <uapi/linux/uio/uio.h>
++
++#include "uio_dmabuf.h"
++
++struct uio_dmabuf_mem {
++	int dbuf_fd;
++	struct dma_buf *dbuf;
++	struct dma_buf_attachment *dbuf_attach;
++	struct sg_table *sgt;
++	enum dma_data_direction dir;
++	struct list_head list;
++};
++
++long uio_dmabuf_map(struct uio_device *dev, struct list_head *dbufs,
++		    struct mutex *dbufs_lock, void __user *user_args)
++{
++	struct uio_dmabuf_args args;
++	struct uio_dmabuf_mem *dbuf_mem;
++	struct dma_buf *dbuf;
++	struct dma_buf_attachment *dbuf_attach;
++	enum dma_data_direction dir;
++	struct sg_table *sgt;
++	long ret;
++
++	if (copy_from_user(&args, user_args, sizeof(args))) {
++		ret = -EFAULT;
++		dev_err(dev->dev.parent, "failed to copy from user\n");
++		goto err;
++	}
++
++	dbuf = dma_buf_get(args.dbuf_fd);
++	if (IS_ERR(dbuf)) {
++		dev_err(dev->dev.parent, "failed to get dmabuf\n");
++		return PTR_ERR(dbuf);
++	}
++
++	dbuf_attach = dma_buf_attach(dbuf, dev->dev.parent);
++	if (IS_ERR(dbuf_attach)) {
++		dev_err(dev->dev.parent, "failed to attach dmabuf\n");
++		ret = PTR_ERR(dbuf_attach);
++		goto err_put;
++	}
++
++	switch (args.dir) {
++	case UIO_DMABUF_DIR_BIDIR:
++		dir = DMA_BIDIRECTIONAL;
++		break;
++	case UIO_DMABUF_DIR_TO_DEV:
++		dir = DMA_TO_DEVICE;
++		break;
++	case UIO_DMABUF_DIR_FROM_DEV:
++		dir = DMA_FROM_DEVICE;
++		break;
++	default:
++		/* Not needed with check. Just here for any future change  */
++		dev_err(dev->dev.parent, "invalid direction\n");
++		ret = -EINVAL;
++		goto err_detach;
++	}
++
++	sgt = dma_buf_map_attachment(dbuf_attach, dir);
++	if (IS_ERR(sgt)) {
++		dev_err(dev->dev.parent, "failed to get dmabuf scatterlist\n");
++		ret = PTR_ERR(sgt);
++		goto err_detach;
++	}
++
++	/* Accept only contiguous one */
++	if (sgt->nents != 1) {
++		dma_addr_t next_addr = sg_dma_address(sgt->sgl);
++		struct scatterlist *s;
++		unsigned int i;
++
++		for_each_sg(sgt->sgl, s, sgt->nents, i) {
++			if (!sg_dma_len(s))
++				continue;
++
++			if (sg_dma_address(s) != next_addr) {
++				dev_err(dev->dev.parent,
++					"dmabuf not contiguous\n");
++				ret = -EINVAL;
++				goto err_unmap;
++			}
++
++			next_addr = sg_dma_address(s) + sg_dma_len(s);
++		}
++	}
++
++	dbuf_mem = kzalloc(sizeof(*dbuf_mem), GFP_KERNEL);
++	if (!dbuf_mem) {
++		ret = -ENOMEM;
++		goto err_unmap;
++	}
++
++	dbuf_mem->dbuf_fd = args.dbuf_fd;
++	dbuf_mem->dbuf = dbuf;
++	dbuf_mem->dbuf_attach = dbuf_attach;
++	dbuf_mem->sgt = sgt;
++	dbuf_mem->dir = dir;
++	args.dma_addr = sg_dma_address(sgt->sgl);
++	args.size = dbuf->size;
++
++	if (copy_to_user(user_args, &args, sizeof(args))) {
++		ret = -EFAULT;
++		dev_err(dev->dev.parent, "failed to copy to user\n");
++		goto err_free;
++	}
++
++	mutex_lock(dbufs_lock);
++	list_add(&dbuf_mem->list, dbufs);
++	mutex_unlock(dbufs_lock);
++
++	return 0;
++
++err_free:
++	kfree(dbuf_mem);
++err_unmap:
++	dma_buf_unmap_attachment(dbuf_attach, sgt, dir);
++err_detach:
++	dma_buf_detach(dbuf, dbuf_attach);
++err_put:
++	dma_buf_put(dbuf);
++err:
++	return ret;
++}
++
++long uio_dmabuf_unmap(struct uio_device *dev, struct list_head *dbufs,
++		      struct mutex *dbufs_lock, void __user *user_args)
++
++{
++	struct uio_dmabuf_args args;
++	struct uio_dmabuf_mem *dbuf_mem;
++	long ret;
++
++	if (copy_from_user(&args, user_args, sizeof(args))) {
++		ret = -EFAULT;
++		goto err;
++	}
++
++	mutex_lock(dbufs_lock);
++	list_for_each_entry(dbuf_mem, dbufs, list) {
++		if (dbuf_mem->dbuf_fd == args.dbuf_fd)
++			break;
++	}
++
++	if (dbuf_mem->dbuf_fd != args.dbuf_fd) {
++		dev_err(dev->dev.parent, "failed to find the dmabuf (%d)\n",
++			args.dbuf_fd);
++		ret = -EINVAL;
++		goto err_unlock;
++	}
++	list_del(&dbuf_mem->list);
++	mutex_unlock(dbufs_lock);
++
++	dma_buf_unmap_attachment(dbuf_mem->dbuf_attach, dbuf_mem->sgt,
++				 dbuf_mem->dir);
++	dma_buf_detach(dbuf_mem->dbuf, dbuf_mem->dbuf_attach);
++	dma_buf_put(dbuf_mem->dbuf);
++	kfree(dbuf_mem);
++
++	memset(&args, 0x0, sizeof(args));
++
++	if (copy_to_user(user_args, &args, sizeof(args))) {
++		ret = -EFAULT;
++		goto err;
++	}
++
++	return 0;
++
++err_unlock:
++	mutex_unlock(dbufs_lock);
++err:
++	return ret;
++}
++
++int uio_dmabuf_cleanup(struct uio_device *dev, struct list_head *dbufs,
++		       struct mutex *dbufs_lock)
++{
++	struct uio_dmabuf_mem *dbuf_mem, *next;
++
++	mutex_lock(dbufs_lock);
++	list_for_each_entry_safe(dbuf_mem, next, dbufs, list) {
++		list_del(&dbuf_mem->list);
++		dma_buf_unmap_attachment(dbuf_mem->dbuf_attach, dbuf_mem->sgt,
++					 dbuf_mem->dir);
++		dma_buf_detach(dbuf_mem->dbuf, dbuf_mem->dbuf_attach);
++		dma_buf_put(dbuf_mem->dbuf);
++		kfree(dbuf_mem);
++	}
++	mutex_unlock(dbufs_lock);
++
++	return 0;
++}
+diff --git a/drivers/uio/uio_dmabuf.h b/drivers/uio/uio_dmabuf.h
+new file mode 100644
+index 000000000000..30200306d53a
+--- /dev/null
++++ b/drivers/uio/uio_dmabuf.h
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2019 Xilinx, Inc.
++ *
++ * Author: Hyun Woo Kwon <hyun.kwon@xilinx.com>
++ *
++ * DMA buf support for UIO device
++ *
++ */
++
++#ifndef _UIO_DMABUF_H_
++#define _UIO_DMABUF_H_
++
++struct uio_device;
++struct list_head;
++struct mutex;
++
++long uio_dmabuf_map(struct uio_device *dev, struct list_head *dbufs,
++		    struct mutex *dbufs_lock, void __user *user_args);
++long uio_dmabuf_unmap(struct uio_device *dev, struct list_head *dbufs,
++		      struct mutex *dbufs_lock, void __user *user_args);
++
++int uio_dmabuf_cleanup(struct uio_device *dev, struct list_head *dbufs,
++		       struct mutex *dbufs_lock);
++
++#endif
+diff --git a/include/uapi/linux/uio/uio.h b/include/uapi/linux/uio/uio.h
+new file mode 100644
+index 000000000000..db92d311c85f
+--- /dev/null
++++ b/include/uapi/linux/uio/uio.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * The header for UIO driver
++ *
++ * Copyright (C) 2019 Xilinx, Inc.
++ *
++ * Author: Hyun Woo Kwon <hyun.kwon@xilinx.com>
++ */
++
++#ifndef _UAPI_UIO_UIO_H_
++#define _UAPI_UIO_UIO_H_
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++/**
++ * enum uio_dmabuf_dir - list of dma directions for mapping management
++ * @UIO_DMABUF_DIR_BIDIR: Bidirectional DMA. To and from device
++ * @UIO_DMABUF_DIR_TO_DEV: DMA to device
++ * @UIO_DMABUF_DIR_FROM_DEV: DMA from device
++ * @UIO_DMABUF_DIR_NONE: Direction not specified
++ */
++enum uio_dmabuf_dir {
++	UIO_DMABUF_DIR_BIDIR	= 1,
++	UIO_DMABUF_DIR_TO_DEV	= 2,
++	UIO_DMABUF_DIR_FROM_DEV	= 3,
++	UIO_DMABUF_DIR_NONE	= 4,
++};
++
++/**
++ * struct uio_dmabuf_args - arguments from userspace to map / unmap dmabuf
++ * @dbuf_fd: The fd or dma buf
++ * @dma_addr: The dma address of dmabuf @dbuf_fd
++ * @size: The size of dmabuf @dbuf_fd
++ * @dir: direction of dma transfer of dmabuf @dbuf_fd
++ */
++struct uio_dmabuf_args {
++	__s32	dbuf_fd;
++	__u64	dma_addr;
++	__u64	size;
++	__u8	dir;
++};
++
++#define UIO_IOC_BASE		'U'
++
++/**
++ * DOC: UIO_IOC_MAP_DMABUF - Map the dma buf to userspace uio application
++ *
++ * This takes uio_dmabuf_args, and maps the given dmabuf @dbuf_fd and returns
++ * information to userspace.
++ * FIXME: This is experimental and may change at any time. Don't consider this
++ * as stable ABI.
++ */
++#define	UIO_IOC_MAP_DMABUF	_IOWR(UIO_IOC_BASE, 0x1, struct uio_dmabuf_args)
++
++/**
++ * DOC: UIO_IOC_UNMAP_DMABUF - Unmap the dma buf
++ *
++ * This takes uio_dmabuf_args, and unmaps the previous mapped dmabuf @dbuf_fd.
++ * FIXME: This is experimental and may change at any time. Don't consider this
++ * as stable ABI.
++ */
++#define	UIO_IOC_UNMAP_DMABUF	_IOWR(UIO_IOC_BASE, 0x2, struct uio_dmabuf_args)
++
++#endif
+-- 
+2.31.1
+

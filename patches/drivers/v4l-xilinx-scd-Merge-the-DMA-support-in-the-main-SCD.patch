@@ -1,0 +1,457 @@
+From 03abf66f6000aee0f20f7fe1b614209e524a3258 Mon Sep 17 00:00:00 2001
+From: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Date: Wed, 3 Apr 2019 13:01:46 -0700
+Subject: [PATCH 0597/1852] v4l: xilinx: scd: Merge the DMA support in the main
+ SCD driver
+
+commit 34b3462a83bdf1f412e6203f8af0a0ac8eaf33df from
+https://github.com/Xilinx/linux-xlnx.git
+
+There's no need to create a separate platform_driver and platform_device
+for the DMA support. Merge the xscd_dma_device structure into the
+xscd_device. This allows removing duplicating fields, as well as
+unneeded code.
+
+Signed-off-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Satish Kumar Nagireddy <satish.nagireddy.nagireddy@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ .../platform/xilinx/xilinx-scenechange-dma.c  | 130 +++++++-----------
+ .../platform/xilinx/xilinx-scenechange.c      |  36 +----
+ .../platform/xilinx/xilinx-scenechange.h      |  38 ++---
+ 3 files changed, 60 insertions(+), 144 deletions(-)
+
+diff --git a/drivers/media/platform/xilinx/xilinx-scenechange-dma.c b/drivers/media/platform/xilinx/xilinx-scenechange-dma.c
+index 4621cbd26ae3..23b8dc58dd84 100644
+--- a/drivers/media/platform/xilinx/xilinx-scenechange-dma.c
++++ b/drivers/media/platform/xilinx/xilinx-scenechange-dma.c
+@@ -35,14 +35,14 @@
+  */
+ static irqreturn_t xscd_dma_irq_handler(int irq, void *data)
+ {
+-	struct xscd_dma_device *dev = data;
++	struct xscd_device *xscd = data;
+ 	struct xscd_dma_chan *chan;
+ 
+-	if (dev->memory_based) {
++	if (xscd->shared_data.memory_based) {
+ 		u32 chan_en = 0, id;
+ 
+-		for (id = 0; id < dev->numchannels; id++) {
+-			chan = dev->chan[id];
++		for (id = 0; id < xscd->numchannels; id++) {
++			chan = xscd->channels[id];
+ 			spin_lock(&chan->lock);
+ 			chan->idle = true;
+ 
+@@ -63,8 +63,8 @@ static irqreturn_t xscd_dma_irq_handler(int irq, void *data)
+ 			xscd_dma_start(chan);
+ 		}
+ 
+-		for (id = 0; id < dev->numchannels; id++) {
+-			chan = dev->chan[id];
++		for (id = 0; id < xscd->numchannels; id++) {
++			chan = xscd->channels[id];
+ 			tasklet_schedule(&chan->tasklet);
+ 		}
+ 	}
+@@ -320,11 +320,11 @@ static int xscd_dma_terminate_all(struct dma_chan *dchan)
+ static void xscd_dma_issue_pending(struct dma_chan *dchan)
+ {
+ 	struct xscd_dma_chan *chan = to_xscd_dma_chan(dchan);
+-	struct xscd_dma_device *dev = chan->xdev;
++	struct xscd_device *xscd = chan->xscd;
+ 	u32 chan_en = 0, id;
+ 
+-	for (id = 0; id < dev->numchannels; id++) {
+-		chan = dev->chan[id];
++	for (id = 0; id < xscd->numchannels; id++) {
++		chan = xscd->channels[id];
+ 		spin_lock(&chan->lock);
+ 		chan->idle = true;
+ 
+@@ -359,9 +359,9 @@ static enum dma_status xscd_dma_tx_status(struct dma_chan *dchan,
+  */
+ void xscd_dma_halt(struct xscd_dma_chan *chan)
+ {
+-	struct xscd_dma_device *xdev = chan->xdev;
++	struct xscd_device *xscd = chan->xscd;
+ 
+-	if (xdev->memory_based)
++	if (xscd->shared_data.memory_based)
+ 		xscd_clr(chan->iomem, XSCD_CTRL_OFFSET, XSCD_CTRL_AP_START);
+ 	else
+ 		/* Streaming based */
+@@ -377,9 +377,9 @@ void xscd_dma_halt(struct xscd_dma_chan *chan)
+  */
+ void xscd_dma_start(struct xscd_dma_chan *chan)
+ {
+-	struct xscd_dma_device *xdev = chan->xdev;
++	struct xscd_device *xscd = chan->xscd;
+ 
+-	if (xdev->memory_based)
++	if (xscd->shared_data.memory_based)
+ 		xscd_set(chan->iomem, XSCD_CTRL_OFFSET, XSCD_CTRL_AP_START);
+ 	else
+ 		/* Streaming based */
+@@ -443,26 +443,24 @@ static int xscd_dma_alloc_chan_resources(struct dma_chan *dchan)
+ static struct dma_chan *of_scdma_xilinx_xlate(struct of_phandle_args *dma_spec,
+ 					      struct of_dma *ofdma)
+ {
+-	struct xscd_dma_device *xdev = ofdma->of_dma_data;
++	struct xscd_device *xscd = ofdma->of_dma_data;
+ 	u32 chan_id = dma_spec->args[0];
+ 
+-	if (chan_id >= xdev->numchannels)
++	if (chan_id >= xscd->numchannels)
+ 		return NULL;
+ 
+-	if (!xdev->chan[chan_id])
++	if (!xscd->channels[chan_id])
+ 		return NULL;
+ 
+-	return dma_get_slave_channel(&xdev->chan[chan_id]->common);
++	return dma_get_slave_channel(&xscd->channels[chan_id]->common);
+ }
+ 
+ static struct xscd_dma_chan *
+-xscd_dma_chan_probe(struct xscd_dma_device *xdev, int chan_id)
++xscd_dma_chan_probe(struct xscd_device *xscd, int chan_id)
+ {
+-	struct xscd_dma_chan *chan;
++	struct xscd_dma_chan *chan = xscd->channels[chan_id];
+ 
+-	chan = xdev->chan[chan_id];
+-	chan->dev = xdev->dev;
+-	chan->xdev = xdev;
++	chan->xscd = xscd;
+ 	chan->idle = true;
+ 
+ 	spin_lock_init(&chan->lock);
+@@ -470,58 +468,42 @@ xscd_dma_chan_probe(struct xscd_dma_device *xdev, int chan_id)
+ 	INIT_LIST_HEAD(&chan->done_list);
+ 	tasklet_init(&chan->tasklet, xscd_dma_do_tasklet,
+ 		     (unsigned long)chan);
+-	chan->common.device = &xdev->common;
+-	list_add_tail(&chan->common.device_node, &xdev->common.channels);
++	chan->common.device = &xscd->dma_device;
++	list_add_tail(&chan->common.device_node, &xscd->dma_device.channels);
+ 
+ 	return chan;
+ }
+ 
+ /**
+- * xilinx_dma_probe - Driver probe function
+- * @pdev: Pointer to the device structure
++ * xscd_dma_init - Initialize the SCD DMA engine
++ * @xscd: Pointer to the SCD device structure
+  *
+  * Return: '0' on success and failure value on error
+  */
+-static int xscd_dma_probe(struct platform_device *pdev)
++int xscd_dma_init(struct xscd_device *xscd)
+ {
+-	struct xscd_dma_device *xdev;
+-	struct device_node *node;
++	struct device_node *node = xscd->dev->of_node;
++	struct dma_device *ddev = &xscd->dma_device;
+ 	struct xscd_dma_chan *chan;
+-	struct dma_device *ddev;
+-	struct xscd_shared_data *shared_data;
+ 	int  ret, irq_num, chan_id = 0;
+ 
+-	/* Allocate and initialize the DMA engine structure */
+-	xdev = devm_kzalloc(&pdev->dev, sizeof(*xdev), GFP_KERNEL);
+-	if (!xdev)
+-		return -ENOMEM;
+-
+-	xdev->dev = &pdev->dev;
+-	ddev = &xdev->common;
+-	ddev->dev = &pdev->dev;
+-	node = xdev->dev->parent->of_node;
+-	xdev->dev->of_node = node;
+-	shared_data = (struct xscd_shared_data *)pdev->dev.parent->driver_data;
+-	xdev->regs = shared_data->iomem;
+-	xdev->chan = shared_data->dma_chan_list;
+-	xdev->memory_based = shared_data->memory_based;
+-	dma_set_mask(xdev->dev, DMA_BIT_MASK(32));
+-
+ 	/* Initialize the DMA engine */
+-	xdev->common.dev = &pdev->dev;
++	ddev->dev = xscd->dev;
++	dma_set_mask(xscd->dev, DMA_BIT_MASK(32));
++
+ 	ret = of_property_read_u32(node, "xlnx,numstreams",
+-				   &xdev->numchannels);
++				   &xscd->numchannels);
+ 
+ 	irq_num = irq_of_parse_and_map(node, 0);
+ 	if (!irq_num) {
+-		dev_err(xdev->dev, "No valid irq found\n");
++		dev_err(xscd->dev, "No valid irq found\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* TODO: Clean up multiple interrupt handlers as there is one device */
+-	ret = devm_request_irq(xdev->dev, irq_num, xscd_dma_irq_handler,
+-			       IRQF_SHARED, "xilinx_scenechange DMA", xdev);
+-	INIT_LIST_HEAD(&xdev->common.channels);
++	ret = devm_request_irq(xscd->dev, irq_num, xscd_dma_irq_handler,
++			       IRQF_SHARED, "xilinx_scenechange DMA", xscd);
++	INIT_LIST_HEAD(&ddev->channels);
+ 	dma_cap_set(DMA_SLAVE, ddev->cap_mask);
+ 	dma_cap_set(DMA_PRIVATE, ddev->cap_mask);
+ 	ddev->device_alloc_chan_resources = xscd_dma_alloc_chan_resources;
+@@ -530,12 +512,11 @@ static int xscd_dma_probe(struct platform_device *pdev)
+ 	ddev->device_issue_pending = xscd_dma_issue_pending;
+ 	ddev->device_terminate_all = xscd_dma_terminate_all;
+ 	ddev->device_prep_interleaved_dma = xscd_dma_prep_interleaved;
+-	platform_set_drvdata(pdev, xdev);
+ 
+-	for (chan_id = 0; chan_id < xdev->numchannels; chan_id++) {
+-		chan = xscd_dma_chan_probe(xdev, chan_id);
++	for (chan_id = 0; chan_id < xscd->numchannels; chan_id++) {
++		chan = xscd_dma_chan_probe(xscd, chan_id);
+ 		if (IS_ERR(chan)) {
+-			dev_err(xdev->dev, "failed to probe a channel\n");
++			dev_err(xscd->dev, "failed to probe a channel\n");
+ 			ret = PTR_ERR(chan);
+ 			goto error;
+ 		}
+@@ -543,46 +524,27 @@ static int xscd_dma_probe(struct platform_device *pdev)
+ 
+ 	ret = dma_async_device_register(ddev);
+ 	if (ret) {
+-		dev_err(xdev->dev, "failed to register the dma device\n");
++		dev_err(xscd->dev, "failed to register the dma device\n");
+ 		goto error;
+ 	}
+ 
+-	ret = of_dma_controller_register(xdev->dev->of_node,
+-					 of_scdma_xilinx_xlate, xdev);
++	ret = of_dma_controller_register(xscd->dev->of_node,
++					 of_scdma_xilinx_xlate, xscd);
+ 	if (ret) {
+-		dev_err(xdev->dev, "failed to register DMA to DT DMA helper\n");
++		dev_err(xscd->dev, "failed to register DMA to DT DMA helper\n");
+ 		goto error_of_dma;
+ 	}
+ 
+-	dev_info(&pdev->dev, "Xilinx Scene Change DMA is probed!\n");
++	dev_info(xscd->dev, "Xilinx Scene Change DMA is probed!\n");
+ 	return 0;
+ 
+ error_of_dma:
+ 	dma_async_device_unregister(ddev);
+ 
+ error:
+-	for (chan_id = 0; chan_id < xdev->numchannels; chan_id++) {
+-		if (xdev->chan[chan_id])
+-			xscd_dma_chan_remove(xdev->chan[chan_id]);
++	for (chan_id = 0; chan_id < xscd->numchannels; chan_id++) {
++		if (xscd->channels[chan_id])
++			xscd_dma_chan_remove(xscd->channels[chan_id]);
+ 	}
+ 	return ret;
+ }
+-
+-static int xscd_dma_remove(struct platform_device *pdev)
+-{
+-	return 0;
+-}
+-
+-static struct platform_driver xscd_dma_driver = {
+-	.probe		= xscd_dma_probe,
+-	.remove		= xscd_dma_remove,
+-	.driver		= {
+-		.name	= "xlnx,scdma",
+-	},
+-};
+-
+-module_platform_driver(xscd_dma_driver);
+-
+-MODULE_AUTHOR("Xilinx, Inc.");
+-MODULE_DESCRIPTION("Xilinx Scene Change Detect DMA driver");
+-MODULE_LICENSE("GPL v2");
+diff --git a/drivers/media/platform/xilinx/xilinx-scenechange.c b/drivers/media/platform/xilinx/xilinx-scenechange.c
+index bcf216e5acb8..bc12750038af 100644
+--- a/drivers/media/platform/xilinx/xilinx-scenechange.c
++++ b/drivers/media/platform/xilinx/xilinx-scenechange.c
+@@ -31,34 +31,6 @@ static irqreturn_t xscd_irq_handler(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static
+-struct platform_device *xilinx_scdma_device_init(struct platform_device *pdev,
+-						 struct device_node *node)
+-{
+-	struct platform_device *dma;
+-	int ret;
+-
+-	dma = platform_device_alloc("xlnx,scdma", 0);
+-	if (!dma)
+-		return ERR_PTR(-ENOMEM);
+-
+-	dma->dev.parent = &pdev->dev;
+-	ret = platform_device_add(dma);
+-	if (ret)
+-		goto error;
+-
+-	return dma;
+-
+-error:
+-	platform_device_unregister(dma);
+-	return ERR_PTR(ret);
+-}
+-
+-static void xilinx_scdma_device_exit(struct platform_device *dev)
+-{
+-	platform_device_unregister(dev);
+-}
+-
+ static int xscd_init_resources(struct xscd_device *xscd)
+ {
+ 	struct platform_device *pdev = to_platform_device(xscd->dev);
+@@ -141,6 +113,7 @@ static int xscd_probe(struct platform_device *pdev)
+ 	gpiod_set_value_cansleep(xscd->rst_gpio, XSCD_RESET_DEASSERT);
+ 
+ 	xscd->shared_data.iomem = xscd->iomem;
++	xscd->shared_data.dma_chan_list = xscd->channels;
+ 	platform_set_drvdata(pdev, (void *)&xscd->shared_data);
+ 
+ 	id = 0;
+@@ -163,8 +136,8 @@ static int xscd_probe(struct platform_device *pdev)
+ 		id++;
+ 	}
+ 
+-	xscd->dma_device = xilinx_scdma_device_init(pdev, xscd->dma_node);
+-	if (IS_ERR(xscd->dma_node))
++	ret = xscd_dma_init(xscd);
++	if (ret < 0)
+ 		dev_err(&pdev->dev, "Failed to initialize the DMA\n");
+ 
+ 	dev_info(xscd->dev, "scene change detect device found!\n");
+@@ -175,9 +148,6 @@ static int xscd_remove(struct platform_device *pdev)
+ {
+ 	struct xscd_device *xscd = platform_get_drvdata(pdev);
+ 
+-	xilinx_scdma_device_exit(xscd->dma_device);
+-	xscd->dma_node = NULL;
+-
+ 	clk_disable_unprepare(xscd->clk);
+ 
+ 	return 0;
+diff --git a/drivers/media/platform/xilinx/xilinx-scenechange.h b/drivers/media/platform/xilinx/xilinx-scenechange.h
+index 6e00c3e9acc8..598703685100 100644
+--- a/drivers/media/platform/xilinx/xilinx-scenechange.h
++++ b/drivers/media/platform/xilinx/xilinx-scenechange.h
+@@ -102,7 +102,7 @@ to_xscd_dma_tx_descriptor(struct dma_async_tx_descriptor *tx)
+ 
+ /**
+  * struct xscd_dma_chan - DMA Channel structure
+- * @xdev: DMA engine driver specific device structure
++ * @xscd: SCD device
+  * @iomem: device I/O register space remapped to kernel virtual memory
+  * @lock: Descriptor operation lock
+  * @chan_node: Member of a list of framebuffer channel instances
+@@ -111,7 +111,6 @@ to_xscd_dma_tx_descriptor(struct dma_async_tx_descriptor *tx)
+  * @staged_desc: Next buffer to be programmed
+  * @active_desc: Currently active buffer being read/written to
+  * @common: DMA common channel
+- * @dev: The dma device
+  * @idle: Channel idle state
+  * @tasklet: Cleanup work after irq
+  * @id: scene change channel ID
+@@ -119,7 +118,7 @@ to_xscd_dma_tx_descriptor(struct dma_async_tx_descriptor *tx)
+  * @valid_interrupt: Valid interrupt for the channel
+  */
+ struct xscd_dma_chan {
+-	struct xscd_dma_device *xdev;
++	struct xscd_device *xscd;
+ 	void __iomem *iomem;
+ 
+ 	/* Descriptor operation Lock */
+@@ -130,7 +129,6 @@ struct xscd_dma_chan {
+ 	struct xscd_dma_tx_descriptor *staged_desc;
+ 	struct xscd_dma_tx_descriptor *active_desc;
+ 	struct dma_chan common;
+-	struct device *dev;
+ 	bool idle;
+ 	struct tasklet_struct tasklet;
+ 	u8 id;
+@@ -174,24 +172,6 @@ static inline struct xscd_chan *to_xscd_chan(struct v4l2_subdev *subdev)
+ 	return container_of(subdev, struct xscd_chan, subdev);
+ }
+ 
+-/**
+- * struct xscd_dma_device - Scene Change DMA device
+- * @regs: I/O mapped base address
+- * @dev: Device Structure
+- * @common: DMA device structure
+- * @chan: Driver specific DMA channel
+- * @numchannels: Total number of channels
+- * @memory_based: Memory based or streaming based
+- */
+-struct xscd_dma_device {
+-	void __iomem *regs;
+-	struct device *dev;
+-	struct dma_device common;
+-	struct xscd_dma_chan **chan;
+-	u32 numchannels;
+-	u8 memory_based;
+-};
+-
+ /**
+  * struct xscd_shared_data - Data to be shared among v4l subdev and DMA engine
+  * @iomem: device I/O register space remapped to kernel virtual memory
+@@ -201,7 +181,7 @@ struct xscd_dma_device {
+  */
+ struct xscd_shared_data {
+ 	void __iomem *iomem;
+-	struct xscd_dma_chan *dma_chan_list[XSCD_MAX_CHANNELS];
++	struct xscd_dma_chan **dma_chan_list;
+ 	u8 active_streams;
+ 	u8 memory_based;
+ };
+@@ -214,10 +194,11 @@ struct xscd_shared_data {
+  * @dev: (OF) device
+  * @rst_gpio: reset GPIO
+  * @clk: video core clock
+- * @dma_device: DMA device pointer
+  * @shared_data: Data Shared across devices
+- * @dma_node: DMA device node
+  * @chans: video stream instances
++ * @dma_device: DMA device structure
++ * @channels: DMA channels
++ * @numchannels: Total number of channels
+  */
+ struct xscd_device {
+ 	void __iomem *iomem;
+@@ -226,10 +207,12 @@ struct xscd_device {
+ 	struct device *dev;
+ 	struct gpio_desc *rst_gpio;
+ 	struct clk *clk;
+-	struct platform_device *dma_device;
+ 	struct xscd_shared_data shared_data;
+-	struct device_node *dma_node;
+ 	struct xscd_chan *chans[XSCD_MAX_CHANNELS];
++
++	struct dma_device dma_device;
++	struct xscd_dma_chan *channels[XSCD_MAX_CHANNELS];
++	u32 numchannels;
+ };
+ 
+ /*
+@@ -260,6 +243,7 @@ void xscd_dma_start(struct xscd_dma_chan *chan);
+ void xscd_dma_chan_enable(struct xscd_dma_chan *chan, int chan_en);
+ void xscd_dma_reset(struct xscd_dma_chan *chan);
+ void xscd_dma_halt(struct xscd_dma_chan *chan);
++int xscd_dma_init(struct xscd_device *xscd);
+ 
+ void xscd_chan_irq_handler(struct xscd_chan *chan);
+ int xscd_chan_init(struct xscd_device *xscd, unsigned int chan_id,
+-- 
+2.31.1
+

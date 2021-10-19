@@ -1,0 +1,147 @@
+From c822263d28ea31b858c374fa614c434f411656c3 Mon Sep 17 00:00:00 2001
+From: Piyush Mehta <piyush.mehta@xilinx.com>
+Date: Thu, 23 Jan 2020 19:50:31 +0530
+Subject: [PATCH 0981/1852] usb: gadget: f_tcm: adjust write length with max
+ packet size
+
+commit 4fe7c310aa0e0455cd6975b511d3dbadaf346d8d from
+https://github.com/Xilinx/linux-xlnx.git
+
+Transfer size on out endpoint should be in multiple of endpoint
+max packet size. this patch will adjust transfer size on out endpint
+with multiple of max packet size
+
+Signed-off-by: Rajnikant Bhojani <rajnikant.bhojani@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+Signed-off-by: Piyush Mehta <piyush.mehta@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/usb/gadget/function/f_tcm.c | 75 +++++++++++++++++++++--------
+ 1 file changed, 56 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/usb/gadget/function/f_tcm.c b/drivers/usb/gadget/function/f_tcm.c
+index 7f01f78b1d23..ccb0b04a8435 100644
+--- a/drivers/usb/gadget/function/f_tcm.c
++++ b/drivers/usb/gadget/function/f_tcm.c
+@@ -245,7 +245,6 @@ static int bot_send_write_request(struct usbg_cmd *cmd)
+ {
+ 	struct f_uas *fu = cmd->fu;
+ 	struct se_cmd *se_cmd = &cmd->se_cmd;
+-	struct usb_gadget *gadget = fuas_to_gadget(fu);
+ 	int ret;
+ 
+ 	init_completion(&cmd->write_complete);
+@@ -256,22 +255,6 @@ static int bot_send_write_request(struct usbg_cmd *cmd)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!gadget->sg_supported) {
+-		cmd->data_buf = kmalloc(se_cmd->data_length, GFP_KERNEL);
+-		if (!cmd->data_buf)
+-			return -ENOMEM;
+-
+-		fu->bot_req_out->buf = cmd->data_buf;
+-	} else {
+-		fu->bot_req_out->buf = NULL;
+-		fu->bot_req_out->num_sgs = se_cmd->t_data_nents;
+-		fu->bot_req_out->sg = se_cmd->t_data_sg;
+-	}
+-
+-	fu->bot_req_out->complete = usbg_data_write_cmpl;
+-	fu->bot_req_out->length = se_cmd->data_length;
+-	fu->bot_req_out->context = cmd;
+-
+ 	ret = usbg_prepare_w_request(cmd, fu->bot_req_out);
+ 	if (ret)
+ 		goto cleanup;
+@@ -949,6 +932,56 @@ static int get_cmd_dir(const unsigned char *cdb)
+ 	return ret;
+ }
+ 
++static void recover_w_length_with_maxpacket(struct usbg_cmd *cmd,
++					    struct usb_request *req)
++{
++	struct se_cmd *se_cmd = &cmd->se_cmd;
++	struct f_uas *fu = cmd->fu;
++	struct usb_gadget *gadget = fuas_to_gadget(fu);
++	int rem;
++
++	rem = se_cmd->data_length % fu->ep_out->maxpacket;
++	if (rem) {
++		/* recover paded data length */
++		cmd->data_len -= fu->ep_out->maxpacket - rem;
++
++		if (gadget->sg_supported) {
++			struct scatterlist *s = sg_last(se_cmd->t_data_sg,
++					se_cmd->t_data_nents);
++
++			s->length -= fu->ep_out->maxpacket - rem;
++		}
++	}
++}
++
++static void adjust_w_length_with_maxpacket(struct usbg_cmd *cmd,
++					   struct usb_request *req)
++{
++	struct se_cmd *se_cmd = &cmd->se_cmd;
++	struct f_uas *fu = cmd->fu;
++	struct usb_gadget *gadget = fuas_to_gadget(fu);
++	int rem;
++
++	cmd->data_len = se_cmd->data_length;
++	rem = cmd->data_len % fu->ep_out->maxpacket;
++	if (rem) {
++		/* pad data length so that transfer size can be in multiple of
++		 * max packet size
++		 */
++		cmd->data_len += fu->ep_out->maxpacket - rem;
++
++		if (gadget->sg_supported) {
++			/* if sg is supported and data length in page also need
++			 * to be adjusted as multiple of max packet size.
++			 */
++			struct scatterlist *s = sg_last(se_cmd->t_data_sg,
++					se_cmd->t_data_nents);
++
++			s->length += fu->ep_out->maxpacket - rem;
++		}
++	}
++}
++
+ static void usbg_data_write_cmpl(struct usb_ep *ep, struct usb_request *req)
+ {
+ 	struct usbg_cmd *cmd = req->context;
+@@ -959,6 +992,8 @@ static void usbg_data_write_cmpl(struct usb_ep *ep, struct usb_request *req)
+ 		goto cleanup;
+ 	}
+ 
++	recover_w_length_with_maxpacket(cmd, req);
++
+ 	if (req->num_sgs == 0) {
+ 		sg_copy_from_buffer(se_cmd->t_data_sg,
+ 				se_cmd->t_data_nents,
+@@ -979,8 +1014,10 @@ static int usbg_prepare_w_request(struct usbg_cmd *cmd, struct usb_request *req)
+ 	struct f_uas *fu = cmd->fu;
+ 	struct usb_gadget *gadget = fuas_to_gadget(fu);
+ 
++	adjust_w_length_with_maxpacket(cmd, req);
++
+ 	if (!gadget->sg_supported) {
+-		cmd->data_buf = kmalloc(se_cmd->data_length, GFP_ATOMIC);
++		cmd->data_buf = kmalloc(cmd->data_len, GFP_ATOMIC);
+ 		if (!cmd->data_buf)
+ 			return -ENOMEM;
+ 
+@@ -992,7 +1029,7 @@ static int usbg_prepare_w_request(struct usbg_cmd *cmd, struct usb_request *req)
+ 	}
+ 
+ 	req->complete = usbg_data_write_cmpl;
+-	req->length = se_cmd->data_length;
++	req->length = cmd->data_len;
+ 	req->context = cmd;
+ 	return 0;
+ }
+-- 
+2.31.1
+

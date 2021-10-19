@@ -1,0 +1,156 @@
+From 1dd32321cca948693783617ce7f857159d487bbc Mon Sep 17 00:00:00 2001
+From: Robert Hancock <hancock@sedsystems.ca>
+Date: Thu, 6 Jun 2019 16:28:16 -0600
+Subject: [PATCH 0949/1852] net: axienet: Add optional support for Ethernet
+ core interrupt
+
+commit 522856cefaf09d1a06ddc02535c7e1e81730c278 upstream
+
+Previously this driver only handled interrupts from the DMA RX and TX
+blocks, not from the Ethernet core itself. Add optional support for
+the Ethernet core interrupt, which is used to detect rx_missed and
+framing errors signalled by the hardware. In order to use this
+interrupt, a third interrupt needs to be specified in the device tree.
+
+Signed-off-by: Robert Hancock <hancock@sedsystems.ca>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ .../bindings/net/xilinx_axienet.txt           |  3 +-
+ drivers/net/ethernet/xilinx/xilinx_axienet.h  |  1 +
+ .../net/ethernet/xilinx/xilinx_axienet_main.c | 49 +++++++++++++++++++
+ 3 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/net/xilinx_axienet.txt b/Documentation/devicetree/bindings/net/xilinx_axienet.txt
+index 2dea90332ebb..0be335c7abed 100644
+--- a/Documentation/devicetree/bindings/net/xilinx_axienet.txt
++++ b/Documentation/devicetree/bindings/net/xilinx_axienet.txt
+@@ -18,7 +18,8 @@ Required properties:
+ - compatible	: Must be one of "xlnx,axi-ethernet-1.00.a",
+ 		  "xlnx,axi-ethernet-1.01.a", "xlnx,axi-ethernet-2.01.a"
+ - reg		: Address and length of the IO space.
+-- interrupts	: Should be a list of two interrupt, TX and RX.
++- interrupts	: Should be a list of 2 or 3 interrupts: TX DMA, RX DMA,
++		  and optionally Ethernet core.
+ - phy-handle	: Should point to the external phy device.
+ 		  See ethernet.txt file in the same directory.
+ - xlnx,rxmem	: Set to allocated memory buffer for Rx/Tx in the hardware
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet.h b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+index 6b6d28ff014f..8e605a84b24d 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet.h
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+@@ -435,6 +435,7 @@ struct axienet_local {
+ 
+ 	int tx_irq;
+ 	int rx_irq;
++	int eth_irq;
+ 	phy_interface_t phy_mode;
+ 
+ 	u32 options;			/* Current options word */
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index d46555e94c4f..834fafdff219 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -502,6 +502,8 @@ static void axienet_device_reset(struct net_device *ndev)
+ 	axienet_status = axienet_ior(lp, XAE_IP_OFFSET);
+ 	if (axienet_status & XAE_INT_RXRJECT_MASK)
+ 		axienet_iow(lp, XAE_IS_OFFSET, XAE_INT_RXRJECT_MASK);
++	axienet_iow(lp, XAE_IE_OFFSET, lp->eth_irq > 0 ?
++		    XAE_INT_RECV_ERROR_MASK : 0);
+ 
+ 	axienet_iow(lp, XAE_FCC_OFFSET, XAE_FCC_FCRX_MASK);
+ 
+@@ -916,6 +918,35 @@ static irqreturn_t axienet_rx_irq(int irq, void *_ndev)
+ 	return IRQ_HANDLED;
+ }
+ 
++/**
++ * axienet_eth_irq - Ethernet core Isr.
++ * @irq:	irq number
++ * @_ndev:	net_device pointer
++ *
++ * Return: IRQ_HANDLED if device generated a core interrupt, IRQ_NONE otherwise.
++ *
++ * Handle miscellaneous conditions indicated by Ethernet core IRQ.
++ */
++static irqreturn_t axienet_eth_irq(int irq, void *_ndev)
++{
++	struct net_device *ndev = _ndev;
++	struct axienet_local *lp = netdev_priv(ndev);
++	unsigned int pending;
++
++	pending = axienet_ior(lp, XAE_IP_OFFSET);
++	if (!pending)
++		return IRQ_NONE;
++
++	if (pending & XAE_INT_RXFIFOOVR_MASK)
++		ndev->stats.rx_missed_errors++;
++
++	if (pending & XAE_INT_RXRJECT_MASK)
++		ndev->stats.rx_frame_errors++;
++
++	axienet_iow(lp, XAE_IS_OFFSET, pending);
++	return IRQ_HANDLED;
++}
++
+ static void axienet_dma_err_handler(unsigned long data);
+ 
+ /**
+@@ -976,9 +1007,18 @@ static int axienet_open(struct net_device *ndev)
+ 			  ndev->name, ndev);
+ 	if (ret)
+ 		goto err_rx_irq;
++	/* Enable interrupts for Axi Ethernet core (if defined) */
++	if (lp->eth_irq > 0) {
++		ret = request_irq(lp->eth_irq, axienet_eth_irq, IRQF_SHARED,
++				  ndev->name, ndev);
++		if (ret)
++			goto err_eth_irq;
++	}
+ 
+ 	return 0;
+ 
++err_eth_irq:
++	free_irq(lp->rx_irq, ndev);
+ err_rx_irq:
+ 	free_irq(lp->tx_irq, ndev);
+ err_tx_irq:
+@@ -1042,6 +1082,8 @@ static int axienet_stop(struct net_device *ndev)
+ 
+ 	tasklet_kill(&lp->dma_err_tasklet);
+ 
++	if (lp->eth_irq > 0)
++		free_irq(lp->eth_irq, ndev);
+ 	free_irq(lp->tx_irq, ndev);
+ 	free_irq(lp->rx_irq, ndev);
+ 
+@@ -1505,6 +1547,8 @@ static void axienet_dma_err_handler(unsigned long data)
+ 	axienet_status = axienet_ior(lp, XAE_IP_OFFSET);
+ 	if (axienet_status & XAE_INT_RXRJECT_MASK)
+ 		axienet_iow(lp, XAE_IS_OFFSET, XAE_INT_RXRJECT_MASK);
++	axienet_iow(lp, XAE_IE_OFFSET, lp->eth_irq > 0 ?
++		    XAE_INT_RECV_ERROR_MASK : 0);
+ 	axienet_iow(lp, XAE_FCC_OFFSET, XAE_FCC_FCRX_MASK);
+ 
+ 	/* Sync default options with HW but leave receiver and
+@@ -1674,6 +1718,7 @@ static int axienet_probe(struct platform_device *pdev)
+ 	}
+ 	lp->rx_irq = irq_of_parse_and_map(np, 1);
+ 	lp->tx_irq = irq_of_parse_and_map(np, 0);
++	lp->eth_irq = irq_of_parse_and_map(np, 2);
+ 	of_node_put(np);
+ 	if ((lp->rx_irq <= 0) || (lp->tx_irq <= 0)) {
+ 		dev_err(&pdev->dev, "could not determine irqs\n");
+@@ -1681,6 +1726,10 @@ static int axienet_probe(struct platform_device *pdev)
+ 		goto free_netdev;
+ 	}
+ 
++	/* Check for Ethernet core IRQ (optional) */
++	if (lp->eth_irq <= 0)
++		dev_info(&pdev->dev, "Ethernet core IRQ not defined\n");
++
+ 	/* Retrieve the MAC address */
+ 	mac_addr = of_get_mac_address(pdev->dev.of_node);
+ 	if (IS_ERR(mac_addr)) {
+-- 
+2.31.1
+

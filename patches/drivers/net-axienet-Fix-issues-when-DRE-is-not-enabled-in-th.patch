@@ -1,0 +1,160 @@
+From d90d6816e2fe5a9c5fc02252db3b8711a0201dfa Mon Sep 17 00:00:00 2001
+From: Appana Durga Kedareswara Rao <appana.durga.rao@xilinx.com>
+Date: Fri, 24 Jan 2020 20:52:35 +0530
+Subject: [PATCH 1060/1852] net: axienet: Fix issues when DRE is not enabled in
+ the h/w
+
+commit 8daf52f28b3fa372397fbe2fb25f7b5129ff3564 from
+https://github.com/Xilinx/linux-xlnx.git
+
+If DRE (Data realignment engine) is not enabled in the DMA h/w,
+SW has to take care of the alignment of the buffers.
+
+Currently driver is not handling alignment of buffers properly,
+Resulting weird behaviour when try to test the ethernet interface
+with these kind of designs.
+
+This patch fixes this issue by allocating a pool of tx buffers
+In the driver when DRE is not enabled in the h/w.
+When there is an unaligned skb comes it will use those
+Allocated tx buffers when DRE is not enabled in the h/w.
+
+Note: When DRE is not enabled in the h/w the tx
+Side performance will be very less as there is
+a manual copy in the hard_xmit for this case.
+Tx Perf Numbers on ZynqMP:
+Without DRE: 248 Mbits/sec.
+With DRE:   932 Mbits/sec.
+
+Signed-off-by: Appana Durga Kedareswara Rao <appana.durga.rao@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+Signed-off-by: Radhey Shyam Pandey <radhey.shyam.pandey@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/net/ethernet/xilinx/xilinx_axienet.h  | 14 +++++++
+ .../net/ethernet/xilinx/xilinx_axienet_main.c | 41 ++++++++++++++++++-
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet.h b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+index 440b900db858..894aa660d28b 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet.h
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+@@ -388,6 +388,10 @@
+ #define XAE_TX_PTP_LEN		16
+ #define XXV_TX_PTP_LEN		12
+ 
++/* Macros used when AXI DMA h/w is configured without DRE */
++#define XAE_TX_BUFFERS		64
++#define XAE_MAX_PKT_LEN		8192
++
+ /**
+  * struct axidma_bd - Axi Dma buffer descriptor layout
+  * @next:         MM2S/S2MM Next Descriptor Pointer
+@@ -459,6 +463,12 @@ struct axidma_bd {
+  * @tx_bd_p:	Physical address(start address) of the TX buffer descr. ring
+  * @rx_bd_v:	Virtual address of the RX buffer descriptor ring
+  * @rx_bd_p:	Physical address(start address) of the RX buffer descr. ring
++ * @tx_buf:	Virtual address of the Tx buffer pool used by the driver when
++ *		DMA h/w is configured without DRE.
++ * @tx_bufs:	Virutal address of the Tx buffer address.
++ * @tx_bufs_dma: Physical address of the Tx buffer address used by the driver
++ *		 when DMA h/w is configured without DRE.
++ * @eth_hasdre: Tells whether DMA h/w is configured with dre or not.
+  * @tx_bd_ci:	Stores the index of the Tx buffer descriptor in the ring being
+  *		accessed currently. Used while alloc. BDs before a TX starts
+  * @tx_bd_tail:	Stores the index of the Tx buffer descriptor in the ring being
+@@ -524,6 +534,10 @@ struct axienet_local {
+ 	struct axidma_bd *rx_bd_v;
+ 	dma_addr_t rx_bd_p;
+ 	u32 rx_bd_num;
++	unsigned char *tx_buf[XAE_TX_BUFFERS];
++	unsigned char *tx_bufs;
++	dma_addr_t tx_bufs_dma;
++	bool eth_hasdre;
+ 	u32 tx_bd_ci;
+ 	u32 tx_bd_tail;
+ 	u32 rx_bd_ci;
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index 7d464f018e87..a0e4dc1cdbe1 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -218,6 +218,14 @@ static void axienet_dma_bd_release(struct net_device *ndev)
+ 				  lp->tx_bd_v,
+ 				  lp->tx_bd_p);
+ 	}
++
++	if (lp->tx_bufs) {
++		dma_free_coherent(ndev->dev.parent,
++				  XAE_MAX_PKT_LEN * lp->tx_bd_num,
++				  lp->tx_bufs,
++				  lp->tx_bufs_dma);
++	}
++
+ }
+ 
+ /**
+@@ -261,6 +269,18 @@ static int axienet_dma_bd_init(struct net_device *ndev)
+ 				      ((i + 1) % lp->tx_bd_num);
+ 	}
+ 
++	if (!lp->eth_hasdre) {
++		lp->tx_bufs = dma_alloc_coherent(ndev->dev.parent,
++						 XAE_MAX_PKT_LEN * lp->tx_bd_num,
++						 &lp->tx_bufs_dma,
++						 GFP_KERNEL);
++		if (!lp->tx_bufs)
++			goto out;
++
++		for (i = 0; i < lp->tx_bd_num; i++)
++			lp->tx_buf[i] = &lp->tx_bufs[i * XAE_MAX_PKT_LEN];
++	}
++
+ 	for (i = 0; i < lp->rx_bd_num; i++) {
+ 		lp->rx_bd_v[i].next = lp->rx_bd_p +
+ 				      sizeof(*lp->rx_bd_v) *
+@@ -1025,8 +1045,23 @@ axienet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 	}
+ 
+ 	cur_p->cntrl = (skb_headlen(skb) | XAXIDMA_BD_CTRL_TXSOF_MASK) + pad;
+-	cur_p->phys = dma_map_single(ndev->dev.parent, skb->data,
+-				     skb_headlen(skb), DMA_TO_DEVICE);
++	if (!lp->eth_hasdre &&
++	    (((phys_addr_t)skb->data & 0x3) || (num_frag > 0))) {
++		skb_copy_and_csum_dev(skb, lp->tx_buf[lp->tx_bd_tail]);
++
++		cur_p->phys = lp->tx_bufs_dma +
++			      (lp->tx_buf[lp->tx_bd_tail] - lp->tx_bufs);
++
++		if (num_frag > 0) {
++			pad = skb_pagelen(skb) - skb_headlen(skb);
++			cur_p->cntrl = (skb_headlen(skb) |
++					XAXIDMA_BD_CTRL_TXSOF_MASK) + pad;
++		}
++		goto out;
++	} else {
++		cur_p->phys = dma_map_single(ndev->dev.parent, skb->data,
++					     skb_headlen(skb), DMA_TO_DEVICE);
++	}
+ 	cur_p->tx_desc_mapping = DESC_DMA_MAP_SINGLE;
+ 
+ 	for (ii = 0; ii < num_frag; ii++) {
+@@ -1045,6 +1080,7 @@ axienet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 		cur_p->tx_desc_mapping = DESC_DMA_MAP_PAGE;
+ 	}
+ 
++out:
+ 	cur_p->cntrl |= XAXIDMA_BD_CTRL_TXEOF_MASK;
+ 	cur_p->tx_skb = (phys_addr_t)skb;
+ 
+@@ -2610,6 +2646,7 @@ static int axienet_probe(struct platform_device *pdev)
+ 		ret = -ENOMEM;
+ 		goto free_netdev;
+ 	}
++	lp->eth_hasdre = of_property_read_bool(np, "xlnx,include-dre");
+ 
+ 	spin_lock_init(&lp->tx_lock);
+ 	spin_lock_init(&lp->rx_lock);
+-- 
+2.31.1
+

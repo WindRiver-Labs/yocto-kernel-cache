@@ -1,0 +1,437 @@
+From 412752f4ca171b5396438014320ee3491ec5bc6d Mon Sep 17 00:00:00 2001
+From: Wendy Liang <wendy.liang@xilinx.com>
+Date: Tue, 25 Aug 2020 10:56:59 -0700
+Subject: [PATCH 1529/1852] misc: xilinx-ai-engine: add clock scanning when
+ requesting partition and tiles requesting
+
+commit df249c7298170e91c3872b01cd65339c6bc10e57 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Add clock gating functions to AI engine driver:
+* scanning when the partition is being requested to know which tiles
+  are in use.
+* check if a tile is gated or not
+* tiles requesting and releasing ioctl so that user application can
+  enable/disable tiles at runtime.
+
+Signed-off-by: Wendy Liang <wendy.liang@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/xilinx-ai-engine/Makefile        |   3 +-
+ .../misc/xilinx-ai-engine/ai-engine-clock.c   | 246 ++++++++++++++++++
+ drivers/misc/xilinx-ai-engine/ai-engine-dev.c |  10 +-
+ .../xilinx-ai-engine/ai-engine-internal.h     |   7 +
+ .../misc/xilinx-ai-engine/ai-engine-part.c    |  25 ++
+ include/uapi/linux/xlnx-ai-engine.h           |  32 +++
+ 6 files changed, 318 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/misc/xilinx-ai-engine/ai-engine-clock.c
+
+diff --git a/drivers/misc/xilinx-ai-engine/Makefile b/drivers/misc/xilinx-ai-engine/Makefile
+index 1547f55d5866..a1df68559a6b 100644
+--- a/drivers/misc/xilinx-ai-engine/Makefile
++++ b/drivers/misc/xilinx-ai-engine/Makefile
+@@ -5,7 +5,8 @@
+ 
+ obj-$(CONFIG_XILINX_AIE)	+= xilinx-aie.o
+ 
+-xilinx-aie-$(CONFIG_XILINX_AIE) := ai-engine-dev.o \
++xilinx-aie-$(CONFIG_XILINX_AIE) := ai-engine-clock.o \
++				   ai-engine-dev.o \
+ 				   ai-engine-dma.o \
+ 				   ai-engine-fpga.o \
+ 				   ai-engine-mem.o \
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-clock.c b/drivers/misc/xilinx-ai-engine/ai-engine-clock.c
+new file mode 100644
+index 000000000000..a0e0f135d1c8
+--- /dev/null
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-clock.c
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx AI Engine device driver
++ *
++ * Copyright (C) 2020 Xilinx, Inc.
++ */
++
++#include "ai-engine-internal.h"
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++
++/**
++ * aie_part_get_clk_state_bit() - return bit position of the clock state of a
++ *				  tile
++ * @apart: AI engine partition
++ * @loc: AI engine tile location
++ * @return: bit position for success, negative value for failure
++ */
++static int aie_part_get_clk_state_bit(struct aie_partition *apart,
++				      struct aie_location *loc)
++{
++	if (apart->adev->ops->get_tile_type(loc) != AIE_TILE_TYPE_TILE)
++		return -EINVAL;
++
++	return loc->col * (apart->range.size.row - 1) + loc->row - 1;
++}
++
++/**
++ * aie_part_scan_clk_state() - scan the clock states of tiles of the AI engine
++ *			       partition
++ * @apart: AI engine partition
++ * @return: 0 for success, negative value for failure.
++ *
++ * This function will scan the clock status of both the memory and core
++ * modules.
++ */
++int aie_part_scan_clk_state(struct aie_partition *apart)
++{
++	return apart->adev->ops->scan_part_clocks(apart);
++}
++
++/**
++ * aie_part_check_clk_enable_loc() - return if clock of a tile is enabled
++ * @apart: AI engine partition
++ * @loc: AI engine tile location
++ * @return: true for enabled, false for disabled
++ */
++bool aie_part_check_clk_enable_loc(struct aie_partition *apart,
++				   struct aie_location *loc)
++{
++	int bit;
++
++	if (apart->adev->ops->get_tile_type(loc) != AIE_TILE_TYPE_TILE)
++		return true;
++
++	bit = aie_part_get_clk_state_bit(apart, loc);
++	return aie_resource_testbit(&apart->cores_clk_state, bit);
++}
++
++/**
++ * aie_part_request_tiles() - request tiles from an AI engine partition.
++ * @apart: AI engine partition
++ * @num_tiles: number of tiles to request. If it is 0, it means all tiles
++ * @locs: the AI engine tiles locations array which will be requested
++ * @return: 0 for success, negative value for failure.
++ *
++ * This function will enable clocks of the specified tiles.
++ */
++static int aie_part_request_tiles(struct aie_partition *apart, int num_tiles,
++				  struct aie_location *locs)
++{
++	if (num_tiles == 0) {
++		aie_resource_set(&apart->cores_clk_state, 0,
++				 apart->cores_clk_state.total);
++	} else {
++		u32 n;
++
++		if (!locs)
++			return -EINVAL;
++
++		for (n = 0; n < num_tiles; n++) {
++			int bit = aie_part_get_clk_state_bit(apart, &locs[n]);
++
++			if (bit >= 0)
++				aie_resource_set(&apart->cores_clk_state,
++						 bit, 1);
++		}
++	}
++
++	return apart->adev->ops->set_part_clocks(apart);
++}
++
++/**
++ * aie_part_release_tiles() - release tiles from an AI engine partition.
++ * @apart: AI engine partition
++ * @num_tiles: number of tiles to release. If it is 0, it means all tiles
++ * @locs: the AI engine tiles locations array which will be released
++ * @return: 0 for success, negative value for failure.
++ *
++ * This function will disable clocks of the specified tiles.
++ */
++static int aie_part_release_tiles(struct aie_partition *apart, int num_tiles,
++				  struct aie_location *locs)
++{
++	if (num_tiles == 0) {
++		aie_resource_clear(&apart->cores_clk_state, 0,
++				   apart->cores_clk_state.total);
++	} else {
++		u32 n;
++
++		if (!locs)
++			return -EINVAL;
++
++		for (n = 0; n < num_tiles; n++) {
++			int bit = aie_part_get_clk_state_bit(apart, &locs[n]);
++
++			if (bit >= 0)
++				aie_resource_clear(&apart->cores_clk_state,
++						   bit, 1);
++		}
++	}
++
++	return apart->adev->ops->set_part_clocks(apart);
++}
++
++/**
++ * aie_part_request_tiles_from_user() - request tiles from an AI engine
++ *					partition from user
++ * @apart: AI engine partition
++ * @user_args: user AI engine request tiles argument
++ * @return: 0 for success, negative value for failure.
++ *
++ * This function will request tiles from user request.
++ */
++int aie_part_request_tiles_from_user(struct aie_partition *apart,
++				     void __user *user_args)
++{
++	struct aie_tiles_array args;
++	struct aie_location *locs = NULL;
++	int ret;
++
++	if (copy_from_user(&args, user_args, sizeof(args)))
++		return -EFAULT;
++
++	if (args.num_tiles) {
++		u32 i;
++
++		locs = kmalloc_array(args.num_tiles, sizeof(*locs),
++				     GFP_KERNEL);
++		if (!locs)
++			return -ENOMEM;
++
++		if (copy_from_user(locs, (void __user *)args.locs,
++				   args.num_tiles * sizeof(*locs))) {
++			kfree(locs);
++			return -EFAULT;
++		}
++
++		/* update the location to absolute location */
++		for (i = 0; i < args.num_tiles; i++) {
++			if (locs[i].col > apart->range.size.col ||
++			    locs[i].row > apart->range.size.row) {
++				dev_err(&apart->dev,
++					"failed to request tiles, invalid tile(%u,%u).\n",
++					locs[i].col, locs[i].row);
++				kfree(locs);
++				return -EINVAL;
++			}
++			locs[i].col += apart->range.start.col;
++			locs[i].row += apart->range.start.row;
++		}
++	}
++
++	ret = mutex_lock_interruptible(&apart->mlock);
++	if (ret) {
++		kfree(locs);
++		return ret;
++	}
++
++	ret = aie_part_request_tiles(apart, args.num_tiles, locs);
++	mutex_unlock(&apart->mlock);
++
++	kfree(locs);
++	return ret;
++}
++
++/**
++ * aie_part_release_tiles_from_user() - release tiles from an AI engine
++ *					partition from user
++ * @apart: AI engine partition
++ * @user_args: user AI engine request tiles argument
++ * @return: 0 for success, negative value for failure.
++ *
++ * This function will release tiles from user request.
++ */
++int aie_part_release_tiles_from_user(struct aie_partition *apart,
++				     void __user *user_args)
++{
++	struct aie_tiles_array args;
++	struct aie_location *locs = NULL;
++	int ret;
++
++	if (copy_from_user(&args, user_args, sizeof(args)))
++		return -EFAULT;
++
++	if (args.num_tiles) {
++		int i;
++
++		locs = kmalloc_array(args.num_tiles, sizeof(*locs),
++				     GFP_KERNEL);
++		if (!locs)
++			return -ENOMEM;
++
++		if (copy_from_user(locs, (void __user *)args.locs,
++				   args.num_tiles * sizeof(*locs))) {
++			kfree(locs);
++			return -EFAULT;
++		}
++
++		/* update the location to absolute location */
++		for (i = 0; i < args.num_tiles; i++) {
++			if (locs[i].col > apart->range.size.col ||
++			    locs[i].row > apart->range.size.row) {
++				dev_err(&apart->dev,
++					"failed to release tiles, invalid tile(%u,%u).\n",
++					locs[i].col, locs[i].row);
++				kfree(locs);
++				return -EINVAL;
++			}
++			locs[i].col += apart->range.start.col;
++			locs[i].row += apart->range.start.row;
++		}
++	}
++
++	ret = mutex_lock_interruptible(&apart->mlock);
++	if (ret) {
++		kfree(locs);
++		return ret;
++	}
++
++	ret = aie_part_release_tiles(apart, args.num_tiles, locs);
++	mutex_unlock(&apart->mlock);
++
++	kfree(locs);
++	return ret;
++}
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-dev.c b/drivers/misc/xilinx-ai-engine/ai-engine-dev.c
+index a148ab87f0d1..106eb63f2c47 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-dev.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-dev.c
+@@ -165,6 +165,7 @@ static int aie_partition_get(struct aie_partition *apart,
+ 			     struct aie_partition_req *req)
+ {
+ 	struct file *filep;
++	int ret;
+ 
+ 	(void)req;
+ 
+@@ -179,12 +180,13 @@ static int aie_partition_get(struct aie_partition *apart,
+ 	 * 1. It will check image UID too to see if the user matches what's
+ 	 *    loaded in the AI engine partition. And check the meta data to see
+ 	 *    which resources used by application.
+-	 * 2. scan to see which tiles have been clock gated.
+-	 * 3. set the partition cleanup flag to indicate if it needs to clean
+-	 *    up AI engine partition resource when no one is using the AI
+-	 *    engine partition.
+ 	 */
+ 
++	/* scan to setup the initial clock state for tiles */
++	ret = aie_part_scan_clk_state(apart);
++	if (ret)
++		return ret;
++
+ 	/* Get a file for the partition */
+ 	filep = anon_inode_getfile(dev_name(&apart->dev), &aie_part_fops,
+ 				   apart, O_RDWR);
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index ea1a932b96fe..fa9a1fb3a8ee 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -368,5 +368,12 @@ long aie_part_detach_dmabuf_req(struct aie_partition *apart,
+ long aie_part_set_bd(struct aie_partition *apart, void __user *user_args);
+ void aie_part_release_dmabufs(struct aie_partition *apart);
+ 
++int aie_part_scan_clk_state(struct aie_partition *apart);
++bool aie_part_check_clk_enable_loc(struct aie_partition *apart,
++				   struct aie_location *loc);
++int aie_part_request_tiles_from_user(struct aie_partition *apart,
++				     void __user *user_args);
++int aie_part_release_tiles_from_user(struct aie_partition *apart,
++				     void __user *user_args);
+ int aiev1_device_init(struct aie_device *adev);
+ #endif /* AIE_INTERNAL_H */
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-part.c b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+index c55a04ce7bab..3e233ad9f7e4 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-part.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+@@ -94,6 +94,27 @@ static int aie_part_reg_validation(struct aie_partition *apart, size_t offset,
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * We check if a tile is gated before trying to access the tile.
++	 * As we mmap() the registers as read only to enable faster status
++	 * enquiry, and mmap() memories as write/read to faster memory access,
++	 * user can still access the clock gated tiles from userspace by
++	 * accessing the mmapped space.
++	 * Accessing the gated tiles can cause decode error. With PDI flow,
++	 * the PDI sets up the SHIM NOC AXI MM to only generate AI engine error
++	 * even instead of generating the NSU error. but for non PDI flow, as
++	 * the AXI MM register are protected register, until we have EEMI API
++	 * to update the AXI MM register, access the gated tiles can cause NSU
++	 * errors.
++	 * TODO: To solve this, we need to either request EEMI to configure
++	 * AXI MM or split the mmapped space into tiles based lists.
++	 */
++	if (!aie_part_check_clk_enable_loc(apart, &loc)) {
++		dev_err(&apart->dev,
++			"Tile(%u,%d) is gated.\n", loc.col, loc.row);
++		return -EINVAL;
++	}
++
+ 	if (!is_write)
+ 		return 0;
+ 
+@@ -400,6 +421,10 @@ static long aie_part_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+ 		return aie_part_detach_dmabuf_req(apart, argp);
+ 	case AIE_SET_SHIMDMA_BD_IOCTL:
+ 		return aie_part_set_bd(apart, argp);
++	case AIE_REQUEST_TILES_IOCTL:
++		return aie_part_request_tiles_from_user(apart, argp);
++	case AIE_RELEASE_TILES_IOCTL:
++		return aie_part_release_tiles_from_user(apart, argp);
+ 	default:
+ 		dev_err(&apart->dev, "Invalid ioctl command %u.\n", cmd);
+ 		ret = -EINVAL;
+diff --git a/include/uapi/linux/xlnx-ai-engine.h b/include/uapi/linux/xlnx-ai-engine.h
+index dfc52d9e28be..57c3ff38bc39 100644
+--- a/include/uapi/linux/xlnx-ai-engine.h
++++ b/include/uapi/linux/xlnx-ai-engine.h
+@@ -145,6 +145,16 @@ struct aie_dma_bd_args {
+ 	__u32 bd_id;
+ };
+ 
++/**
++ * struct aie_tiles_array - AIE tiles array
++ * @locs: tiles locations array
++ * @num_tiles: number of tiles in the tiles locations array
++ */
++struct aie_tiles_array {
++	struct aie_location *locs;
++	__u32 num_tiles;
++};
++
+ #define AIE_IOCTL_BASE 'A'
+ 
+ /* AI engine device IOCTL operations */
+@@ -198,4 +208,26 @@ struct aie_dma_bd_args {
+  */
+ #define AIE_SET_SHIMDMA_BD_IOCTL	_IOW(AIE_IOCTL_BASE, 0xd, \
+ 					     struct aie_dma_bd_args)
++
++/**
++ * DOC: AIE_REQUEST_TILES_IOCTL - request AI engine tiles
++ *
++ * This ioctl is used to request tiles.
++ * When requested the AI engine partition, the kernel driver will scan the
++ * partition to track which tiles are enabled or not. After that, if user
++ * want to request for more tiles, it will use this ioctl to request more
++ * tiles.
++ * If the aie_tiles_array is empty, it means it will request for all tiles
++ * in the partition.
++ */
++#define AIE_REQUEST_TILES_IOCTL		_IOW(AIE_IOCTL_BASE, 0xe, \
++					     struct aie_tiles_array)
++
++/**
++ * DOC: AIE_RELEASE_TILES_IOCTL - release AI engine tiles
++ *
++ * This ioctl is used to release tiles
++ */
++#define AIE_RELEASE_TILES_IOCTL		_IOW(AIE_IOCTL_BASE, 0xf, \
++					     struct aie_tiles_array)
+ #endif
+-- 
+2.31.1
+
