@@ -1,0 +1,169 @@
+From f5c03d308cd625ad7d13ad1441a50bdfbd3f1841 Mon Sep 17 00:00:00 2001
+From: Hyun Kwon <hyun.kwon@xilinx.com>
+Date: Thu, 4 Apr 2019 10:03:33 -0700
+Subject: [PATCH 0616/1851] uio: xilinx_ai_engine: Simulate the irq if no hw
+ irq is available
+
+commit 52ade43262ea55ca138273529a055c06386513ad from
+https://github.com/Xilinx/linux-xlnx.git
+
+Only when there's no hw irq available and the debugfs is enabled,
+simulate the irq. This allows users to trigger the interrupt through
+debugfs and helps debug, as some emulation platforms don't even
+have the NPI interrupt connected.
+
+Signed-off-by: Hyun Kwon <hyun.kwon@xilinx.com>
+Reviewed-by: Wendy Liang <wendy.liang@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/uio/Kconfig                |   1 +
+ drivers/uio/uio_xilinx_ai_engine.c | 105 ++++++++++++++++++++++++++++-
+ 2 files changed, 104 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/uio/Kconfig b/drivers/uio/Kconfig
+index 7cdb65442270..799891b52688 100644
+--- a/drivers/uio/Kconfig
++++ b/drivers/uio/Kconfig
+@@ -169,6 +169,7 @@ config UIO_HV_GENERIC
+ 
+ config UIO_XILINX_AI_ENGINE
+ 	tristate "Xilinx AI Engine driver"
++	select IRQ_SIM
+ 	select UIO_DMEM_GENIRQ
+ 	help
+ 	  The driver for Xilinx AI Engine that utilizes the uio_dmem_genirq.
+diff --git a/drivers/uio/uio_xilinx_ai_engine.c b/drivers/uio/uio_xilinx_ai_engine.c
+index 29538f770d1f..174efa805b52 100644
+--- a/drivers/uio/uio_xilinx_ai_engine.c
++++ b/drivers/uio/uio_xilinx_ai_engine.c
+@@ -7,6 +7,8 @@
+  * Author: Hyun Woo Kwon <hyun.kwon@xilinx.com>
+  */
+ 
++#include <linux/debugfs.h>
++#include <linux/irq_sim.h>
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -27,6 +29,102 @@ module_param_named(mem_size, xilinx_ai_engine_mem_size, uint, 0444);
+ MODULE_PARM_DESC(mem_size,
+ 		 "Dynamic memory allocation size in bytes (default: 32 MB)");
+ 
++#ifdef CONFIG_DEBUG_FS
++
++static ssize_t xilinx_ai_engine_debugfs_write(struct file *f,
++					      const char __user *buf,
++					      size_t size, loff_t *pos)
++{
++	struct irq_sim *irq_sim = file_inode(f)->i_private;
++
++	irq_sim_fire(irq_sim, 1);
++
++	return size;
++}
++
++static const struct file_operations debugfs_ops = {
++	.owner = THIS_MODULE,
++	.write = xilinx_ai_engine_debugfs_write,
++};
++
++/**
++ * xilinx_ai_engine_debugfs_init - Initialize the debugfs for irq sim
++ * @pdev: platform device to simulate irq for
++ * @irq_sim: simualated irq
++ *
++ * Initialize the debugfs for irq simulation. This allows to generate
++ * the simulated interrupt from user.
++ *
++ * Return: 0 for success, error code otherwise.
++ */
++static int xilinx_ai_engine_debugfs_init(struct platform_device *pdev,
++					 struct irq_sim *irq_sim)
++{
++	int ret;
++	struct dentry *debugfs_dir, *debugfs_file;
++
++	debugfs_dir = debugfs_create_dir("xilinx-ai-engine", NULL);
++	if (!debugfs_dir)
++		return -ENODEV;
++
++	debugfs_file = debugfs_create_file(dev_name(&pdev->dev), 0644,
++					   debugfs_dir, irq_sim, &debugfs_ops);
++	if (!debugfs_file) {
++		ret = -ENODEV;
++		goto err_out;
++	}
++
++	return 0;
++
++err_out:
++	debugfs_remove_recursive(debugfs_dir);
++	return ret;
++}
++
++/**
++ * xilinx_ai_engine_simulate_irq - Simulate the irq
++ * @pdev: platform device to simulate irq for
++ *
++ * Simulate the irq so the irq can be generated from user. This is only for
++ * debugging purpose.
++ *
++ * Return: 0 for success, error code otherwise.
++ */
++static int xilinx_ai_engine_simulate_irq(struct platform_device *pdev)
++{
++	struct irq_sim *irq_sim;
++	int irq, ret;
++
++	irq_sim = devm_kzalloc(&pdev->dev, sizeof(*irq_sim), GFP_KERNEL);
++	if (!irq_sim)
++		return -ENOMEM;
++
++	/*
++	 * Sometimes, the returned base value is 0, so allocate 2 irqs, and
++	 * always use the 2nd one.
++	 */
++	irq = devm_irq_sim_init(&pdev->dev, irq_sim, 2);
++	if (irq < 0)
++		return irq;
++
++	ret = xilinx_ai_engine_debugfs_init(pdev, irq_sim);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed create debugfs for sim irq");
++		return ret;
++	}
++
++	return irq_sim_irqnum(irq_sim, 1);
++}
++
++#else
++
++static int xilinx_ai_engine_simulate_irq(struct platform_device *pdev)
++{
++	return -ENODEV;
++}
++
++#endif
++
+ static int xilinx_ai_engine_mem_index(struct uio_info *info,
+ 				      struct vm_area_struct *vma)
+ {
+@@ -127,8 +225,11 @@ static int xilinx_ai_engine_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* Interrupt is optional */
+-	if (ret < 0)
+-		ret = UIO_IRQ_CUSTOM;
++	if (ret < 0) {
++		ret = xilinx_ai_engine_simulate_irq(pdev);
++		if (ret < 0)
++			ret = UIO_IRQ_CUSTOM;
++	}
+ 	pdata->uioinfo.irq = ret;
+ 
+ 	ret = platform_device_add_data(uio, pdata, sizeof(*pdata));
+-- 
+2.31.1
+

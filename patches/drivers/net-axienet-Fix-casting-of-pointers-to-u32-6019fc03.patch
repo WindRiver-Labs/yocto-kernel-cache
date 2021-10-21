@@ -1,0 +1,150 @@
+From 9790be40942bdd40ee3a756e23c403fae12c7711 Mon Sep 17 00:00:00 2001
+From: Robert Hancock <hancock@sedsystems.ca>
+Date: Thu, 6 Jun 2019 16:28:05 -0600
+Subject: [PATCH 0938/1851] net: axienet: Fix casting of pointers to u32
+
+commit 23e6b2dc93630b60a6c33bd2a1289686bc33e272 upstream
+
+This driver was casting skb pointers to u32 and storing them as such in
+the DMA buffer descriptor, which is obviously broken on 64-bit. The area
+of the buffer descriptor being used is not accessed by the hardware and
+has sufficient room for a 32 or 64-bit pointer, so just store the skb
+pointer as such.
+
+Signed-off-by: Robert Hancock <hancock@sedsystems.ca>
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/xilinx/xilinx_axienet.h  | 11 +++-----
+ .../net/ethernet/xilinx/xilinx_axienet_main.c | 26 ++++++++++---------
+ 2 files changed, 17 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet.h b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+index 011adae32b89..e09dc1433187 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet.h
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+@@ -356,9 +356,6 @@
+  * @app2:         MM2S/S2MM User Application Field 2.
+  * @app3:         MM2S/S2MM User Application Field 3.
+  * @app4:         MM2S/S2MM User Application Field 4.
+- * @sw_id_offset: MM2S/S2MM Sw ID
+- * @reserved5:    Reserved and not used
+- * @reserved6:    Reserved and not used
+  */
+ struct axidma_bd {
+ 	u32 next;	/* Physical address of next buffer descriptor */
+@@ -373,11 +370,9 @@ struct axidma_bd {
+ 	u32 app1;	/* TX start << 16 | insert */
+ 	u32 app2;	/* TX csum seed */
+ 	u32 app3;
+-	u32 app4;
+-	u32 sw_id_offset;
+-	u32 reserved5;
+-	u32 reserved6;
+-};
++	u32 app4;   /* Last field used by HW */
++	struct sk_buff *skb;
++} __aligned(XAXIDMA_BD_MINIMUM_ALIGNMENT);
+ 
+ /**
+  * struct axienet_local - axienet private per device data
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index 65c16772e589..d3a1932eec5e 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -159,8 +159,7 @@ static void axienet_dma_bd_release(struct net_device *ndev)
+ 	for (i = 0; i < RX_BD_NUM; i++) {
+ 		dma_unmap_single(ndev->dev.parent, lp->rx_bd_v[i].phys,
+ 				 lp->max_frm_size, DMA_FROM_DEVICE);
+-		dev_kfree_skb((struct sk_buff *)
+-			      (lp->rx_bd_v[i].sw_id_offset));
++		dev_kfree_skb(lp->rx_bd_v[i].skb);
+ 	}
+ 
+ 	if (lp->rx_bd_v) {
+@@ -227,7 +226,7 @@ static int axienet_dma_bd_init(struct net_device *ndev)
+ 		if (!skb)
+ 			goto out;
+ 
+-		lp->rx_bd_v[i].sw_id_offset = (u32) skb;
++		lp->rx_bd_v[i].skb = skb;
+ 		lp->rx_bd_v[i].phys = dma_map_single(ndev->dev.parent,
+ 						     skb->data,
+ 						     lp->max_frm_size,
+@@ -595,14 +594,15 @@ static void axienet_start_xmit_done(struct net_device *ndev)
+ 		dma_unmap_single(ndev->dev.parent, cur_p->phys,
+ 				(cur_p->cntrl & XAXIDMA_BD_CTRL_LENGTH_MASK),
+ 				DMA_TO_DEVICE);
+-		if (cur_p->app4)
+-			dev_consume_skb_irq((struct sk_buff *)cur_p->app4);
++		if (cur_p->skb)
++			dev_consume_skb_irq(cur_p->skb);
+ 		/*cur_p->phys = 0;*/
+ 		cur_p->app0 = 0;
+ 		cur_p->app1 = 0;
+ 		cur_p->app2 = 0;
+ 		cur_p->app4 = 0;
+ 		cur_p->status = 0;
++		cur_p->skb = NULL;
+ 
+ 		size += status & XAXIDMA_BD_STS_ACTUAL_LEN_MASK;
+ 		packets++;
+@@ -721,7 +721,7 @@ axienet_start_xmit(struct sk_buff *skb, struct net_device *ndev)
+ 	}
+ 
+ 	cur_p->cntrl |= XAXIDMA_BD_CTRL_TXEOF_MASK;
+-	cur_p->app4 = (unsigned long)skb;
++	cur_p->skb = skb;
+ 
+ 	tail_p = lp->tx_bd_p + sizeof(*lp->tx_bd_v) * lp->tx_bd_tail;
+ 	/* Start the transfer */
+@@ -756,13 +756,15 @@ static void axienet_recv(struct net_device *ndev)
+ 
+ 	while ((cur_p->status & XAXIDMA_BD_STS_COMPLETE_MASK)) {
+ 		tail_p = lp->rx_bd_p + sizeof(*lp->rx_bd_v) * lp->rx_bd_ci;
+-		skb = (struct sk_buff *) (cur_p->sw_id_offset);
+-		length = cur_p->app4 & 0x0000FFFF;
+ 
+ 		dma_unmap_single(ndev->dev.parent, cur_p->phys,
+ 				 lp->max_frm_size,
+ 				 DMA_FROM_DEVICE);
+ 
++		skb = cur_p->skb;
++		cur_p->skb = NULL;
++		length = cur_p->app4 & 0x0000FFFF;
++
+ 		skb_put(skb, length);
+ 		skb->protocol = eth_type_trans(skb, ndev);
+ 		/*skb_checksum_none_assert(skb);*/
+@@ -797,7 +799,7 @@ static void axienet_recv(struct net_device *ndev)
+ 					     DMA_FROM_DEVICE);
+ 		cur_p->cntrl = lp->max_frm_size;
+ 		cur_p->status = 0;
+-		cur_p->sw_id_offset = (u32) new_skb;
++		cur_p->skb = new_skb;
+ 
+ 		++lp->rx_bd_ci;
+ 		lp->rx_bd_ci %= RX_BD_NUM;
+@@ -1357,8 +1359,8 @@ static void axienet_dma_err_handler(unsigned long data)
+ 					 (cur_p->cntrl &
+ 					  XAXIDMA_BD_CTRL_LENGTH_MASK),
+ 					 DMA_TO_DEVICE);
+-		if (cur_p->app4)
+-			dev_kfree_skb_irq((struct sk_buff *) cur_p->app4);
++		if (cur_p->skb)
++			dev_kfree_skb_irq(cur_p->skb);
+ 		cur_p->phys = 0;
+ 		cur_p->cntrl = 0;
+ 		cur_p->status = 0;
+@@ -1367,7 +1369,7 @@ static void axienet_dma_err_handler(unsigned long data)
+ 		cur_p->app2 = 0;
+ 		cur_p->app3 = 0;
+ 		cur_p->app4 = 0;
+-		cur_p->sw_id_offset = 0;
++		cur_p->skb = NULL;
+ 	}
+ 
+ 	for (i = 0; i < RX_BD_NUM; i++) {
+-- 
+2.31.1
+

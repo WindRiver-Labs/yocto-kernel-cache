@@ -1,0 +1,202 @@
+From 3160e2683d04883751a894a46908229a0786a648 Mon Sep 17 00:00:00 2001
+From: Vishal Sagar <vishal.sagar@xilinx.com>
+Date: Mon, 19 Mar 2018 18:49:37 +0530
+Subject: [PATCH 0166/1851] dmaengine: xilinx_frmbuf: Add interlaced support to
+ Xilinx Framebuffer driver
+
+commit 67eb1862347728dafff25f3c05729fed72ca3200 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Adds support for reading or setting the field id of framebuffer written
+to memory or read back from memory in the Xilinx Framebuffer driver.
+
+Signed-off-by: Vishal Sagar <vishal.sagar@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/dma/xilinx/xilinx_frmbuf.c | 68 ++++++++++++++++++++++++++++++
+ include/linux/dma/xilinx_frmbuf.h  | 40 ++++++++++++++++++
+ 2 files changed, 108 insertions(+)
+
+diff --git a/drivers/dma/xilinx/xilinx_frmbuf.c b/drivers/dma/xilinx/xilinx_frmbuf.c
+index 4526cbbdd25d..4bf5b3cbf27e 100644
+--- a/drivers/dma/xilinx/xilinx_frmbuf.c
++++ b/drivers/dma/xilinx/xilinx_frmbuf.c
+@@ -51,6 +51,7 @@
+ #define XILINX_FRMBUF_FMT_OFFSET		0x28
+ #define XILINX_FRMBUF_ADDR_OFFSET		0x30
+ #define XILINX_FRMBUF_ADDR2_OFFSET		0x3c
++#define XILINX_FRMBUF_FID_OFFSET		0x48
+ 
+ /* Control Registers */
+ #define XILINX_FRMBUF_CTRL_AP_START		BIT(0)
+@@ -92,6 +93,9 @@
+ #define XILINX_FRMBUF_FMT_UYVY8			28
+ #define XILINX_FRMBUF_FMT_BGR8				29
+ 
++/* FID Register */
++#define XILINX_FRMBUF_FID_MASK			BIT(0)
++
+ /**
+  * struct xilinx_frmbuf_desc_hw - Hardware Descriptor
+  * @luma_plane_addr: Luma or packed plane buffer address
+@@ -114,11 +118,13 @@ struct xilinx_frmbuf_desc_hw {
+  * @async_tx: Async transaction descriptor
+  * @hw: Hardware descriptor
+  * @node: Node in the channel descriptors list
++ * @fid: Field ID of buffer
+  */
+ struct xilinx_frmbuf_tx_descriptor {
+ 	struct dma_async_tx_descriptor async_tx;
+ 	struct xilinx_frmbuf_desc_hw hw;
+ 	struct list_head node;
++	u32 fid;
+ };
+ 
+ /**
+@@ -611,6 +617,56 @@ int xilinx_xdma_get_v4l2_vid_fmts(struct dma_chan *chan, u32 *fmt_cnt,
+ }
+ EXPORT_SYMBOL(xilinx_xdma_get_v4l2_vid_fmts);
+ 
++int xilinx_xdma_get_fid(struct dma_chan *chan,
++			struct dma_async_tx_descriptor *async_tx, u32 *fid)
++{
++	struct xilinx_frmbuf_device *xdev;
++	struct xilinx_frmbuf_tx_descriptor *desc;
++
++	xdev = frmbuf_find_dev(chan);
++	if (IS_ERR(xdev))
++		return PTR_ERR(xdev);
++
++	if (!async_tx || !fid)
++		return -EINVAL;
++
++	if (xdev->chan.direction != DMA_DEV_TO_MEM)
++		return -EINVAL;
++
++	desc = to_dma_tx_descriptor(async_tx);
++	if (!desc)
++		return -EINVAL;
++
++	*fid = desc->fid;
++	return 0;
++}
++EXPORT_SYMBOL(xilinx_xdma_get_fid);
++
++int xilinx_xdma_set_fid(struct dma_chan *chan,
++			struct dma_async_tx_descriptor *async_tx, u32 fid)
++{
++	struct xilinx_frmbuf_device *xdev;
++	struct xilinx_frmbuf_tx_descriptor *desc;
++
++	if (fid > 1 || !async_tx)
++		return -EINVAL;
++
++	xdev = frmbuf_find_dev(chan);
++	if (IS_ERR(xdev))
++		return PTR_ERR(xdev);
++
++	if (xdev->chan.direction != DMA_MEM_TO_DEV)
++		return -EINVAL;
++
++	desc = to_dma_tx_descriptor(async_tx);
++	if (!desc)
++		return -EINVAL;
++
++	desc->fid = fid;
++	return 0;
++}
++EXPORT_SYMBOL(xilinx_xdma_set_fid);
++
+ /**
+  * of_dma_xilinx_xlate - Translation function
+  * @dma_spec: Pointer to DMA specifier as found in the device tree
+@@ -806,6 +862,14 @@ static void xilinx_frmbuf_complete_descriptor(struct xilinx_frmbuf_chan *chan)
+ {
+ 	struct xilinx_frmbuf_tx_descriptor *desc = chan->active_desc;
+ 
++	/*
++	 * In case of frame buffer write, read the fid register
++	 * and associate it with descriptor
++	 */
++	if (chan->direction == DMA_DEV_TO_MEM)
++		desc->fid = frmbuf_read(chan, XILINX_FRMBUF_FID_OFFSET) &
++			    XILINX_FRMBUF_FID_MASK;
++
+ 	dma_cookie_complete(&desc->async_tx);
+ 	list_add_tail(&desc->node, &chan->done_list);
+ }
+@@ -850,6 +914,10 @@ static void xilinx_frmbuf_start_transfer(struct xilinx_frmbuf_chan *chan)
+ 	frmbuf_write(chan, XILINX_FRMBUF_HEIGHT_OFFSET, desc->hw.vsize);
+ 	frmbuf_write(chan, XILINX_FRMBUF_FMT_OFFSET, chan->vid_fmt->id);
+ 
++	/* If it is framebuffer read IP set the FID */
++	if (chan->direction == DMA_MEM_TO_DEV)
++		frmbuf_write(chan, XILINX_FRMBUF_FID_OFFSET, desc->fid);
++
+ 	/* Start the hardware */
+ 	xilinx_frmbuf_start(chan);
+ 	list_del(&desc->node);
+diff --git a/include/linux/dma/xilinx_frmbuf.h b/include/linux/dma/xilinx_frmbuf.h
+index 431579c4958b..3b6886522969 100644
+--- a/include/linux/dma/xilinx_frmbuf.h
++++ b/include/linux/dma/xilinx_frmbuf.h
+@@ -72,6 +72,32 @@ int xilinx_xdma_get_drm_vid_fmts(struct dma_chan *chan, u32 *fmt_cnt,
+  */
+ int xilinx_xdma_get_v4l2_vid_fmts(struct dma_chan *chan, u32 *fmt_cnt,
+ 				  u32 **fmts);
++
++/**
++ * xilinx_xdma_get_fid - Get the Field ID of the buffer received.
++ * This function should be called from the callback function registered
++ * per descriptor in prep_interleaved.
++ *
++ * @chan: dma channel instance
++ * @async_tx: descriptor whose parent structure contains fid.
++ * @fid: Output param - Field ID of the buffer. 0 - even, 1 - odd.
++ *
++ * Return: 0 on success, -EINVAL in case of invalid chan
++ */
++int xilinx_xdma_get_fid(struct dma_chan *chan,
++			struct dma_async_tx_descriptor *async_tx, u32 *fid);
++
++/**
++ * xilinx_xdma_set_fid - Set the Field ID of the buffer to be transmitted
++ * @chan: dma channel instance
++ * @async_tx: dma async tx descriptor for the buffer
++ * @fid: Field ID of the buffer. 0 - even, 1 - odd.
++ *
++ * Return: 0 on success, -EINVAL in case of invalid chan
++ */
++int xilinx_xdma_set_fid(struct dma_chan *chan,
++			struct dma_async_tx_descriptor *async_tx, u32 fid);
++
+ #else
+ static inline void xilinx_xdma_drm_config(struct dma_chan *chan, u32 drm_fourcc)
+ { }
+@@ -91,6 +117,20 @@ static inline int xilinx_xdma_get_v4l2_vid_fmts(struct dma_chan *chan,
+ {
+ 	return -ENODEV;
+ }
++
++static inline int xilinx_xdma_get_fid(struct dma_chan *chan,
++				      struct dma_async_tx_descriptor *async_tx,
++				      u32 *fid);
++{
++	return -ENODEV;
++}
++
++static inline int xilinx_xdma_set_fid(struct dma_chan *chan,
++				      struct dma_async_tx_descriptor *async_tx,
++				      u32 fid)
++{
++	return -ENODEV;
++}
+ #endif
+ 
+ #endif /*__XILINX_FRMBUF_DMA_H*/
+-- 
+2.31.1
+

@@ -1,0 +1,177 @@
+From 9a9da5a9ec7a3cb9aac88fcd64ab7bf3f7eeec26 Mon Sep 17 00:00:00 2001
+From: Sai Krishna Potthuri <lakshmi.sai.krishna.potthuri@xilinx.com>
+Date: Thu, 26 Dec 2019 04:16:22 -0700
+Subject: [PATCH 0925/1851] mtd: cadence-quadspi: Added support STIG write
+
+commit 303acdbbfbfa091d5425aeda19d737f247fa34f4 from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch adds support for STIG data write.
+This is a temporary support, once IOCTL IDs for OSPI Mux Select
+got approved this patch can be reverted.
+
+Signed-off-by: Sai Krishna Potthuri <lakshmi.sai.krishna.potthuri@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/mtd/spi-nor/cadence-quadspi.c | 73 ++++++++++++++++++++++++++-
+ drivers/mtd/spi-nor/spi-nor.c         |  3 +-
+ include/linux/mtd/spi-nor.h           |  2 +
+ 3 files changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mtd/spi-nor/cadence-quadspi.c b/drivers/mtd/spi-nor/cadence-quadspi.c
+index f2dd9cfa7442..be82df49e4bb 100644
+--- a/drivers/mtd/spi-nor/cadence-quadspi.c
++++ b/drivers/mtd/spi-nor/cadence-quadspi.c
+@@ -35,6 +35,7 @@
+ /* Quirks */
+ #define CQSPI_NEEDS_WR_DELAY		BIT(0)
+ #define CQSPI_HAS_DMA			BIT(1)
++#define CQSPI_STIG_WRITE		BIT(2)
+ 
+ /* Capabilities mask */
+ #define CQSPI_BASE_HWCAPS_MASK					\
+@@ -95,6 +96,7 @@ struct cqspi_st {
+ 	int			bytes_to_dma;
+ 	loff_t			addr;
+ 	dma_addr_t		dma_addr;
++	bool			stig_write;
+ 	int (*indirect_read_dma)(struct spi_nor *nor, u_char *rxbuf,
+ 				 loff_t from_addr, size_t n_rx);
+ };
+@@ -720,6 +722,69 @@ static int cqspi_write_setup(struct spi_nor *nor)
+ 	return 0;
+ }
+ 
++static int cqspi_stig_write(struct spi_nor *nor, loff_t addr,
++			    const u8 *txbuf, unsigned int n_tx)
++{
++	struct cqspi_flash_pdata *f_pdata = nor->priv;
++	struct cqspi_st *cqspi = f_pdata->cqspi;
++	void __iomem *reg_base = cqspi->iobase;
++	unsigned int reg;
++	unsigned int data;
++	int ret;
++	unsigned int pgmlen = 0, wr_len;
++
++	if (n_tx && !txbuf) {
++		dev_err(nor->dev,
++			"Invalid input argument, cmdlen %d txbuf 0x%p\n",
++			n_tx, txbuf);
++		return -EINVAL;
++	}
++	pgmlen = n_tx;
++	if (n_tx > 8)
++		n_tx = 8;
++
++	while (pgmlen) {
++		ret = nor->write_reg(nor, SPINOR_OP_WREN, NULL, 0);
++		if (ret)
++			return ret;
++
++		reg = nor->program_opcode << CQSPI_REG_CMDCTRL_OPCODE_LSB;
++		reg |= (0x1 << CQSPI_REG_CMDCTRL_WR_EN_LSB);
++		reg |= ((n_tx - 1) & CQSPI_REG_CMDCTRL_WR_BYTES_MASK) <<
++			CQSPI_REG_CMDCTRL_WR_BYTES_LSB;
++		reg |= (0x1 << CQSPI_REG_CMDCTRL_ADDR_EN_LSB);
++		reg |= ((nor->addr_width - 1) &
++			CQSPI_REG_CMDCTRL_ADD_BYTES_MASK) <<
++			CQSPI_REG_CMDCTRL_ADD_BYTES_LSB;
++		writel(addr, reg_base + CQSPI_REG_CMDADDRESS);
++
++		wr_len = n_tx > 4 ? 4 : n_tx;
++		data = 0;
++		memcpy(&data, txbuf, wr_len);
++		writel(data, reg_base + CQSPI_REG_CMDWRITEDATALOWER);
++		if (n_tx > 4) {
++			txbuf += wr_len;
++			wr_len = n_tx - wr_len;
++			data = 0;
++			memcpy(&data, txbuf, wr_len);
++			writel(data, reg_base + CQSPI_REG_CMDWRITEDATAUPPER);
++		}
++
++		txbuf += wr_len;
++		pgmlen -= n_tx;
++		addr += n_tx;
++		n_tx = pgmlen > 8 ? 8 : pgmlen;
++		ret = cqspi_exec_flash_cmd(cqspi, reg);
++		if (ret)
++			return ret;
++
++		ret = spi_nor_wait_till_ready(nor);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
+ static int cqspi_indirect_write_execute(struct spi_nor *nor, loff_t to_addr,
+ 					const u8 *txbuf, const size_t n_tx)
+ {
+@@ -1073,6 +1138,8 @@ static ssize_t cqspi_write(struct spi_nor *nor, loff_t to,
+ 	if (f_pdata->use_direct_mode) {
+ 		memcpy_toio(cqspi->ahb_base + to, buf, len);
+ 		ret = cqspi_wait_idle(cqspi);
++	} else if (cqspi->stig_write) {
++		ret = cqspi_stig_write(nor, to, buf, len);
+ 	} else {
+ 		ret = cqspi_indirect_write_execute(nor, to, buf, len);
+ 	}
+@@ -1636,10 +1703,14 @@ static int cqspi_probe(struct platform_device *pdev)
+ 		cqspi->read_dma = true;
+ 	}
+ 
++	cqspi->stig_write = false;
+ 	if (of_device_is_compatible(pdev->dev.of_node,
+ 				    "xlnx,versal-ospi-1.0") &&
+ 				    cqspi->read_dma) {
+ 		cqspi->indirect_read_dma = cqspi_versal_indirect_read_dma;
++		if (ddata && (ddata->quirks & CQSPI_STIG_WRITE)) {
++			cqspi->stig_write = true;
++		}
+ 	}
+ 
+ 	ret = devm_request_irq(dev, irq, cqspi_irq_handler, 0,
+@@ -1737,7 +1808,7 @@ static const struct cqspi_driver_platdata am654_ospi = {
+ static const struct cqspi_driver_platdata versal_ospi = {
+ 	.hwcaps_mask = (SNOR_HWCAPS_READ | SNOR_HWCAPS_READ_FAST |
+ 			SNOR_HWCAPS_PP | SNOR_HWCAPS_READ_1_1_8),
+-	.quirks = CQSPI_HAS_DMA,
++	.quirks = CQSPI_HAS_DMA | CQSPI_STIG_WRITE,
+ };
+ 
+ static const struct of_device_id cqspi_dt_ids[] = {
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index 863e7549d393..33e268b22e0c 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -911,11 +911,12 @@ static int spi_nor_wait_till_ready_with_timeout(struct spi_nor *nor,
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int spi_nor_wait_till_ready(struct spi_nor *nor)
++int spi_nor_wait_till_ready(struct spi_nor *nor)
+ {
+ 	return spi_nor_wait_till_ready_with_timeout(nor,
+ 						    DEFAULT_READY_WAIT_JIFFIES);
+ }
++EXPORT_SYMBOL_GPL(spi_nor_wait_till_ready);
+ 
+ static int write_ear(struct spi_nor *nor, u32 addr)
+ {
+diff --git a/include/linux/mtd/spi-nor.h b/include/linux/mtd/spi-nor.h
+index 3aca01d134dd..f3ee1d5ed8c0 100644
+--- a/include/linux/mtd/spi-nor.h
++++ b/include/linux/mtd/spi-nor.h
+@@ -698,4 +698,6 @@ int spi_nor_scan(struct spi_nor *nor, const char *name,
+  */
+ void spi_nor_restore(struct spi_nor *nor);
+ 
++int spi_nor_wait_till_ready(struct spi_nor *nor);
++
+ #endif
+-- 
+2.31.1
+

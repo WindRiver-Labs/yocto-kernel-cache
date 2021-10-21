@@ -1,0 +1,295 @@
+From eb67eba8f36f3217333a039bd65796c3d21f4d59 Mon Sep 17 00:00:00 2001
+From: Nishad Saraf <nishad.saraf@xilinx.com>
+Date: Tue, 6 Oct 2020 00:35:34 -0700
+Subject: [PATCH 1690/1851] misc: xilinx-ai-engine: Handle interrupts in
+ kthreads
+
+commit 83f3f3695b19a59f3ce6d0cdc8557f71c5b95c7a from
+https://github.com/Xilinx/linux-xlnx.git
+
+Interrupts from AI-Engine are disabled in the top-half and re-enabled at
+the end of the bottom half, in aie_array_backtrack() function. The
+aie_register_notification() API and aie_flush_error() API also invokes
+the same aie_array_backtrack() API.  This is the reason for the kernel
+to panic, as calling the above APIs, re-enables an already enabled
+interrupt.
+
+  [   57.535990] Unbalanced enable for IRQ 42
+
+This patch fixes the above issue by converting the existing AI-Engine
+interrupts to threaded interrupts. By doing so, global AI-Engine
+interrupt only remains disabled in the thread function. The interrupt
+handler disables the global interrupt and returns a call to the
+thread_fn IRQ handler. The thread function then disables and
+acknowledges all the level 2 interrupt controllers, if required, also
+acknowledges the interrupt in NPI, and schedules a task in the
+workqueue. The global interrupt is re-enabled soon after thread function
+returns IRQ_HANDLED.
+
+This patch also adds helper APIs to copy data between a buffer and a
+resource bitmap. These APIs are useful for storing and retrieving data
+from the L2 mask bitmap.
+
+Signed-off-by: Nishad Saraf <nishad.saraf@xilinx.com>
+Reviewed-by: Wendy Liang <wendy.liang@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/misc/xilinx-ai-engine/ai-engine-dev.c |   4 +-
+ .../xilinx-ai-engine/ai-engine-internal.h     |   4 +
+ .../xilinx-ai-engine/ai-engine-interrupt.c    | 117 +++++++++++++-----
+ drivers/misc/xilinx-ai-engine/ai-engine-res.c |  38 ++++++
+ 4 files changed, 131 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-dev.c b/drivers/misc/xilinx-ai-engine/ai-engine-dev.c
+index f6ffe61d8377..fc072332c40e 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-dev.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-dev.c
+@@ -454,8 +454,8 @@ static int xilinx_ai_engine_probe(struct platform_device *pdev)
+ 	if (adev->irq < 0)
+ 		goto free_ida;
+ 
+-	ret = devm_request_irq(dev, adev->irq, aie_interrupt, 0, dev_name(dev),
+-			       adev);
++	ret = devm_request_threaded_irq(dev, adev->irq, NULL, aie_interrupt,
++					IRQF_ONESHOT, dev_name(dev), adev);
+ 	if (ret) {
+ 		dev_err(&pdev->dev, "Failed to request AIE IRQ.\n");
+ 		goto free_ida;
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index 6ba6eaaa1a44..767082bce313 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -513,6 +513,10 @@ int aie_resource_get_region(struct aie_resource *res, u32 start,
+ 			    u32 count);
+ void aie_resource_put_region(struct aie_resource *res, int start, u32 count);
+ int aie_resource_set(struct aie_resource *res, u32 start, u32 count);
++int aie_resource_cpy_from_arr32(struct aie_resource *res, u32 start,
++				const u32 *src, u32 nbits);
++int aie_resource_cpy_to_arr32(struct aie_resource *res, u32 start, u32 *dst,
++			      u32 nbits);
+ int aie_resource_clear(struct aie_resource *res, u32 start, u32 count);
+ int aie_resource_clear_all(struct aie_resource *res);
+ bool aie_resource_testbit(struct aie_resource *res, u32 bit);
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c b/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+index 7894b62a1548..4a0e373640ca 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-interrupt.c
+@@ -565,9 +565,10 @@ static bool aie_l1_backtrack(struct aie_partition *apart,
+ static void aie_l2_backtrack(struct aie_partition *apart)
+ {
+ 	struct aie_location loc;
+-	unsigned long status;
+-	u32 n, ttype, l2_mask;
++	unsigned long l2_mask = 0;
++	u32 n, ttype, l2_bitmap_offset = 0;
+ 	int ret;
++	bool notify = false, sched_work = false;
+ 
+ 	ret = mutex_lock_interruptible(&apart->mlock);
+ 	if (ret) {
+@@ -580,17 +581,20 @@ static void aie_l2_backtrack(struct aie_partition *apart)
+ 	     loc.col < apart->range.start.col + apart->range.size.col;
+ 	     loc.col++) {
+ 		ttype = apart->adev->ops->get_tile_type(&loc);
+-		if (ttype == AIE_TILE_TYPE_SHIMNOC) {
+-			l2_mask = aie_get_l2_mask(apart, &loc);
+-			aie_disable_l2_ctrl(apart, &loc, l2_mask);
+-
+-			status = aie_get_l2_status(apart, &loc);
+-			aie_clear_l2_intr(apart, &loc, status);
+-			for_each_set_bit(n, &status,
+-					 apart->adev->l2_ctrl->num_broadcasts)
+-				ret = aie_l1_backtrack(apart, loc, n);
+-			aie_enable_l2_ctrl(apart, &loc, l2_mask);
++		if (ttype != AIE_TILE_TYPE_SHIMNOC)
++			continue;
++
++		aie_resource_cpy_to_arr32(&apart->l2_mask, l2_bitmap_offset *
++					  32, (u32 *)&l2_mask, 32);
++		l2_bitmap_offset++;
++
++		for_each_set_bit(n, &l2_mask,
++				 apart->adev->l2_ctrl->num_broadcasts) {
++			if (aie_l1_backtrack(apart, loc, n))
++				notify = true;
+ 		}
++
++		aie_enable_l2_ctrl(apart, &loc, l2_mask);
+ 	}
+ 
+ 	/*
+@@ -603,14 +607,18 @@ static void aie_l2_backtrack(struct aie_partition *apart)
+ 	     loc.col++) {
+ 		if (aie_get_l1_status(apart, &loc, AIE_SHIM_SWITCH_A) ||
+ 		    aie_get_l1_status(apart, &loc, AIE_SHIM_SWITCH_B)) {
++			mutex_unlock(&apart->mlock);
++			sched_work = true;
+ 			schedule_work(&apart->adev->backtrack);
+ 			break;
+ 		}
+ 	}
+-	mutex_unlock(&apart->mlock);
++
++	if (!sched_work)
++		mutex_unlock(&apart->mlock);
+ 
+ 	/* If error was assert, then notify the application */
+-	if (ret && apart->error_cb.cb)
++	if (notify && apart->error_cb.cb)
+ 		apart->error_cb.cb(apart->error_cb.priv);
+ }
+ 
+@@ -649,18 +657,7 @@ void aie_array_backtrack(struct work_struct *work)
+ 	list_for_each_entry(apart, &adev->partitions, node)
+ 		aie_part_backtrack(apart);
+ 
+-	/* For ES1 silicon, interrupts are latched in NPI */
+-	if (adev->version == VERSAL_ES1_REV_ID) {
+-		ret = adev->eemi_ops->ioctl(adev->pm_node_id,
+-					    IOCTL_AIE_ISR_CLEAR,
+-					    AIE_NPI_ERROR_ID, 0, NULL);
+-		if (ret < 0) {
+-			dev_err_ratelimited(&adev->dev,
+-					    "Failed to clear NPI ISR\n");
+-		}
+-	}
+ 	mutex_unlock(&adev->mlock);
+-	enable_irq(adev->irq);
+ }
+ 
+ /**
+@@ -669,16 +666,76 @@ void aie_array_backtrack(struct work_struct *work)
+  * @data: AI engine device structure.
+  * @return: IRQ_HANDLED.
+  *
+- * This function disables IRQ and schedules a task in workqueue to backtrack
+- * the source of error interrupt. Disabled interrupts are re-enabled after
+- * successful completion of bottom half.
++ * This thread function disables level 2 interrupt controllers and schedules a
++ * task in workqueue to backtrack the source of error interrupt. Disabled
++ * interrupts are re-enabled after successful completion of bottom half.
+  */
+ irqreturn_t aie_interrupt(int irq, void *data)
+ {
+ 	struct aie_device *adev = data;
++	struct aie_partition *apart;
++	int ret;
++	bool sched_work = false;
++
++	ret = mutex_lock_interruptible(&adev->mlock);
++	if (ret) {
++		dev_err(&adev->dev,
++			"Failed to acquire lock. Process was interrupted by fatal signals\n");
++		return IRQ_NONE;
++	}
++
++	list_for_each_entry(apart, &adev->partitions, node) {
++		struct aie_location loc;
++		u32 ttype, l2_mask, l2_status, l2_bitmap_offset  = 0;
++
++		ret = mutex_lock_interruptible(&apart->mlock);
++		if (ret) {
++			dev_err(&apart->dev,
++				"Failed to acquire lock. Process was interrupted by fatal signals\n");
++			return IRQ_NONE;
++		}
++
++		for (loc.col = apart->range.start.col, loc.row = 0;
++		     loc.col < apart->range.start.col + apart->range.size.col;
++		     loc.col++) {
++			ttype = apart->adev->ops->get_tile_type(&loc);
++			if (ttype != AIE_TILE_TYPE_SHIMNOC)
++				continue;
++
++			l2_mask = aie_get_l2_mask(apart, &loc);
++			if (l2_mask) {
++				aie_resource_cpy_from_arr32(&apart->l2_mask,
++							    l2_bitmap_offset  *
++							    32, &l2_mask, 32);
++				aie_disable_l2_ctrl(apart, &loc, l2_mask);
++			}
++			l2_bitmap_offset++;
++
++			l2_status = aie_get_l2_status(apart, &loc);
++			if (l2_status) {
++				aie_clear_l2_intr(apart, &loc, l2_status);
++				sched_work = true;
++			} else {
++				aie_enable_l2_ctrl(apart, &loc, l2_mask);
++			}
++		}
++		mutex_unlock(&apart->mlock);
++	}
++
++	/* For ES1 silicon, interrupts are latched in NPI */
++	if (adev->version == VERSAL_ES1_REV_ID) {
++		ret = adev->eemi_ops->ioctl(adev->pm_node_id,
++					    IOCTL_AIE_ISR_CLEAR,
++					    AIE_NPI_ERROR_ID, 0, NULL);
++		if (ret < 0)
++			dev_err(&adev->dev, "Failed to clear NPI ISR\n");
++	}
++
++	mutex_unlock(&adev->mlock);
++
++	if (sched_work)
++		schedule_work(&adev->backtrack);
+ 
+-	disable_irq_nosync(irq);
+-	schedule_work(&adev->backtrack);
+ 	return IRQ_HANDLED;
+ }
+ 
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-res.c b/drivers/misc/xilinx-ai-engine/ai-engine-res.c
+index 6d92e2995937..f1bb75bcd5d8 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-res.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-res.c
+@@ -131,6 +131,44 @@ int aie_resource_set(struct aie_resource *res, u32 start, u32 count)
+ 	return 0;
+ }
+ 
++/**
++ * aie_resource_cpy_from_arr32() - copies nbits from u32[] to bitmap.
++ * @res: pointer to AI engine resource
++ * @start: start bit in bitmap
++ * @src: source buffer
++ * @nbits: number of bits to copy from u32[]
++ * @return: 0 for success and negative value for failure
++ */
++int aie_resource_cpy_from_arr32(struct aie_resource *res, u32 start,
++				const u32 *src, u32 nbits)
++{
++	if (!res || !res->bitmap || !nbits || start + nbits  > res->total ||
++	    !src)
++		return -EINVAL;
++
++	bitmap_from_arr32(res->bitmap + BIT_WORD(start), src, nbits);
++	return 0;
++}
++
++/**
++ * aie_resource_cpy_to_arr32() - copies nbits to u32[] from bitmap.
++ * @res: pointer to AI engine resource
++ * @start: start bit in bitmap
++ * @dst: destination buffer
++ * @nbits: number of bits to copy to u32[]
++ * @return: 0 for success and negative value for failure
++ */
++int aie_resource_cpy_to_arr32(struct aie_resource *res, u32 start, u32 *dst,
++			      u32 nbits)
++{
++	if (!res || !res->bitmap || !nbits || start + nbits  > res->total ||
++	    !dst)
++		return -EINVAL;
++
++	bitmap_to_arr32(dst, res->bitmap + BIT_WORD(start), nbits);
++	return 0;
++}
++
+ /**
+  * aie_resource_clear() - clear the AI engine resource bits
+  * @res: pointer to AI engine resource
+-- 
+2.31.1
+

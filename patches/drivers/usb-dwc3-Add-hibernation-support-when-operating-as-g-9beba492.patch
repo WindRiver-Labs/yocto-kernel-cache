@@ -1,0 +1,1115 @@
+From e28056efd4263eb8ef94ee9f752697378004c486 Mon Sep 17 00:00:00 2001
+From: Anurag Kumar Vulisha <anurag.kumar.vulisha@xilinx.com>
+Date: Thu, 23 Jan 2020 19:50:54 +0530
+Subject: [PATCH 1006/1851] usb: dwc3: Add hibernation support when operating
+ as gadget
+
+commit 526f56822f971265d67428fe61e40fe18f95ac81 from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch adds hibernation support when dwc3 controller is
+operating in gadget mode
+
+Signed-off-by: Mayank Adesara <mayank.adesara@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+Signed-off-by: Anurag Kumar Vulisha <anurag.kumar.vulisha@xilinx.com>
+Signed-off-by: Piyush Mehta <piyush.mehta@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/usb/dwc3/Makefile             |   4 +-
+ drivers/usb/dwc3/core.c               |  16 +-
+ drivers/usb/dwc3/core.h               |  12 +
+ drivers/usb/dwc3/gadget.c             | 147 +++++--
+ drivers/usb/dwc3/gadget.h             |  15 +
+ drivers/usb/dwc3/gadget_hibernation.c | 568 ++++++++++++++++++++++++++
+ 6 files changed, 733 insertions(+), 29 deletions(-)
+ create mode 100644 drivers/usb/dwc3/gadget_hibernation.c
+
+diff --git a/drivers/usb/dwc3/Makefile b/drivers/usb/dwc3/Makefile
+index ae86da0dc5bd..c317f369bb4a 100644
+--- a/drivers/usb/dwc3/Makefile
++++ b/drivers/usb/dwc3/Makefile
+@@ -14,8 +14,8 @@ ifneq ($(filter y,$(CONFIG_USB_DWC3_HOST) $(CONFIG_USB_DWC3_DUAL_ROLE)),)
+ 	dwc3-y				+= host.o
+ endif
+ 
+-ifneq ($(filter y,$(CONFIG_USB_DWC3_GADGET) $(CONFIG_USB_DWC3_DUAL_ROLE)),)
+-	dwc3-y				+= gadget.o ep0.o
++ifneq ($(filter y,$(CONFIG_USB_DWC3_GADGET) $(CONFIG_USB_DWC3_DUAL_ROLE) $(CONFIG_USB_DWC3_OTG)),)
++	dwc3-y				+= gadget.o ep0.o gadget_hibernation.o
+ endif
+ 
+ ifneq ($(CONFIG_USB_DWC3_DUAL_ROLE),)
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 2246fbf440f5..77a7d0329afd 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -246,6 +246,9 @@ static int dwc3_core_soft_reset(struct dwc3 *dwc)
+ 	 * XHCI driver will reset the host block. If dwc3 was configured for
+ 	 * host-only mode, then we can return early.
+ 	 */
++	if (dwc->dr_mode == USB_DR_MODE_HOST || dwc->is_hibernated == true)
++		return 0;
++
+ 	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST)
+ 		return 0;
+ 
+@@ -368,7 +371,7 @@ static struct dwc3_event_buffer *dwc3_alloc_one_event_buffer(struct dwc3 *dwc,
+  * dwc3_free_event_buffers - frees all allocated event buffers
+  * @dwc: Pointer to our controller context structure
+  */
+-static void dwc3_free_event_buffers(struct dwc3 *dwc)
++void dwc3_free_event_buffers(struct dwc3 *dwc)
+ {
+ 	struct dwc3_event_buffer	*evt;
+ 
+@@ -385,7 +388,7 @@ static void dwc3_free_event_buffers(struct dwc3 *dwc)
+  * Returns 0 on success otherwise negative errno. In the error case, dwc
+  * may contain some buffers allocated but not all which were requested.
+  */
+-static int dwc3_alloc_event_buffers(struct dwc3 *dwc, unsigned length)
++int dwc3_alloc_event_buffers(struct dwc3 *dwc, unsigned length)
+ {
+ 	struct dwc3_event_buffer *evt;
+ 
+@@ -807,8 +810,15 @@ static void dwc3_core_setup_global_control(struct dwc3 *dwc)
+ 			reg &= ~DWC3_GCTL_DSBLCLKGTNG;
+ 		break;
+ 	case DWC3_GHWPARAMS1_EN_PWROPT_HIB:
++		if (!device_property_read_bool(dwc->dev,
++					       "snps,enable-hibernation")) {
++			dev_dbg(dwc->dev, "Hibernation not enabled\n");
++			break;
++		}
++
+ 		/* enable hibernation here */
+ 		dwc->nr_scratch = DWC3_GHWPARAMS4_HIBER_SCRATCHBUFS(hwparams4);
++		dwc->has_hibernation = 1;
+ 
+ 		/*
+ 		 * REVISIT Enabling this bit so that host-mode hibernation
+@@ -954,7 +964,7 @@ static void dwc3_set_incr_burst_type(struct dwc3 *dwc)
+  *
+  * Returns 0 on success otherwise negative errno.
+  */
+-static int dwc3_core_init(struct dwc3 *dwc)
++int dwc3_core_init(struct dwc3 *dwc)
+ {
+ 	u32			reg;
+ 	int			ret;
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 3bbede500e00..4f55799ce5f3 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -465,6 +465,7 @@
+ 
+ /* Device Status Register */
+ #define DWC3_DSTS_DCNRD			BIT(29)
++#define DWC3_DSTS_SRE			BIT(28)
+ 
+ /* This applies for core versions 1.87a and earlier */
+ #define DWC3_DSTS_PWRUPREQ		BIT(24)
+@@ -1054,6 +1055,7 @@ struct dwc3_scratchpad_array {
+  * @parkmode_disable_ss_quirk: set if we need to disable all SuperSpeed
+  *			instances in park mode.
+  * @tx_de_emphasis_quirk: set if we enable Tx de-emphasis quirk
++ * @is_hibernated: true when dwc3 is hibernated; abort processing events
+  * @tx_de_emphasis: Tx de-emphasis value
+  * 	0	- -6dB de-emphasis
+  * 	1	- -3.5dB de-emphasis
+@@ -1063,6 +1065,11 @@ struct dwc3_scratchpad_array {
+  * @imod_interval: set the interrupt moderation interval in 250ns
+  *                 increments or 0 to disable.
+  * @is_d3: set if the controller is in d3 state
++ * @saved_regs: registers to be saved/restored during hibernation/wakeup events
++ * @irq_wakeup: wakeup IRQ number, triggered when host asks to wakeup from
++ *              hibernation
++ * @force_hiber_wake: flag set when the gadget driver is forcefully triggering
++		a hibernation wakeup event
+  */
+ struct dwc3 {
+ 	struct work_struct	drd_work;
+@@ -1250,11 +1257,15 @@ struct dwc3 {
+ 
+ 	unsigned		tx_de_emphasis_quirk:1;
+ 	unsigned		tx_de_emphasis:2;
++	unsigned		is_hibernated:1;
+ 
+ 	unsigned		dis_metastability_quirk:1;
+ 
+ 	u16			imod_interval;
+ 	bool			is_d3;
++	u32			*saved_regs;
++	u32			irq_wakeup;
++	bool			force_hiber_wake;
+ };
+ 
+ #define INCRX_BURST_MODE 0
+@@ -1474,6 +1485,7 @@ int dwc3_gadget_set_link_state(struct dwc3 *dwc, enum dwc3_link_state state);
+ int dwc3_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned cmd,
+ 		struct dwc3_gadget_ep_cmd_params *params);
+ int dwc3_send_gadget_generic_command(struct dwc3 *dwc, unsigned cmd, u32 param);
++int dwc3_core_init(struct dwc3 *dwc);
+ #else
+ static inline int dwc3_gadget_init(struct dwc3 *dwc)
+ { return 0; }
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 906330bce008..7bac82be544e 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -421,8 +421,7 @@ static int dwc3_send_clear_stall_ep_cmd(struct dwc3_ep *dep)
+ 	return dwc3_send_gadget_ep_cmd(dep, cmd, &params);
+ }
+ 
+-static dma_addr_t dwc3_trb_dma_offset(struct dwc3_ep *dep,
+-		struct dwc3_trb *trb)
++dma_addr_t dwc3_trb_dma_offset(struct dwc3_ep *dep, struct dwc3_trb *trb)
+ {
+ 	u32		offset = (char *) trb - (char *) dep->trb_pool;
+ 
+@@ -617,7 +616,7 @@ int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	u32			reg;
+ 	int			ret;
+ 
+-	if (!(dep->flags & DWC3_EP_ENABLED)) {
++	if (!(dep->flags & DWC3_EP_ENABLED) || dwc->is_hibernated) {
+ 		ret = dwc3_gadget_start_config(dep);
+ 		if (ret)
+ 			return ret;
+@@ -627,7 +626,7 @@ int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!(dep->flags & DWC3_EP_ENABLED)) {
++	if (!(dep->flags & DWC3_EP_ENABLED) || dwc->is_hibernated) {
+ 		struct dwc3_trb	*trb_st_hw;
+ 		struct dwc3_trb	*trb_link;
+ 
+@@ -641,11 +640,13 @@ int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 		if (usb_endpoint_xfer_control(desc))
+ 			goto out;
+ 
+-		/* Initialize the TRB ring */
+-		dep->trb_dequeue = 0;
+-		dep->trb_enqueue = 0;
+-		memset(dep->trb_pool, 0,
+-		       sizeof(struct dwc3_trb) * DWC3_TRB_NUM);
++		if (!dwc->is_hibernated) {
++			/* Initialize the TRB ring */
++			dep->trb_dequeue = 0;
++			dep->trb_enqueue = 0;
++			memset(dep->trb_pool, 0,
++			       sizeof(struct dwc3_trb) * DWC3_TRB_NUM);
++		}
+ 
+ 		/* Link TRB. The HWO bit is never reset */
+ 		trb_st_hw = &dep->trb_pool[0];
+@@ -661,8 +662,8 @@ int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	 * Issue StartTransfer here with no-op TRB so we can always rely on No
+ 	 * Response Update Transfer command.
+ 	 */
+-	if ((usb_endpoint_xfer_bulk(desc) && !dep->stream_capable) ||
+-			usb_endpoint_xfer_int(desc)) {
++	if (((usb_endpoint_xfer_bulk(desc) && !dep->stream_capable) ||
++	     usb_endpoint_xfer_int(desc)) && !dwc->is_hibernated) {
+ 		struct dwc3_gadget_ep_cmd_params params;
+ 		struct dwc3_trb	*trb;
+ 		dma_addr_t trb_dma;
+@@ -688,8 +689,6 @@ int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action)
+ 	return 0;
+ }
+ 
+-static void dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force,
+-		bool interrupt);
+ static void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep)
+ {
+ 	struct dwc3_request		*req;
+@@ -1230,7 +1229,7 @@ static void dwc3_prepare_trbs(struct dwc3_ep *dep)
+ 
+ static void dwc3_gadget_ep_cleanup_cancelled_requests(struct dwc3_ep *dep);
+ 
+-static int __dwc3_gadget_kick_transfer(struct dwc3_ep *dep)
++int __dwc3_gadget_kick_transfer(struct dwc3_ep *dep)
+ {
+ 	struct dwc3_gadget_ep_cmd_params params;
+ 	struct dwc3_request		*req;
+@@ -1444,6 +1443,7 @@ static int __dwc3_gadget_start_isoc(struct dwc3_ep *dep)
+ 	return ret;
+ }
+ 
++static void dwc3_gadget_wakeup_interrupt(struct dwc3 *dwc);
+ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
+ {
+ 	struct dwc3		*dwc = dep->dwc;
+@@ -1479,6 +1479,13 @@ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
+ 		return 0;
+ 	}
+ 
++	/* If core is hibernated, need to wakeup (remote wakeup) */
++	if (dwc->is_hibernated) {
++		dwc->force_hiber_wake = true;
++		gadget_wakeup_interrupt(dwc);
++		dwc->force_hiber_wake = false;
++	}
++
+ 	/*
+ 	 * NOTICE: Isochronous endpoints should NEVER be prestarted. We must
+ 	 * wait for a XferNotReady event so we will know what's the current
+@@ -1854,7 +1861,7 @@ static int dwc3_gadget_set_selfpowered(struct usb_gadget *g,
+ 	return 0;
+ }
+ 
+-static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
++int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend)
+ {
+ 	u32			reg;
+ 	u32			timeout = 500;
+@@ -1943,6 +1950,10 @@ void dwc3_gadget_enable_irq(struct dwc3 *dwc)
+ 			DWC3_DEVTEN_USBRSTEN |
+ 			DWC3_DEVTEN_DISCONNEVTEN);
+ 
++	/* Enable hibernation IRQ */
++	if (dwc->has_hibernation)
++		reg |= DWC3_DEVTEN_HIBERNATIONREQEVTEN;
++
+ 	if (dwc->revision < DWC3_REVISION_250A)
+ 		reg |= DWC3_DEVTEN_ULSTCNGEN;
+ 
+@@ -2076,6 +2087,7 @@ static int __dwc3_gadget_start(struct dwc3 *dwc)
+ 	return ret;
+ }
+ 
++static irqreturn_t wakeup_interrupt(int irq, void *_dwc);
+ static int dwc3_gadget_start(struct usb_gadget *g,
+ 		struct usb_gadget_driver *driver)
+ {
+@@ -2093,6 +2105,18 @@ static int dwc3_gadget_start(struct usb_gadget *g,
+ 		goto err0;
+ 	}
+ 
++	/* look for wakeup interrupt if hibernation is supported */
++	if (dwc->has_hibernation) {
++		irq = dwc->irq_wakeup;
++		ret = devm_request_irq(dwc->dev, irq, wakeup_interrupt,
++				       IRQF_SHARED, "usb-wakeup", dwc);
++		if (ret) {
++			dev_err(dwc->dev, "failed to request wakeup irq #%d --> %d\n",
++				irq, ret);
++			goto err0;
++		}
++	}
++
+ 	spin_lock_irqsave(&dwc->lock, flags);
+ 	if (dwc->gadget_driver) {
+ 		dev_err(dwc->dev, "%s is already bound to %s\n",
+@@ -2113,7 +2137,10 @@ static int dwc3_gadget_start(struct usb_gadget *g,
+ 
+ err1:
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+-	free_irq(irq, dwc);
++	if (dwc->irq_gadget)
++		free_irq(dwc->irq_gadget, dwc->ev_buf);
++	if (dwc->irq_wakeup)
++		free_irq(dwc->irq_wakeup, dwc);
+ 
+ err0:
+ 	return ret;
+@@ -2749,8 +2776,8 @@ static void dwc3_reset_gadget(struct dwc3 *dwc)
+ 	}
+ }
+ 
+-static void dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force,
+-	bool interrupt)
++void dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force,
++			bool interrupt)
+ {
+ 	struct dwc3 *dwc = dep->dwc;
+ 	struct dwc3_gadget_ep_cmd_params params;
+@@ -2845,6 +2872,15 @@ static void dwc3_gadget_disconnect_interrupt(struct dwc3 *dwc)
+ 
+ 	dwc3_disconnect_gadget(dwc);
+ 
++	/* In USB 2.0, to avoid hibernation interrupt at the time of connection
++	 * clear DWC3_DCTL_KEEP_CONNECT bit.
++	 */
++	if (dwc->has_hibernation) {
++		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++		reg &= ~DWC3_DCTL_KEEP_CONNECT;
++		dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++	}
++
+ 	dwc->gadget.speed = USB_SPEED_UNKNOWN;
+ 	dwc->setup_packet_pending = false;
+ 	usb_gadget_set_state(&dwc->gadget, USB_STATE_NOTATTACHED);
+@@ -3017,6 +3053,16 @@ static void dwc3_gadget_conndone_interrupt(struct dwc3 *dwc)
+ 		return;
+ 	}
+ 
++	/*
++	 * In USB 2.0, to avoid hibernation interrupt at the time of connection
++	 * set DWC3_DCTL_KEEP_CONNECT bit here
++	 */
++	if (dwc->has_hibernation) {
++		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++		reg |= DWC3_DCTL_KEEP_CONNECT;
++		dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++	}
++
+ 	/*
+ 	 * Configure PHY via GUSB3PIPECTLn if required.
+ 	 *
+@@ -3040,6 +3086,17 @@ static void dwc3_gadget_wakeup_interrupt(struct dwc3 *dwc)
+ 	}
+ }
+ 
++static irqreturn_t wakeup_interrupt(int irq, void *_dwc)
++{
++	struct dwc3 *dwc = (struct dwc3 *)_dwc;
++
++	spin_lock(&dwc->lock);
++	gadget_wakeup_interrupt(dwc);
++	spin_unlock(&dwc->lock);
++
++	return IRQ_HANDLED;
++}
++
+ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
+ 		unsigned int evtinfo)
+ {
+@@ -3167,10 +3224,12 @@ static void dwc3_gadget_hibernation_interrupt(struct dwc3 *dwc,
+ 	 * STAR#9000546576: Device Mode Hibernation: Issue in USB 2.0
+ 	 * Device Fallback from SuperSpeed
+ 	 */
+-	if (!!is_ss ^ (dwc->speed >= DWC3_DSTS_SUPERSPEED))
++	if ((!!is_ss ^ (dwc->speed >= DWC3_DSTS_SUPERSPEED)) &&
++	    (!(dwc->has_hibernation)))
+ 		return;
+ 
+ 	/* enter hibernation here */
++	gadget_hibernation_interrupt(dwc);
+ }
+ 
+ static void dwc3_gadget_interrupt(struct dwc3 *dwc,
+@@ -3264,12 +3323,18 @@ static irqreturn_t dwc3_process_event_buf(struct dwc3_event_buffer *evt)
+ 		 */
+ 		evt->lpos = (evt->lpos + 4) % evt->length;
+ 		left -= 4;
++
++		if (dwc->is_hibernated)
++			break;
+ 	}
+ 
+ 	evt->count = 0;
+ 	evt->flags &= ~DWC3_EVENT_PENDING;
+ 	ret = IRQ_HANDLED;
+ 
++	if (dwc->is_hibernated)
++		return ret;
++
+ 	/* Unmask interrupt */
+ 	reg = dwc3_readl(dwc->regs, DWC3_GEVNTSIZ(0));
+ 	reg &= ~DWC3_GEVNTSIZ_INTMASK;
+@@ -3311,6 +3376,9 @@ static irqreturn_t dwc3_check_event_buf(struct dwc3_event_buffer *evt)
+ 		return IRQ_HANDLED;
+ 	}
+ 
++	if (dwc->is_hibernated)
++		return IRQ_HANDLED;
++
+ 	/*
+ 	 * With PCIe legacy interrupt, test shows that top-half irq handler can
+ 	 * be called again after HW interrupt deassertion. Check if bottom-half
+@@ -3372,7 +3440,21 @@ static int dwc3_gadget_get_irq(struct dwc3 *dwc)
+ 
+ 	irq = platform_get_irq(dwc3_pdev, 0);
+ 	if (irq > 0)
+-		goto out;
++		dwc->irq_gadget = irq;
++
++	/* look for wakeup interrupt if hibernation is supported */
++	if (dwc->has_hibernation) {
++		irq = platform_get_irq(dwc3_pdev, 2);
++		if (irq <= 0) {
++			if (irq != -EPROBE_DEFER)
++				dev_err(dwc->dev, "missing wakeup IRQ\n");
++			if (!irq)
++				irq = -EINVAL;
++			return irq;
++		}
++
++		dwc->irq_wakeup = irq;
++	}
+ 
+ 	if (!irq)
+ 		irq = -EINVAL;
+@@ -3398,8 +3480,6 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 		goto err0;
+ 	}
+ 
+-	dwc->irq_gadget = irq;
+-
+ 	if (dwc->dr_mode == USB_DR_MODE_OTG) {
+ 		struct usb_phy *phy;
+ 
+@@ -3492,8 +3572,7 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 						&dwc->gadget);
+ 				if (ret) {
+ 					dev_err(dwc->dev,
+-					"%s otg_set_peripheral failed\n",
+-							__func__);
++						"otg_set_peripheral failed\n");
+ 					usb_put_phy(phy);
+ 					phy = NULL;
+ 					goto err4;
+@@ -3545,6 +3624,16 @@ int dwc3_gadget_suspend(struct dwc3 *dwc)
+ 	if (!dwc->gadget_driver)
+ 		return 0;
+ 
++	if (dwc->is_hibernated) {
++		/*
++		 * As we are about to suspend, wake the controller from
++		 * D3 & hibernation states
++		 */
++		dwc->force_hiber_wake = true;
++		gadget_wakeup_interrupt(dwc);
++		dwc->force_hiber_wake = false;
++	}
++
+ 	dwc3_gadget_run_stop(dwc, false, false);
+ 	dwc3_disconnect_gadget(dwc);
+ 	__dwc3_gadget_stop(dwc);
+@@ -3555,6 +3644,7 @@ int dwc3_gadget_suspend(struct dwc3 *dwc)
+ int dwc3_gadget_resume(struct dwc3 *dwc)
+ {
+ 	int			ret;
++	u32			reg;
+ 
+ 	if (!dwc->gadget_driver)
+ 		return 0;
+@@ -3567,6 +3657,15 @@ int dwc3_gadget_resume(struct dwc3 *dwc)
+ 	if (ret < 0)
+ 		goto err1;
+ 
++	/* In USB 2.0, to avoid hibernation interrupt at the time of connection
++	 * set DWC3_DCTL_KEEP_CONNECT bit.
++	 */
++	if (dwc->has_hibernation) {
++		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++		reg |= DWC3_DCTL_KEEP_CONNECT;
++		dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++	}
++
+ 	return 0;
+ 
+ err1:
+diff --git a/drivers/usb/dwc3/gadget.h b/drivers/usb/dwc3/gadget.h
+index a37ce2846ff6..35562cd815f5 100644
+--- a/drivers/usb/dwc3/gadget.h
++++ b/drivers/usb/dwc3/gadget.h
+@@ -54,6 +54,14 @@ struct dwc3;
+ /* U2 Device exit Latency */
+ #define DWC3_DEFAULT_U2_DEV_EXIT_LAT	0x1FF	/* Less then 511 microsec */
+ 
++/* Below used in hibernation */
++#define DWC3_NON_STICKY_RESTORE_RETRIES	500
++#define DWC3_NON_STICKY_SAVE_RETRIES	500
++#define DWC3_DEVICE_CTRL_READY_RETRIES	20000
++#define DWC3_NON_STICKY_RESTORE_DELAY	100
++#define DWC3_NON_STICKY_SAVE_DELAY	100
++#define DWC3_DEVICE_CTRL_READY_DELAY	5
++
+ /* -------------------------------------------------------------------------- */
+ 
+ #define to_dwc3_request(r)	(container_of(r, struct dwc3_request, request))
+@@ -115,6 +123,13 @@ int dwc3_gadget_ep0_queue(struct usb_ep *ep, struct usb_request *request,
+ int __dwc3_gadget_ep_set_halt(struct dwc3_ep *dep, int value, int protocol);
+ int __dwc3_gadget_ep_enable(struct dwc3_ep *dep, unsigned int action);
+ int __dwc3_gadget_ep_disable(struct dwc3_ep *dep);
++int __dwc3_gadget_kick_transfer(struct dwc3_ep *dep);
++void dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force,
++		bool interrupt);
++int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on, int suspend);
++dma_addr_t dwc3_trb_dma_offset(struct dwc3_ep *dep, struct dwc3_trb *trb);
++void gadget_hibernation_interrupt(struct dwc3 *dwc);
++void gadget_wakeup_interrupt(struct dwc3 *dwc);
+ 
+ /**
+  * dwc3_gadget_ep_get_transfer_index - Gets transfer index from HW
+diff --git a/drivers/usb/dwc3/gadget_hibernation.c b/drivers/usb/dwc3/gadget_hibernation.c
+new file mode 100644
+index 000000000000..850c59625892
+--- /dev/null
++++ b/drivers/usb/dwc3/gadget_hibernation.c
+@@ -0,0 +1,568 @@
++// SPDX-License-Identifier: GPL-2.0
++/**
++ * gadget_hibernation.c - DesignWare USB3 DRD Controller gadget hibernation file
++ *
++ * This file has routines to handle hibernation and wakeup events in gadget mode
++ *
++ * Author: Mayank Adesara <madesara@xilinx.com>
++ * Author: Anurag Kumar Vulisha <anuragku@xilinx.com>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2  of
++ * the License as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "core.h"
++#include "gadget.h"
++#include "debug.h"
++#include "io.h"
++
++/* array of registers to save on hibernation and restore them on wakeup */
++static u32 save_reg_addr[] = {
++	DWC3_DCTL,
++	DWC3_DCFG,
++	DWC3_DEVTEN
++};
++
++/*
++ * wait_timeout - Waits until timeout
++ * @wait_time: time to wait in jiffies
++ */
++static void wait_timeout(unsigned long wait_time)
++{
++	unsigned long timeout = jiffies + wait_time;
++
++	while (!time_after_eq(jiffies, timeout))
++		cpu_relax();
++}
++
++/**
++ * save_regs - Saves registers on hibernation
++ * @dwc: pointer to our controller context structure
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int save_regs(struct dwc3 *dwc)
++{
++	int i;
++
++	if (!dwc->saved_regs) {
++		dwc->saved_regs = devm_kmalloc(dwc->dev,
++					       sizeof(save_reg_addr),
++					       GFP_KERNEL);
++		if (!dwc->saved_regs) {
++			dev_err(dwc->dev, "Not enough memory to save regs\n");
++			return -ENOMEM;
++		}
++	}
++
++	for (i = 0; i < ARRAY_SIZE(save_reg_addr); i++)
++		dwc->saved_regs[i] = dwc3_readl(dwc->regs,
++						save_reg_addr[i]);
++	return 0;
++}
++
++/**
++ * restore_regs - Restores registers on wakeup
++ * @dwc: pointer to our controller context structure
++ */
++static void restore_regs(struct dwc3 *dwc)
++{
++	int i;
++
++	if (!dwc->saved_regs) {
++		dev_warn(dwc->dev, "Regs not saved\n");
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(save_reg_addr); i++)
++		dwc3_writel(dwc->regs, save_reg_addr[i],
++			    dwc->saved_regs[i]);
++}
++
++/**
++ * restart_ep0_trans - Restarts EP0 transfer on wakeup
++ * @dwc: pointer to our controller context structure
++ * epnum: endpoint number
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int restart_ep0_trans(struct dwc3 *dwc, int epnum)
++{
++	struct dwc3_ep *dep = dwc->eps[epnum];
++	struct dwc3_trb *trb = dwc->ep0_trb;
++	struct dwc3_gadget_ep_cmd_params params;
++	int ret;
++	u32 cmd;
++
++	memset(&params, 0, sizeof(params));
++	params.param0 = upper_32_bits(dwc->ep0_trb_addr);
++	params.param1 = lower_32_bits(dwc->ep0_trb_addr);
++
++	/* set HWO bit back to 1 and restart transfer */
++	trb->ctrl |= DWC3_TRB_CTRL_HWO;
++
++	/* Clear the TRBSTS feild */
++	trb->size &= ~(0x0F << 28);
++
++	cmd = DWC3_DEPCMD_STARTTRANSFER | DWC3_DEPCMD_PARAM(0);
++	ret = dwc3_send_gadget_ep_cmd(dep, cmd, &params);
++	if (ret < 0) {
++		dev_err(dwc->dev, "failed to restart transfer on %s\n",
++			dep->name);
++		return ret;
++	}
++
++	dwc3_gadget_ep_get_transfer_index(dep);
++
++	return 0;
++}
++
++extern dma_addr_t dwc3_trb_dma_offset(struct dwc3_ep *dep,
++				      struct dwc3_trb *trb);
++/**
++ * restore_eps - Restores non EP0 eps in the same state as they were before
++ * hibernation
++ * @dwc: pointer to our controller context structure
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int restore_eps(struct dwc3 *dwc)
++{
++	int epnum, ret;
++
++	for (epnum = 2; epnum < DWC3_ENDPOINTS_NUM; epnum++) {
++		/* Enable the endpoint */
++		struct dwc3_ep *dep = dwc->eps[epnum];
++
++		if (!dep)
++			continue;
++
++		if (!(dep->flags & DWC3_EP_ENABLED))
++			continue;
++
++		ret = __dwc3_gadget_ep_enable(dep, true);
++		if (ret) {
++			dev_err(dwc->dev, "failed to enable %s\n", dep->name);
++			return ret;
++		}
++	}
++
++	for (epnum = 2; epnum < DWC3_ENDPOINTS_NUM; epnum++) {
++		struct dwc3_ep *dep = dwc->eps[epnum];
++
++		if (!dep)
++			continue;
++
++		if (!(dep->flags & DWC3_EP_ENABLED))
++			continue;
++
++		if (dep->flags & DWC3_EP_STALL) {
++			/* Set stall for the endpoint */
++			struct dwc3_gadget_ep_cmd_params	params;
++
++			memset(&params, 0x00, sizeof(params));
++
++			ret = dwc3_send_gadget_ep_cmd(dep, DWC3_DEPCMD_SETSTALL,
++						      &params);
++			if (ret) {
++				dev_err(dwc->dev, "failed to set STALL on %s\n",
++					dep->name);
++				return ret;
++			}
++		} else {
++			u32 cmd;
++			struct dwc3_gadget_ep_cmd_params params;
++			struct dwc3_trb *trb;
++			u8 trb_dequeue = dep->trb_dequeue;
++
++			trb = &dep->trb_pool[trb_dequeue];
++
++			/*
++			 * check the last processed TRBSTS field has value
++			 * 4 (TRBInProgress), if yes resubmit the same TRB
++			 */
++			if (DWC3_TRB_SIZE_TRBSTS(trb->size) ==
++					DWC3_TRB_STS_XFER_IN_PROG) {
++				/* Set the HWO bit */
++				trb->ctrl |= DWC3_TRB_CTRL_HWO;
++
++				/* Clear the TRBSTS field */
++				trb->size &= ~(0x0F << 28);
++
++				memset(&params, 0, sizeof(params));
++
++				/* Issue starttransfer */
++				params.param0 =
++					upper_32_bits(dwc3_trb_dma_offset(dep,
++									  trb));
++				params.param1 =
++					lower_32_bits(dwc3_trb_dma_offset(dep,
++									  trb));
++
++				cmd = DWC3_DEPCMD_STARTTRANSFER |
++					DWC3_DEPCMD_PARAM(0);
++
++				dwc3_send_gadget_ep_cmd(dep, cmd, &params);
++
++				dwc3_gadget_ep_get_transfer_index(dep);
++			} else {
++				ret = __dwc3_gadget_kick_transfer(dep);
++				if (ret) {
++					dev_err(dwc->dev,
++						"%s: restart transfer failed\n",
++						dep->name);
++					return ret;
++				}
++			}
++		}
++	}
++
++	return 0;
++}
++
++/**
++ * restore_ep0 - Restores EP0 in the same state as they were before hibernation
++ * @dwc: pointer to our controller context structure
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int restore_ep0(struct dwc3 *dwc)
++{
++	int epnum, ret;
++
++	for (epnum = 0; epnum < 2; epnum++) {
++		struct dwc3_ep *dep = dwc->eps[epnum];
++
++		if (!dep)
++			continue;
++
++		if (!(dep->flags & DWC3_EP_ENABLED))
++			continue;
++
++		ret = __dwc3_gadget_ep_enable(dep, true);
++		if (ret) {
++			dev_err(dwc->dev, "failed to enable %s\n", dep->name);
++			return ret;
++		}
++
++		if (dep->flags & DWC3_EP_STALL) {
++			struct dwc3_gadget_ep_cmd_params        params;
++
++			memset(&params, 0x00, sizeof(params));
++
++			ret = dwc3_send_gadget_ep_cmd(dep, DWC3_DEPCMD_SETSTALL,
++						      &params);
++			if (ret) {
++				dev_err(dwc->dev, "failed to set STALL on %s\n",
++					dep->name);
++				return ret;
++			}
++		} else {
++			if (!dep->resource_index && epnum)
++				continue;
++
++			ret = restart_ep0_trans(dwc, epnum);
++			if (ret) {
++				dev_err(dwc->dev,
++					"failed to restart transfer on: %s\n",
++					dep->name);
++				return ret;
++			}
++		}
++	}
++
++	return 0;
++}
++
++/**
++ * save_endpoint_state - Saves ep state on hibernation
++ * @dep: endpoint to get state
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int save_endpoint_state(struct dwc3_ep *dep)
++{
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_gadget_ep_cmd_params params;
++	int ret;
++
++	memset(&params, 0, sizeof(params));
++	ret = dwc3_send_gadget_ep_cmd(dep, DWC3_DEPCMD_GETEPSTATE,
++				      &params);
++	if (ret) {
++		dev_err(dwc->dev, "Failed to get endpoint state on %s\n",
++			dep->name);
++		return ret;
++	}
++
++	dep->saved_state = dwc3_readl(dep->regs, DWC3_DEPCMDPAR2);
++	return 0;
++}
++
++/**
++ * gadget_hibernation_interrupt - Interrupt handler of hibernation
++ * @dwc: pointer to our controller context structure
++ */
++void gadget_hibernation_interrupt(struct dwc3 *dwc)
++{
++	u32 epnum, reg;
++	int retries, ret;
++
++	/* Check if the link state is valid before hibernating */
++	switch (dwc3_gadget_get_link_state(dwc)) {
++	case DWC3_LINK_STATE_U3:
++	case DWC3_LINK_STATE_SS_DIS:
++		break;
++	default:
++		dev_dbg(dwc->dev,
++			"%s: Got fake hiber event\n", __func__);
++		return;
++	}
++
++	/* stop all active transfers and save endpoint status */
++	for (epnum = 0; epnum < DWC3_ENDPOINTS_NUM; epnum++) {
++		struct dwc3_ep *dep = dwc->eps[epnum];
++
++		if (!dep)
++			continue;
++
++		if (!(dep->flags & DWC3_EP_ENABLED))
++			continue;
++
++		if (dep->flags & DWC3_EP_TRANSFER_STARTED)
++			dwc3_stop_active_transfer(dep, false, false);
++
++		save_endpoint_state(dep);
++	}
++
++	/* stop the controller */
++	dwc3_gadget_run_stop(dwc, false, true);
++	dwc->is_hibernated = true;
++
++	/*
++	 * ack events, don't process them; h/w decrements the count by the value
++	 * written
++	 */
++	reg = dwc3_readl(dwc->regs, DWC3_GEVNTCOUNT(0));
++	dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(0), reg);
++	dwc->ev_buf->count = 0;
++	dwc->ev_buf->flags &= ~DWC3_EVENT_PENDING;
++
++	reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++
++	/* disable keep connect if we are disconnected right now */
++	if (dwc3_gadget_get_link_state(dwc) == DWC3_LINK_STATE_SS_DIS) {
++		reg &= ~DWC3_DCTL_KEEP_CONNECT;
++		dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++	} else {
++		reg |= DWC3_DCTL_KEEP_CONNECT;
++		 dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++	}
++
++	/* save generic registers */
++	save_regs(dwc);
++
++	/* initiate controller save state */
++	reg |= DWC3_DCTL_CSS;
++	dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++
++	/* wait till controller saves state */
++	retries = DWC3_NON_STICKY_SAVE_RETRIES;
++	do {
++		reg = dwc3_readl(dwc->regs, DWC3_DSTS);
++		if (!(reg & DWC3_DSTS_SSS))
++			break;
++
++		udelay(DWC3_NON_STICKY_SAVE_DELAY);
++	} while (--retries);
++
++	if (retries < 0) {
++		dev_err(dwc->dev, "USB core failed to save state\n");
++		goto err;
++	}
++
++	/* Set the controller as wakeup capable */
++	dwc3_simple_wakeup_capable(dwc->dev, true);
++
++	/* set USB core power state to D3 - power down */
++	ret = dwc3_set_usb_core_power(dwc, false);
++	if (ret < 0) {
++		dev_err(dwc->dev, "%s: Failed to hibernate\n", __func__);
++		/* call wakeup handler */
++		gadget_wakeup_interrupt(dwc);
++		return;
++	}
++
++	dev_info(dwc->dev, "Hibernated!\n");
++	return;
++
++err:
++	dev_err(dwc->dev, "Fail in handling Hibernation Interrupt\n");
++}
++
++/**
++ * gadget_wakeup_interrupt - Interrupt handler of wakeup
++ * @dwc: pointer to our controller context structure
++ */
++void gadget_wakeup_interrupt(struct dwc3 *dwc)
++{
++	u32 reg, link_state;
++	int ret, retries;
++	bool enter_hiber = false;
++
++	/* On USB 2.0 we observed back to back wakeup interrupts */
++	if (!dwc->is_hibernated) {
++		dev_err(dwc->dev, "Not in hibernated state\n");
++		goto err;
++	}
++
++	/* Restore power to USB core */
++	if (dwc3_set_usb_core_power(dwc, true)) {
++		dev_err(dwc->dev, "Failed to restore USB core power\n");
++		goto err;
++	}
++
++	/* Clear the controller wakeup capable flag */
++	dwc3_simple_wakeup_capable(dwc->dev, false);
++
++	/* Initialize the core and restore the saved registers */
++	dwc3_core_init(dwc);
++	restore_regs(dwc);
++
++	/* ask controller to save the non-sticky registers */
++	reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++	reg |= DWC3_DCTL_CRS;
++	dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++
++	/* Wait till non-sticky registers are restored */
++	retries = DWC3_NON_STICKY_RESTORE_RETRIES;
++	do {
++		reg = dwc3_readl(dwc->regs, DWC3_DSTS);
++		if (!(reg & DWC3_DSTS_RSS))
++			break;
++
++		udelay(DWC3_NON_STICKY_RESTORE_DELAY);
++	} while (--retries);
++
++	if (retries < 0 || (reg & DWC3_DSTS_SRE)) {
++		dev_err(dwc->dev, "Failed to restore non-sticky regs\n");
++		goto err;
++	}
++
++	/* restore ep0 endpoints */
++	ret = restore_ep0(dwc);
++	if (ret) {
++		dev_err(dwc->dev, "Failed in restorig EP0 states\n");
++		goto err;
++	}
++
++	/* start the controller */
++	ret = dwc3_gadget_run_stop(dwc, true, false);
++	if (ret < 0) {
++		dev_err(dwc->dev, "USB core failed to start on wakeup\n");
++		goto err;
++	}
++
++	/* Wait until device controller is ready */
++	retries = DWC3_DEVICE_CTRL_READY_RETRIES;
++	while (--retries) {
++		reg = dwc3_readl(dwc->regs, DWC3_DSTS);
++		if (reg & DWC3_DSTS_DCNRD)
++			udelay(DWC3_DEVICE_CTRL_READY_DELAY);
++		else
++			break;
++	}
++
++	if (retries < 0) {
++		dev_err(dwc->dev, "USB core failed to restore controller\n");
++		goto err;
++	}
++
++	/*
++	 * As some suprious signals also cause wakeup event, wait for some time
++	 * and check the link state to confirm if the wakeup signal is real
++	 */
++	wait_timeout(msecs_to_jiffies(10));
++
++	link_state = dwc3_gadget_get_link_state(dwc);
++
++	/* check if the link state is in a valid state */
++	switch (link_state) {
++	case DWC3_LINK_STATE_RESET:
++		/* Reset devaddr */
++		reg = dwc3_readl(dwc->regs, DWC3_DCFG);
++		reg &= ~(DWC3_DCFG_DEVADDR_MASK);
++		dwc3_writel(dwc->regs, DWC3_DCFG, reg);
++
++		/* issue recovery on the link */
++		ret = dwc3_gadget_set_link_state(dwc, DWC3_LINK_STATE_RECOV);
++		if (ret < 0) {
++			dev_err(dwc->dev,
++				"Failed to set link state to Recovery\n");
++			goto err;
++		}
++
++		break;
++
++	case DWC3_LINK_STATE_SS_DIS:
++		/* Clear keep connect from reconnecting to HOST */
++		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++		reg &= ~DWC3_DCTL_KEEP_CONNECT;
++		dwc3_writel(dwc->regs, DWC3_DCTL, reg);
++		/* fall through */
++	case DWC3_LINK_STATE_U3:
++		/* Ignore wakeup event as the link is still in U3 state */
++		dev_dbg(dwc->dev, "False wakeup event %d\n", link_state);
++
++		if (!dwc->force_hiber_wake)
++			enter_hiber = true;
++		break;
++
++	default:
++		/* issue recovery on the link */
++		ret = dwc3_gadget_set_link_state(dwc, DWC3_LINK_STATE_RECOV);
++		if (ret < 0) {
++			dev_err(dwc->dev,
++				"Failed to set link state to Recovery\n");
++			goto err;
++		}
++
++		break;
++	}
++
++	if (link_state != DWC3_LINK_STATE_SS_DIS) {
++		/* Restore non EP0 EPs */
++		ret = restore_eps(dwc);
++		if (ret) {
++			dev_err(dwc->dev, "Failed restoring non-EP0 states\n");
++			goto err;
++		}
++	}
++
++	/* clear the flag */
++	dwc->is_hibernated = false;
++
++	if (enter_hiber) {
++		/*
++		 * as the wakeup was because of the spurious signals,
++		 * enter hibernation again
++		 */
++		gadget_hibernation_interrupt(dwc);
++		return;
++	}
++
++	dev_info(dwc->dev, "We are back from hibernation!\n");
++	return;
++
++err:
++	dev_err(dwc->dev, "Fail in handling Wakeup Interrupt\n");
++}
+-- 
+2.31.1
+

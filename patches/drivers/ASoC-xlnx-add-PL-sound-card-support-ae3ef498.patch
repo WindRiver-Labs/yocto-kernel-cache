@@ -1,0 +1,325 @@
+From 0e964dccb3889dd569845f1fffc457dcb3b70756 Mon Sep 17 00:00:00 2001
+From: Maruthi Srinivas Bayyavarapu <maruthi.srinivas.bayyavarapu@xilinx.com>
+Date: Thu, 6 Sep 2018 17:43:32 +0530
+Subject: [PATCH 0116/1851] ASoC: xlnx: add PL sound card support
+
+commit 6f3905dc09d344b35cd2c7ad3e455d732dd646b7 from
+https://github.com/Xilinx/linux-xlnx.git
+
+The sound card driver creates the pipeline/DAI link to provide
+playback and capture usecases. Currently this single driver supports
+I2S, HDMI, SDI audio interfaces. Proper audio interface is selected
+based on the device tree node compatible string from the platform data.
+
+Check if parsing phandle of platform node is successful. In case of
+failure, do not create sound card.
+
+SDI audio driver was upgraded to v2.0 and v1.0 is not
+supported. Made the dependent change in PL sound card driver.
+
+HDMI Tx audio driver needs SND_SOC_HDMI_CODEC config option
+to be selected for HDMI playback functionality.
+
+Signed-off-by: Maruthi Srinivas Bayyavarapu <maruthi.srinivas.bayyavarapu@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ sound/soc/xilinx/Kconfig            |  12 ++
+ sound/soc/xilinx/Makefile           |   1 +
+ sound/soc/xilinx/xlnx_pl_snd_card.c | 246 ++++++++++++++++++++++++++++
+ 3 files changed, 259 insertions(+)
+ create mode 100644 sound/soc/xilinx/xlnx_pl_snd_card.c
+
+diff --git a/sound/soc/xilinx/Kconfig b/sound/soc/xilinx/Kconfig
+index 705a37fccde2..7fe22751f3d9 100644
+--- a/sound/soc/xilinx/Kconfig
++++ b/sound/soc/xilinx/Kconfig
+@@ -29,6 +29,7 @@ config SND_SOC_XILINX_I2S
+ 	  mode, IP receives audio in AES format, extracts PCM and sends
+ 	  PCM data. In receiver mode, IP receives PCM audio and
+ 	  encapsulates PCM in AES format and sends AES data.
++	  I2S playback and capture using xilinx soft IP
+ 
+ config SND_SOC_XILINX_AUDIO_FORMATTER
+         tristate "Audio support for the the Xilinx audio formatter"
+@@ -43,3 +44,14 @@ config SND_SOC_XILINX_SPDIF
+           Select this option to enable Xilinx SPDIF Audio.
+           This provides playback and capture of SPDIF audio in
+           AES format.
++
++config SND_SOC_XILINX_PL_SND_CARD
++	tristate "Audio support for the the Xilinx PL sound card"
++	depends on SND_SOC_XILINX_AUDIO_FORMATTER
++	depends on SND_SOC_XILINX_I2S
++	depends on SND_SOC_XILINX_SDI
++	select SND_SOC_HDMI_CODEC
++	help
++	  Select this option to enable Xilinx PL sound card
++	  support. This enables sound card using xilinx soft IPs
++	  in audio pipeline.
+diff --git a/sound/soc/xilinx/Makefile b/sound/soc/xilinx/Makefile
+index b476117ba3a4..16eb1169e4e7 100644
+--- a/sound/soc/xilinx/Makefile
++++ b/sound/soc/xilinx/Makefile
+@@ -10,3 +10,4 @@ snd-soc-xlnx-formatter-pcm-objs := xlnx_formatter_pcm.o
+ obj-$(CONFIG_SND_SOC_XILINX_AUDIO_FORMATTER) += snd-soc-xlnx-formatter-pcm.o
+ snd-soc-xlnx-spdif-objs := xlnx_spdif.o
+ obj-$(CONFIG_SND_SOC_XILINX_SPDIF) += snd-soc-xlnx-spdif.o
++obj-$(CONFIG_SND_SOC_XILINX_PL_SND_CARD) += xlnx_pl_snd_card.o
+diff --git a/sound/soc/xilinx/xlnx_pl_snd_card.c b/sound/soc/xilinx/xlnx_pl_snd_card.c
+new file mode 100644
+index 000000000000..36120e825b6c
+--- /dev/null
++++ b/sound/soc/xilinx/xlnx_pl_snd_card.c
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx ASoC sound card support
++ *
++ * Copyright (C) 2018 Xilinx, Inc.
++ */
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#include "xlnx_snd_common.h"
++
++#define I2S_CLOCK_RATIO 384
++
++enum {
++	I2S_AUDIO = 0,
++	HDMI_AUDIO,
++	SDI_AUDIO,
++	XLNX_MAX_IFACE,
++};
++
++static const char *dev_compat[][XLNX_MAX_IFACE] = {
++	[XLNX_PLAYBACK] = {
++		"xlnx,i2s-transmitter-1.0",
++		"xlnx,v-hdmi-tx-ss-3.1",
++		"xlnx,v-uhdsdi-audio-2.0",
++	},
++	[XLNX_CAPTURE] = {
++		"xlnx,i2s-receiver-1.0",
++		"xlnx,v-hdmi-rx-ss-3.1",
++		"xlnx,v-uhdsdi-audio-2.0",
++	},
++};
++
++static struct snd_soc_card xlnx_card = {
++	.name = "xilinx FPGA sound card",
++	.owner = THIS_MODULE,
++};
++
++static int xlnx_i2s_card_hw_params(struct snd_pcm_substream *substream,
++				   struct snd_pcm_hw_params *params)
++{
++	int ret, clk_div;
++	u32 ch, data_width, sample_rate;
++
++	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
++
++	ch = params_channels(params);
++	data_width = params_width(params);
++	sample_rate = params_rate(params);
++
++	/*
++	 * Supports only a fixed combination of 48khz, 24 bits/sample,
++	 * 2 channels.
++	 */
++	if (ch != 2 || data_width != 24 || sample_rate != 48000)
++		return -EINVAL;
++
++	/*
++	 * For the fixed Mclk, I2S_CLOCK_RATIO of 384 is ued to get 48KHz.
++	 * Ex. For a master clock(MCLK) of 18.43MHz and to get 48KHz
++	 * sampling rate, Mclk/srate = 384.
++	 */
++	clk_div = DIV_ROUND_UP(I2S_CLOCK_RATIO, ch * data_width);
++	ret = snd_soc_dai_set_clkdiv(cpu_dai, 0, clk_div);
++
++	return ret;
++}
++
++static const struct snd_soc_ops xlnx_i2s_card_ops = {
++	.hw_params = xlnx_i2s_card_hw_params,
++};
++
++SND_SOC_DAILINK_DEFS(xlnx_i2s,
++		     DAILINK_COMP_ARRAY(COMP_CPU("xilinx-i2s")),
++		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
++		     DAILINK_COMP_ARRAY(COMP_PLATFORM(NULL)));
++
++SND_SOC_DAILINK_DEFS(xlnx_hdmi_tx,
++		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
++		     DAILINK_COMP_ARRAY(COMP_CODEC("hdmi-audio-codec.0", "i2s-hifi")),
++		     DAILINK_COMP_ARRAY(COMP_PLATFORM(NULL)));
++
++SND_SOC_DAILINK_DEFS(xlnx_hdmi_rx,
++		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
++		     DAILINK_COMP_ARRAY(COMP_CODEC(NULL, "xlnx_hdmi_rx")),
++		     DAILINK_COMP_ARRAY(COMP_PLATFORM(NULL)));
++
++SND_SOC_DAILINK_DEFS(xlnx_sdi_tx,
++		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
++		     DAILINK_COMP_ARRAY(COMP_CODEC(NULL, "xlnx_sdi_tx")),
++		     DAILINK_COMP_ARRAY(COMP_PLATFORM(NULL)));
++
++SND_SOC_DAILINK_DEFS(xlnx_sdi_rx,
++		     DAILINK_COMP_ARRAY(COMP_DUMMY()),
++		     DAILINK_COMP_ARRAY(COMP_CODEC(NULL, "xlnx_sdi_rx")),
++		     DAILINK_COMP_ARRAY(COMP_PLATFORM(NULL)));
++
++static struct snd_soc_dai_link xlnx_snd_dai[][XLNX_MAX_PATHS] = {
++	[I2S_AUDIO] = {
++		{
++			.name = "xilinx-i2s_playback",
++			SND_SOC_DAILINK_REG(xlnx_i2s),
++			.ops = &xlnx_i2s_card_ops,
++		},
++		{
++			.name = "xilinx-i2s_capture",
++			SND_SOC_DAILINK_REG(xlnx_i2s),
++			.ops = &xlnx_i2s_card_ops,
++		},
++	},
++	[HDMI_AUDIO] = {
++		{
++			.name = "xilinx-hdmi-playback",
++			SND_SOC_DAILINK_REG(xlnx_hdmi_tx),
++		},
++		{
++			.name = "xilinx-hdmi-capture",
++			SND_SOC_DAILINK_REG(xlnx_hdmi_rx),
++		},
++	},
++	[SDI_AUDIO] = {
++		{
++			.name = "xlnx-sdi-playback",
++			SND_SOC_DAILINK_REG(xlnx_sdi_tx),
++		},
++		{
++			.name = "xlnx-sdi-capture",
++			SND_SOC_DAILINK_REG(xlnx_sdi_rx),
++		},
++	},
++};
++
++static int find_link(struct device_node *node, int direction)
++{
++	int ret;
++	u32 i, size;
++	const char **link_names = dev_compat[direction];
++
++	size = ARRAY_SIZE(dev_compat[direction]);
++
++	for (i = 0; i < size; i++) {
++		ret = of_device_is_compatible(node, link_names[i]);
++		if (ret)
++			return i;
++	}
++	return -ENODEV;
++}
++
++static int xlnx_snd_probe(struct platform_device *pdev)
++{
++	u32 i;
++	int ret, audio_interface;
++	struct snd_soc_dai_link *dai;
++
++	struct snd_soc_card *card = &xlnx_card;
++	struct device_node **node = pdev->dev.platform_data;
++
++	/*
++	 * TODO:support multi instance of sound card later. currently,
++	 * single instance supported.
++	 */
++	if (!node || card->instantiated)
++		return -ENODEV;
++
++	card->dev = &pdev->dev;
++
++	card->dai_link = devm_kzalloc(card->dev,
++				      sizeof(*dai) * XLNX_MAX_PATHS,
++				      GFP_KERNEL);
++	if (!card->dai_link)
++		return -ENOMEM;
++
++	card->num_links = 0;
++	for (i = XLNX_PLAYBACK; i < XLNX_MAX_PATHS; i++) {
++		struct device_node *pnode = of_parse_phandle(node[i],
++							     "xlnx,snd-pcm", 0);
++		if (!pnode) {
++			dev_err(card->dev, "platform node not found\n");
++			of_node_put(pnode);
++			return -ENODEV;
++		}
++		of_node_put(pnode);
++		dai = &card->dai_link[i];
++		audio_interface = find_link(node[i], i);
++		switch (audio_interface) {
++		case I2S_AUDIO:
++			*dai = xlnx_snd_dai[I2S_AUDIO][i];
++			dai->platforms->of_node = pnode;
++			dai->cpus->of_node = node[i];
++			card->num_links++;
++			dev_dbg(card->dev, "%s registered\n",
++				card->dai_link[i].name);
++			break;
++		case HDMI_AUDIO:
++			*dai = xlnx_snd_dai[HDMI_AUDIO][i];
++			dai->platforms->of_node = pnode;
++			if (i == XLNX_CAPTURE)
++				dai->codecs->of_node = node[i];
++			card->num_links++;
++			dev_dbg(card->dev, "%s registered\n",
++				card->dai_link[i].name);
++			break;
++		case SDI_AUDIO:
++			*dai = xlnx_snd_dai[SDI_AUDIO][i];
++			dai->platforms->of_node = pnode;
++			dai->codecs->of_node = node[i];
++			card->num_links++;
++			dev_dbg(card->dev, "%s registered\n",
++				card->dai_link[i].name);
++			break;
++		default:
++			dev_err(card->dev, "Invalid audio interface\n");
++			return -ENODEV;
++		}
++	}
++
++	if (card->num_links) {
++		ret = devm_snd_soc_register_card(card->dev, card);
++		if (ret) {
++			dev_err(card->dev, "%s registration failed\n",
++				card->name);
++			return ret;
++		}
++	}
++	dev_info(card->dev, "%s registered\n", card->name);
++
++	return 0;
++}
++
++static struct platform_driver xlnx_snd_driver = {
++	.driver = {
++		.name = "xlnx_snd_card",
++	},
++	.probe = xlnx_snd_probe,
++};
++
++module_platform_driver(xlnx_snd_driver);
++
++MODULE_DESCRIPTION("Xilinx FPGA sound card driver");
++MODULE_AUTHOR("Maruthi Srinivas Bayyavarapu");
++MODULE_LICENSE("GPL v2");
+-- 
+2.31.1
+

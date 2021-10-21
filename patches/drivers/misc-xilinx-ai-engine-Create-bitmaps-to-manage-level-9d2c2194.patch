@@ -1,0 +1,145 @@
+From ebaf2129fc3514caee60c566b499ae59af96340c Mon Sep 17 00:00:00 2001
+From: Nishad Saraf <nishad.saraf@xilinx.com>
+Date: Tue, 6 Oct 2020 00:35:33 -0700
+Subject: [PATCH 1689/1851] misc: xilinx-ai-engine: Create bitmaps to manage
+ level 2 controller
+
+commit ac5c444c8c9dcc5bedee7d34b459da803abb636a from
+https://github.com/Xilinx/linux-xlnx.git
+
+Create bitmaps to store and retrieve level 2 interrupt controller
+mask value. Level 2 mask keeps track of the broadcast channels which
+can trigger an interrupt to level 2. Since this value will be cleared
+when L2 controller is disabled in the interrupt thread function, it has
+to be locally cached. While backtracking tiles, this value is retrieved
+to reenable only the channel(s) which were disabled.
+
+Signed-off-by: Nishad Saraf <nishad.saraf@xilinx.com>
+Reviewed-by: Wendy Liang <wendy.liang@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ .../xilinx-ai-engine/ai-engine-internal.h     |  5 +++
+ .../misc/xilinx-ai-engine/ai-engine-part.c    | 42 +++++++++++++++++++
+ .../misc/xilinx-ai-engine/ai-engine-reset.c   |  1 +
+ 3 files changed, 48 insertions(+)
+
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index ac2f3e63ed55..6ba6eaaa1a44 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -51,6 +51,9 @@
+ 
+ #define AIE_NPI_ERROR_ID		BIT(1)
+ 
++/* Macros relevant to interrupts */
++#define AIE_INTR_L2_CTRL_MASK_WIDTH	32
++
+ /*
+  * enum aie_shim_switch_type - identifies different switches in shim tile.
+  */
+@@ -376,6 +379,7 @@ struct aie_part_bridge {
+  * @core_event_status: core module event bitmap
+  * @mem_event_status: memory module event bitmap
+  * @pl_event_status: pl module event bitmap
++ * @l2_mask: level 2 interrupt controller mask bitmap
+  * @partition_id: partition id. Partition ID is the identifier
+  *		  of the AI engine partition in the system.
+  * @status: indicate if the partition is in use
+@@ -398,6 +402,7 @@ struct aie_partition {
+ 	struct aie_resource core_event_status;
+ 	struct aie_resource mem_event_status;
+ 	struct aie_resource pl_event_status;
++	struct aie_resource l2_mask;
+ 	u32 partition_id;
+ 	u32 status;
+ 	u32 cntrflag;
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-part.c b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+index a4a55637084f..210ba7643619 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-part.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-part.c
+@@ -307,6 +307,39 @@ static int aie_part_create_event_bitmap(struct aie_partition *apart)
+ 	return 0;
+ }
+ 
++/**
++ * aie_part_create_l2_bitmap() - create bitmaps to record mask and status
++ *				 values for level 2 interrupt controllers.
++ * @apart: AI engine partition
++ * @return: 0 for success, and negative value for failure.
++ */
++static int aie_part_create_l2_bitmap(struct aie_partition *apart)
++{
++	struct aie_location loc;
++	u8 num_l2_ctrls = 0;
++	int ret;
++
++	loc.row = 0;
++	for (loc.col = apart->range.start.col;
++	     loc.col < apart->range.start.col + apart->range.size.col;
++	     loc.col++) {
++		u32 ttype = apart->adev->ops->get_tile_type(&loc);
++
++		if (ttype == AIE_TILE_TYPE_SHIMNOC)
++			num_l2_ctrls++;
++	}
++
++	ret = aie_resource_initialize(&apart->l2_mask, num_l2_ctrls *
++				      AIE_INTR_L2_CTRL_MASK_WIDTH);
++	if (ret) {
++		dev_err(&apart->dev,
++			"failed to initialize l2 mask resource.\n");
++		return ret;
++	}
++
++	return 0;
++}
++
+ /**
+  * aie_part_release_event_bitmap() - Deallocates event bitmap for all modules
+  *				     in a given partition.
+@@ -337,6 +370,7 @@ static int aie_part_release(struct inode *inode, struct file *filp)
+ 	apart->status = 0;
+ 
+ 	aie_part_clear_cached_events(apart);
++	aie_resource_clear_all(&apart->l2_mask);
+ 
+ 	mutex_unlock(&apart->mlock);
+ 
+@@ -524,6 +558,7 @@ static void aie_part_release_device(struct device *dev)
+ 	aie_resource_put_region(&adev->cols_res, apart->range.start.col,
+ 				apart->range.size.col);
+ 	aie_part_release_event_bitmap(apart);
++	aie_resource_uninitialize(&apart->l2_mask);
+ 	list_del(&apart->node);
+ 	mutex_unlock(&adev->mlock);
+ 	aie_fpga_free_bridge(apart);
+@@ -668,6 +703,13 @@ static struct aie_partition *aie_create_partition(struct aie_device *adev,
+ 		return ERR_PTR(ret);
+ 	}
+ 
++	ret = aie_part_create_l2_bitmap(apart);
++	if (ret < 0) {
++		dev_err(&apart->dev, "Failed to allocate l2 bitmap.\n");
++		put_device(dev);
++		return ERR_PTR(ret);
++	}
++
+ 	ret = mutex_lock_interruptible(&adev->mlock);
+ 	if (ret) {
+ 		put_device(dev);
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-reset.c b/drivers/misc/xilinx-ai-engine/ai-engine-reset.c
+index a0aab0b538dc..230ca320b16a 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-reset.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-reset.c
+@@ -209,6 +209,7 @@ int aie_part_reset(struct aie_partition *apart)
+ 	aie_part_set_cols_clkbuf(apart, false);
+ 
+ 	aie_part_clear_cached_events(apart);
++	aie_resource_clear_all(&apart->l2_mask);
+ 
+ 	mutex_unlock(&apart->mlock);
+ 	return 0;
+-- 
+2.31.1
+

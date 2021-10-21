@@ -1,0 +1,182 @@
+From 770c4fbd597c5fe2fb2624342bdf9f419cce00e1 Mon Sep 17 00:00:00 2001
+From: Kieran Bingham <kieran.bingham@ideasonboard.com>
+Date: Wed, 7 Mar 2018 13:13:29 -0800
+Subject: [PATCH 0330/1851] uvcvideo: Prevent new URBs being processed at
+ stream stop
+
+commit b6da10a0da343d89a2891383e69b51972cc86568 from
+https://github.com/Xilinx/linux-xlnx.git
+
+With asynchronous handling of the URBs from the USB Complete handler, we
+get a continual stream of packets being received while we are attempting
+to shutdown the stream.
+
+Packets that have already been received and processed are on a
+work-queue, but during stream shutdown the URBs that those packets
+belong to are killed and free'd.
+
+To prevent this race from causing invalid memory accesses, prevent new
+URBs from being processed when uvc_stop_streaming() is called by
+introducing a new flag "UVC_QUEUE_STOPPING" into the queue, and checking
+this when processing the URB to be queued.
+
+With this, we can flush the work queue, and commence a normal pipe
+shutdown. Work tasks that are already queued are processed, but the URBs
+are prevented from being re-submitted to the USB stack.
+
+Signed-off-by: Kieran Bingham <kieran.bingham@ideasonboard.com>
+Signed-off-by: Christian Kohn <christian.kohn@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/media/usb/uvc/uvc_queue.c | 13 +++++++
+ drivers/media/usb/uvc/uvc_video.c | 62 ++++++++++++++++++++++++-------
+ drivers/media/usb/uvc/uvcvideo.h  |  1 +
+ 3 files changed, 63 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/media/usb/uvc/uvc_queue.c b/drivers/media/usb/uvc/uvc_queue.c
+index da72577c2998..4e46a113dfdb 100644
+--- a/drivers/media/usb/uvc/uvc_queue.c
++++ b/drivers/media/usb/uvc/uvc_queue.c
+@@ -185,14 +185,27 @@ static int uvc_start_streaming(struct vb2_queue *vq, unsigned int count)
+ static void uvc_stop_streaming(struct vb2_queue *vq)
+ {
+ 	struct uvc_video_queue *queue = vb2_get_drv_priv(vq);
++	struct uvc_streaming *stream = uvc_queue_to_stream(queue);
+ 
+ 	lockdep_assert_irqs_enabled();
+ 
++	/* Prevent new buffers coming in. */
++	spin_lock_irq(&queue->irqlock);
++	queue->flags |= UVC_QUEUE_STOPPING;
++	spin_unlock_irq(&queue->irqlock);
++
++	/*
++	 * All pending work should be completed before disabling the stream, as
++	 * all URBs will be free'd during uvc_video_enable(s, 0).
++	 */
++	flush_workqueue(stream->async_wq);
++
+ 	if (vq->type != V4L2_BUF_TYPE_META_CAPTURE)
+ 		uvc_video_stop_streaming(uvc_queue_to_stream(queue));
+ 
+ 	spin_lock_irq(&queue->irqlock);
+ 	uvc_queue_return_buffers(queue, UVC_BUF_STATE_ERROR);
++	queue->flags &= ~UVC_QUEUE_STOPPING;
+ 	spin_unlock_irq(&queue->irqlock);
+ }
+ 
+diff --git a/drivers/media/usb/uvc/uvc_video.c b/drivers/media/usb/uvc/uvc_video.c
+index 8fa77a81dd7f..f3f783e1e4f9 100644
+--- a/drivers/media/usb/uvc/uvc_video.c
++++ b/drivers/media/usb/uvc/uvc_video.c
+@@ -1097,6 +1097,20 @@ static int uvc_video_decode_start(struct uvc_streaming *stream,
+ 	return data[0];
+ }
+ 
++static void uvc_video_copy_packets(struct uvc_urb *uvc_urb)
++{
++	unsigned int i;
++
++	for (i = 0; i < uvc_urb->async_operations; i++) {
++		struct uvc_copy_op *op = &uvc_urb->copy_operations[i];
++
++		memcpy(op->dst, op->src, op->len);
++
++		/* Release reference taken on this buffer. */
++		uvc_queue_buffer_release(op->buf);
++	}
++}
++
+ /*
+  * uvc_video_decode_data_work: Asynchronous memcpy processing
+  *
+@@ -1106,22 +1120,26 @@ static int uvc_video_decode_start(struct uvc_streaming *stream,
+ static void uvc_video_copy_data_work(struct work_struct *work)
+ {
+ 	struct uvc_urb *uvc_urb = container_of(work, struct uvc_urb, work);
+-	unsigned int i;
++	struct uvc_streaming *stream = uvc_urb->stream;
++	struct uvc_video_queue *queue = &stream->queue;
+ 	int ret;
+ 
+-	for (i = 0; i < uvc_urb->async_operations; i++) {
+-		struct uvc_copy_op *op = &uvc_urb->copy_operations[i];
+-
+-		memcpy(op->dst, op->src, op->len);
++	uvc_video_copy_packets(uvc_urb);
+ 
+-		/* Release reference taken on this buffer. */
+-		uvc_queue_buffer_release(op->buf);
++	/*
++	 * Prevent resubmitting URBs when shutting down to ensure that no new
++	 * work item will be scheduled after uvc_stop_streaming() flushes the
++	 * work queue.
++	 */
++	spin_lock_irq(&queue->irqlock);
++	if (!(queue->flags & UVC_QUEUE_STOPPING)) {
++		ret = usb_submit_urb(uvc_urb->urb, GFP_ATOMIC);
++		if (ret < 0)
++			uvc_printk(KERN_ERR,
++				   "Failed to resubmit video URB (%d).\n",
++				   ret);
+ 	}
+-
+-	ret = usb_submit_urb(uvc_urb->urb, GFP_KERNEL);
+-	if (ret < 0)
+-		uvc_printk(KERN_ERR, "Failed to resubmit video URB (%d).\n",
+-			   ret);
++	spin_unlock_irq(&queue->irqlock);
+ }
+ 
+ static void uvc_video_decode_data(struct uvc_urb *uvc_urb,
+@@ -1524,6 +1542,10 @@ static void uvc_video_complete(struct urb *urb)
+ 
+ 	buf = uvc_queue_get_current_buffer(queue);
+ 
++	/*
++	 * Process the URB headers, and optionally queue expensive memcpy tasks
++	 * to be deferred to a work queue.
++	 */
+ 	if (vb2_qmeta) {
+ 		spin_lock_irqsave(&qmeta->irqlock, flags);
+ 		if (!list_empty(&qmeta->irqqueue))
+@@ -1551,7 +1573,21 @@ static void uvc_video_complete(struct urb *urb)
+ 		return;
+ 	}
+ 
+-	queue_work(stream->async_wq, &uvc_urb->work);
++	/*
++	 * When the stream is stopped, all URBs are freed as part of the call to
++	 * uvc_stop_streaming() and must not be handled asynchronously. In that
++	 * event we can safely complete the packet work directly in this
++	 * context, without resubmitting the URB.
++	 */
++	spin_lock_irqsave(&queue->irqlock, flags);
++	if (!(queue->flags & UVC_QUEUE_STOPPING)) {
++		/* Handle any heavy lifting required */
++		INIT_WORK(&uvc_urb->work, uvc_video_copy_data_work);
++		queue_work(stream->async_wq, &uvc_urb->work);
++	} else {
++		uvc_video_copy_packets(uvc_urb);
++	}
++	spin_unlock_irqrestore(&queue->irqlock, flags);
+ }
+ 
+ /*
+diff --git a/drivers/media/usb/uvc/uvcvideo.h b/drivers/media/usb/uvc/uvcvideo.h
+index 795286a975c2..4ee465ade494 100644
+--- a/drivers/media/usb/uvc/uvcvideo.h
++++ b/drivers/media/usb/uvc/uvcvideo.h
+@@ -421,6 +421,7 @@ struct uvc_buffer {
+ 
+ #define UVC_QUEUE_DISCONNECTED		(1 << 0)
+ #define UVC_QUEUE_DROP_CORRUPTED	(1 << 1)
++#define UVC_QUEUE_STOPPING		(1 << 2)
+ 
+ struct uvc_video_queue {
+ 	struct vb2_queue queue;
+-- 
+2.31.1
+

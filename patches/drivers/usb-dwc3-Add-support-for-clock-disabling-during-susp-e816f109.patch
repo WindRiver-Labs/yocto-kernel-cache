@@ -1,0 +1,207 @@
+From 5ae760d31a1030606a0e709f9ec7167b8437c218 Mon Sep 17 00:00:00 2001
+From: Michal Simek <michal.simek@xilinx.com>
+Date: Mon, 16 Mar 2020 13:34:39 +0100
+Subject: [PATCH 0993/1851] usb: dwc3: Add support for clock disabling during
+ suspend
+
+commit 6d0468b837bc2b3cce625f59904d137e63637b5d from
+https://github.com/Xilinx/linux-xlnx.git
+
+In dwc3 usb controller, when remote wakeup feature is enabled and
+the controller is in U3 state (suspended), it requires suspend_clk
+to be active to detect wakeup signalling driven on the link.
+For all other cases usb clocks can be disabled once the controller
+enters U3 state.
+
+This patch adds the logic for disabling usb clocks when remote
+wakeup feature is not enabled.
+
+Signed-off-by: Piyush Mehta <piyush.mehta@xilinx.com>
+Signed-off-by: Anurag Kumar Vulisha <anurag.kumar.vulisha@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/usb/dwc3/core.h           |  9 ++++++++
+ drivers/usb/dwc3/dwc3-of-simple.c | 35 +++++++++++++++++++++++++++++++
+ drivers/usb/dwc3/host.c           |  6 ++++++
+ drivers/usb/host/xhci-plat.c      |  9 ++++++++
+ include/linux/usb/xhci_pdriver.h  | 26 +++++++++++++++++++++++
+ 5 files changed, 85 insertions(+)
+ create mode 100644 include/linux/usb/xhci_pdriver.h
+
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index c7ba9634fb57..1fa345167605 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1052,6 +1052,7 @@ struct dwc3_scratchpad_array {
+  * @dis_metastability_quirk: set to disable metastability quirk.
+  * @imod_interval: set the interrupt moderation interval in 250ns
+  *                 increments or 0 to disable.
++ * @is_d3: set if the controller is in d3 state
+  */
+ struct dwc3 {
+ 	struct work_struct	drd_work;
+@@ -1240,6 +1241,7 @@ struct dwc3 {
+ 	unsigned		dis_metastability_quirk:1;
+ 
+ 	u16			imod_interval;
++	bool			is_d3;
+ };
+ 
+ #define INCRX_BURST_MODE 0
+@@ -1416,6 +1418,13 @@ static inline bool dwc3_is_usb31(struct dwc3 *dwc)
+ 	return !!(dwc->revision & DWC3_REVISION_IS_DWC31);
+ }
+ 
++#if IS_ENABLED(CONFIG_USB_DWC3_OF_SIMPLE)
++void dwc3_simple_wakeup_capable(struct device *dev, bool wakeup);
++#else
++void dwc3_simple_wakeup_capable(struct device *dev, bool wakeup)
++{ ; }
++#endif
++
+ bool dwc3_has_imod(struct dwc3 *dwc);
+ 
+ int dwc3_event_buffers_setup(struct dwc3 *dwc);
+diff --git a/drivers/usb/dwc3/dwc3-of-simple.c b/drivers/usb/dwc3/dwc3-of-simple.c
+index a34e13354472..e71e2abf33c0 100644
+--- a/drivers/usb/dwc3/dwc3-of-simple.c
++++ b/drivers/usb/dwc3/dwc3-of-simple.c
+@@ -31,12 +31,44 @@ struct dwc3_of_simple {
+ 	struct clk_bulk_data	*clks;
+ 	int			num_clocks;
+ 	void __iomem		*regs;
++	struct dwc3		*dwc;
+ 	struct phy		*phy;
++	bool			wakeup_capable;
++	bool			enable_d3_suspend;
+ 	struct reset_control	*resets;
+ 	bool			pulse_resets;
+ 	bool			need_reset;
+ };
+ 
++void dwc3_simple_wakeup_capable(struct device *dev, bool wakeup)
++{
++	struct device_node *node = of_node_get(dev->parent->of_node);
++
++	/* check for valid parent node */
++	while (node) {
++		if (!of_device_is_compatible(node, "xlnx,zynqmp-dwc3") ||
++		    !of_device_is_compatible(node, "xlnx,versal-dwc3"))
++			node = of_get_next_parent(node);
++		else
++			break;
++	}
++
++	if (node)  {
++		struct platform_device *pdev_parent;
++		struct dwc3_of_simple   *simple;
++
++		pdev_parent = of_find_device_by_node(node);
++		simple = platform_get_drvdata(pdev_parent);
++
++		/* Set wakeup capable as true or false */
++		simple->wakeup_capable = wakeup;
++
++		/* Allow D3 state if wakeup capable only */
++		simple->enable_d3_suspend = wakeup;
++	}
++}
++EXPORT_SYMBOL(dwc3_simple_wakeup_capable);
++
+ static int dwc3_simple_set_phydata(struct dwc3_of_simple *simple)
+ {
+ 	struct device		*dev = simple->dev;
+@@ -199,6 +231,9 @@ static int __maybe_unused dwc3_of_simple_resume(struct device *dev)
+ {
+ 	struct dwc3_of_simple *simple = dev_get_drvdata(dev);
+ 
++	if (simple->wakeup_capable || simple->dwc->is_d3)
++		return 0;
++
+ 	if (simple->need_reset)
+ 		reset_control_deassert(simple->resets);
+ 
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index 256ef177c1b4..277a0c218738 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -9,9 +9,15 @@
+ 
+ #include <linux/platform_device.h>
+ #include <linux/of_device.h>
++#include <linux/usb/xhci_pdriver.h>
+ 
+ #include "core.h"
+ 
++void dwc3_host_wakeup_capable(struct device *dev, bool wakeup)
++{
++	dwc3_simple_wakeup_capable(dev, wakeup);
++}
++
+ static int dwc3_host_get_irq(struct dwc3 *dwc)
+ {
+ 	struct platform_device	*dwc3_pdev = to_platform_device(dwc->dev);
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+index ff2d7c68bb9b..3bfac0b834dd 100644
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -20,6 +20,7 @@
+ #include <linux/acpi.h>
+ #include <linux/usb/of.h>
+ #include <linux/usb/otg.h>
++#include <linux/usb/xhci_pdriver.h>
+ 
+ #include "xhci.h"
+ #include "xhci-plat.h"
+@@ -437,6 +438,14 @@ static int __maybe_unused xhci_plat_suspend(struct device *dev)
+ 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
+ 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
+ 
++#if IS_ENABLED(CONFIG_USB_DWC3_OF_SIMPLE)
++	/* Inform dwc3 driver about the device wakeup capability */
++	if (device_may_wakeup(dev))
++		dwc3_host_wakeup_capable(dev, true);
++	else
++		dwc3_host_wakeup_capable(dev, false);
++#endif
++
+ 	/*
+ 	 * xhci_suspend() needs `do_wakeup` to know whether host is allowed
+ 	 * to do wakeup during suspend. Since xhci_plat_suspend is currently
+diff --git a/include/linux/usb/xhci_pdriver.h b/include/linux/usb/xhci_pdriver.h
+new file mode 100644
+index 000000000000..a25043b8c8aa
+--- /dev/null
++++ b/include/linux/usb/xhci_pdriver.h
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Xilinx Zynq MPSoC Firmware layer
++ *
++ *  Copyright (C) 2018-2020 Xilinx, Inc.
++ *
++ *  Michal Simek <michal.simek@xilinx.com>
++ *  Anurag Kumar Vulisha <anuragku@xilinx.com>
++ */
++#ifndef __USB_CORE_XHCI_PDRIVER_H
++#define __USB_CORE_XHCI_PDRIVER_H
++
++/* Call dwc3_host_wakeup_capable() only for dwc3 DRD mode or HOST only mode */
++#if (IS_REACHABLE(CONFIG_USB_DWC3_HOST) || \
++		(IS_REACHABLE(CONFIG_USB_DWC3_OF_SIMPLE) && \
++			!IS_REACHABLE(CONFIG_USB_DWC3_GADGET)))
++
++/* Let the dwc3 driver know about device wakeup capability */
++void dwc3_host_wakeup_capable(struct device *dev, bool wakeup);
++
++#else
++void dwc3_host_wakeup_capable(struct device *dev, bool wakeup)
++{ ; }
++#endif
++
++#endif /* __USB_CORE_XHCI_PDRIVER_H */
+-- 
+2.31.1
+

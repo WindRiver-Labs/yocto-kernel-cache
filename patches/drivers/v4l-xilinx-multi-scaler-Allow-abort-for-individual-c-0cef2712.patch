@@ -1,0 +1,154 @@
+From 9f09c27e1b21af3a71c39065fe1f3ed3ae6d934a Mon Sep 17 00:00:00 2001
+From: Suresh Gupta <suresh.gupta@xilinx.com>
+Date: Fri, 5 Oct 2018 19:42:58 +0530
+Subject: [PATCH 0451/1851] v4l: xilinx-multi-scaler: Allow abort for
+ individual channels
+
+commit 76ac630a46d3c6e881010dea32ea757fb64154ce from
+https://github.com/Xilinx/linux-xlnx.git
+
+Driver do not support individual stremoff/abort of any channel and
+consider abort will come together for all channels.
+
+This patch allows individual channel abort,
+by freeing all pending buffers. This will help to
+remove/abort the last running channel while all
+other channels continue running stream.
+
+Signed-off-by: Suresh Gupta <suresh.gupta@xilinx.com>
+Reviewed-by: Satish Kumar Nagireddy <satish.nagireddy.nagireddy@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ .../platform/xilinx/xilinx-multi-scaler.c     | 70 ++++++++-----------
+ 1 file changed, 30 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/media/platform/xilinx/xilinx-multi-scaler.c b/drivers/media/platform/xilinx/xilinx-multi-scaler.c
+index 0b88a6ac757c..0e9caa4da922 100644
+--- a/drivers/media/platform/xilinx/xilinx-multi-scaler.c
++++ b/drivers/media/platform/xilinx/xilinx-multi-scaler.c
+@@ -295,7 +295,6 @@ struct xm2msc_chan_ctx {
+  * @max_wd: maximum number of column in a plane
+  * @supported_fmt: bitmap for all supported fmts by HW
+  * @dma_addr_size: Size of dma address pointer in IP (either 32 or 64)
+- * @aborting: abort after next irq
+  * @rst_gpio: reset gpio handler
+  * @opened_chan: bitmap for all open channel
+  * @out_streamed_chan: bitmap for all out streamed channel
+@@ -322,7 +321,6 @@ struct xm2m_msc_dev {
+ 	u32 opened_chan;
+ 	u32 out_streamed_chan;
+ 	u32 cap_streamed_chan;
+-	bool aborting;
+ 
+ 	struct v4l2_device v4l2_dev;
+ 
+@@ -497,7 +495,6 @@ xm2msc_pr_status(struct xm2m_msc_dev *xm2msc,
+ 	dev_dbg(dev, "0x%x           0x%x               0x%x\n",
+ 		xm2msc->opened_chan, xm2msc->out_streamed_chan,
+ 		xm2msc->cap_streamed_chan);
+-	dev_dbg(dev, "aborting = %d\n", xm2msc->aborting);
+ 	dev_dbg(dev, "\n\n");
+ }
+ 
+@@ -707,13 +704,40 @@ static int xm2msc_job_ready(void *priv)
+ 	return 0;
+ }
+ 
++static void xm2msc_chan_abort_bufs(struct xm2msc_chan_ctx *chan_ctx)
++{
++	struct xm2m_msc_dev *xm2msc = chan_ctx->xm2msc_dev;
++	struct vb2_v4l2_buffer *dst_vb, *src_vb;
++
++	spin_lock(&xm2msc->lock);
++	dev_dbg(xm2msc->dev, "aborting all buffers\n");
++
++	while (v4l2_m2m_num_src_bufs_ready(chan_ctx->m2m_ctx) > 0) {
++		src_vb = v4l2_m2m_src_buf_remove(chan_ctx->m2m_ctx);
++		v4l2_m2m_buf_done(src_vb, VB2_BUF_STATE_ERROR);
++	}
++
++	while (v4l2_m2m_num_dst_bufs_ready(chan_ctx->m2m_ctx) > 0) {
++		dst_vb = v4l2_m2m_dst_buf_remove(chan_ctx->m2m_ctx);
++		v4l2_m2m_buf_done(dst_vb, VB2_BUF_STATE_ERROR);
++	}
++
++	v4l2_m2m_job_finish(chan_ctx->m2m_dev, chan_ctx->m2m_ctx);
++	spin_unlock(&xm2msc->lock);
++}
++
+ static void xm2msc_job_abort(void *priv)
+ {
+ 	struct xm2msc_chan_ctx *chan_ctx = priv;
+-	struct xm2m_msc_dev *xm2msc = chan_ctx->xm2msc_dev;
+ 
+-	/* Handle this in next ISR */
+-	xm2msc->aborting = true;
++	xm2msc_chan_abort_bufs(chan_ctx);
++
++	/*
++	 * Stream off the channel as job_abort may not always
++	 * be called after streamoff
++	 */
++	xm2msc_set_chan_stream(chan_ctx, false, XM2MSC_CHAN_OUT);
++	xm2msc_set_chan_stream(chan_ctx, false, XM2MSC_CHAN_CAP);
+ }
+ 
+ static int xm2msc_set_bufaddr(struct xm2m_msc_dev *xm2msc)
+@@ -802,33 +826,6 @@ static void xm2msc_device_run(void *priv)
+ 	xm2msc_start(xm2msc);
+ }
+ 
+-static void xm2msc_alljob_abort(struct xm2m_msc_dev *xm2msc)
+-{
+-	unsigned int chan;
+-	unsigned long flags;
+-
+-	for (chan = 0; chan < xm2msc->max_chan; chan++) {
+-		struct xm2msc_chan_ctx *chan_ctx;
+-
+-		chan_ctx = &xm2msc->xm2msc_chan[chan];
+-
+-		do {
+-			struct vb2_v4l2_buffer *src_vb, *dst_vb;
+-
+-			src_vb = v4l2_m2m_src_buf_remove(chan_ctx->m2m_ctx);
+-			dst_vb = v4l2_m2m_dst_buf_remove(chan_ctx->m2m_ctx);
+-
+-			if (!(src_vb && dst_vb))
+-				break;
+-
+-			spin_lock_irqsave(&xm2msc->lock, flags);
+-			v4l2_m2m_buf_done(src_vb, VB2_BUF_STATE_ERROR);
+-			v4l2_m2m_buf_done(dst_vb, VB2_BUF_STATE_ERROR);
+-			spin_unlock_irqrestore(&xm2msc->lock, flags);
+-		} while (1);
+-	}
+-}
+-
+ static void xm2msc_job_finish(struct xm2m_msc_dev *xm2msc)
+ {
+ 	unsigned int chan;
+@@ -886,18 +883,11 @@ static irqreturn_t xm2msc_isr(int irq, void *data)
+ 
+ 	xm2msc_job_done(xm2msc);
+ 
+-	if (xm2msc->aborting) {
+-		xm2msc_alljob_abort(xm2msc);
+-		xm2msc->aborting = false;
+-		goto finished;
+-	}
+-
+ 	if (xm2msc_job_ready(xm2msc->xm2msc_chan)) {
+ 		xm2msc_device_run(xm2msc->xm2msc_chan);
+ 		goto handled;
+ 	}
+ 
+-finished:
+ 	xm2msc_job_finish(xm2msc);
+ handled:
+ 	return IRQ_HANDLED;
+-- 
+2.31.1
+

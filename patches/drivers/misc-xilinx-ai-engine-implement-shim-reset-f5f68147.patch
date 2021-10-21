@@ -1,0 +1,187 @@
+From d53e8980cc55a3abc822643883add25e28e3cf72 Mon Sep 17 00:00:00 2001
+From: Wendy Liang <wendy.liang@xilinx.com>
+Date: Tue, 28 Jul 2020 22:40:25 -0700
+Subject: [PATCH 1475/1851] misc: xilinx-ai-engine: implement shim reset
+
+commit 79697c0dbd21a8acc3226a5ebc78853d827d2c3c from
+https://github.com/Xilinx/linux-xlnx.git
+
+Implement AI engine shim reset. It uses EEMI ops to assert and release
+SHIM reset of the AI engine device. But due to reset framework for versal
+is not ready yet, hardcode the SHIM reset ID in the .c file for now.
+
+Signed-off-by: Wendy Liang <wendy.liang@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ .../xilinx-ai-engine/ai-engine-internal.h     | 17 ++++
+ drivers/misc/xilinx-ai-engine/ai-engine-v1.c  | 79 +++++++++++++++++++
+ 2 files changed, 96 insertions(+)
+
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+index b1fb22d4edcb..02b3be1b5798 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-internal.h
+@@ -80,6 +80,7 @@ struct aie_part_mem {
+  * struct aie_tile_operations - AI engine device operations
+  * @get_tile_type: get type of tile based on tile operation
+  * @get_mem_info: get different types of memories information
++ * @reset_shim: reset shim, it will assert and then release SHIM reset
+  *
+  * Different AI engine device version has its own device
+  * operation.
+@@ -88,6 +89,7 @@ struct aie_tile_operations {
+ 	u32 (*get_tile_type)(struct aie_location *loc);
+ 	unsigned int (*get_mem_info)(struct aie_range *range,
+ 				     struct aie_part_mem *pmem);
++	int (*reset_shim)(struct aie_device *adev, struct aie_range *range);
+ };
+ 
+ /**
+@@ -206,6 +208,21 @@ extern const struct file_operations aie_part_fops;
+ #define aie_cal_tile_reg(adev, regoff) ( \
+ 	aie_tile_reg_field_get(aie_tile_reg_mask(adev), 0, regoff))
+ 
++/**
++ * aie_cal_regoff() - calculate register offset to the whole AI engine
++ *		      device start address
++ * @adev: AI engine device
++ * @loc: AI engine tile location
++ * @regoff_intile: register offset within a tile
++ * @return: register offset to the whole AI engine device start address
++ */
++static inline u32 aie_cal_regoff(struct aie_device *adev,
++				 struct aie_location loc, u32 regoff_intile)
++{
++	return regoff_intile + (loc.col << adev->col_shift) +
++	       (loc.row << adev->row_shift);
++}
++
+ /**
+  * aie_validate_location() - validate tile location within an AI engine
+  *			     partition
+diff --git a/drivers/misc/xilinx-ai-engine/ai-engine-v1.c b/drivers/misc/xilinx-ai-engine/ai-engine-v1.c
+index 7ee87f9e9572..02b562a9c9db 100644
+--- a/drivers/misc/xilinx-ai-engine/ai-engine-v1.c
++++ b/drivers/misc/xilinx-ai-engine/ai-engine-v1.c
+@@ -5,6 +5,9 @@
+  * Copyright (C) 2020 Xilinx, Inc.
+  */
+ 
++#include <linux/bitfield.h>
++#include <linux/firmware/xlnx-zynqmp.h>
++#include <linux/io.h>
+ #include <linux/slab.h>
+ 
+ #include "ai-engine-internal.h"
+@@ -31,6 +34,19 @@
+ #define AIE_SHIMPL_RESET_REGOFF			0x0003604cU
+ #define AIE_TILE_CORE_CLKCNTR_REGOFF		0x00036040U
+ 
++/*
++ * Register masks
++ */
++#define AIE_SHIMPL_SHIMRST_MASK			0x1U
++
++/*
++ * AI engine SHIM reset ID.
++ * TODO: it should follow the Linux reset framework. The ID should be in the
++ * device tree. However, as versal resets is not ready, we hardcode it in the
++ * driver.
++ */
++#define VERSAL_PM_RST_AIE_SHIM_ID			0xc10405fU
++
+ static const struct aie_tile_regs aiev1_kernel_regs[] = {
+ 	/* SHIM AXI MM Config */
+ 	{.attribute = AIE_TILE_TYPE_SHIMNOC << AIE_REGS_ATTR_TILE_TYPE_SHIFT,
+@@ -69,6 +85,8 @@ static const struct aie_tile_regs aiev1_kernel_regs[] = {
+ 	},
+ };
+ 
++static const struct zynqmp_eemi_ops *eemi_ops;
++
+ static u32 aiev1_get_tile_type(struct aie_location *loc)
+ {
+ 	if (loc->row)
+@@ -111,9 +129,64 @@ static unsigned int aiev1_get_mem_info(struct aie_range *range,
+ 	return NUM_MEMS_PER_TILE;
+ }
+ 
++/**
++ * aiev1_set_shim_reset() - Set AI engine SHIM reset
++ * @adev: AI engine device
++ * @range: range of AI engine tiles
++ * @assert: true to set reset, false to unset reset
++ */
++static void aiev1_set_shim_reset(struct aie_device *adev,
++				 struct aie_range *range, bool assert)
++{
++	u32 c;
++	u32 val;
++	struct aie_location loc;
++
++	val = FIELD_PREP(AIE_SHIMPL_SHIMRST_MASK, (assert ? 1 : 0));
++	loc.row = 0;
++	for (c = range->start.col; c < range->start.col + range->size.col;
++	     c++) {
++		u32 regoff;
++
++		loc.col = c;
++		regoff = aie_cal_regoff(adev, loc, AIE_SHIMPL_RESET_REGOFF);
++		iowrite32(val, adev->base + regoff);
++	}
++}
++
++static int aiev1_reset_shim(struct aie_device *adev, struct aie_range *range)
++{
++	int ret;
++
++	/* Enable shim reset of each column */
++	aiev1_set_shim_reset(adev, range, true);
++
++	/* Assert shim reset of AI engine array */
++	ret = eemi_ops->reset_assert(VERSAL_PM_RST_AIE_SHIM_ID,
++				     PM_RESET_ACTION_ASSERT);
++	if (ret < 0) {
++		dev_err(&adev->dev, "failed to assert SHIM reset.\n");
++		return ret;
++	}
++
++	/* Release shim reset of AI engine array */
++	ret = eemi_ops->reset_assert(VERSAL_PM_RST_AIE_SHIM_ID,
++				     PM_RESET_ACTION_RELEASE);
++	if (ret < 0) {
++		dev_err(&adev->dev, "failed to release SHIM reset.\n");
++		return ret;
++	}
++
++	/* Disable shim reset of each column */
++	aiev1_set_shim_reset(adev, range, false);
++
++	return 0;
++}
++
+ static const struct aie_tile_operations aiev1_ops = {
+ 	.get_tile_type = aiev1_get_tile_type,
+ 	.get_mem_info = aiev1_get_mem_info,
++	.reset_shim = aiev1_reset_shim,
+ };
+ 
+ /**
+@@ -137,6 +210,12 @@ int aiev1_device_init(struct aie_device *adev)
+ 	adev->num_kernel_regs = ARRAY_SIZE(aiev1_kernel_regs);
+ 	adev->kernel_regs = aiev1_kernel_regs;
+ 
++	eemi_ops = zynqmp_pm_get_eemi_ops();
++	if (IS_ERR(eemi_ops) || !eemi_ops->reset_assert) {
++		dev_err(&adev->dev, "failed to get eemi ops.\n");
++		return PTR_ERR(eemi_ops);
++	}
++
+ 	/* Get the columns resource */
+ 	/* Get number of columns from AI engine memory resource */
+ 	ret = aie_resource_initialize(&adev->cols_res, 50);
+-- 
+2.31.1
+

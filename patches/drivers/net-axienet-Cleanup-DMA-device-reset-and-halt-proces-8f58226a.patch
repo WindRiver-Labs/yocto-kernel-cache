@@ -1,0 +1,139 @@
+From 7fa83c27a73a3b37370f203a5b204c6e49aad980 Mon Sep 17 00:00:00 2001
+From: Robert Hancock <hancock@sedsystems.ca>
+Date: Thu, 6 Jun 2019 16:28:12 -0600
+Subject: [PATCH 0945/1851] net: axienet: Cleanup DMA device reset and halt
+ process
+
+commit 489d4d7713d1cad40b1049720b44d08f53918b30 upstream
+
+The Xilinx DMA blocks each have their own reset register, but they both
+reset the entire DMA engine, so only one of them needs to be reset.
+
+Also, when stopping the device, we need to not just command the DMA
+blocks to stop, but wait for them to stop, and trigger a device reset
+to ensure that they are completely stopped.
+
+Signed-off-by: Robert Hancock <hancock@sedsystems.ca>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ drivers/net/ethernet/xilinx/xilinx_axienet.h  |  2 +
+ .../net/ethernet/xilinx/xilinx_axienet_main.c | 54 ++++++++++++++-----
+ 2 files changed, 42 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet.h b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+index 4a135ed6e8a3..1ffb113e2c29 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet.h
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet.h
+@@ -83,6 +83,8 @@
+ #define XAXIDMA_CR_RUNSTOP_MASK	0x00000001 /* Start/stop DMA channel */
+ #define XAXIDMA_CR_RESET_MASK	0x00000004 /* Reset DMA engine */
+ 
++#define XAXIDMA_SR_HALT_MASK	0x00000001 /* Indicates DMA channel halted */
++
+ #define XAXIDMA_BD_NDESC_OFFSET		0x00 /* Next descriptor pointer */
+ #define XAXIDMA_BD_BUFA_OFFSET		0x08 /* Buffer address */
+ #define XAXIDMA_BD_CTRL_LEN_OFFSET	0x18 /* Control/buffer length */
+diff --git a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+index 97d73ffc8689..b8097709f1ea 100644
+--- a/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
++++ b/drivers/net/ethernet/xilinx/xilinx_axienet_main.c
+@@ -434,17 +434,20 @@ static void axienet_setoptions(struct net_device *ndev, u32 options)
+ 	lp->options |= options;
+ }
+ 
+-static void __axienet_device_reset(struct axienet_local *lp, off_t offset)
++static void __axienet_device_reset(struct axienet_local *lp)
+ {
+ 	u32 timeout;
+ 	/* Reset Axi DMA. This would reset Axi Ethernet core as well. The reset
+ 	 * process of Axi DMA takes a while to complete as all pending
+ 	 * commands/transfers will be flushed or completed during this
+ 	 * reset process.
++	 * Note that even though both TX and RX have their own reset register,
++	 * they both reset the entire DMA core, so only one needs to be used.
+ 	 */
+-	axienet_dma_out32(lp, offset, XAXIDMA_CR_RESET_MASK);
++	axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET, XAXIDMA_CR_RESET_MASK);
+ 	timeout = DELAY_OF_ONE_MILLISEC;
+-	while (axienet_dma_in32(lp, offset) & XAXIDMA_CR_RESET_MASK) {
++	while (axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET) &
++				XAXIDMA_CR_RESET_MASK) {
+ 		udelay(1);
+ 		if (--timeout == 0) {
+ 			netdev_err(lp->ndev, "%s: DMA reset timeout!\n",
+@@ -470,8 +473,7 @@ static void axienet_device_reset(struct net_device *ndev)
+ 	u32 axienet_status;
+ 	struct axienet_local *lp = netdev_priv(ndev);
+ 
+-	__axienet_device_reset(lp, XAXIDMA_TX_CR_OFFSET);
+-	__axienet_device_reset(lp, XAXIDMA_RX_CR_OFFSET);
++	__axienet_device_reset(lp);
+ 
+ 	lp->max_frm_size = XAE_MAX_VLAN_FRAME_SIZE;
+ 	lp->options |= XAE_OPTION_VLAN;
+@@ -995,20 +997,45 @@ static int axienet_open(struct net_device *ndev)
+  */
+ static int axienet_stop(struct net_device *ndev)
+ {
+-	u32 cr;
++	u32 cr, sr;
++	int count;
+ 	struct axienet_local *lp = netdev_priv(ndev);
+ 
+ 	dev_dbg(&ndev->dev, "axienet_close()\n");
+ 
+-	cr = axienet_dma_in32(lp, XAXIDMA_RX_CR_OFFSET);
+-	axienet_dma_out32(lp, XAXIDMA_RX_CR_OFFSET,
+-			  cr & (~XAXIDMA_CR_RUNSTOP_MASK));
+-	cr = axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET);
+-	axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET,
+-			  cr & (~XAXIDMA_CR_RUNSTOP_MASK));
+ 	axienet_setoptions(ndev, lp->options &
+ 			   ~(XAE_OPTION_TXEN | XAE_OPTION_RXEN));
+ 
++	cr = axienet_dma_in32(lp, XAXIDMA_RX_CR_OFFSET);
++	cr &= ~(XAXIDMA_CR_RUNSTOP_MASK | XAXIDMA_IRQ_ALL_MASK);
++	axienet_dma_out32(lp, XAXIDMA_RX_CR_OFFSET, cr);
++
++	cr = axienet_dma_in32(lp, XAXIDMA_TX_CR_OFFSET);
++	cr &= ~(XAXIDMA_CR_RUNSTOP_MASK | XAXIDMA_IRQ_ALL_MASK);
++	axienet_dma_out32(lp, XAXIDMA_TX_CR_OFFSET, cr);
++
++	axienet_iow(lp, XAE_IE_OFFSET, 0);
++
++	/* Give DMAs a chance to halt gracefully */
++	sr = axienet_dma_in32(lp, XAXIDMA_RX_SR_OFFSET);
++	for (count = 0; !(sr & XAXIDMA_SR_HALT_MASK) && count < 5; ++count) {
++		msleep(20);
++		sr = axienet_dma_in32(lp, XAXIDMA_RX_SR_OFFSET);
++	}
++
++	sr = axienet_dma_in32(lp, XAXIDMA_TX_SR_OFFSET);
++	for (count = 0; !(sr & XAXIDMA_SR_HALT_MASK) && count < 5; ++count) {
++		msleep(20);
++		sr = axienet_dma_in32(lp, XAXIDMA_TX_SR_OFFSET);
++	}
++
++	/* Do a reset to ensure DMA is really stopped */
++	mutex_lock(&lp->mii_bus->mdio_lock);
++	axienet_mdio_disable(lp);
++	__axienet_device_reset(lp);
++	axienet_mdio_enable(lp);
++	mutex_unlock(&lp->mii_bus->mdio_lock);
++
+ 	tasklet_kill(&lp->dma_err_tasklet);
+ 
+ 	free_irq(lp->tx_irq, ndev);
+@@ -1340,8 +1367,7 @@ static void axienet_dma_err_handler(unsigned long data)
+ 	 */
+ 	mutex_lock(&lp->mii_bus->mdio_lock);
+ 	axienet_mdio_disable(lp);
+-	__axienet_device_reset(lp, XAXIDMA_TX_CR_OFFSET);
+-	__axienet_device_reset(lp, XAXIDMA_RX_CR_OFFSET);
++	__axienet_device_reset(lp);
+ 	axienet_mdio_enable(lp);
+ 	mutex_unlock(&lp->mii_bus->mdio_lock);
+ 
+-- 
+2.31.1
+

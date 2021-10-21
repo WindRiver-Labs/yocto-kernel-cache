@@ -1,0 +1,546 @@
+From 3e5a6e325c6bfc5dc5a680a5eafc5749db4dc73f Mon Sep 17 00:00:00 2001
+From: Michal Simek <michal.simek@xilinx.com>
+Date: Mon, 7 Aug 2017 10:55:09 +0200
+Subject: [PATCH 0725/1851] arm: zynq: Suspend support
+
+commit a0b2e49d59e55eaa76e0826f395c951b5235fa99 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Adding initial suspend support to the Zynq architecture. The
+required suspend functions are implemented and suspend is at least
+partially working.
+Clock gating and PLL bypassing heavily depend on device drivers.
+It's likely that drivers/HW not implementing proper suspend
+and resume callbacks break when a suspend is triggered.
+During suspend DRAM is put into self-refresh and all DDR related
+clocks are stopped and the DDR PLL is bypassed.
+
+Also leave L2 cache enabled during suspend and enable A9 clock gating
+feature.
+
+Having self-refresh enabled at all times negatively affects
+memory performance. Hence, only enable clock-stop at boot and limit
+self-refresh to suspend.
+
+Probably related: http://www.xilinx.com/support/answers/47514.htm
+
+Signed-off-by: Soren Brinkmann <soren.brinkmann@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ arch/arm/mach-zynq/Makefile  |   4 +
+ arch/arm/mach-zynq/common.h  |   3 +
+ arch/arm/mach-zynq/pm.c      | 170 ++++++++++++++++++++++++++++++++
+ arch/arm/mach-zynq/slcr.c    |   2 +-
+ arch/arm/mach-zynq/suspend.S | 185 +++++++++++++++++++++++++++++++++++
+ drivers/clk/zynq/clkc.c      |  43 ++++++++
+ include/linux/clk/zynq.h     |   4 +
+ 7 files changed, 410 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/mach-zynq/suspend.S
+
+diff --git a/arch/arm/mach-zynq/Makefile b/arch/arm/mach-zynq/Makefile
+index 3dc3f024c4fc..374207c87f96 100644
+--- a/arch/arm/mach-zynq/Makefile
++++ b/arch/arm/mach-zynq/Makefile
+@@ -7,3 +7,7 @@
+ obj-y				:= common.o efuse.o slcr.o zynq_ocm.o pm.o
+ 
+ obj-$(CONFIG_SMP)		+= headsmp.o platsmp.o
++ORIG_AFLAGS := $(KBUILD_AFLAGS)
++KBUILD_AFLAGS = $(subst -march=armv6k,,$(ORIG_AFLAGS))
++AFLAGS_suspend.o 		+=-Wa,-march=armv7-a -mcpu=cortex-a9
++obj-$(CONFIG_SUSPEND)		+= suspend.o
+diff --git a/arch/arm/mach-zynq/common.h b/arch/arm/mach-zynq/common.h
+index db82c106e319..5816d57e5a5d 100644
+--- a/arch/arm/mach-zynq/common.h
++++ b/arch/arm/mach-zynq/common.h
+@@ -32,9 +32,12 @@ extern const struct smp_operations zynq_smp_ops;
+ extern void zynq_slcr_init_preload_fpga(void);
+ extern void zynq_slcr_init_postload_fpga(void);
+ 
++extern void __iomem *zynq_slcr_base;
+ extern void __iomem *zynq_scu_base;
+ 
+ void zynq_pm_late_init(void);
++extern unsigned int zynq_sys_suspend_sz;
++int zynq_sys_suspend(void __iomem *ddrc_base, void __iomem *slcr_base);
+ 
+ static inline void zynq_prefetch_init(void)
+ {
+diff --git a/arch/arm/mach-zynq/pm.c b/arch/arm/mach-zynq/pm.c
+index 8ba450ab559c..b9445a654b59 100644
+--- a/arch/arm/mach-zynq/pm.c
++++ b/arch/arm/mach-zynq/pm.c
+@@ -7,6 +7,14 @@
+  *  Sören Brinkmann <soren.brinkmann@xilinx.com>
+  */
+ 
++#include <linux/clk/zynq.h>
++#include <linux/genalloc.h>
++#include <linux/suspend.h>
++#include <asm/cacheflush.h>
++#include <asm/fncpy.h>
++#include <asm/hardware/cache-l2x0.h>
++#include <asm/mach/map.h>
++#include <asm/suspend.h>
+ #include <linux/io.h>
+ #include <linux/of_address.h>
+ #include <linux/of_device.h>
+@@ -22,6 +30,165 @@
+ 
+ static void __iomem *ddrc_base;
+ 
++#ifdef CONFIG_SUSPEND
++static int (*zynq_suspend_ptr)(void __iomem *, void __iomem *);
++
++static int zynq_pm_prepare_late(void)
++{
++	return zynq_clk_suspend_early();
++}
++
++static void zynq_pm_wake(void)
++{
++	zynq_clk_resume_late();
++}
++
++static int zynq_pm_suspend(unsigned long arg)
++{
++	u32 reg;
++	int do_ddrpll_bypass = 1;
++
++	/* Topswitch clock stop disable */
++	zynq_clk_topswitch_disable();
++
++	if (!zynq_suspend_ptr || !ddrc_base) {
++		do_ddrpll_bypass = 0;
++	} else {
++		/* enable DDRC self-refresh mode */
++		reg = readl(ddrc_base + DDRC_CTRL_REG1_OFFS);
++		reg |= DDRC_SELFREFRESH_MASK;
++		writel(reg, ddrc_base + DDRC_CTRL_REG1_OFFS);
++	}
++
++	if (do_ddrpll_bypass) {
++		/*
++		 * Going this way will turn off DDR related clocks and the DDR
++		 * PLL. I.e. We might brake sub systems relying on any of this
++		 * clocks. And even worse: If there are any other masters in the
++		 * system (e.g. in the PL) accessing DDR they are screwed.
++		 */
++		flush_cache_all();
++		if (zynq_suspend_ptr(ddrc_base, zynq_slcr_base))
++			pr_warn("DDR self refresh failed.\n");
++	} else {
++		WARN_ONCE(1, "DRAM self-refresh not available\n");
++		cpu_do_idle();
++	}
++
++	/* disable DDRC self-refresh mode */
++	if (do_ddrpll_bypass) {
++		reg = readl(ddrc_base + DDRC_CTRL_REG1_OFFS);
++		reg &= ~DDRC_SELFREFRESH_MASK;
++		writel(reg, ddrc_base + DDRC_CTRL_REG1_OFFS);
++	}
++
++	/* Topswitch clock stop enable */
++	zynq_clk_topswitch_enable();
++
++	return 0;
++}
++
++static int zynq_pm_enter(suspend_state_t suspend_state)
++{
++	switch (suspend_state) {
++	case PM_SUSPEND_STANDBY:
++	case PM_SUSPEND_MEM:
++		cpu_suspend(0, zynq_pm_suspend);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct platform_suspend_ops zynq_pm_ops = {
++	.prepare_late	= zynq_pm_prepare_late,
++	.enter		= zynq_pm_enter,
++	.wake		= zynq_pm_wake,
++	.valid		= suspend_valid_only_mem,
++};
++
++/**
++ * zynq_pm_remap_ocm() - Remap OCM
++ * Returns a pointer to the mapped memory or NULL.
++ *
++ * Remap the OCM.
++ */
++static void __iomem *zynq_pm_remap_ocm(void)
++{
++	struct device_node *np;
++	const char *comp = "xlnx,zynq-ocmc-1.0";
++	void __iomem *base = NULL;
++
++	np = of_find_compatible_node(NULL, NULL, comp);
++	if (np) {
++		struct device *dev;
++		unsigned long pool_addr;
++		unsigned long pool_addr_virt;
++		struct gen_pool *pool;
++
++		of_node_put(np);
++
++		dev = &(of_find_device_by_node(np)->dev);
++
++		/* Get OCM pool from device tree or platform data */
++		pool = gen_pool_get(dev, NULL);
++		if (!pool) {
++			pr_warn("%s: OCM pool is not available\n", __func__);
++			return NULL;
++		}
++
++		pool_addr_virt = gen_pool_alloc(pool, zynq_sys_suspend_sz);
++		if (!pool_addr_virt) {
++			pr_warn("%s: Can't get OCM poll\n", __func__);
++			return NULL;
++		}
++		pool_addr = gen_pool_virt_to_phys(pool, pool_addr_virt);
++		if (!pool_addr) {
++			pr_warn("%s: Can't get physical address of OCM pool\n",
++				__func__);
++			return NULL;
++		}
++		base = __arm_ioremap_exec(pool_addr, zynq_sys_suspend_sz,
++				     MT_MEMORY_RWX);
++		if (!base) {
++			pr_warn("%s: IOremap OCM pool failed\n", __func__);
++			return NULL;
++		}
++		pr_debug("%s: Remap OCM %s from %lx to %lx\n", __func__, comp,
++			 pool_addr_virt, (unsigned long)base);
++	} else {
++		pr_warn("%s: no compatible node found for '%s'\n", __func__,
++				comp);
++	}
++
++	return base;
++}
++
++static void zynq_pm_suspend_init(void)
++{
++	void __iomem *ocm_base = zynq_pm_remap_ocm();
++
++	if (!ocm_base) {
++		pr_warn("%s: Unable to map OCM.\n", __func__);
++	} else {
++		/*
++		 * Copy code to suspend system into OCM. The suspend code
++		 * needs to run from OCM as DRAM may no longer be available
++		 * when the PLL is stopped.
++		 */
++		zynq_suspend_ptr = fncpy((__force void *)ocm_base,
++					 (__force void *)&zynq_sys_suspend,
++					 zynq_sys_suspend_sz);
++	}
++
++	suspend_set_ops(&zynq_pm_ops);
++}
++#else	/* CONFIG_SUSPEND */
++static void zynq_pm_suspend_init(void) { };
++#endif	/* CONFIG_SUSPEND */
++
+ /**
+  * zynq_pm_ioremap() - Create IO mappings
+  * @comp:	DT compatible string
+@@ -68,4 +235,7 @@ void __init zynq_pm_late_init(void)
+ 		reg |= DDRC_CLOCKSTOP_MASK;
+ 		writel(reg, ddrc_base + DDRC_DRAM_PARAM_REG3_OFFS);
+ 	}
++
++	/* set up suspend */
++	zynq_pm_suspend_init();
+ }
+diff --git a/arch/arm/mach-zynq/slcr.c b/arch/arm/mach-zynq/slcr.c
+index b4cdef65162c..18a36c48db2e 100644
+--- a/arch/arm/mach-zynq/slcr.c
++++ b/arch/arm/mach-zynq/slcr.c
+@@ -30,7 +30,7 @@
+ #define SLCR_PSS_IDCODE_DEVICE_SHIFT	12
+ #define SLCR_PSS_IDCODE_DEVICE_MASK	0x1F
+ 
+-static void __iomem *zynq_slcr_base;
++void __iomem *zynq_slcr_base;
+ static struct regmap *zynq_slcr_regmap;
+ 
+ /**
+diff --git a/arch/arm/mach-zynq/suspend.S b/arch/arm/mach-zynq/suspend.S
+new file mode 100644
+index 000000000000..f3f8440e8018
+--- /dev/null
++++ b/arch/arm/mach-zynq/suspend.S
+@@ -0,0 +1,185 @@
++/*
++ * Suspend support for Zynq
++ *
++ *  Copyright (C) 2012 Xilinx
++ *
++ *  Soren Brinkmann <soren.brinkmann@xilinx.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/linkage.h>
++
++#define ARMPLL_CTRL_OFFS	0x100
++#define DDRPLL_CTRL_OFFS	0x104
++#define PLLSTATUS_OFFS		0x10c
++#define DDR_CLK_CTRL_OFFS	0x124
++#define DCI_CLK_CTRL_OFFS	0x128
++#define MODE_STS_OFFS		0x54
++
++#define PLL_RESET_MASK		1
++#define PLL_PWRDWN_MASK		(1 << 1)
++#define PLL_BYPASS_MASK		(1 << 4)
++#define DCICLK_ENABLE_MASK	1
++#define DDRCLK_ENABLE_MASK	3
++#define ARM_LOCK_MASK		(1 << 0)
++#define DDR_LOCK_MASK		(1 << 1)
++#define DDRC_STATUS_MASK	7
++
++#define DDRC_OPMODE_SR		3
++#define MAXTRIES		100
++
++	.text
++	.align 3
++
++/**
++ * zynq_sys_suspend - Enter suspend
++ * @ddrc_base:	Base address of the DDRC
++ * @slcr_base:	Base address of the SLCR
++ * Returns -1 if DRAM subsystem is not gated off, 0 otherwise.
++ *
++ * This function is moved into OCM and finishes the suspend operation. I.e. DDR
++ * related clocks are gated off and the DDR PLL is bypassed.
++ */
++ENTRY(zynq_sys_suspend)
++	push	{r4 - r7}
++
++	/* Check DDRC is in self-refresh mode */
++	ldr	r2, [r0, #MODE_STS_OFFS]
++	and	r2, #DDRC_STATUS_MASK
++	cmp	r2, #DDRC_OPMODE_SR
++	movweq	r3, #0xff00
++	bne	suspend
++
++	mov	r3, #MAXTRIES
++	movw	r4, #0xfff0
++	movt	r4, #0x1f
++	/* Wait for command queue empty */
++1:	subs	r3, #1
++	movweq	r3, #0xff00
++	beq	suspend
++	dsb	sy
++	ldr	r2, [r0, #MODE_STS_OFFS]
++	ands	r2, r4
++	bne	1b
++
++	dsb	sy
++
++	/*
++	 * Wait for DDRC pipeline/queues to drain.
++	 * We should wait ~40 DDR cycles. DDR is still at full speed while the
++	 * CPU might already run in PLL bypass mode. The fastest speed the CPU
++	 * runs at is ~1 GHz ~ 2 * DDR speed.
++	 */
++	mov	r3, #160
++1:	nop
++	subs	r3, #1
++	bne	1b
++
++	dsb	sy
++
++	/* read back CAM status once more */
++	ldr	r2, [r0, #MODE_STS_OFFS]
++	ands	r2, r4
++	movwne	r3, #0xff00
++	bne	suspend
++
++	/* Stop DDR clocks */
++	ldr	r2, [r1, #DDR_CLK_CTRL_OFFS]
++	bic	r2, #DDRCLK_ENABLE_MASK
++	str	r2, [r1, #DDR_CLK_CTRL_OFFS]
++
++	dmb	st
++
++	ldr	r2, [r1, #DCI_CLK_CTRL_OFFS]
++	bic	r2, #DCICLK_ENABLE_MASK
++	str	r2, [r1, #DCI_CLK_CTRL_OFFS]
++
++	dmb	st
++
++	/* Bypass and powerdown DDR PLL */
++	ldr	r2, [r1, #DDRPLL_CTRL_OFFS]
++	orr	r2, #PLL_BYPASS_MASK
++	str	r2, [r1, #DDRPLL_CTRL_OFFS]
++	orr	r2, #(PLL_PWRDWN_MASK | PLL_RESET_MASK)
++	str	r2, [r1, #DDRPLL_CTRL_OFFS]
++
++	/* Bypass and powerdown ARM PLL */
++	ldr	r2, [r1, #ARMPLL_CTRL_OFFS]
++	orr	r2, #PLL_BYPASS_MASK
++	str	r2, [r1, #ARMPLL_CTRL_OFFS]
++	orr	r2, #(PLL_PWRDWN_MASK | PLL_RESET_MASK)
++	str	r2, [r1, #ARMPLL_CTRL_OFFS]
++
++suspend:
++	dsb	sy
++	wfi
++	dsb	sy
++	cmp	r3, #0xff00
++	moveq	r0, #-1
++	beq	exit
++
++	/* Power up ARM PLL */
++	ldr	r2, [r1, #ARMPLL_CTRL_OFFS]
++	bic	r2, #(PLL_PWRDWN_MASK | PLL_RESET_MASK)
++	str	r2, [r1, #ARMPLL_CTRL_OFFS]
++	/* wait for lock */
++1:	ldr	r2, [r1, #PLLSTATUS_OFFS]
++	ands	r2, #ARM_LOCK_MASK
++	beq	1b
++
++	dsb	sy
++
++	/* Disable ARM PLL bypass */
++	ldr	r2, [r1, #ARMPLL_CTRL_OFFS]
++	bic	r2, #PLL_BYPASS_MASK
++	str	r2, [r1, #ARMPLL_CTRL_OFFS]
++
++	dmb	st
++
++	/* Power up DDR PLL */
++	ldr	r2, [r1, #DDRPLL_CTRL_OFFS]
++	bic	r2, #(PLL_PWRDWN_MASK | PLL_RESET_MASK)
++	str	r2, [r1, #DDRPLL_CTRL_OFFS]
++	/* wait for lock */
++1:	ldr	r2, [r1, #PLLSTATUS_OFFS]
++	ands	r2, #DDR_LOCK_MASK
++	beq	1b
++
++	dsb	sy
++
++	/* Disable DDR PLL bypass */
++	ldr	r2, [r1, #DDRPLL_CTRL_OFFS]
++	bic	r2, #PLL_BYPASS_MASK
++	str	r2, [r1, #DDRPLL_CTRL_OFFS]
++
++	dmb	st
++
++	/* Start DDR clocks */
++	ldr	r2, [r1, #DCI_CLK_CTRL_OFFS]
++	orr	r2, #DCICLK_ENABLE_MASK
++	str	r2, [r1, #DCI_CLK_CTRL_OFFS]
++
++	dmb	st
++
++	ldr	r2, [r1, #DDR_CLK_CTRL_OFFS]
++	orr	r2, #DDRCLK_ENABLE_MASK
++	str	r2, [r1, #DDR_CLK_CTRL_OFFS]
++
++	dsb	sy
++
++	mov	r0, #0
++exit:	pop	{r4 - r7}
++	bx	lr
++
++ENTRY(zynq_sys_suspend_sz)
++	.word	. - zynq_sys_suspend
++
++	ENDPROC(zynq_sys_suspend)
+diff --git a/drivers/clk/zynq/clkc.c b/drivers/clk/zynq/clkc.c
+index ffbb9008c1c9..f7cde869c7f7 100644
+--- a/drivers/clk/zynq/clkc.c
++++ b/drivers/clk/zynq/clkc.c
+@@ -37,6 +37,7 @@ static void __iomem *zynq_clkc_base;
+ #define SLCR_CAN_MIOCLK_CTRL		(zynq_clkc_base + 0x60)
+ #define SLCR_DBG_CLK_CTRL		(zynq_clkc_base + 0x64)
+ #define SLCR_PCAP_CLK_CTRL		(zynq_clkc_base + 0x68)
++#define SLCR_TOPSW_CLK_CTRL		(zynq_clkc_base + 0x6c)
+ #define SLCR_FPGA0_CLK_CTRL		(zynq_clkc_base + 0x70)
+ #define SLCR_621_TRUE			(zynq_clkc_base + 0xc4)
+ #define SLCR_SWDT_CLK_SEL		(zynq_clkc_base + 0x204)
+@@ -99,6 +100,48 @@ static const char *const gem1_emio_input_names[] __initconst = {
+ static const char *const swdt_ext_clk_input_names[] __initconst = {
+ 	"swdt_ext_clk"};
+ 
++#ifdef CONFIG_SUSPEND
++static struct clk *iopll_save_parent;
++
++#define TOPSW_CLK_CTRL_DIS_MASK	BIT(0)
++
++int zynq_clk_suspend_early(void)
++{
++	int ret;
++
++	iopll_save_parent = clk_get_parent(clks[iopll]);
++
++	ret = clk_set_parent(clks[iopll], ps_clk);
++	if (ret)
++		pr_info("%s: reparent iopll failed %d\n", __func__, ret);
++
++	return 0;
++}
++
++void zynq_clk_resume_late(void)
++{
++	clk_set_parent(clks[iopll], iopll_save_parent);
++}
++
++void zynq_clk_topswitch_enable(void)
++{
++	u32 reg;
++
++	reg = readl(SLCR_TOPSW_CLK_CTRL);
++	reg &= ~TOPSW_CLK_CTRL_DIS_MASK;
++	writel(reg, SLCR_TOPSW_CLK_CTRL);
++}
++
++void zynq_clk_topswitch_disable(void)
++{
++	u32 reg;
++
++	reg = readl(SLCR_TOPSW_CLK_CTRL);
++	reg |= TOPSW_CLK_CTRL_DIS_MASK;
++	writel(reg, SLCR_TOPSW_CLK_CTRL);
++}
++#endif
++
+ static void __init zynq_clk_register_fclk(enum zynq_clk fclk,
+ 		const char *clk_name, void __iomem *fclk_ctrl_reg,
+ 		const char **parents, int enable)
+diff --git a/include/linux/clk/zynq.h b/include/linux/clk/zynq.h
+index a198dd9255a4..d1135756aedf 100644
+--- a/include/linux/clk/zynq.h
++++ b/include/linux/clk/zynq.h
+@@ -9,6 +9,10 @@
+ 
+ #include <linux/spinlock.h>
+ 
++int zynq_clk_suspend_early(void);
++void zynq_clk_resume_late(void);
++void zynq_clk_topswitch_enable(void);
++void zynq_clk_topswitch_disable(void);
+ void zynq_clock_init(void);
+ 
+ struct clk *clk_register_zynq_pll(const char *name, const char *parent,
+-- 
+2.31.1
+

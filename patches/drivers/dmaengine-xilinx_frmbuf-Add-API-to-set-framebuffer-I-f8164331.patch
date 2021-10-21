@@ -1,0 +1,279 @@
+From 47414b7ac03681b121a1d266accb107b7b7dc11e Mon Sep 17 00:00:00 2001
+From: Devarsh Thakkar <devarsh.thakkar@xilinx.com>
+Date: Tue, 9 Oct 2018 16:30:22 -0700
+Subject: [PATCH 0173/1851] dmaengine: xilinx_frmbuf: Add API to set
+ framebuffer IP mode
+
+commit ab603c65781cff29cc1843364391e69d8cf575ce from
+https://github.com/Xilinx/linux-xlnx.git
+
+This adds API so that client driver can set operation mode
+for framebuffer IP core to either auto_restart or default mode
+of operation :
+
+- Auto_restart or free-running mode is more suitable for streaming
+  usecases which have a strict requirement to maintain uniform
+  throughput to display devices. In this mode framebuffer IP
+  core is restarted automatically after completing first transaction
+  even if input is delayed or blocked, where core will use same descriptor
+  again thereby maintaining consistent throughput by duplicating frames.
+
+- Default mode of operation is suitable for non-streaming usecases
+  like mem2mem usecases where there has to be a 1-to-1 relationship
+  for frame sequence and frame numbers with respect to input and
+  so if input is delayed core should wait until it gets new descriptor.
+
+- Unless explicitly set by client driver framebuffer IP core should
+  use auto_restart mode as previously, so set mode as auto_restart during
+  channel probe.
+
+- Add enum in framebuffer channel structure to select operation mode.
+
+- Use operation mode enum to decide mode during framebuffer start and halt.
+
+- Add a function "frmbuf_find_chan" to find corresponding framebuffer
+  channel structure from dma channel structure.
+
+- Export an API "xilinx_xdma_set_mode" to set operation mode of framebuffer
+  IP core to either auto-restart or default.
+
+- Unlike Auto-restart mode which follows a 3-stage model
+  where it marks the descriptor as staging on submit,
+  as active when next interrupt is received, and eventually
+  as complete after next interrupt is received, there is no
+  such requirement in default mode, so for default mode
+  we directly mark the current descriptor submitted to IP
+  as active and then mark it as complete when next
+  interrupt is received.
+
+- Fix some typos in xilinx_xdma_drm_config and xilinx_xdma_v4l2_config
+  description.
+
+Signed-off-by: Devarsh Thakkar <devarsh.thakkar@xilinx.com>
+Reviewed-by: Satish Kumar Nagireddy <satish.nagireddy.nagireddy@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/dma/xilinx/xilinx_frmbuf.c | 73 ++++++++++++++++++++++--------
+ include/linux/dma/xilinx_frmbuf.h  | 36 +++++++++++++--
+ 2 files changed, 86 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/dma/xilinx/xilinx_frmbuf.c b/drivers/dma/xilinx/xilinx_frmbuf.c
+index 2a601c947712..26f4b2efbacb 100644
+--- a/drivers/dma/xilinx/xilinx_frmbuf.c
++++ b/drivers/dma/xilinx/xilinx_frmbuf.c
+@@ -162,6 +162,7 @@ struct xilinx_frmbuf_tx_descriptor {
+  * @tasklet: Cleanup work after irq
+  * @vid_fmt: Reference to currently assigned video format description
+  * @hw_fid: FID enabled in hardware flag
++ * @mode: Select operation mode
+  */
+ struct xilinx_frmbuf_chan {
+ 	struct xilinx_frmbuf_device *xdev;
+@@ -182,6 +183,7 @@ struct xilinx_frmbuf_chan {
+ 	struct tasklet_struct tasklet;
+ 	const struct xilinx_frmbuf_format_desc *vid_fmt;
+ 	bool hw_fid;
++	enum operation_mode mode;
+ };
+ 
+ /**
+@@ -586,6 +588,29 @@ static void frmbuf_init_format_array(struct xilinx_frmbuf_device *xdev)
+ 	}
+ }
+ 
++static struct xilinx_frmbuf_chan *frmbuf_find_chan(struct dma_chan *chan)
++{
++	struct xilinx_frmbuf_chan *xil_chan;
++	bool found_xchan = false;
++
++	mutex_lock(&frmbuf_chan_list_lock);
++	list_for_each_entry(xil_chan, &frmbuf_chan_list, chan_node) {
++		if (chan == &xil_chan->common) {
++			found_xchan = true;
++			break;
++		}
++	}
++	mutex_unlock(&frmbuf_chan_list_lock);
++
++	if (!found_xchan) {
++		dev_dbg(chan->device->dev,
++			"dma chan not a Video Framebuffer channel instance\n");
++		return ERR_PTR(-EINVAL);
++	}
++
++	return xil_chan;
++}
++
+ static struct xilinx_frmbuf_device *frmbuf_find_dev(struct dma_chan *chan)
+ {
+ 	struct xilinx_frmbuf_chan *xchan, *temp;
+@@ -642,24 +667,11 @@ static int frmbuf_verify_format(struct dma_chan *chan, u32 fourcc, u32 type)
+ static void xilinx_xdma_set_config(struct dma_chan *chan, u32 fourcc, u32 type)
+ {
+ 	struct xilinx_frmbuf_chan *xil_chan;
+-	bool found_xchan = false;
+ 	int ret;
+ 
+-	mutex_lock(&frmbuf_chan_list_lock);
+-	list_for_each_entry(xil_chan, &frmbuf_chan_list, chan_node) {
+-		if (chan == &xil_chan->common) {
+-			found_xchan = true;
+-			break;
+-		}
+-	}
+-	mutex_unlock(&frmbuf_chan_list_lock);
+-
+-	if (!found_xchan) {
+-		dev_dbg(chan->device->dev,
+-			"dma chan not a Video Framebuffer channel instance\n");
++	xil_chan = frmbuf_find_chan(chan);
++	if (IS_ERR(xil_chan))
+ 		return;
+-	}
+-
+ 	ret = frmbuf_verify_format(chan, fourcc, type);
+ 	if (ret == -EINVAL) {
+ 		dev_err(chan->device->dev,
+@@ -669,6 +681,21 @@ static void xilinx_xdma_set_config(struct dma_chan *chan, u32 fourcc, u32 type)
+ 	}
+ }
+ 
++void xilinx_xdma_set_mode(struct dma_chan *chan, enum operation_mode
++			  mode)
++{
++	struct xilinx_frmbuf_chan *xil_chan;
++
++	xil_chan = frmbuf_find_chan(chan);
++	if (IS_ERR(xil_chan))
++		return;
++
++	xil_chan->mode = mode;
++
++	return;
++
++} EXPORT_SYMBOL_GPL(xilinx_xdma_set_mode);
++
+ void xilinx_xdma_drm_config(struct dma_chan *chan, u32 drm_fourcc)
+ {
+ 	xilinx_xdma_set_config(chan, drm_fourcc, XDMA_DRM);
+@@ -932,8 +959,8 @@ static enum dma_status xilinx_frmbuf_tx_status(struct dma_chan *dchan,
+ static void xilinx_frmbuf_halt(struct xilinx_frmbuf_chan *chan)
+ {
+ 	frmbuf_clr(chan, XILINX_FRMBUF_CTRL_OFFSET,
+-		   XILINX_FRMBUF_CTRL_AP_START |
+-		   XILINX_FRMBUF_CTRL_AUTO_RESTART);
++			XILINX_FRMBUF_CTRL_AP_START |
++			chan->mode);
+ 	chan->idle = true;
+ }
+ 
+@@ -944,8 +971,8 @@ static void xilinx_frmbuf_halt(struct xilinx_frmbuf_chan *chan)
+ static void xilinx_frmbuf_start(struct xilinx_frmbuf_chan *chan)
+ {
+ 	frmbuf_set(chan, XILINX_FRMBUF_CTRL_OFFSET,
+-		   XILINX_FRMBUF_CTRL_AP_START |
+-		   XILINX_FRMBUF_CTRL_AUTO_RESTART);
++			XILINX_FRMBUF_CTRL_AP_START |
++			chan->mode);
+ 	chan->idle = false;
+ }
+ 
+@@ -1014,7 +1041,12 @@ static void xilinx_frmbuf_start_transfer(struct xilinx_frmbuf_chan *chan)
+ 	/* Start the hardware */
+ 	xilinx_frmbuf_start(chan);
+ 	list_del(&desc->node);
+-	chan->staged_desc = desc;
++
++	/* No staging descriptor required when auto restart is disabled */
++	if (chan->mode == AUTO_RESTART)
++		chan->staged_desc = desc;
++	else
++		chan->active_desc = desc;
+ }
+ 
+ /**
+@@ -1290,6 +1322,7 @@ static int xilinx_frmbuf_chan_probe(struct xilinx_frmbuf_device *xdev,
+ 	chan->dev = xdev->dev;
+ 	chan->xdev = xdev;
+ 	chan->idle = true;
++	chan->mode = AUTO_RESTART;
+ 
+ 	err = of_property_read_u32(node, "xlnx,dma-addr-width",
+ 				   &dma_addr_size);
+diff --git a/include/linux/dma/xilinx_frmbuf.h b/include/linux/dma/xilinx_frmbuf.h
+index 3b6886522969..6b44e6f963f3 100644
+--- a/include/linux/dma/xilinx_frmbuf.h
++++ b/include/linux/dma/xilinx_frmbuf.h
+@@ -24,7 +24,33 @@ enum vid_frmwork_type {
+ 	XDMA_V4L2,
+ };
+ 
++/**
++ * enum operation_mode - FB IP control register field settings to select mode
++ * @DEFAULT : Use default mode, No explicit bit field settings required.
++ * @AUTO_RESTART : Use auto-restart mode by setting BIT(7) of control register.
++ */
++enum operation_mode {
++	DEFAULT = 0x0,
++	AUTO_RESTART = BIT(7),
++};
++
+ #if IS_ENABLED(CONFIG_XILINX_FRMBUF)
++/**
++ * xilinx_xdma_set_mode - Set operation mode for framebuffer IP
++ * @chan: dma channel instance
++ * @mode: Famebuffer IP operation mode.
++ * This routine is used when utilizing "video format aware" Xilinx DMA IP
++ * (such as Video Framebuffer Read or Video Framebuffer Write).  This call
++ * must be made prior to dma_async_issue_pending(). This routine should be
++ * called by client driver to set the operation mode for framebuffer IP based
++ * upon the use-case, for e.g. for non-streaming usecases (like MEM2MEM) it's
++ * more appropriate to use default mode unlike streaming usecases where
++ * auto-restart mode is more suitable.
++ *
++ * auto-restart or free running mode.
++ */
++void xilinx_xdma_set_mode(struct dma_chan *chan, enum operation_mode mode);
++
+ /**
+  * xilinx_xdma_drm_config - configure video format in video aware DMA
+  * @chan: dma channel instance
+@@ -32,19 +58,19 @@ enum vid_frmwork_type {
+  *
+  * This routine is used when utilizing "video format aware" Xilinx DMA IP
+  * (such as Video Framebuffer Read or Video Framebuffer Write).  This call
+- * must be made prior to dma_async_issue_pending() to enstablish the video
++ * must be made prior to dma_async_issue_pending() to establish the video
+  * data memory format within the hardware DMA.
+  */
+ void xilinx_xdma_drm_config(struct dma_chan *chan, u32 drm_fourcc);
+ 
+ /**
+- * xilinx_xdma_drm_config - configure video format in video aware DMA
++ * xilinx_xdma_v4l2_config - configure video format in video aware DMA
+  * @chan: dma channel instance
+  * @v4l2_fourcc: V4L2 fourcc code describing the memory layout of video data
+  *
+  * This routine is used when utilizing "video format aware" Xilinx DMA IP
+  * (such as Video Framebuffer Read or Video Framebuffer Write).  This call
+- * must be made prior to dma_async_issue_pending() to enstablish the video
++ * must be made prior to dma_async_issue_pending() to establish the video
+  * data memory format within the hardware DMA.
+  */
+ void xilinx_xdma_v4l2_config(struct dma_chan *chan, u32 v4l2_fourcc);
+@@ -99,6 +125,10 @@ int xilinx_xdma_set_fid(struct dma_chan *chan,
+ 			struct dma_async_tx_descriptor *async_tx, u32 fid);
+ 
+ #else
++static inline void xilinx_xdma_set_mode(struct dma_chan *chan,
++					enum operation_mode mode)
++{ }
++
+ static inline void xilinx_xdma_drm_config(struct dma_chan *chan, u32 drm_fourcc)
+ { }
+ 
+-- 
+2.31.1
+

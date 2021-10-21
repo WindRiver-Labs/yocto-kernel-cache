@@ -1,0 +1,250 @@
+From 97dbdaaaeb3c829b7a25d8adf43c13d47dd93b9d Mon Sep 17 00:00:00 2001
+From: Nava kishore Manne <nava.manne@xilinx.com>
+Date: Tue, 21 Jan 2020 16:00:01 +0530
+Subject: [PATCH 0935/1851] fpga: support loading from a pre-allocated buffer
+
+commit 1a0c556193a3d81ff6bde4c571c38b2c19bbb443 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Some systems are memory constrained but they need to load very
+large Configuration files. The FPGA subsystem allows drivers to
+request this Configuration image be loaded from the filesystem,
+but this requires that the entire configuration data be loaded
+into kernel memory first before it's provided to the driver.
+This can lead to a situation where we map the configuration
+data twice, once to load the configuration data into kernel
+memory and once to copy the configuration data into the final
+resting place which is nothing but a dma-able continuous buffer.
+
+This creates needless memory pressure and delays due to multiple
+copies. Let's add a dmabuf handling support to the fpga manager
+framework that allows drivers to load the Configuration data
+directly from a pre-allocated buffer. This skips the intermediate
+step of allocating a buffer in kernel memory to hold the
+Configuration data.
+
+Signed-off-by: Nava kishore Manne <nava.manne@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/fpga/fpga-mgr.c       | 113 +++++++++++++++++++++++++++++++++-
+ drivers/fpga/of-fpga-region.c |   3 +
+ include/linux/fpga/fpga-mgr.h |   6 ++
+ 3 files changed, 120 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/fpga/fpga-mgr.c b/drivers/fpga/fpga-mgr.c
+index e4e96d31cc40..dbeafd0b59ba 100644
+--- a/drivers/fpga/fpga-mgr.c
++++ b/drivers/fpga/fpga-mgr.c
+@@ -8,6 +8,7 @@
+  * With code from the mailing list:
+  * Copyright (C) 2013 Xilinx, Inc.
+  */
++#include <linux/dma-buf.h>
+ #include <linux/kernel.h>
+ #include <linux/firmware.h>
+ #include <linux/fpga/fpga-mgr.h>
+@@ -303,6 +304,39 @@ static int fpga_mgr_buf_load(struct fpga_manager *mgr,
+ 	return rc;
+ }
+ 
++static int fpga_dmabuf_load(struct fpga_manager *mgr,
++			    struct fpga_image_info *info)
++{
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	int ret;
++
++	/* create attachment for dmabuf with the user device */
++	attach = dma_buf_attach(mgr->dmabuf, &mgr->dev);
++	if (IS_ERR(attach)) {
++		pr_err("failed to attach dmabuf\n");
++		ret = PTR_ERR(attach);
++		goto fail_put;
++	}
++
++	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		goto fail_detach;
++	}
++
++	info->sgt = sgt;
++	ret = fpga_mgr_buf_load_sg(mgr, info, info->sgt);
++	dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
++
++fail_detach:
++	dma_buf_detach(mgr->dmabuf, attach);
++fail_put:
++	dma_buf_put(mgr->dmabuf);
++
++	return ret;
++}
++
+ /**
+  * fpga_mgr_firmware_load - request firmware and load to fpga
+  * @mgr:	fpga manager
+@@ -359,6 +393,8 @@ static int fpga_mgr_firmware_load(struct fpga_manager *mgr,
+  */
+ int fpga_mgr_load(struct fpga_manager *mgr, struct fpga_image_info *info)
+ {
++	if (info->flags & FPGA_MGR_CONFIG_DMA_BUF)
++		return fpga_dmabuf_load(mgr, info);
+ 	if (info->sgt)
+ 		return fpga_mgr_buf_load_sg(mgr, info, info->sgt);
+ 	if (info->buf && info->count)
+@@ -652,6 +688,62 @@ static const struct file_operations fpga_mgr_ops_image = {
+ };
+ #endif
+ 
++static int fpga_dmabuf_fd_get(struct file *file, char __user *argp)
++{
++	struct fpga_manager *mgr =  (struct fpga_manager *)(file->private_data);
++	int buffd;
++
++	if (copy_from_user(&buffd, argp, sizeof(buffd)))
++		return -EFAULT;
++
++	mgr->dmabuf = dma_buf_get(buffd);
++	if (IS_ERR_OR_NULL(mgr->dmabuf))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int fpga_device_open(struct inode *inode, struct file *file)
++{
++	struct miscdevice *miscdev = file->private_data;
++	struct fpga_manager *mgr = container_of(miscdev,
++						struct fpga_manager, miscdev);
++
++	file->private_data = mgr;
++
++	return 0;
++}
++
++static int fpga_device_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static long fpga_device_ioctl(struct file *file, unsigned int cmd,
++			      unsigned long arg)
++{
++	char __user *argp = (char __user *)arg;
++	int err;
++
++	switch (cmd) {
++	case FPGA_IOCTL_LOAD_DMA_BUFF:
++		err = fpga_dmabuf_fd_get(file, argp);
++		break;
++	default:
++		err = -ENOTTY;
++	}
++
++	return err;
++}
++
++static const struct file_operations fpga_fops = {
++	.owner		= THIS_MODULE,
++	.open		= fpga_device_open,
++	.release	= fpga_device_release,
++	.unlocked_ioctl	= fpga_device_ioctl,
++	.compat_ioctl	= fpga_device_ioctl,
++};
++
+ /**
+  * fpga_mgr_lock - Lock FPGA manager for exclusive use
+  * @mgr:	fpga manager
+@@ -705,8 +797,7 @@ struct fpga_manager *fpga_mgr_create(struct device *dev, const char *name,
+ 	int id, ret;
+ 
+ 	if (!mops || !mops->write_complete || !mops->state ||
+-	    !mops->write_init || (!mops->write && !mops->write_sg) ||
+-	    (mops->write && mops->write_sg)) {
++	    !mops->write_init || (!mops->write && !mops->write_sg)) {
+ 		dev_err(dev, "Attempt to register without fpga_manager_ops\n");
+ 		return NULL;
+ 	}
+@@ -739,10 +830,28 @@ struct fpga_manager *fpga_mgr_create(struct device *dev, const char *name,
+ 	mgr->dev.of_node = dev->of_node;
+ 	mgr->dev.id = id;
+ 
++	/* Make device dma capable by inheriting from parent's */
++	set_dma_ops(&mgr->dev, get_dma_ops(dev));
++	ret = dma_coerce_mask_and_coherent(&mgr->dev, dma_get_mask(dev));
++	if (ret) {
++		dev_warn(dev,
++		"Failed to set DMA mask %llx. Trying to continue... %x\n",
++		dma_get_mask(dev), ret);
++	}
++
+ 	ret = dev_set_name(&mgr->dev, "fpga%d", id);
+ 	if (ret)
+ 		goto error_device;
+ 
++	mgr->miscdev.minor = MISC_DYNAMIC_MINOR;
++	mgr->miscdev.name = kobject_name(&mgr->dev.kobj);
++	mgr->miscdev.fops = &fpga_fops;
++	ret = misc_register(&mgr->miscdev);
++	if (ret) {
++		pr_err("fpga: failed to register misc device.\n");
++		goto error_device;
++	}
++
+ 	return mgr;
+ 
+ error_device:
+diff --git a/drivers/fpga/of-fpga-region.c b/drivers/fpga/of-fpga-region.c
+index 75f64abf9c81..9ec367070b2a 100644
+--- a/drivers/fpga/of-fpga-region.c
++++ b/drivers/fpga/of-fpga-region.c
+@@ -233,6 +233,9 @@ static struct fpga_image_info *of_fpga_region_parse_ov(
+ 	if (of_property_read_bool(overlay, "encrypted-fpga-config"))
+ 		info->flags |= FPGA_MGR_ENCRYPTED_BITSTREAM;
+ 
++	if (of_property_read_bool(overlay, "fpga-config-from-dmabuf"))
++		info->flags |= FPGA_MGR_CONFIG_DMA_BUF;
++
+ 	if (!of_property_read_string(overlay, "firmware-name",
+ 				     &firmware_name)) {
+ 		info->firmware_name = devm_kstrdup(dev, firmware_name,
+diff --git a/include/linux/fpga/fpga-mgr.h b/include/linux/fpga/fpga-mgr.h
+index 1a56794af904..bd67af3b5451 100644
+--- a/include/linux/fpga/fpga-mgr.h
++++ b/include/linux/fpga/fpga-mgr.h
+@@ -9,6 +9,7 @@
+ #define _LINUX_FPGA_MGR_H
+ 
+ #include <linux/mutex.h>
++#include <linux/miscdevice.h>
+ #include <linux/platform_device.h>
+ 
+ #define ENCRYPTED_KEY_LEN	64 /* Bytes */
+@@ -86,6 +87,7 @@ enum fpga_mgr_states {
+ #define FPGA_MGR_USERKEY_ENCRYPTED_BITSTREAM	BIT(5)
+ #define FPGA_MGR_DDR_MEM_AUTH_BITSTREAM		BIT(6)
+ #define FPGA_MGR_SECURE_MEM_AUTH_BITSTREAM	BIT(7)
++#define FPGA_MGR_CONFIG_DMA_BUF			BIT(8)
+ 
+ /**
+  * struct fpga_image_info - information specific to a FPGA image
+@@ -195,6 +197,8 @@ struct fpga_manager {
+ 	unsigned long flags;
+ 	char key[ENCRYPTED_KEY_LEN + 1];
+ 	struct device dev;
++	struct miscdevice miscdev;
++	struct dma_buf *dmabuf;
+ 	struct mutex ref_mutex;
+ 	enum fpga_mgr_states state;
+ 	struct fpga_compat_id *compat_id;
+@@ -233,4 +237,6 @@ struct fpga_manager *devm_fpga_mgr_create(struct device *dev, const char *name,
+ 					  const struct fpga_manager_ops *mops,
+ 					  void *priv);
+ 
++#define FPGA_IOCTL_LOAD_DMA_BUFF	_IOWR('R', 1, __u32)
++
+ #endif /*_LINUX_FPGA_MGR_H */
+-- 
+2.31.1
+

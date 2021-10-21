@@ -1,0 +1,146 @@
+From 41c9b2f2ee69199d2a6a689a808b761440bcacfc Mon Sep 17 00:00:00 2001
+From: Rajan Vaja <rajan.vaja@xilinx.com>
+Date: Tue, 3 Dec 2019 01:03:27 -0800
+Subject: [PATCH 0042/1851] clk: zynqmp: Fix divider calculation
+
+commit ab22499e96c59c9af13832865cec1491a7fa88e5 from
+https://github.com/Xilinx/linux-xlnx.git
+
+Linux doesn't know maximum value of divisor that it can support.
+zynqmp_clk_divider_round_rate() returns actual divider value
+after calculating from parent rate and desired rate, even though
+that rate is not supported by single divider of hardware. It is
+also possible that such divisor value can be achieved through 2
+different dividers. As, Linux tries to set such divisor value(out
+of range) in single divider set divider is getting failed.
+
+Fix the same by computing best possible combination of two
+divisors which provides more accurate clock rate.
+
+Signed-off-by: Rajan Vaja <rajan.vaja@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+Signed-off-by: Tejas Patel <tejas.patel@xilinx.com>
+Link: https://lkml.org/lkml/2019/11/7/173
+State: upstream (4ebd92d2e228ceb33bafa273fd9cb2b16615cdd4)
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/clk/zynqmp/divider.c         | 60 ++++++++++++++++++++++++++++
+ include/linux/firmware/xlnx-zynqmp.h |  1 +
+ 2 files changed, 61 insertions(+)
+
+diff --git a/drivers/clk/zynqmp/divider.c b/drivers/clk/zynqmp/divider.c
+index 25c75dda378d..16583b789352 100644
+--- a/drivers/clk/zynqmp/divider.c
++++ b/drivers/clk/zynqmp/divider.c
+@@ -41,6 +41,7 @@ struct zynqmp_clk_divider {
+ 	bool is_frac;
+ 	u32 clk_id;
+ 	u32 div_type;
++	u32 max_div;
+ };
+ 
+ static inline int zynqmp_divider_get_val(unsigned long parent_rate,
+@@ -108,6 +109,34 @@ static unsigned long zynqmp_clk_divider_recalc_rate(struct clk_hw *hw,
+ 	return DIV_ROUND_UP_ULL(parent_rate, value);
+ }
+ 
++static void zynqmp_compute_divider(struct clk_hw *hw,
++				   unsigned long rate,
++				   unsigned long parent_rate,
++				   u32 max_div,
++				   int *bestdiv)
++{
++	int div1;
++	int div2;
++	long error = LONG_MAX;
++	struct clk_hw *parent_hw = clk_hw_get_parent(hw);
++	struct zynqmp_clk_divider *pdivider = to_zynqmp_clk_divider(parent_hw);
++
++	if (!pdivider)
++		return;
++
++	*bestdiv = 1;
++	for (div1 = 1; div1 <= pdivider->max_div; div1++) {
++		for (div2 = 1; div2 <= max_div; div2++) {
++			long new_error = ((parent_rate / div1) / div2) - rate;
++
++			if (abs(new_error) < abs(error)) {
++				*bestdiv = div2;
++				error = new_error;
++			}
++		}
++	}
++}
++
+ /**
+  * zynqmp_clk_divider_round_rate() - Round rate of divider clock
+  * @hw:			handle between common and hardware-specific interfaces
+@@ -148,8 +177,21 @@ static long zynqmp_clk_divider_round_rate(struct clk_hw *hw,
+ 
+ 	bestdiv = zynqmp_divider_get_val(*prate, rate, divider->flags);
+ 
++	/*
++	 * In case of two divisors, compute best divider values and return
++	 * divider2 value based on compute value. div1 will  be automatically
++	 * set to optimum based on required total divider value.
++	 */
++	if (div_type == TYPE_DIV2 &&
++	    (clk_hw_get_flags(hw) & CLK_SET_RATE_PARENT)) {
++		zynqmp_compute_divider(hw, rate, *prate,
++				       divider->max_div, &bestdiv);
++	}
++
+ 	if ((clk_hw_get_flags(hw) & CLK_SET_RATE_PARENT) && divider->is_frac)
+ 		bestdiv = rate % *prate ? 1 : bestdiv;
++
++	bestdiv = min_t(u32, bestdiv, divider->max_div);
+ 	*prate = rate * bestdiv;
+ 
+ 	return rate;
+@@ -221,6 +263,9 @@ struct clk_hw *zynqmp_clk_register_divider(const char *name,
+ 	struct clk_hw *hw;
+ 	struct clk_init_data init;
+ 	int ret;
++	const struct zynqmp_eemi_ops *eemi_ops = zynqmp_pm_get_eemi_ops();
++	struct zynqmp_pm_query_data qdata = {0};
++	u32 ret_payload[PAYLOAD_ARG_CNT];
+ 
+ 	/* allocate the divider */
+ 	div = kzalloc(sizeof(*div), GFP_KERNEL);
+@@ -241,6 +286,21 @@ struct clk_hw *zynqmp_clk_register_divider(const char *name,
+ 	div->clk_id = clk_id;
+ 	div->div_type = nodes->type;
+ 
++	/*
++	 * To achieve best possible rate, maximum limit of divider is required
++	 * while computation. Get maximum supported divisor from firmware. To
++	 * maintain backward compatibility assign maximum possible value(0xFFFF)
++	 * if query for max divisor is not successful.
++	 */
++	qdata.qid = PM_QID_CLOCK_GET_MAX_DIVISOR;
++	qdata.arg1 = clk_id;
++	qdata.arg2 = nodes->type;
++	ret = eemi_ops->query_data(qdata, ret_payload);
++	if (ret)
++		div->max_div = 0XFFFF;
++	else
++		div->max_div = ret_payload[1];
++
+ 	hw = &div->hw;
+ 	ret = clk_hw_register(NULL, hw);
+ 	if (ret) {
+diff --git a/include/linux/firmware/xlnx-zynqmp.h b/include/linux/firmware/xlnx-zynqmp.h
+index adb14bcedca2..e6db8e609f3d 100644
+--- a/include/linux/firmware/xlnx-zynqmp.h
++++ b/include/linux/firmware/xlnx-zynqmp.h
+@@ -106,6 +106,7 @@ enum pm_query_id {
+ 	PM_QID_CLOCK_GET_PARENTS,
+ 	PM_QID_CLOCK_GET_ATTRIBUTES,
+ 	PM_QID_CLOCK_GET_NUM_CLOCKS = 12,
++	PM_QID_CLOCK_GET_MAX_DIVISOR,
+ };
+ 
+ enum zynqmp_pm_reset_action {
+-- 
+2.31.1
+

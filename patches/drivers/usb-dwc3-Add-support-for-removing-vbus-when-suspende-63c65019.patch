@@ -1,0 +1,153 @@
+From f9ad6c2dfe8a4b8e60f39107c6468b5164f82c08 Mon Sep 17 00:00:00 2001
+From: Michal Simek <michal.simek@xilinx.com>
+Date: Mon, 16 Mar 2020 13:36:27 +0100
+Subject: [PATCH 0994/1851] usb: dwc3: Add support for removing vbus when
+ suspended
+
+commit 3d600fd776cbda29abdea084f7437f7d9102b2a5 from
+https://github.com/Xilinx/linux-xlnx.git
+
+During suspend, dwc3 host puts the device into U3 state and disables the
+clocks. During resume, dwc3 host drives LFPS.polling to detect the
+connected usb device and most of the usb devices detect LFPS.polling signal
+and drives LFPS.U3 exit signal and gets detected by the dwc3 host. But very
+few usb devices during resume doesn't drive u3 exit signalling even after
+seeing LFPS.polling signal on the link and wait for the host to initiate an
+u3 exit(Currently the USB stack doesn't drive U3 exit during resume from
+suspened). These kind of devices doesn't even respond to warm reset
+signalling sent by the host. Since these usb devices doesn't respond to
+polling or warm reset, host controller doesn't generate USB detect event
+after resume from suspend until manual disconnect.
+
+To aviod the above said issue, during suspend we need to ask ULPI phy to
+stop driving of VBUS and restore VBUS during resume. Doing so, will make
+usb device to enter into RX Detect state and start LFPS.polling after
+restoring LFPS.polling signal and thus generating detect event on the host
+side.
+
+This patch does the above said with a check to ensure that VBUS is not
+disabled for the usb devices that are remote wakeup capable.
+
+Signed-off-by: Piyush Mehta <piyush.mehta@xilinx.com>
+Anurag Kumar Vulisha <anurag.kumar.vulisha@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/usb/dwc3/core.h           |  3 ++
+ drivers/usb/dwc3/dwc3-of-simple.c | 54 +++++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 1fa345167605..dddbb2dd217f 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1420,9 +1420,12 @@ static inline bool dwc3_is_usb31(struct dwc3 *dwc)
+ 
+ #if IS_ENABLED(CONFIG_USB_DWC3_OF_SIMPLE)
+ void dwc3_simple_wakeup_capable(struct device *dev, bool wakeup);
++void dwc3_set_simple_data(struct dwc3 *dwc);
+ #else
+ void dwc3_simple_wakeup_capable(struct device *dev, bool wakeup)
+ { ; }
++void dwc3_set_simple_data(struct dwc3 *dwc)
++{ ; }
+ #endif
+ 
+ bool dwc3_has_imod(struct dwc3 *dwc);
+diff --git a/drivers/usb/dwc3/dwc3-of-simple.c b/drivers/usb/dwc3/dwc3-of-simple.c
+index e71e2abf33c0..c45630bcf959 100644
+--- a/drivers/usb/dwc3/dwc3-of-simple.c
++++ b/drivers/usb/dwc3/dwc3-of-simple.c
+@@ -25,6 +25,14 @@
+ #include <linux/phy/phy-zynqmp.h>
+ 
+ #include "core.h"
++#include "io.h"
++
++/* ULPI control registers */
++#define ULPI_OTG_CTRL_SET		0xB
++#define ULPI_OTG_CTRL_CLEAR		0XC
++#define OTG_CTRL_DRVVBUS_OFFSET		5
++
++#define DWC3_OF_ADDRESS(ADDR)		((ADDR) - DWC3_GLOBALS_REGS_START)
+ 
+ struct dwc3_of_simple {
+ 	struct device		*dev;
+@@ -40,6 +48,24 @@ struct dwc3_of_simple {
+ 	bool			need_reset;
+ };
+ 
++void dwc3_set_simple_data(struct dwc3 *dwc)
++{
++	struct device_node *node = of_get_parent(dwc->dev->of_node);
++
++	if (node && (of_device_is_compatible(node, "xlnx,zynqmp-dwc3") ||
++		     of_device_is_compatible(node, "xlnx,versal-dwc3")))  {
++		struct platform_device *pdev_parent;
++		struct dwc3_of_simple   *simple;
++
++		pdev_parent = of_find_device_by_node(node);
++		simple = platform_get_drvdata(pdev_parent);
++
++		/* Set (struct dwc3 *) to simple->dwc for future use */
++		simple->dwc =  dwc;
++	}
++}
++EXPORT_SYMBOL(dwc3_set_simple_data);
++
+ void dwc3_simple_wakeup_capable(struct device *dev, bool wakeup)
+ {
+ 	struct device_node *node = of_node_get(dev->parent->of_node);
+@@ -201,6 +227,28 @@ static int dwc3_of_simple_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM
++
++static void dwc3_simple_vbus(struct dwc3 *dwc, bool vbus_off)
++{
++	u32 reg, addr;
++	u8  val;
++
++	if (vbus_off)
++		addr = ULPI_OTG_CTRL_CLEAR;
++	else
++		addr = ULPI_OTG_CTRL_SET;
++
++	val = (1 << OTG_CTRL_DRVVBUS_OFFSET);
++
++	reg = DWC3_GUSB2PHYACC_NEWREGREQ | DWC3_GUSB2PHYACC_ADDR(addr);
++	reg |= DWC3_GUSB2PHYACC_WRITE | val;
++	addr = DWC3_OF_ADDRESS(DWC3_GUSB2PHYACC(0));
++	writel(reg, dwc->regs + addr);
++}
++
++#endif
++
+ static int __maybe_unused dwc3_of_simple_runtime_suspend(struct device *dev)
+ {
+ 	struct dwc3_of_simple	*simple = dev_get_drvdata(dev);
+@@ -221,6 +269,9 @@ static int __maybe_unused dwc3_of_simple_suspend(struct device *dev)
+ {
+ 	struct dwc3_of_simple *simple = dev_get_drvdata(dev);
+ 
++	/* Ask ULPI to turn OFF Vbus */
++	dwc3_simple_vbus(simple->dwc, true);
++
+ 	if (simple->need_reset)
+ 		reset_control_assert(simple->resets);
+ 
+@@ -237,6 +288,9 @@ static int __maybe_unused dwc3_of_simple_resume(struct device *dev)
+ 	if (simple->need_reset)
+ 		reset_control_deassert(simple->resets);
+ 
++	/* Ask ULPI to turn ON Vbus */
++	dwc3_simple_vbus(simple->dwc, false);
++
+ 	return 0;
+ }
+ 
+-- 
+2.31.1
+

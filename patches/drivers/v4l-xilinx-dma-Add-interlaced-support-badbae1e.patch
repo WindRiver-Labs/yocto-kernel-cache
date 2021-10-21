@@ -1,0 +1,239 @@
+From e6403a68e25672868a410d32395f611806976afa Mon Sep 17 00:00:00 2001
+From: Vishal Sagar <vishal.sagar@xilinx.com>
+Date: Mon, 23 Apr 2018 17:44:23 +0530
+Subject: [PATCH 0345/1851] v4l: xilinx: dma: Add interlaced support
+
+commit 0a60e21f394b6ee1eaf442104c8169e6bc8ab64d from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch adds interlaced support to the Xilinx V4L dma client. In case
+of capture pipeline, the field id is read from the callback.
+
+A check is present to find and correct sequence number in case
+a frame is dropped i.e. fid is repeated. For this the prev_fid member is
+used to store the previous fid value to be compared with one returned.
+
+In case of output pipeline, the field id is set per dma descriptor.
+
+A dma descriptor pointer is added to xvip_dma_buffer so that it may be
+passed as a reference while getting the fid.
+
+The video node gets the field type of the subdev prior and checks if it
+is of V4L2_FIELD_ALTERNATE type. If yes then height is halved.
+
+Some other minor fixes for checkpatch are also applied here.
+
+Signed-off-by: Vishal Sagar <vishal.sagar@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+Signed-off-by: Michal Simek <michal.simek@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/media/platform/xilinx/xilinx-dma.c | 76 ++++++++++++++++++++--
+ drivers/media/platform/xilinx/xilinx-dma.h |  3 +
+ 2 files changed, 73 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/xilinx/xilinx-dma.c b/drivers/media/platform/xilinx/xilinx-dma.c
+index 2c0bf07f2147..b549e4ac8ed5 100644
+--- a/drivers/media/platform/xilinx/xilinx-dma.c
++++ b/drivers/media/platform/xilinx/xilinx-dma.c
+@@ -64,7 +64,7 @@ static int xvip_dma_verify_format(struct xvip_dma *dma)
+ 	int width, height;
+ 
+ 	subdev = xvip_dma_remote_subdev(&dma->pad, &fmt.pad);
+-	if (subdev == NULL)
++	if (!subdev)
+ 		return -EPIPE;
+ 
+ 	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+@@ -102,7 +102,7 @@ static struct media_pad *xvip_get_entity_sink(struct media_entity *entity,
+ 	/* The source pad can be NULL when the entity has no source pad. Return
+ 	 * the first pad in that case, guaranteed to be a sink pad.
+ 	 */
+-	if (source == NULL)
++	if (!source)
+ 		return &entity->pads[0];
+ 
+ 	/* Iterates through the pads to find a connected sink pad. */
+@@ -146,7 +146,7 @@ static int xvip_pipeline_start_stop(struct xvip_pipeline *pipe, bool start)
+ 
+ 	while (1) {
+ 		pad = xvip_get_entity_sink(entity, pad);
+-		if (pad == NULL)
++		if (!pad)
+ 			break;
+ 
+ 		if (!(pad->flags & MEDIA_PAD_FL_SINK))
+@@ -331,11 +331,13 @@ static int xvip_pipeline_prepare(struct xvip_pipeline *pipe,
+  * @buf: vb2 buffer base object
+  * @queue: buffer list entry in the DMA engine queued buffers list
+  * @dma: DMA channel that uses the buffer
++ * @desc: Descriptor associated with this structure
+  */
+ struct xvip_dma_buffer {
+ 	struct vb2_v4l2_buffer buf;
+ 	struct list_head queue;
+ 	struct xvip_dma *dma;
++	struct dma_async_tx_descriptor *desc;
+ };
+ 
+ #define to_xvip_dma_buffer(vb)	container_of(vb, struct xvip_dma_buffer, buf)
+@@ -345,6 +347,8 @@ static void xvip_dma_complete(void *param)
+ 	struct xvip_dma_buffer *buf = param;
+ 	struct xvip_dma *dma = buf->dma;
+ 	int i, sizeimage;
++	u32 fid;
++	int status;
+ 
+ 	spin_lock(&dma->queued_lock);
+ 	list_del(&buf->queue);
+@@ -354,6 +358,26 @@ static void xvip_dma_complete(void *param)
+ 	buf->buf.sequence = dma->sequence++;
+ 	buf->buf.vb2_buf.timestamp = ktime_get_ns();
+ 
++	status = xilinx_xdma_get_fid(dma->dma, buf->desc, &fid);
++	if (!status) {
++		if (((V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) &&
++		     dma->format.fmt.pix_mp.field == V4L2_FIELD_ALTERNATE) ||
++		     dma->format.fmt.pix.field == V4L2_FIELD_ALTERNATE) {
++			/*
++			 * fid = 1 is odd field i.e. V4L2_FIELD_TOP.
++			 * fid = 0 is even field i.e. V4L2_FIELD_BOTTOM.
++			 */
++			buf->buf.field = fid ?
++					 V4L2_FIELD_TOP : V4L2_FIELD_BOTTOM;
++
++			if (fid == dma->prev_fid)
++				buf->buf.sequence = dma->sequence++;
++
++			buf->buf.sequence >>= 1;
++			dma->prev_fid = fid;
++		}
++	}
++
+ 	if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type)) {
+ 		for (i = 0; i < dma->fmtinfo->buffers; i++) {
+ 			sizeimage =
+@@ -432,6 +456,7 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
+ 	u32 flags;
+ 	u32 luma_size;
+ 	u32 padding_factor_nume, padding_factor_deno, bpl_nume, bpl_deno;
++	u32 fid = ~0;
+ 
+ 	if (dma->queue.type == V4L2_BUF_TYPE_VIDEO_CAPTURE ||
+ 	    dma->queue.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+@@ -518,6 +543,16 @@ static void xvip_dma_buffer_queue(struct vb2_buffer *vb)
+ 	}
+ 	desc->callback = xvip_dma_complete;
+ 	desc->callback_param = buf;
++	buf->desc = desc;
++
++	if (buf->buf.field == V4L2_FIELD_TOP)
++		fid = 1;
++	else if (buf->buf.field == V4L2_FIELD_BOTTOM)
++		fid = 0;
++	else if (buf->buf.field == V4L2_FIELD_NONE)
++		fid = 0;
++
++	xilinx_xdma_set_fid(dma->dma, desc, fid);
+ 
+ 	spin_lock_irq(&dma->queued_lock);
+ 	list_add_tail(&buf->queue, &dma->queued_bufs);
+@@ -537,6 +572,7 @@ static int xvip_dma_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	int ret;
+ 
+ 	dma->sequence = 0;
++	dma->prev_fid = ~0;
+ 
+ 	/*
+ 	 * Start streaming on the pipeline. No link touching an entity in the
+@@ -756,6 +792,30 @@ __xvip_dma_try_format(struct xvip_dma *dma,
+ 	unsigned int fourcc;
+ 	unsigned int padding_factor_nume, padding_factor_deno;
+ 	unsigned int bpl_nume, bpl_deno;
++	struct v4l2_subdev_format fmt;
++	struct v4l2_subdev *subdev;
++	int ret;
++
++	subdev = xvip_dma_remote_subdev(&dma->pad, &fmt.pad);
++	if (!subdev)
++		return;
++
++	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
++	ret = v4l2_subdev_call(subdev, pad, get_fmt, NULL, &fmt);
++	if (ret < 0)
++		return;
++
++	if (fmt.format.field == V4L2_FIELD_ALTERNATE) {
++		if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type))
++			dma->format.fmt.pix_mp.field = V4L2_FIELD_ALTERNATE;
++		else
++			dma->format.fmt.pix.field = V4L2_FIELD_ALTERNATE;
++	} else {
++		if (V4L2_TYPE_IS_MULTIPLANAR(dma->format.type))
++			dma->format.fmt.pix_mp.field = V4L2_FIELD_NONE;
++		else
++			dma->format.fmt.pix.field = V4L2_FIELD_NONE;
++	}
+ 
+ 	/* Retrieve format information and select the default format if the
+ 	 * requested format isn't supported.
+@@ -788,12 +848,14 @@ __xvip_dma_try_format(struct xvip_dma *dma,
+ 
+ 		pix_mp = &format->fmt.pix_mp;
+ 		plane_fmt = pix_mp->plane_fmt;
+-		pix_mp->field = V4L2_FIELD_NONE;
++		pix_mp->field = dma->format.fmt.pix_mp.field;
+ 		width = rounddown(pix_mp->width * info->bpl_factor, align);
+ 		pix_mp->width = clamp(width, min_width, max_width) /
+ 				info->bpl_factor;
+ 		pix_mp->height = clamp(pix_mp->height, XVIP_DMA_MIN_HEIGHT,
+ 				       XVIP_DMA_MAX_HEIGHT);
++		if (pix_mp->field == V4L2_FIELD_ALTERNATE)
++			pix_mp->height = pix_mp->height / 2;
+ 
+ 		/*
+ 		 * Clamp the requested bytes per line value. If the maximum
+@@ -850,14 +912,16 @@ __xvip_dma_try_format(struct xvip_dma *dma,
+ 		struct v4l2_pix_format *pix;
+ 
+ 		pix = &format->fmt.pix;
+-		pix->field = V4L2_FIELD_NONE;
+-
++		pix->field = dma->format.fmt.pix.field;
+ 		width = rounddown(pix->width * info->bpl_factor, align);
+ 		pix->width = clamp(width, min_width, max_width) /
+ 			     info->bpl_factor;
+ 		pix->height = clamp(pix->height, XVIP_DMA_MIN_HEIGHT,
+ 				    XVIP_DMA_MAX_HEIGHT);
+ 
++		if (pix->field == V4L2_FIELD_ALTERNATE)
++			pix->height = pix->height / 2;
++
+ 		min_bpl = (pix->width * info->bpl_factor *
+ 			  padding_factor_nume * bpl_nume) /
+ 			  (padding_factor_deno * bpl_deno);
+diff --git a/drivers/media/platform/xilinx/xilinx-dma.h b/drivers/media/platform/xilinx/xilinx-dma.h
+index 8c7f21eea645..301e27fa2a63 100644
+--- a/drivers/media/platform/xilinx/xilinx-dma.h
++++ b/drivers/media/platform/xilinx/xilinx-dma.h
+@@ -72,6 +72,7 @@ static inline struct xvip_pipeline *to_xvip_pipeline(struct media_entity *e)
+  * @align: transfer alignment required by the DMA channel (in bytes)
+  * @xt: dma interleaved template for dma configuration
+  * @sgl: data chunk structure for dma_interleaved_template
++ * @prev_fid: Previous Field ID
+  */
+ struct xvip_dma {
+ 	struct list_head list;
+@@ -99,6 +100,8 @@ struct xvip_dma {
+ 	unsigned int align;
+ 	struct dma_interleaved_template xt;
+ 	struct data_chunk sgl[1];
++
++	u32 prev_fid;
+ };
+ 
+ #define to_xvip_dma(vdev)	container_of(vdev, struct xvip_dma, video)
+-- 
+2.31.1
+

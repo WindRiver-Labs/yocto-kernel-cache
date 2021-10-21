@@ -1,0 +1,243 @@
+From ff360eb98b60979e68fd5823246b130c2638c46e Mon Sep 17 00:00:00 2001
+From: Sai Krishna Potthuri <lakshmi.sai.krishna.potthuri@xilinx.com>
+Date: Mon, 8 Jun 2020 18:37:02 +0530
+Subject: [PATCH 1373/1851] mtd: cadence-quadspi: Added support for Stacked
+ mode
+
+commit 6ab15b27433db8d5e3c7b50f0195202d96b37206 from
+https://github.com/Xilinx/linux-xlnx.git
+
+This patch adds Dual Stacked mode support for OSPI.
+nor->flags will be updated with the CS information dynamically based on
+the address for read, write and erase operations. cadence-quadspi driver
+will configure the chipselect based on the nor->flags.
+
+Signed-off-by: Sai Krishna Potthuri <lakshmi.sai.krishna.potthuri@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/mtd/spi-nor/cadence-quadspi.c |  8 +++
+ drivers/mtd/spi-nor/spi-nor.c         | 74 +++++++++++++++++++--------
+ include/linux/mtd/spi-nor.h           |  1 +
+ 3 files changed, 62 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/mtd/spi-nor/cadence-quadspi.c b/drivers/mtd/spi-nor/cadence-quadspi.c
+index ce77a848af78..13be70b428dd 100644
+--- a/drivers/mtd/spi-nor/cadence-quadspi.c
++++ b/drivers/mtd/spi-nor/cadence-quadspi.c
+@@ -334,6 +334,9 @@ struct cqspi_driver_platdata {
+ #define CQSPI_TX_TAP_MASTER	0x19
+ #define CQSPI_MAX_DLL_TAPS	128
+ 
++#define CQSPI_CS0	0
++#define CQSPI_CS1	1
++
+ static int cqspi_wait_for_bit(void __iomem *reg, const u32 mask, bool clr)
+ {
+ 	u32 val;
+@@ -1155,6 +1158,11 @@ static int cqspi_set_protocol(struct spi_nor *nor, const int read)
+ 	f_pdata->addr_width = CQSPI_INST_TYPE_SINGLE;
+ 	f_pdata->data_width = CQSPI_INST_TYPE_SINGLE;
+ 
++	if (nor->flags & SNOR_F_UPPER_CS)
++		f_pdata->cs = CQSPI_CS1;
++	else
++		f_pdata->cs = CQSPI_CS0;
++
+ 	if (read) {
+ 		switch (nor->read_proto) {
+ 		case SNOR_PROTO_1_1_1:
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index 5c00da8c6163..0ab24efc3fc7 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -987,6 +987,21 @@ static int write_sr_cr(struct spi_nor *nor, u8 *sr_cr)
+ 	return 0;
+ }
+ 
++static inline void update_cs_flag(struct spi_nor *nor, u8 is_upper)
++{
++	if (is_upper) {
++		if (nor->spi)
++			nor->spi->master->flags |= SPI_MASTER_U_PAGE;
++		else
++			nor->flags |= SNOR_F_UPPER_CS;
++	} else {
++		if (nor->spi)
++			nor->spi->master->flags &= ~SPI_MASTER_U_PAGE;
++		else
++			nor->flags &= ~SNOR_F_UPPER_CS;
++	}
++}
++
+ /*
+  * Erase the whole flash memory
+  *
+@@ -1020,7 +1035,16 @@ static int erase_chip(struct spi_nor *nor)
+ 		return ret;
+ 	}
+ 
+-	return nor->write_reg(nor, SPINOR_OP_CHIP_ERASE, NULL, 0);
++	if (nor->isstacked)
++		nor->flags &= ~SNOR_F_UPPER_CS;
++
++	ret = nor->write_reg(nor, SPINOR_OP_CHIP_ERASE, NULL, 0);
++	if (nor->isstacked && !ret) {
++		nor->flags |= SNOR_F_UPPER_CS;
++		write_enable(nor);
++		ret = nor->write_reg(nor, SPINOR_OP_CHIP_ERASE, NULL, 0);
++	}
++	return ret;
+ }
+ 
+ static int spi_nor_lock_and_prep(struct spi_nor *nor, enum spi_nor_ops ops)
+@@ -1447,11 +1471,9 @@ static int spi_nor_erase(struct mtd_info *mtd, struct erase_info *instr)
+ 			if (nor->isstacked == 1) {
+ 				if (offset >= (mtd->size / 2)) {
+ 					offset = offset - (mtd->size / 2);
+-					nor->spi->master->flags |=
+-						SPI_MASTER_U_PAGE;
++					update_cs_flag(nor, 1);
+ 				} else {
+-					nor->spi->master->flags &=
+-						~SPI_MASTER_U_PAGE;
++					update_cs_flag(nor, 0);
+ 				}
+ 			}
+ 			if (nor->addr_width == 3) {
+@@ -1913,9 +1935,9 @@ static int spi_nor_lock(struct mtd_info *mtd, loff_t ofs, uint64_t len)
+ 	if (nor->isstacked == 1) {
+ 		if (ofs >= (mtd->size / 2)) {
+ 			ofs = ofs - (mtd->size / 2);
+-			nor->spi->master->flags |= SPI_MASTER_U_PAGE;
++			update_cs_flag(nor, 1);
+ 		} else {
+-			nor->spi->master->flags &= ~SPI_MASTER_U_PAGE;
++			update_cs_flag(nor, 0);
+ 		}
+ 	}
+ 	ret = nor->params.locking_ops->lock(nor, ofs, len);
+@@ -1957,9 +1979,9 @@ static int spi_nor_unlock(struct mtd_info *mtd, loff_t ofs, uint64_t len)
+ 	if (nor->isstacked == 1) {
+ 		if (ofs >= (mtd->size / 2)) {
+ 			ofs = ofs - (mtd->size / 2);
+-			nor->spi->master->flags |= SPI_MASTER_U_PAGE;
++			update_cs_flag(nor, 1);
+ 		} else {
+-			nor->spi->master->flags &= ~SPI_MASTER_U_PAGE;
++			update_cs_flag(nor, 0);
+ 		}
+ 	}
+ 	ret = nor->params.locking_ops->unlock(nor, ofs, len);
+@@ -2958,9 +2980,9 @@ static int spi_nor_read(struct mtd_info *mtd, loff_t from, size_t len,
+ 			stack_shift = 1;
+ 			if (offset >= (mtd->size / 2)) {
+ 				offset = offset - (mtd->size / 2);
+-				nor->spi->master->flags |= SPI_MASTER_U_PAGE;
++				update_cs_flag(nor, 1);
+ 			} else {
+-				nor->spi->master->flags &= ~SPI_MASTER_U_PAGE;
++				update_cs_flag(nor, 0);
+ 			}
+ 		}
+ 		if (nor->addr_width == 4) {
+@@ -3194,9 +3216,9 @@ static int spi_nor_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 			stack_shift = 1;
+ 			if (offset >= (mtd->size / 2)) {
+ 				offset = offset - (mtd->size / 2);
+-				nor->spi->master->flags |= SPI_MASTER_U_PAGE;
++				update_cs_flag(nor, 1);
+ 			} else {
+-				nor->spi->master->flags &= ~SPI_MASTER_U_PAGE;
++				update_cs_flag(nor, 0);
+ 			}
+ 		}
+ 
+@@ -3211,7 +3233,7 @@ static int spi_nor_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 			}
+ 		}
+ 		if (nor->isstacked == 1) {
+-			if (len <= rem_bank_len) {
++			if ((len - i) <= rem_bank_len) {
+ 				page_remain = min_t(size_t,
+ 						    nor->page_size -
+ 						    page_offset, len - i);
+@@ -3220,7 +3242,9 @@ static int spi_nor_write(struct mtd_info *mtd, loff_t to, size_t len,
+ 				 * the size of data remaining
+ 				 * on the first page
+ 				 */
+-				page_remain = rem_bank_len;
++				page_remain = min_t(size_t,
++						    nor->page_size -
++						    page_offset, rem_bank_len);
+ 			}
+ 		} else {
+ 			page_remain = min_t(size_t,
+@@ -4940,11 +4964,18 @@ static int spi_nor_switch_micron_octal_ddr(struct spi_nor *nor)
+ 	u8 cr = SPINOR_VCR_OCTAL_DDR;
+ 	int ret;
+ 
+-	write_enable(nor);
+ 	nor->addr_width = 3;
+ 	nor->is_addrvalid = true;
+ 	nor->reg_addr = 0x0;
++	if (nor->isstacked)
++		nor->flags &= ~SNOR_F_UPPER_CS;
++	write_enable(nor);
+ 	ret = nor->write_reg(nor, SPINOR_OP_WRCR, &cr, 1);
++	if (nor->isstacked && !ret) {
++		nor->flags |= SNOR_F_UPPER_CS;
++		write_enable(nor);
++		ret = nor->write_reg(nor, SPINOR_OP_WRCR, &cr, 1);
++	}
+ 	nor->is_addrvalid = false;
+ 	nor->addr_width = 4;
+ 	if (ret < 0) {
+@@ -5397,11 +5428,9 @@ static int spi_nor_set_addr_width(struct spi_nor *nor)
+ 				} else {
+ 					nor->params.set_4byte(nor, true);
+ 					if (nor->isstacked) {
+-						nor->spi->master->flags |=
+-							SPI_MASTER_U_PAGE;
++						update_cs_flag(nor, 1);
+ 						nor->params.set_4byte(nor, true);
+-						nor->spi->master->flags &=
+-							~SPI_MASTER_U_PAGE;
++						update_cs_flag(nor, 0);
+ 					}
+ 				}
+ 			}
+@@ -5586,7 +5615,9 @@ int spi_nor_scan(struct spi_nor *nor, const char *name,
+ 		(of_property_match_string(np_spi, "compatible",
+ 				"xlnx,zynqmp-qspi-1.0") >= 0)) ||
+ 		(of_property_match_string(np_spi, "compatible",
+-				"xlnx,versal-qspi-1.0") >= 0)) {
++				"xlnx,versal-qspi-1.0") >= 0) ||
++		(of_property_match_string(np_spi, "compatible",
++				"xlnx,versal-ospi-1.0") >= 0)) {
+ 		if (of_property_read_u32(np_spi, "is-dual",
+ 					 &is_dual) < 0) {
+ 			/* Default to single if prop not defined */
+@@ -5624,6 +5655,7 @@ int spi_nor_scan(struct spi_nor *nor, const char *name,
+ 				if (is_stacked) {
+ 					/* dual stacked */
+ 					nor->shift = 0;
++
+ 					mtd->size <<= 1;
+ 					info->n_sectors <<= 1;
+ 					nor->isstacked = 1;
+diff --git a/include/linux/mtd/spi-nor.h b/include/linux/mtd/spi-nor.h
+index 5e873c52c4f8..c8b4132d26e1 100644
+--- a/include/linux/mtd/spi-nor.h
++++ b/include/linux/mtd/spi-nor.h
+@@ -269,6 +269,7 @@ enum spi_nor_option_flags {
+ 	SNOR_F_HAS_4BAIT	= BIT(7),
+ 	SNOR_F_HAS_LOCK		= BIT(8),
+ 	SNOR_F_BROKEN_OCTAL_DDR = BIT(9),
++	SNOR_F_UPPER_CS		= BIT(10),
+ };
+ 
+ /**
+-- 
+2.31.1
+

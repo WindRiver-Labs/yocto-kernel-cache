@@ -1,0 +1,350 @@
+From 317f175ce68f8d555431b5402d52076ea8be8217 Mon Sep 17 00:00:00 2001
+From: Hyun Kwon <hyun.kwon@xilinx.com>
+Date: Wed, 11 Mar 2020 15:34:03 -0700
+Subject: [PATCH 1280/1851] v4l: xilinx: vipp: use async list for start and
+ stop
+
+commit 4e95cebc7126e027ace68eea40ce20b889b4fdba from
+https://github.com/Xilinx/linux-xlnx.git
+
+Check dependencies (sink or source) based on steam on / off, to sequence
+enabling / disabling sub-devices, using the asd list.
+
+The current implementation relies on the depth first media graph walk,
+which doesn't take the direction(sink / source) into account. When there's
+an entity with multiple source pads, it ends up enabling the sink first.
+So the list created from media graph walk becomes meaningless in terms of
+ordering, but just holds all subdevs in the graph. That is how asd list is
+used in xilinx-vipp already. And doing it for all dmas in the graph will
+just waste iterations for no benefit: all are set in first iteration,
+and all following iterations are null.
+
+This patch instead iterates the asd list and checkes the dependencies
+before enabling / disabling. This process is repeated until there's no
+change in sub-device enable/disable state, which means all sub-devices are
+handled or dependencies can't be met. Iterating through DMAs is removed
+because all sub-devices are captured in asd list anyway as explained.
+
+More efficient way than repeating iterations to resolve dependencies
+would be just to follow the link and perform in correct order. It can be
+solved on top of this.
+
+Signed-off-by: Hyun Kwon <hyun.kwon@xilinx.com>
+Reviewed-by: Dylan Yip <dylan.yip@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/media/platform/xilinx/xilinx-dma.c  |  93 +-------------
+ drivers/media/platform/xilinx/xilinx-vipp.c | 127 ++++++++++++++++++--
+ drivers/media/platform/xilinx/xilinx-vipp.h |   3 +-
+ 3 files changed, 124 insertions(+), 99 deletions(-)
+
+diff --git a/drivers/media/platform/xilinx/xilinx-dma.c b/drivers/media/platform/xilinx/xilinx-dma.c
+index 3fb95ef3e8b7..713c865a5a6b 100644
+--- a/drivers/media/platform/xilinx/xilinx-dma.c
++++ b/drivers/media/platform/xilinx/xilinx-dma.c
+@@ -96,82 +96,6 @@ static int xvip_dma_verify_format(struct xvip_dma *dma)
+  */
+ 
+ 
+-/**
+- * xvip_pipeline_start_stop - Start ot stop streaming on a pipeline
+- * @xdev: Composite video device
+- * @dma: xvip dma
+- * @start: Start (when true) or stop (when false) the pipeline
+- *
+- * Walk the entities chain starting @dma and start or stop all of them
+- *
+- * Return: 0 if successful, or the return value of the failed video::s_stream
+- * operation otherwise.
+- */
+-static int xvip_pipeline_start_stop(struct xvip_composite_device *xdev,
+-				    struct xvip_dma *dma, bool start)
+-{
+-	struct media_graph graph;
+-	struct media_entity *entity = &dma->video.entity;
+-	struct media_device *mdev = entity->graph_obj.mdev;
+-	struct xventity_list *temp, *_temp;
+-	LIST_HEAD(ent_list);
+-	int ret = 0;
+-
+-	mutex_lock(&mdev->graph_mutex);
+-
+-	/* Walk the graph to locate the subdev nodes */
+-	ret = media_graph_walk_init(&graph, mdev);
+-	if (ret)
+-		goto error;
+-
+-	media_graph_walk_start(&graph, entity);
+-
+-	/* get the list of entities */
+-	while ((entity = media_graph_walk_next(&graph))) {
+-		struct xventity_list *ele;
+-
+-		/* We want to stream on/off only subdevs */
+-		if (!is_media_entity_v4l2_subdev(entity))
+-			continue;
+-
+-		/* Maintain the pipeline sequence in a list */
+-		ele = kzalloc(sizeof(*ele), GFP_KERNEL);
+-		if (!ele) {
+-			ret = -ENOMEM;
+-			goto error;
+-		}
+-
+-		ele->entity = entity;
+-		list_add(&ele->list, &ent_list);
+-	}
+-
+-	if (start) {
+-		list_for_each_entry_safe(temp, _temp, &ent_list, list) {
+-			/* Enable all subdevs from sink to source */
+-			ret = xvip_entity_start_stop(xdev, temp->entity, start);
+-			if (ret < 0) {
+-				dev_err(xdev->dev, "ret = %d for entity %s\n",
+-					ret, temp->entity->name);
+-				break;
+-			}
+-		}
+-	} else {
+-		list_for_each_entry_safe_reverse(temp, _temp, &ent_list, list)
+-			/* Enable all subdevs from source to sink */
+-			xvip_entity_start_stop(xdev, temp->entity, start);
+-	}
+-
+-	list_for_each_entry_safe(temp, _temp, &ent_list, list) {
+-		list_del(&temp->list);
+-		kfree(temp);
+-	}
+-
+-error:
+-	mutex_unlock(&mdev->graph_mutex);
+-	media_graph_walk_cleanup(&graph);
+-	return ret;
+-}
+-
+ /**
+  * xvip_pipeline_set_stream - Enable/disable streaming on a pipeline
+  * @pipe: The pipeline
+@@ -201,7 +125,6 @@ static int xvip_pipeline_start_stop(struct xvip_composite_device *xdev,
+ static int xvip_pipeline_set_stream(struct xvip_pipeline *pipe, bool on)
+ {
+ 	struct xvip_composite_device *xdev;
+-	struct xvip_dma *dma;
+ 	int ret = 0;
+ 
+ 	mutex_lock(&pipe->lock);
+@@ -209,22 +132,14 @@ static int xvip_pipeline_set_stream(struct xvip_pipeline *pipe, bool on)
+ 
+ 	if (on) {
+ 		if (pipe->stream_count == pipe->num_dmas - 1) {
+-			/*
+-			 * This will iterate the DMAs and the stream-on of
+-			 * subdevs may not be sequential due to multiple
+-			 * sub-graph path
+-			 */
+-			list_for_each_entry(dma, &xdev->dmas, list) {
+-				ret = xvip_pipeline_start_stop(xdev, dma, true);
+-				if (ret < 0)
+-					goto done;
+-			}
++			ret = xvip_graph_start_stop(xdev, true);
++			if (ret < 0)
++				goto done;
+ 		}
+ 		pipe->stream_count++;
+ 	} else {
+ 		if (--pipe->stream_count == 0)
+-			list_for_each_entry(dma, &xdev->dmas, list)
+-				xvip_pipeline_start_stop(xdev, dma, false);
++			xvip_graph_start_stop(xdev, false);
+ 	}
+ 
+ done:
+diff --git a/drivers/media/platform/xilinx/xilinx-vipp.c b/drivers/media/platform/xilinx/xilinx-vipp.c
+index 96c4ea273e76..4d366594f70b 100644
+--- a/drivers/media/platform/xilinx/xilinx-vipp.c
++++ b/drivers/media/platform/xilinx/xilinx-vipp.c
+@@ -76,6 +76,22 @@ xvip_graph_find_entity(struct xvip_composite_device *xdev,
+ 	return NULL;
+ }
+ 
++static struct xvip_graph_entity *
++xvip_graph_find_entity_from_media(struct xvip_composite_device *xdev,
++				  struct media_entity *entity)
++{
++	struct xvip_graph_entity *xvip_entity;
++	struct v4l2_async_subdev *asd;
++
++	list_for_each_entry(asd, &xdev->notifier.asd_list, asd_list) {
++		xvip_entity = to_xvip_entity(asd);
++		if (xvip_entity->entity == entity)
++			return xvip_entity;
++	}
++
++	return NULL;
++}
++
+ static int xvip_graph_build_one(struct xvip_composite_device *xdev,
+ 				struct xvip_graph_entity *entity)
+ {
+@@ -224,25 +240,21 @@ static bool xvip_subdev_set_streaming(struct xvip_composite_device *xdev,
+ 	return false;
+ }
+ 
+-int xvip_entity_start_stop(struct xvip_composite_device *xdev,
+-			   struct media_entity *entity, bool on)
++static int xvip_entity_start_stop(struct xvip_composite_device *xdev,
++				  struct media_entity *entity, bool on)
+ {
+ 	struct v4l2_subdev *subdev;
+-	bool is_streaming;
+ 	int ret = 0;
+ 
+ 	dev_dbg(xdev->dev, "%s entity %s\n",
+ 		on ? "Starting" : "Stopping", entity->name);
+ 	subdev = media_entity_to_v4l2_subdev(entity);
+ 
+-	/* This is to maintain list of stream on/off devices */
+-	is_streaming = xvip_subdev_set_streaming(xdev, subdev, on);
+-
+ 	/*
+ 	 * start or stop the subdev only once in case if they are
+ 	 * shared between sub-graphs
+ 	 */
+-	if (on && !is_streaming) {
++	if (on) {
+ 		/* power-on subdevice */
+ 		ret = v4l2_subdev_call(subdev, core, s_power, 1);
+ 		if (ret < 0 && ret != -ENOIOCTLCMD) {
+@@ -260,7 +272,7 @@ int xvip_entity_start_stop(struct xvip_composite_device *xdev,
+ 			v4l2_subdev_call(subdev, core, s_power, 0);
+ 			xvip_subdev_set_streaming(xdev, subdev, 0);
+ 		}
+-	} else if (!on && is_streaming) {
++	} else {
+ 		/* stream-off subdevice */
+ 		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
+ 		if (ret < 0 && ret != -ENOIOCTLCMD) {
+@@ -276,6 +288,105 @@ int xvip_entity_start_stop(struct xvip_composite_device *xdev,
+ 				"s_power off failed on subdev\n");
+ 	}
+ 
++	if (ret == -ENOIOCTLCMD)
++		ret = 0;
++
++	return ret;
++}
++
++/**
++ * xvip_graph_entity_dependencies_ready - Check if all dependencies are ready
++ * @xdev: composite device
++ * @entity: entity to check
++ * @on: boolean flag. true for enable and false for disable
++ *
++ * Check if all immediate dependencies are ready dependeing on 'on' flag.
++ * If enabling, check all source pads. Sink pads for disabling.
++ *
++ * Return: true if all dependecies are ready. false otherwise.
++ */
++static bool
++xvip_graph_entity_dependencies_ready(struct xvip_composite_device *xdev,
++				     struct xvip_graph_entity *entity,
++				     bool on)
++{
++	unsigned long pad_flag = on ? MEDIA_PAD_FL_SOURCE : MEDIA_PAD_FL_SINK;
++	unsigned int i;
++
++	for (i = 0; i < entity->entity->num_pads; i++) {
++		struct xvip_graph_entity *remote;
++		struct media_pad *pad;
++
++		if (!(entity->entity->pads[i].flags & pad_flag))
++			continue;
++
++		/* skipping not connected pads */
++		pad = media_entity_remote_pad(&entity->entity->pads[i]);
++		if (!pad || !pad->entity)
++			continue;
++
++		/*
++		 * Skip if there is no remote. This entity is at the end,
++		 * such as DMA, sensor, or other type.
++		 */
++		remote = xvip_graph_find_entity_from_media(xdev, pad->entity);
++		if (!remote)
++			continue;
++
++		/* the dependency state doesn't meet */
++		if (remote->streaming != on)
++			return false;
++	}
++
++	return true;
++}
++
++/**
++ * xvip_graph_start_stop - start or stop the entire graph
++ * @xdev: composite device
++ * @on: boolean flag. true for enable and false for disable
++ *
++ * Enable or disable the entire graph by checking dependencies and
++ * repeating iterations until all sub-devices are handled.
++ *
++ * Return: 0 for success, otherwise error code
++ */
++int xvip_graph_start_stop(struct xvip_composite_device *xdev, bool on)
++{
++	struct v4l2_async_subdev *asd;
++	bool updated = true;
++	int ret = 0;
++
++	while (updated) {
++		updated = false;
++		list_for_each_entry(asd, &xdev->notifier.asd_list, asd_list) {
++			struct xvip_graph_entity *entity;
++			struct v4l2_subdev *subdev;
++			bool state;
++
++			entity = to_xvip_entity(asd);
++
++			state = xvip_graph_entity_dependencies_ready(xdev,
++								     entity,
++								     on);
++			if (!state)
++				continue;
++
++			subdev = media_entity_to_v4l2_subdev(entity->entity);
++			state = xvip_subdev_set_streaming(xdev, subdev, on);
++			if (state == on)
++				continue;
++
++			ret = xvip_entity_start_stop(xdev, entity->entity, on);
++			if (ret < 0) {
++				dev_err(xdev->dev, "ret = %d for entity %s\n",
++					ret, entity->entity->name);
++				break;
++			}
++			updated = true;
++		}
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/media/platform/xilinx/xilinx-vipp.h b/drivers/media/platform/xilinx/xilinx-vipp.h
+index c8ce81853945..1a58d729bd39 100644
+--- a/drivers/media/platform/xilinx/xilinx-vipp.h
++++ b/drivers/media/platform/xilinx/xilinx-vipp.h
+@@ -41,7 +41,6 @@ struct xvip_composite_device {
+ 	struct mutex lock; /* lock to protect xvip pipeline instance */
+ };
+ 
+-int xvip_entity_start_stop(struct xvip_composite_device *xdev,
+-			   struct media_entity *entity, bool on);
++int xvip_graph_start_stop(struct xvip_composite_device *xdev, bool on);
+ 
+ #endif /* __XILINX_VIPP_H__ */
+-- 
+2.31.1
+

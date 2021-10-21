@@ -1,0 +1,316 @@
+From 04e6034f068dba5800e138eb11ab4f6c39d9ff94 Mon Sep 17 00:00:00 2001
+From: Dylan Yip <dylan.yip@xilinx.com>
+Date: Fri, 5 Jun 2020 17:35:15 -0700
+Subject: [PATCH 1811/1851] drm: Add generic HDR support
+
+commit a098822dc6447f3dc3884ca9b968db751d08d1d7 from
+https://github.com/Xilinx/linux-xlnx.git
+
+[Postpone backporting this patch, because there are a mountain of
+dependent patches before this patch, on the other side, the modified
+files in this patch are keep intact after this patch]
+
+Currently drm framework only supports HDR10 for HDMI/DP. The existing
+structures are not flexible enough to extend to different connectivity
+devices (ex. SDI) or other HDR types. This patch adds a new generic HDR
+property (GEN_HDR_OUTPUT_METADATA) and corresponding structures. This
+new property and its structures are experimental and may eventually be
+merged into the existing HDR_OUTPUT_METADATA property. This generic HDR
+structure is the same as the HDR metadata structure from the v4l
+framework to allow for zero copy transfer of metadata.
+
+The application can send HDR metadata by creating a property blob and
+passing it to the drm property: GEN_HDR_OUTPUT_METADATA. If the
+connectivity device driver has HDR support, it is expected to use this
+information to form the proper HDR infoframes.
+
+Signed-off-by: Dylan Yip <dylan.yip@xilinx.com>
+Reviewed-by: Hyun Kwon <hyun.kwon@xilinx.com>
+State: pending
+Signed-off-by: Yaliang Wang <Yaliang.Wang@windriver.com>
+---
+ drivers/gpu/drm/drm_atomic_state_helper.c |  4 ++
+ drivers/gpu/drm/drm_atomic_uapi.c         | 10 ++++
+ drivers/gpu/drm/drm_connector.c           | 14 +++++
+ drivers/gpu/drm/drm_edid.c                | 73 +++++++++++++++++++++++
+ include/drm/drm_connector.h               |  7 +++
+ include/drm/drm_edid.h                    |  4 ++
+ include/drm/drm_mode_config.h             |  9 +++
+ include/uapi/drm/drm_mode.h               | 35 +++++++++++
+ 8 files changed, 156 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_atomic_state_helper.c b/drivers/gpu/drm/drm_atomic_state_helper.c
+index e8efbcb7226d..69b0b5620618 100644
+--- a/drivers/gpu/drm/drm_atomic_state_helper.c
++++ b/drivers/gpu/drm/drm_atomic_state_helper.c
+@@ -372,6 +372,9 @@ __drm_atomic_helper_connector_duplicate_state(struct drm_connector *connector,
+ 	if (state->hdr_output_metadata)
+ 		drm_property_blob_get(state->hdr_output_metadata);
+ 
++	if (state->gen_hdr_output_metadata)
++		drm_property_blob_get(state->gen_hdr_output_metadata);
++
+ 	/* Don't copy over a writeback job, they are used only once */
+ 	state->writeback_job = NULL;
+ }
+@@ -421,6 +424,7 @@ __drm_atomic_helper_connector_destroy_state(struct drm_connector_state *state)
+ 		drm_writeback_cleanup_job(state->writeback_job);
+ 
+ 	drm_property_blob_put(state->hdr_output_metadata);
++	drm_property_blob_put(state->gen_hdr_output_metadata);
+ }
+ EXPORT_SYMBOL(__drm_atomic_helper_connector_destroy_state);
+ 
+diff --git a/drivers/gpu/drm/drm_atomic_uapi.c b/drivers/gpu/drm/drm_atomic_uapi.c
+index d1b63b42f9f3..b36033e12ce8 100644
+--- a/drivers/gpu/drm/drm_atomic_uapi.c
++++ b/drivers/gpu/drm/drm_atomic_uapi.c
+@@ -735,6 +735,13 @@ static int drm_atomic_connector_set_property(struct drm_connector *connector,
+ 				sizeof(struct hdr_output_metadata), -1,
+ 				&replaced);
+ 		return ret;
++	} else if (property == config->gen_hdr_output_metadata_property) {
++		ret = drm_atomic_replace_property_blob_from_id(dev,
++				&state->gen_hdr_output_metadata,
++				val,
++				sizeof(struct gen_hdr_output_metadata), -1,
++				&replaced);
++		return ret;
+ 	} else if (property == config->aspect_ratio_property) {
+ 		state->picture_aspect_ratio = val;
+ 	} else if (property == config->content_type_property) {
+@@ -826,6 +833,9 @@ drm_atomic_connector_get_property(struct drm_connector *connector,
+ 	} else if (property == config->hdr_output_metadata_property) {
+ 		*val = state->hdr_output_metadata ?
+ 			state->hdr_output_metadata->base.id : 0;
++	} else if (property == config->gen_hdr_output_metadata_property) {
++		*val = state->gen_hdr_output_metadata ?
++			state->gen_hdr_output_metadata->base.id : 0;
+ 	} else if (property == connector->content_protection_property) {
+ 		*val = state->content_protection;
+ 	} else if (property == config->writeback_fb_id_property) {
+diff --git a/drivers/gpu/drm/drm_connector.c b/drivers/gpu/drm/drm_connector.c
+index 96c997f24ee7..3712868eed28 100644
+--- a/drivers/gpu/drm/drm_connector.c
++++ b/drivers/gpu/drm/drm_connector.c
+@@ -1008,6 +1008,14 @@ static const struct drm_prop_enum_list hdmi_colorspaces[] = {
+  *	hdmi_drm_infoframe_pack() to pack the infoframe as per spec, in case of
+  *	HDMI encoder.
+  *
++ * GEN_HDR_OUTPUT_METADATA:
++ *  This connector property is functionally the same as HDR_OUTPUT_METADATA.
++ *  However, the existing structures for HDR_OUTPUT_METADATA are not flexible
++ *  enough for dynamic HDR or other connectivity devices like SDI. So, this
++ *  property was created to utilize more generic structures that would be
++ *  scalable in the future. This is currently experimental and may possibly
++ *  be merged with the original HDR_OUTPUT_METADATA property in the future.
++ *
+  * max bpc:
+  *	This range property is used by userspace to limit the bit depth. When
+  *	used the driver would limit the bpc in accordance with the valid range
+@@ -1109,6 +1117,12 @@ int drm_connector_create_standard_properties(struct drm_device *dev)
+ 		return -ENOMEM;
+ 	dev->mode_config.hdr_output_metadata_property = prop;
+ 
++	prop = drm_property_create(dev, DRM_MODE_PROP_BLOB,
++				   "GEN_HDR_OUTPUT_METADATA", 0);
++	if (!prop)
++		return -ENOMEM;
++	dev->mode_config.gen_hdr_output_metadata_property = prop;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index 489ec3ff1021..309fd31c0127 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -5073,6 +5073,79 @@ drm_hdmi_infoframe_set_hdr_metadata(struct hdmi_drm_infoframe *frame,
+ }
+ EXPORT_SYMBOL(drm_hdmi_infoframe_set_hdr_metadata);
+ 
++/**
++ * drm_hdmi_infoframe_set_gen_hdr_metadata() - fill an HDMI DRM infoframe with
++ *                                             HDR metadata from userspace
++ * @frame: HDMI DRM infoframe
++ * @conn_state: Connector state containing HDR metadata
++ *
++ * Return: 0 on success or a negative error code on failure.
++ */
++int
++drm_hdmi_infoframe_set_gen_hdr_metadata(struct hdmi_drm_infoframe *frame,
++					const struct drm_connector_state *conn_state)
++{
++	struct drm_connector *connector;
++	struct gen_hdr_output_metadata *gen_hdr_metadata;
++	struct hdr_metadata_infoframe *hdr_infoframe;
++	int err;
++
++	if (!frame || !conn_state)
++		return -EINVAL;
++
++	connector = conn_state->connector;
++
++	if (!conn_state->gen_hdr_output_metadata)
++		return -EINVAL;
++
++	gen_hdr_metadata = conn_state->gen_hdr_output_metadata->data;
++
++	if (!gen_hdr_metadata || !connector)
++		return -EINVAL;
++
++	if (gen_hdr_metadata->metadata_type == DRM_HDR_TYPE_HDR10) {
++		hdr_infoframe = (struct hdr_metadata_infoframe *)
++			gen_hdr_metadata->payload;
++
++		/* Sink EOTF is Bit map while infoframe is absolute values */
++		if (!is_eotf_supported(hdr_infoframe->eotf,
++		    connector->hdr_sink_metadata.hdmi_type1.eotf)) {
++			DRM_DEBUG_KMS("EOTF Not Supported\n");
++			return -EINVAL;
++		}
++
++		err = hdmi_drm_infoframe_init(frame);
++		if (err < 0)
++			return err;
++
++		frame->eotf = hdr_infoframe->eotf;
++		frame->metadata_type = hdr_infoframe->metadata_type;
++
++		BUILD_BUG_ON(sizeof(frame->display_primaries) !=
++			     sizeof(hdr_infoframe->display_primaries));
++		BUILD_BUG_ON(sizeof(frame->white_point) !=
++			     sizeof(hdr_infoframe->white_point));
++
++		memcpy(&frame->display_primaries,
++		       &hdr_infoframe->display_primaries,
++		       sizeof(frame->display_primaries));
++
++		memcpy(&frame->white_point,
++		       &hdr_infoframe->white_point,
++		       sizeof(frame->white_point));
++
++		frame->max_display_mastering_luminance =
++			hdr_infoframe->max_display_mastering_luminance;
++		frame->min_display_mastering_luminance =
++			hdr_infoframe->min_display_mastering_luminance;
++		frame->max_fall = hdr_infoframe->max_fall;
++		frame->max_cll = hdr_infoframe->max_cll;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(drm_hdmi_infoframe_set_gen_hdr_metadata);
++
+ /**
+  * drm_hdmi_avi_infoframe_from_display_mode() - fill an HDMI AVI infoframe with
+  *                                              data from a DRM display mode
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index 43d6f2f468b8..87a3897eee5f 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -605,6 +605,13 @@ struct drm_connector_state {
+ 	 * DRM blob property for HDR output metadata
+ 	 */
+ 	struct drm_property_blob *hdr_output_metadata;
++
++	/**
++	 * @gen_hdr_output_metadata:
++	 * DRM blob property for Generic HDR output metadata
++	 */
++	struct drm_property_blob *gen_hdr_output_metadata;
++
+ };
+ 
+ /**
+diff --git a/include/drm/drm_edid.h b/include/drm/drm_edid.h
+index f461fc0bdad7..615cc0ae7989 100644
+--- a/include/drm/drm_edid.h
++++ b/include/drm/drm_edid.h
+@@ -375,6 +375,10 @@ int
+ drm_hdmi_infoframe_set_hdr_metadata(struct hdmi_drm_infoframe *frame,
+ 				    const struct drm_connector_state *conn_state);
+ 
++int
++drm_hdmi_infoframe_set_gen_hdr_metadata(struct hdmi_drm_infoframe *frame,
++					const struct drm_connector_state *conn_state);
++
+ /**
+  * drm_eld_mnl - Get ELD monitor name length in bytes.
+  * @eld: pointer to an eld memory structure with mnl set
+diff --git a/include/drm/drm_mode_config.h b/include/drm/drm_mode_config.h
+index e78429d14ec0..b9a4bd7de9ec 100644
+--- a/include/drm/drm_mode_config.h
++++ b/include/drm/drm_mode_config.h
+@@ -843,6 +843,15 @@ struct drm_mode_config {
+ 	 */
+ 	struct drm_property *hdr_output_metadata_property;
+ 
++	/**
++	 * @gen_hdr_output_metadata_property: Connector property containing hdr
++	 * metadata. This will be provided by userspace compositors based
++	 * on HDR content. This is functionally the same as
++	 * hdr_output_metadata_property but it uses a generic, experimental
++	 * structure instead of the existing HDR10 specific structure
++	 */
++	struct drm_property *gen_hdr_output_metadata_property;
++
+ 	/* dumb ioctl parameters */
+ 	uint32_t preferred_depth, prefer_shadow;
+ 
+diff --git a/include/uapi/drm/drm_mode.h b/include/uapi/drm/drm_mode.h
+index 1baf9d628ff9..1806b6892830 100644
+--- a/include/uapi/drm/drm_mode.h
++++ b/include/uapi/drm/drm_mode.h
+@@ -641,6 +641,20 @@ struct drm_color_lut {
+ 	__u16 reserved;
+ };
+ 
++enum drm_hdr_type {
++	/*
++	 * This is for the gen_hdr_output_metadata structure.
++	 * MSB differentiates static (0) or dynamic (1) metadata.
++	 * Other 15 bits represent specific HDR standards.
++	 */
++
++	/* static HDR */
++	DRM_HDR_TYPE_HDR10     = 0x0000,
++
++	/* dynamic HDR */
++	DRM_HDR_TYPE_HDR10P    = 1 << 15 | DRM_HDR_TYPE_HDR10,
++};
++
+ /**
+  * struct hdr_metadata_infoframe - HDR Metadata Infoframe Data.
+  *
+@@ -727,6 +741,27 @@ struct hdr_output_metadata {
+ 	};
+ };
+ 
++/**
++ * struct gen_hdr_output_metadata - Generic HDR output metadata
++ *
++ * Generic HDR Metadata Information to be passed from userspace
++ */
++struct gen_hdr_output_metadata {
++	/**
++	 * @metadata_type: HDR type.
++	 */
++	__u16 metadata_type;
++	/**
++	 * @size: size of payload/metadata.
++	 */
++	__u16 size;
++	/**
++	 * @payload: Actual metadata - HDR Metadata Infoframe.
++	 * Currently the largest extended HDR infoframe is 4000 bytes.
++	 */
++	__u8 payload[4000];
++};
++
+ #define DRM_MODE_PAGE_FLIP_EVENT 0x01
+ #define DRM_MODE_PAGE_FLIP_ASYNC 0x02
+ #define DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE 0x4
+-- 
+2.31.1
+
