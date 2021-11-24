@@ -1,0 +1,191 @@
+From 15fb5e011a9eddb94dfe66613097659285d1903b Mon Sep 17 00:00:00 2001
+From: Nicolas Pitre <nicolas.pitre@linaro.org>
+Date: Tue, 1 Aug 2017 00:31:32 -0400
+Subject: [PATCH 07/30] futex: Allow for compiling out PI support
+
+commit bc2eecd7ecce40af43b6eb3d256b6076257df846 upstream.
+
+This makes it possible to preserve basic futex support and compile out the
+PI support when RT mutexes are not available.
+
+Signed-off-by: Nicolas Pitre <nico@linaro.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Darren Hart <dvhart@infradead.org>
+Link: http://lkml.kernel.org/r/alpine.LFD.2.20.1708010024190.5981@knanqh.ubzr
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+---
+ include/linux/futex.h           |  7 ++++++-
+ init/Kconfig                    |  7 ++++++-
+ kernel/futex.c                  | 22 ++++++++++++++++++++++
+ kernel/locking/rtmutex_common.h | 29 +++++++++++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index df9770113196..ddcc4e3f515f 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -57,7 +57,6 @@ union futex_key {
+ 
+ #ifdef CONFIG_FUTEX
+ extern void exit_robust_list(struct task_struct *curr);
+-extern void exit_pi_state_list(struct task_struct *curr);
+ #ifdef CONFIG_HAVE_FUTEX_CMPXCHG
+ #define futex_cmpxchg_enabled 1
+ #else
+@@ -67,8 +66,14 @@ extern int futex_cmpxchg_enabled;
+ static inline void exit_robust_list(struct task_struct *curr)
+ {
+ }
++#endif
++
++#ifdef CONFIG_FUTEX_PI
++extern void exit_pi_state_list(struct task_struct *curr);
++#else
+ static inline void exit_pi_state_list(struct task_struct *curr)
+ {
+ }
+ #endif
++
+ #endif
+diff --git a/init/Kconfig b/init/Kconfig
+index 3b34ffc129a8..76cacc4c6c39 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1644,12 +1644,17 @@ config BASE_FULL
+ config FUTEX
+ 	bool "Enable futex support" if EXPERT
+ 	default y
+-	select RT_MUTEXES
++	imply RT_MUTEXES
+ 	help
+ 	  Disabling this option will cause the kernel to be built without
+ 	  support for "fast userspace mutexes".  The resulting kernel may not
+ 	  run glibc-based applications correctly.
+ 
++config FUTEX_PI
++	bool
++	depends on FUTEX && RT_MUTEXES
++	default y
++
+ config HAVE_FUTEX_CMPXCHG
+ 	bool
+ 	depends on FUTEX
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 9c365bb012bf..a0b9130d6538 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -892,6 +892,8 @@ static struct task_struct *futex_find_get_task(pid_t pid)
+ 	return p;
+ }
+ 
++#ifdef CONFIG_FUTEX_PI
++
+ /*
+  * This task is holding PI mutexes at exit time => bad.
+  * Kernel cleans up PI-state, but userspace is likely hosed.
+@@ -953,6 +955,8 @@ void exit_pi_state_list(struct task_struct *curr)
+ 	raw_spin_unlock_irq(&curr->pi_lock);
+ }
+ 
++#endif
++
+ /*
+  * We need to check the following states:
+  *
+@@ -1828,6 +1832,15 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
+ 	if (nr_wake < 0 || nr_requeue < 0)
+ 		return -EINVAL;
+ 
++	/*
++	 * When PI not supported: return -ENOSYS if requeue_pi is true,
++	 * consequently the compiler knows requeue_pi is always false past
++	 * this point which will optimize away all the conditional code
++	 * further down.
++	 */
++	if (!IS_ENABLED(CONFIG_FUTEX_PI) && requeue_pi)
++		return -ENOSYS;
++
+ 	if (requeue_pi) {
+ 		/*
+ 		 * Requeue PI only works on two distinct uaddrs. This
+@@ -2712,6 +2725,9 @@ static int futex_lock_pi(u32 __user *uaddr, unsigned int flags,
+ 	struct futex_q q = futex_q_init;
+ 	int res, ret;
+ 
++	if (!IS_ENABLED(CONFIG_FUTEX_PI))
++		return -ENOSYS;
++
+ 	if (refill_pi_state_cache())
+ 		return -ENOMEM;
+ 
+@@ -2899,6 +2915,9 @@ static int futex_unlock_pi(u32 __user *uaddr, unsigned int flags)
+ 	struct futex_q *top_waiter;
+ 	int ret;
+ 
++	if (!IS_ENABLED(CONFIG_FUTEX_PI))
++		return -ENOSYS;
++
+ retry:
+ 	if (get_user(uval, uaddr))
+ 		return -EFAULT;
+@@ -3133,6 +3152,9 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 	struct futex_q q = futex_q_init;
+ 	int res, ret;
+ 
++	if (!IS_ENABLED(CONFIG_FUTEX_PI))
++		return -ENOSYS;
++
+ 	if (uaddr == uaddr2)
+ 		return -EINVAL;
+ 
+diff --git a/kernel/locking/rtmutex_common.h b/kernel/locking/rtmutex_common.h
+index 4a39f88ffcc5..93c9b86d4abf 100644
+--- a/kernel/locking/rtmutex_common.h
++++ b/kernel/locking/rtmutex_common.h
+@@ -42,6 +42,9 @@ struct rt_mutex_waiter {
+ /*
+  * Various helpers to access the waiters-tree:
+  */
++
++#ifdef CONFIG_RT_MUTEXES
++
+ static inline int rt_mutex_has_waiters(struct rt_mutex *lock)
+ {
+ 	return !RB_EMPTY_ROOT(&lock->waiters);
+@@ -71,6 +74,32 @@ task_top_pi_waiter(struct task_struct *p)
+ 			pi_tree_entry);
+ }
+ 
++#else
++
++static inline int rt_mutex_has_waiters(struct rt_mutex *lock)
++{
++	return false;
++}
++
++static inline struct rt_mutex_waiter *
++rt_mutex_top_waiter(struct rt_mutex *lock)
++{
++	return NULL;
++}
++
++static inline int task_has_pi_waiters(struct task_struct *p)
++{
++	return false;
++}
++
++static inline struct rt_mutex_waiter *
++task_top_pi_waiter(struct task_struct *p)
++{
++	return NULL;
++}
++
++#endif
++
+ /*
+  * lock->owner state tracking:
+  */
+-- 
+2.31.1
+

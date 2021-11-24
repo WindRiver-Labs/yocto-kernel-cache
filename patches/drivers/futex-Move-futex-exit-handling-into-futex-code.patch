@@ -1,0 +1,218 @@
+From 930d3c247044a15ed9b47aaa02d51bf97c3e238e Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 6 Nov 2019 22:55:36 +0100
+Subject: [PATCH 11/30] futex: Move futex exit handling into futex code
+
+commit ba31c1a48538992316cc71ce94fa9cd3e7b427c0 upstream.
+
+The futex exit handling is #ifdeffed into mm_release() which is not pretty
+to begin with. But upcoming changes to address futex exit races need to add
+more functionality to this exit code.
+
+Split it out into a function, move it into futex code and make the various
+futex exit functions static.
+
+Preparatory only and no functional change.
+
+Folded build fix from Borislav.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20191106224556.049705556@linutronix.de
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[OP: backport of 2f6c5ebbbbc9 from 4.14.y branch of linux-stable]
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+---
+ include/linux/compat.h |  2 --
+ include/linux/futex.h  | 25 ++++++++++++++++---------
+ kernel/fork.c          | 25 +++----------------------
+ kernel/futex.c         | 33 +++++++++++++++++++++++++++++----
+ 4 files changed, 48 insertions(+), 37 deletions(-)
+
+diff --git a/include/linux/compat.h b/include/linux/compat.h
+index 1c5f3152cbb5..0d178488d228 100644
+--- a/include/linux/compat.h
++++ b/include/linux/compat.h
+@@ -315,8 +315,6 @@ struct compat_kexec_segment;
+ struct compat_mq_attr;
+ struct compat_msgbuf;
+ 
+-extern void compat_exit_robust_list(struct task_struct *curr);
+-
+ asmlinkage long
+ compat_sys_set_robust_list(struct compat_robust_list_head __user *head,
+ 			   compat_size_t len);
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index 9f2cd7e9b13f..0ce595e6476c 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -1,7 +1,9 @@
+ #ifndef _LINUX_FUTEX_H
+ #define _LINUX_FUTEX_H
+ 
++#include <linux/sched.h>
+ #include <linux/ktime.h>
++
+ #include <uapi/linux/futex.h>
+ 
+ struct inode;
+@@ -53,19 +55,24 @@ union futex_key {
+ #define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = 0ULL } }
+ 
+ #ifdef CONFIG_FUTEX
+-extern void exit_robust_list(struct task_struct *curr);
+-#else
+-static inline void exit_robust_list(struct task_struct *curr)
++
++static inline void futex_init_task(struct task_struct *tsk)
+ {
+-}
++	tsk->robust_list = NULL;
++#ifdef CONFIG_COMPAT
++	tsk->compat_robust_list = NULL;
+ #endif
++	INIT_LIST_HEAD(&tsk->pi_state_list);
++	tsk->pi_state_cache = NULL;
++}
+ 
+-#ifdef CONFIG_FUTEX_PI
+-extern void exit_pi_state_list(struct task_struct *curr);
++void futex_mm_release(struct task_struct *tsk);
++
++long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
++	      u32 __user *uaddr2, u32 val2, u32 val3);
+ #else
+-static inline void exit_pi_state_list(struct task_struct *curr)
+-{
+-}
++static inline void futex_init_task(struct task_struct *tsk) { }
++static inline void futex_mm_release(struct task_struct *tsk) { }
+ #endif
+ 
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index d9a0405ee22a..81ec45adf351 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1151,20 +1151,7 @@ static int wait_for_vfork_done(struct task_struct *child,
+ void mm_release(struct task_struct *tsk, struct mm_struct *mm)
+ {
+ 	/* Get rid of any futexes when releasing the mm */
+-#ifdef CONFIG_FUTEX
+-	if (unlikely(tsk->robust_list)) {
+-		exit_robust_list(tsk);
+-		tsk->robust_list = NULL;
+-	}
+-#ifdef CONFIG_COMPAT
+-	if (unlikely(tsk->compat_robust_list)) {
+-		compat_exit_robust_list(tsk);
+-		tsk->compat_robust_list = NULL;
+-	}
+-#endif
+-	if (unlikely(!list_empty(&tsk->pi_state_list)))
+-		exit_pi_state_list(tsk);
+-#endif
++	futex_mm_release(tsk);
+ 
+ 	uprobe_free_utask(tsk);
+ 
+@@ -1804,14 +1791,8 @@ static __latent_entropy struct task_struct *copy_process(
+ #ifdef CONFIG_BLOCK
+ 	p->plug = NULL;
+ #endif
+-#ifdef CONFIG_FUTEX
+-	p->robust_list = NULL;
+-#ifdef CONFIG_COMPAT
+-	p->compat_robust_list = NULL;
+-#endif
+-	INIT_LIST_HEAD(&p->pi_state_list);
+-	p->pi_state_cache = NULL;
+-#endif
++	futex_init_task(p);
++
+ 	/*
+ 	 * sigaltstack should be cleared when sharing the same VM
+ 	 */
+diff --git a/kernel/futex.c b/kernel/futex.c
+index dff3d7a459d5..80a7cde4fd94 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -341,6 +341,12 @@ static inline bool should_fail_futex(bool fshared)
+ }
+ #endif /* CONFIG_FAIL_FUTEX */
+ 
++#ifdef CONFIG_COMPAT
++static void compat_exit_robust_list(struct task_struct *curr);
++#else
++static inline void compat_exit_robust_list(struct task_struct *curr) { }
++#endif
++
+ static inline void futex_get_mm(union futex_key *key)
+ {
+ 	mmgrab(key->private.mm);
+@@ -902,7 +908,7 @@ static struct task_struct *futex_find_get_task(pid_t pid)
+  * Kernel cleans up PI-state, but userspace is likely hosed.
+  * (Robust-futex cleanup is separate and might save the day for userspace.)
+  */
+-void exit_pi_state_list(struct task_struct *curr)
++static void exit_pi_state_list(struct task_struct *curr)
+ {
+ 	struct list_head *next, *head = &curr->pi_state_list;
+ 	struct futex_pi_state *pi_state;
+@@ -957,7 +963,8 @@ void exit_pi_state_list(struct task_struct *curr)
+ 	}
+ 	raw_spin_unlock_irq(&curr->pi_lock);
+ }
+-
++#else
++static inline void exit_pi_state_list(struct task_struct *curr) { }
+ #endif
+ 
+ /*
+@@ -3626,7 +3633,7 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
+  *
+  * We silently return on any sign of list-walking problem.
+  */
+-void exit_robust_list(struct task_struct *curr)
++static void exit_robust_list(struct task_struct *curr)
+ {
+ 	struct robust_list_head __user *head = curr->robust_list;
+ 	struct robust_list __user *entry, *next_entry, *pending;
+@@ -3691,6 +3698,24 @@ void exit_robust_list(struct task_struct *curr)
+ 	}
+ }
+ 
++void futex_mm_release(struct task_struct *tsk)
++{
++	if (unlikely(tsk->robust_list)) {
++		exit_robust_list(tsk);
++		tsk->robust_list = NULL;
++	}
++
++#ifdef CONFIG_COMPAT
++	if (unlikely(tsk->compat_robust_list)) {
++		compat_exit_robust_list(tsk);
++		tsk->compat_robust_list = NULL;
++	}
++#endif
++
++	if (unlikely(!list_empty(&tsk->pi_state_list)))
++		exit_pi_state_list(tsk);
++}
++
+ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+ 		u32 __user *uaddr2, u32 val2, u32 val3)
+ {
+@@ -3816,7 +3841,7 @@ static void __user *futex_uaddr(struct robust_list __user *entry,
+  *
+  * We silently return on any sign of list-walking problem.
+  */
+-void compat_exit_robust_list(struct task_struct *curr)
++static void compat_exit_robust_list(struct task_struct *curr)
+ {
+ 	struct compat_robust_list_head __user *head = curr->compat_robust_list;
+ 	struct robust_list __user *entry, *next_entry, *pending;
+-- 
+2.31.1
+
