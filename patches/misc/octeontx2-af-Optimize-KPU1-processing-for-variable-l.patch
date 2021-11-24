@@ -1,0 +1,809 @@
+From dcefd2c6d1421ab7ae8f541b84aec2b59d680aad Mon Sep 17 00:00:00 2001
+From: Kiran Kumar K <kirankumark@marvell.com>
+Date: Wed, 15 Sep 2021 16:27:05 +0530
+Subject: [PATCH 04/11] octeontx2-af: Optimize KPU1 processing for
+ variable-length headers
+
+commit 8cbf5f03d60dc817049d17fd42d05d17c7284680 from
+git@git.assembla.com:cavium/WindRiver.linux.git
+
+Optimized KPU1 entry processing for variable-length custom L2 headers
+of size 24B, 90B by
+	- Moving LA LTYPE parsing for 24B and 90B headers to PKIND.
+	- Removing LA flags assignment for 24B and 90B headers.
+	- Reserving a PKIND 55 to parse variable length headers.
+
+Also, new mailbox(NPC_SET_PKIND) added to configure PKIND with
+corresponding variable-length offset, mask, and shift count
+(NPC_AF_KPUX_ENTRYX_ACTION0).
+
+Signed-off-by: Kiran Kumar K <kirankumark@marvell.com>
+Change-Id: I375b77e133a04c100a1fce0dd2881b4324a9278b
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/62074
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |   8 +-
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |   4 +-
+ .../marvell/octeontx2/af/npc_profile.h        | 382 +++---------------
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   6 +-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |   2 +-
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   |  50 ++-
+ 6 files changed, 125 insertions(+), 327 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index dc8f93cd25fb..0bd0d413e049 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -86,7 +86,7 @@ struct mbox_msghdr {
+ #define OTX2_MBOX_REQ_SIG (0xdead)
+ #define OTX2_MBOX_RSP_SIG (0xbeef)
+ 	u16 sig;         /* Signature, for validating corrupted msgs */
+-#define OTX2_MBOX_VERSION (0x000a)
++#define OTX2_MBOX_VERSION (0x000b)
+ 	u16 ver;         /* Version of msg's structure for this ID */
+ 	u16 next_msgoff; /* Offset of next msg within mailbox region */
+ 	int rc;          /* Msg process'ed response code */
+@@ -639,6 +639,12 @@ struct npc_set_pkind {
+ #define PKIND_RX		BIT_ULL(1)
+ 	u8 dir;
+ 	u8 pkind; /* valid only in case custom flag */
++	u8 var_len_off; /* Offset of custom header length field.
++			 * Valid only for pkind NPC_RX_CUSTOM_PRE_L2_PKIND
++			 */
++	u8 var_len_off_mask; /* Mask for length with in offset */
++	u8 shift_dir;
++	/* shift direction to get length of the header at var_len_off */
+ };
+ 
+ /* NPA mbox message formats */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index 905b3b9df2e9..f0666fa2d504 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -38,6 +38,7 @@ enum npc_kpu_la_ltype {
+ 	NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+ 	NPC_LT_LA_CPT_HDR,
+ 	NPC_LT_LA_CUSTOM_L2_24B_ETHER,
++	NPC_LT_LA_CUSTOM_PRE_L2_ETHER,
+ 	NPC_LT_LA_CUSTOM0 = 0xE,
+ 	NPC_LT_LA_CUSTOM1 = 0xF,
+ };
+@@ -156,10 +157,11 @@ enum npc_kpu_lh_ltype {
+  * Software assigns pkind for each incoming port such as CGX
+  * Ethernet interfaces, LBK interfaces, etc.
+  */
+-#define NPC_UNRESERVED_PKIND_COUNT NPC_RX_VLAN_EXDSA_PKIND
++#define NPC_UNRESERVED_PKIND_COUNT NPC_RX_CUSTOM_PRE_L2_PKIND
+ 
+ enum npc_pkind_type {
+ 	NPC_RX_LBK_PKIND = 0ULL,
++	NPC_RX_CUSTOM_PRE_L2_PKIND = 55ULL,
+ 	NPC_RX_VLAN_EXDSA_PKIND = 56ULL,
+ 	NPC_RX_CHLEN24B_PKIND = 57ULL,
+ 	NPC_RX_CPT_HDR_PKIND,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h b/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
+index 28c277f66bc8..6ed9c7002641 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc_profile.h
+@@ -179,9 +179,8 @@ enum npc_kpu_parser_state {
+ 	NPC_S_KPU1_EXDSA,
+ 	NPC_S_KPU1_HIGIG2,
+ 	NPC_S_KPU1_IH_NIX_HIGIG2,
+-	NPC_S_KPU1_CUSTOM_L2_90B,
++	NPC_S_KPU1_CUSTOM_PRE_L2,
+ 	NPC_S_KPU1_CPT_HDR,
+-	NPC_S_KPU1_CUSTOM_L2_24B,
+ 	NPC_S_KPU1_VLAN_EXDSA,
+ 	NPC_S_KPU2_CTAG,
+ 	NPC_S_KPU2_CTAG2,
+@@ -982,8 +981,8 @@ static struct npc_kpu_profile_action ikpu_action_entries[] = {
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		12, 16, 20, 0, 0,
+-		NPC_S_KPU1_ETHER, 0, 0,
+-		NPC_LID_LA, NPC_LT_NA,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0, 1,
++		NPC_LID_LA, NPC_LT_LA_CUSTOM_PRE_L2_ETHER,
+ 		0,
+ 		0, 0, 0, 0,
+ 
+@@ -999,9 +998,9 @@ static struct npc_kpu_profile_action ikpu_action_entries[] = {
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		36, 40, 44, 0, 0,
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0, 0,
+-		NPC_LID_LA, NPC_LT_NA,
++		12, 16, 20, 0, 0,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 24, 1,
++		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+ 		0,
+ 		0, 0, 0, 0,
+ 
+@@ -1017,9 +1016,9 @@ static struct npc_kpu_profile_action ikpu_action_entries[] = {
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		102, 106, 110, 0, 0,
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0, 0,
+-		NPC_LID_LA, NPC_LT_NA,
++		12, 16, 20, 0, 0,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 90, 1,
++		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+ 		0,
+ 		0, 0, 0, 0,
+ 
+@@ -1714,7 +1713,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_IP,
+ 		0xffff,
+ 		0x0000,
+@@ -1723,7 +1722,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_IP6,
+ 		0xffff,
+ 		0x0000,
+@@ -1732,7 +1731,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_ARP,
+ 		0xffff,
+ 		0x0000,
+@@ -1741,7 +1740,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_RARP,
+ 		0xffff,
+ 		0x0000,
+@@ -1750,7 +1749,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_PTP,
+ 		0xffff,
+ 		0x0000,
+@@ -1759,7 +1758,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_FCOE,
+ 		0xffff,
+ 		0x0000,
+@@ -1768,7 +1767,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_CTAG,
+ 		0xffff,
+ 		NPC_ETYPE_CTAG,
+@@ -1777,7 +1776,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_CTAG,
+ 		0xffff,
+ 		0x0000,
+@@ -1786,7 +1785,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_SBTAG,
+ 		0xffff,
+ 		0x0000,
+@@ -1795,7 +1794,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_QINQ,
+ 		0xffff,
+ 		0x0000,
+@@ -1804,7 +1803,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_ETAG,
+ 		0xffff,
+ 		0x0000,
+@@ -1813,7 +1812,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_MPLSU,
+ 		0xffff,
+ 		0x0000,
+@@ -1822,7 +1821,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_MPLSM,
+ 		0xffff,
+ 		0x0000,
+@@ -1831,7 +1830,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		NPC_ETYPE_NSH,
+ 		0xffff,
+ 		0x0000,
+@@ -1840,7 +1839,7 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 	},
+ 	{
+-		NPC_S_KPU1_CUSTOM_L2_90B, 0xff,
++		NPC_S_KPU1_CUSTOM_PRE_L2, 0xff,
+ 		0x0000,
+ 		0x0000,
+ 		0x0000,
+@@ -1929,141 +1928,6 @@ static struct npc_kpu_profile_cam kpu1_cam_entries[] = {
+ 		0x0000,
+ 		0x0000,
+ 	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_IP,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_IP6,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_ARP,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_RARP,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_PTP,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_FCOE,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_CTAG,
+-		0xffff,
+-		NPC_ETYPE_CTAG,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_CTAG,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_SBTAG,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_QINQ,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_ETAG,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_MPLSU,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_MPLSM,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		NPC_ETYPE_NSH,
+-		0xffff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+-	{
+-		NPC_S_KPU1_CUSTOM_L2_24B, 0xff,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-		0x0000,
+-	},
+ 	{
+ 		NPC_S_KPU1_VLAN_EXDSA, 0xff,
+ 		NPC_ETYPE_CTAG,
+@@ -9183,121 +9047,121 @@ static struct npc_kpu_profile_action kpu1_action_entries[] = {
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 0, 6, 3, 0,
+-		NPC_S_KPU5_IP, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
++		NPC_S_KPU5_IP, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		6, 0, 0, 3, 0,
+-		NPC_S_KPU5_IP6, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
++		NPC_S_KPU5_IP6, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_ARP, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
++		NPC_S_KPU5_ARP, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_RARP, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
++		NPC_S_KPU5_RARP, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_PTP, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
++		NPC_S_KPU5_PTP, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_FCOE, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
++		NPC_S_KPU5_FCOE, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
+ 		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 12, 0, 0, 0,
+-		NPC_S_KPU2_CTAG2, 102, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		NPC_S_KPU2_CTAG2, 12, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		4, 8, 0, 0, 0,
+-		NPC_S_KPU2_CTAG, 102, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		NPC_S_KPU2_CTAG, 12, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		4, 8, 22, 0, 0,
+-		NPC_S_KPU2_SBTAG, 102, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		NPC_S_KPU2_SBTAG, 12, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		4, 8, 0, 0, 0,
+-		NPC_S_KPU2_QINQ, 102, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
++		NPC_S_KPU2_QINQ, 12, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		8, 12, 26, 0, 0,
+-		NPC_S_KPU2_ETAG, 102, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_ETAG,
++		NPC_S_KPU2_ETAG, 12, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		2, 6, 10, 2, 0,
+-		NPC_S_KPU4_MPLS, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_L_WITH_MPLS,
++		NPC_S_KPU4_MPLS, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		2, 6, 10, 2, 0,
+-		NPC_S_KPU4_MPLS, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_L_WITH_MPLS,
++		NPC_S_KPU4_MPLS, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		2, 0, 0, 2, 0,
+-		NPC_S_KPU4_NSH, 104, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_L_WITH_NSH,
++		NPC_S_KPU4_NSH, 14, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		0, 0, 0, 0, 1,
+-		NPC_S_NA, 0, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_90B_ETHER,
+-		NPC_F_LA_L_UNK_ETYPE,
++		NPC_S_NA, 0, 0,
++		NPC_LID_LA, NPC_LT_NA,
++		0,
+ 		0, 0, 0, 0,
+ 	},
+ 	{
+@@ -9372,126 +9236,6 @@ static struct npc_kpu_profile_action kpu1_action_entries[] = {
+ 		NPC_F_LA_L_UNK_ETYPE,
+ 		0, 0, 0, 0,
+ 	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		8, 0, 6, 3, 0,
+-		NPC_S_KPU5_IP, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		0,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		6, 0, 0, 3, 0,
+-		NPC_S_KPU5_IP6, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		0,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_ARP, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		0,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_RARP, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		0,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_PTP, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		0,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		0, 0, 0, 3, 0,
+-		NPC_S_KPU5_FCOE, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		0,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		8, 12, 0, 0, 0,
+-		NPC_S_KPU2_CTAG2, 36, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		4, 8, 0, 0, 0,
+-		NPC_S_KPU2_CTAG, 36, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		4, 8, 22, 0, 0,
+-		NPC_S_KPU2_SBTAG, 36, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		4, 8, 0, 0, 0,
+-		NPC_S_KPU2_QINQ, 36, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_VLAN,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		8, 12, 26, 0, 0,
+-		NPC_S_KPU2_ETAG, 36, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_U_HAS_TAG | NPC_F_LA_L_WITH_ETAG,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		2, 6, 10, 2, 0,
+-		NPC_S_KPU4_MPLS, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_L_WITH_MPLS,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		2, 6, 10, 2, 0,
+-		NPC_S_KPU4_MPLS, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_L_WITH_MPLS,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		2, 0, 0, 2, 0,
+-		NPC_S_KPU4_NSH, 38, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_L_WITH_NSH,
+-		0, 0, 0, 0,
+-	},
+-	{
+-		NPC_ERRLEV_RE, NPC_EC_NOERR,
+-		0, 0, 0, 0, 1,
+-		NPC_S_NA, 0, 1,
+-		NPC_LID_LA, NPC_LT_LA_CUSTOM_L2_24B_ETHER,
+-		NPC_F_LA_L_UNK_ETYPE,
+-		0, 0, 0, 0,
+-	},
+ 	{
+ 		NPC_ERRLEV_RE, NPC_EC_NOERR,
+ 		12, 0, 0, 1, 0,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 7e9c4cd96210..28c8e0b19218 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -825,7 +825,9 @@ int rvu_tim_lookup_rsrc(struct rvu *rvu, struct rvu_block *block,
+ int rvu_npc_get_tx_nibble_cfg(struct rvu *rvu, u64 nibble_ena);
+ bool is_parse_nibble_config_valid(struct rvu *rvu,
+ 				  struct npc_mcam_kex *mcam_kex);
+-int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+-			   u64 pkind);
++int
++rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
++		       u64 pkind, u8 var_len_off, u8 var_len_off_mask,
++		       u8 shift_dir);
+ void rvu_tim_hw_fixes(struct rvu *rvu, int blkaddr);
+ #endif /* RVU_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 7ddf15c55c82..b18750cef3e4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -4468,7 +4468,7 @@ void rvu_nix_lf_teardown(struct rvu *rvu, u16 pcifunc, int blkaddr, int nixlf)
+ 
+ 	/* reset HW config done for Switch headers */
+ 	rvu_npc_set_parse_mode(rvu, pcifunc, OTX2_PRIV_FLAGS_DEFAULT,
+-			       (PKIND_TX | PKIND_RX), 0);
++			       (PKIND_TX | PKIND_RX), 0, 0, 0, 0);
+ 
+ 	nix_ctx_free(rvu, pfvf);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 0d800cd169ea..3781128637eb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -3164,8 +3164,43 @@ int rvu_mbox_handler_npc_get_kex_cfg(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
+-int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+-			   u64 pkind)
++int
++npc_set_var_len_offset_pkind(struct rvu *rvu, u16 pcifunc, u64 pkind,
++			     u8 var_len_off, u8 var_len_off_mask, u8 shift_dir)
++{
++	struct npc_kpu_action0 *act0;
++	u8 shift_count = 0;
++	int blkaddr;
++	u64 val;
++
++	if (!var_len_off_mask)
++		return -EINVAL;
++
++	if (var_len_off_mask != 0xff) {
++		if (shift_dir)
++			shift_count = __ffs(var_len_off_mask);
++		else
++			shift_count = (8 - __fls(var_len_off_mask));
++	}
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, pcifunc);
++	if (blkaddr < 0) {
++		dev_err(rvu->dev, "%s: NPC block not implemented\n", __func__);
++		return -EINVAL;
++	}
++	val = rvu_read64(rvu, blkaddr, NPC_AF_PKINDX_ACTION0(pkind));
++	act0 = (struct npc_kpu_action0 *)&val;
++	act0->var_len_shift = shift_count;
++	act0->var_len_right = shift_dir;
++	act0->var_len_mask = var_len_off_mask;
++	act0->var_len_offset = var_len_off;
++	rvu_write64(rvu, blkaddr, NPC_AF_PKINDX_ACTION0(pkind), val);
++	return 0;
++}
++
++int
++rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
++		       u64 pkind, u8 var_len_off, u8 var_len_off_mask,
++		       u8 shift_dir)
+ 
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
+@@ -3197,6 +3232,14 @@ int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+ 		intf_mode = NPC_INTF_MODE_HIGIG;
+ 		enable_higig2 = true;
+ 	} else if (mode & OTX2_PRIV_FLAGS_CUSTOM) {
++		if (pkind == NPC_RX_CUSTOM_PRE_L2_PKIND) {
++			rc = npc_set_var_len_offset_pkind(rvu, pcifunc, pkind,
++							  var_len_off,
++							  var_len_off_mask,
++							  shift_dir);
++			if (rc)
++				return rc;
++		}
+ 		rxpkind = pkind;
+ 		txpkind = pkind;
+ 	}
+@@ -3235,7 +3278,8 @@ int rvu_mbox_handler_npc_set_pkind(struct rvu *rvu,
+ 				   struct msg_rsp *rsp)
+ {
+ 	return rvu_npc_set_parse_mode(rvu, req->hdr.pcifunc, req->mode,
+-				      req->dir, req->pkind);
++				      req->dir, req->pkind, req->var_len_off,
++				      req->var_len_off_mask, req->shift_dir);
+ }
+ 
+ int rvu_mbox_handler_npc_read_base_steer_rule(struct rvu *rvu,
+-- 
+2.31.1
+
