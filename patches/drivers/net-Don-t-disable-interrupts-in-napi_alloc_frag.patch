@@ -1,0 +1,105 @@
+From b6dbbf0cc84f10dcddf8621749b5e2ec7c0fc51e Mon Sep 17 00:00:00 2001
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date: Fri, 7 Jun 2019 21:20:34 +0200
+Subject: [PATCH 1645/1921] net: Don't disable interrupts in napi_alloc_frag()
+
+netdev_alloc_frag() can be used from any context and is used by NAPI
+and non-NAPI drivers. Non-NAPI drivers use it in interrupt context
+and NAPI drivers use it during initial allocation (->ndo_open() or
+->ndo_change_mtu()). Some NAPI drivers share the same function for the
+initial allocation and the allocation in their NAPI callback.
+
+The interrupts are disabled in order to ensure locked access from every
+context to `netdev_alloc_cache'.
+
+Let netdev_alloc_frag() check if interrupts are disabled. If they are,
+use `netdev_alloc_cache' otherwise disable BH and invoke
+__napi_alloc_frag() for the allocation. The IRQ check is cheaper
+compared to disabling & enabling interrupts and memory allocation with
+disabled interrupts does not work on -RT.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ net/core/skbuff.c | 49 ++++++++++++++++++++++-------------------------
+ 1 file changed, 23 insertions(+), 26 deletions(-)
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 43ddd698c93c..271f26a58a8b 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -365,19 +365,21 @@ struct napi_alloc_cache {
+ static DEFINE_PER_CPU(struct page_frag_cache, netdev_alloc_cache);
+ static DEFINE_PER_CPU(struct napi_alloc_cache, napi_alloc_cache);
+ 
+-static void *__netdev_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
++static void *__napi_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+ {
+-	struct page_frag_cache *nc;
+-	unsigned long flags;
+-	void *data;
++	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ 
+-	local_irq_save(flags);
+-	nc = this_cpu_ptr(&netdev_alloc_cache);
+-	data = page_frag_alloc(nc, fragsz, gfp_mask);
+-	local_irq_restore(flags);
+-	return data;
++	return page_frag_alloc(&nc->page, fragsz, gfp_mask);
+ }
+ 
++void *napi_alloc_frag(unsigned int fragsz)
++{
++	fragsz = SKB_DATA_ALIGN(fragsz);
++
++	return __napi_alloc_frag(fragsz, GFP_ATOMIC);
++}
++EXPORT_SYMBOL(napi_alloc_frag);
++
+ /**
+  * netdev_alloc_frag - allocate a page fragment
+  * @fragsz: fragment size
+@@ -387,26 +389,21 @@ static void *__netdev_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+  */
+ void *netdev_alloc_frag(unsigned int fragsz)
+ {
+-	fragsz = SKB_DATA_ALIGN(fragsz);
+-
+-	return __netdev_alloc_frag(fragsz, GFP_ATOMIC);
+-}
+-EXPORT_SYMBOL(netdev_alloc_frag);
+-
+-static void *__napi_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+-{
+-	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+-
+-	return page_frag_alloc(&nc->page, fragsz, gfp_mask);
+-}
++	struct page_frag_cache *nc;
++	void *data;
+ 
+-void *napi_alloc_frag(unsigned int fragsz)
+-{
+ 	fragsz = SKB_DATA_ALIGN(fragsz);
+-
+-	return __napi_alloc_frag(fragsz, GFP_ATOMIC);
++	if (in_irq() || irqs_disabled()) {
++		nc = this_cpu_ptr(&netdev_alloc_cache);
++		data = page_frag_alloc(nc, fragsz, GFP_ATOMIC);
++	} else {
++		local_bh_disable();
++		data = __napi_alloc_frag(fragsz, GFP_ATOMIC);
++		local_bh_enable();
++	}
++	return data;
+ }
+-EXPORT_SYMBOL(napi_alloc_frag);
++EXPORT_SYMBOL(netdev_alloc_frag);
+ 
+ /**
+  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
+-- 
+2.31.1
+

@@ -1,0 +1,202 @@
+From 7960dcbf08abf2f890ef9428eb1cfca5b1af5ab6 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Sun, 2 May 2021 14:29:58 +0530
+Subject: [PATCH 1552/1921] octeontx2-pf: Implement TC police action with PPS
+
+This patch implements TC flower offload of police
+action with packets-per-second and packets burst
+parameters. Bandwidth profile context in hardware
+accepts either of two modes i.e bytes or packets
+for rate limiting. If PPS action is given then corresponding
+hardware configuration parameters are calculated and
+programmed into profile context.
+
+Example:
+tc filter add dev eth0 parent ffff: \
+protocol ip flower dst_mac 5e:b2:34:ee:29:49 \
+action police pkts_rate 5000 pkts_burst 2048
+
+Above example rate limits ip packets with destination
+mac address '5e:b2:34:ee:29:49' at 5000 packets-per-second
+
+Change-Id: Ia9487650dd18432260e855423fb076c881adbb10
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/52098
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/cn10k.c    | 46 ++++++++++++++++++-
+ .../ethernet/marvell/octeontx2/nic/cn10k.h    |  2 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_tc.c  | 35 ++++++++++----
+ 3 files changed, 71 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+index e40462851fd5..355bd887461d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+@@ -377,7 +377,7 @@ int cn10k_free_matchall_ipolicer(struct otx2_nic *pfvf)
+ }
+ 
+ int cn10k_set_ipolicer_rate(struct otx2_nic *pfvf, u16 profile,
+-			    u32 burst, u64 rate)
++			    u32 burst, u64 rate, bool pps)
+ {
+ 	struct nix_cn10k_aq_enq_req *aq;
+ 	u32 burst_exp, burst_mantissa;
+@@ -413,6 +413,30 @@ int cn10k_set_ipolicer_rate(struct otx2_nic *pfvf, u16 profile,
+ 	aq->prof.rdiv = rdiv;
+ 	aq->prof_mask.rdiv = 0xF;
+ 
++	if (pps) {
++		/* The amount of decremented tokens is calculated according to
++		 * the following equation:
++		 * max([ LMODE ? 0 : (packet_length - LXPTR)] +
++		 *	     ([ADJUST_MANTISSA]/256 - 1) * 2^[ADJUST_EXPONENT],
++		 *	1/256)
++		 * if LMODE is 1 then rate limiting will be based on
++		 * PPS otherwise bps.
++		 * The aim of the ADJUST value is to specify a token cost per
++		 * packet in contrary to the packet length that specifies a
++		 * cost per byte. To rate limit based on PPS adjust mantissa
++		 * is set as 384 and exponent as 1 so that number of tokens
++		 * decremented becomes 1 i.e, 1 token per packeet.
++		 */
++		aq->prof.adjust_exponent = 1;
++		aq->prof_mask.adjust_exponent = 0x1F;
++
++		aq->prof.adjust_mantissa = 384;
++		aq->prof_mask.adjust_mantissa = 0x1FF;
++
++		aq->prof.lmode = 0x1;
++		aq->prof_mask.lmode = 0x1;
++	}
++
+ 	/* Two rate three color marker
+ 	 * With PEIR/EIR set to zero, color will be either green or red
+ 	 */
+@@ -428,6 +452,23 @@ int cn10k_set_ipolicer_rate(struct otx2_nic *pfvf, u16 profile,
+ 	aq->prof.gc_action = NIX_RX_BAND_PROF_ACTIONRESULT_PASS;
+ 	aq->prof_mask.gc_action = 0x3;
+ 
++	/* Setting exponent value as 24 and mantissa as 0 configures
++	 * the bucket with zero values making bucket unused. Peak
++	 * information rate and Excess information rate buckets are
++	 * unused here.
++	 */
++	aq->prof.peir_exponent = 24;
++	aq->prof_mask.peir_exponent = 0x1F;
++
++	aq->prof.peir_mantissa = 0;
++	aq->prof_mask.peir_mantissa = 0xFF;
++
++	aq->prof.pebs_exponent = 24;
++	aq->prof_mask.pebs_exponent = 0x1F;
++
++	aq->prof.pebs_mantissa = 0;
++	aq->prof_mask.pebs_mantissa = 0xFF;
++
+ 	/* Fill AQ info */
+ 	aq->qidx = profile;
+ 	aq->ctype = NIX_AQ_CTYPE_BANDPROF;
+@@ -444,7 +485,8 @@ int cn10k_set_matchall_ipolicer_rate(struct otx2_nic *pfvf,
+ 
+ 	mutex_lock(&pfvf->mbox.lock);
+ 
+-	rc = cn10k_set_ipolicer_rate(pfvf, hw->matchall_ipolicer, burst, rate);
++	rc = cn10k_set_ipolicer_rate(pfvf, hw->matchall_ipolicer, burst,
++				     rate, false);
+ 	if (rc)
+ 		goto out;
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.h b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.h
+index 60a6c01be5d6..1a1ae334477d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.h
+@@ -22,6 +22,6 @@ int cn10k_map_unmap_rq_policer(struct otx2_nic *pfvf, int rq_idx,
+ 			       u16 policer, bool map);
+ int cn10k_alloc_leaf_profile(struct otx2_nic *pfvf, u16 *leaf);
+ int cn10k_set_ipolicer_rate(struct otx2_nic *pfvf, u16 profile,
+-			    u32 burst, u64 rate);
++			    u32 burst, u64 rate, bool pps);
+ int cn10k_free_leaf_profile(struct otx2_nic *pfvf, u16 leaf);
+ #endif /* CN10K_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+index cde63eced31a..186e28b6edc5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+@@ -224,7 +224,7 @@ static int otx2_tc_act_set_police(struct otx2_nic *nic,
+ 				  struct otx2_tc_flow *node,
+ 				  struct flow_cls_offload *f,
+ 				  u64 rate, u32 burst, u32 mark,
+-				  struct npc_install_flow_req *req)
++				  struct npc_install_flow_req *req, bool pps)
+ {
+ 	struct netlink_ext_ack *extack = f->common.extack;
+ 	struct otx2_hw *hw = &nic->hw;
+@@ -244,7 +244,7 @@ static int otx2_tc_act_set_police(struct otx2_nic *nic,
+ 		return rc;
+ 	}
+ 
+-	rc = cn10k_set_ipolicer_rate(nic, node->leaf_profile, burst, rate);
++	rc = cn10k_set_ipolicer_rate(nic, node->leaf_profile, burst, rate, pps);
+ 	if (rc)
+ 		goto free_leaf;
+ 
+@@ -283,7 +283,8 @@ static int otx2_tc_parse_actions(struct otx2_nic *nic,
+ 	struct net_device *target;
+ 	struct otx2_nic *priv;
+ 	u32 burst, mark = 0;
+-	bool act_police;
++	u8 nr_police = 0;
++	bool pps;
+ 	u64 rate;
+ 	int i;
+ 
+@@ -325,9 +326,20 @@ static int otx2_tc_parse_actions(struct otx2_nic *nic,
+ 				return -EOPNOTSUPP;
+ 			}
+ 
+-			act_police = true;
+-			rate = act->police.rate_bytes_ps * 8;
+-			burst = act->police.burst;
++			if (act->police.rate_bytes_ps > 0) {
++				rate = act->police.rate_bytes_ps * 8;
++				burst = act->police.burst;
++			} else if (act->police.rate_pkt_ps > 0) {
++				/* The algorithm used to calculate rate
++				 * mantissa, exponent values for a given token
++				 * rate (token can be byte or packet) requires
++				 * token rate to be mutiplied by 8.
++				 */
++				rate = act->police.rate_pkt_ps * 8;
++				burst = act->police.burst_pkt;
++				pps = true;
++			}
++			nr_police++;
+ 			break;
+ 		case FLOW_ACTION_MARK:
+ 			mark = act->mark;
+@@ -337,10 +349,15 @@ static int otx2_tc_parse_actions(struct otx2_nic *nic,
+ 		}
+ 	}
+ 
+-	if (act_police)
+-		return otx2_tc_act_set_police(nic, node, f, rate, burst,
+-					      mark, req);
++	if (nr_police > 1) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "rate limit police offload requires a single action");
++		return -EOPNOTSUPP;
++	}
+ 
++	if (nr_police)
++		return otx2_tc_act_set_police(nic, node, f, rate, burst,
++					      mark, req, pps);
+ 	return 0;
+ }
+ 
+-- 
+2.31.1
+

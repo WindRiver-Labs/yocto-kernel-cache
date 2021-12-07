@@ -1,0 +1,145 @@
+From ed54e01d7907e3e92f1947c355ec0673dba95190 Mon Sep 17 00:00:00 2001
+From: Pascal van Leeuwen <pascalvanl@gmail.com>
+Date: Fri, 6 Sep 2019 16:31:51 +0200
+Subject: [PATCH 1202/1921] crypto: inside-secure - Base CD fetchcount on
+ actual CD FIFO size
+
+This patch derives the command descriptor fetch count from the actual
+FIFO size advertised by the hardware. Fetching command descriptors
+one at a time is a performance bottleneck for small blocks, especially
+on hardware with multiple pipes. Even moreso if the HW has few rings.
+
+Signed-off-by: Pascal van Leeuwen <pvanleeuwen@verimatrix.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/crypto/inside-secure/safexcel.c | 47 +++++++++++++++++++------
+ drivers/crypto/inside-secure/safexcel.h | 11 ++++++
+ 2 files changed, 48 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/safexcel.c b/drivers/crypto/inside-secure/safexcel.c
+index 1f563e0b4158..32366f703332 100644
+--- a/drivers/crypto/inside-secure/safexcel.c
++++ b/drivers/crypto/inside-secure/safexcel.c
+@@ -310,13 +310,22 @@ static int eip197_load_firmwares(struct safexcel_crypto_priv *priv)
+ static int safexcel_hw_setup_cdesc_rings(struct safexcel_crypto_priv *priv)
+ {
+ 	u32 hdw, cd_size_rnd, val;
+-	int i;
++	int i, cd_fetch_cnt;
+ 
+-	hdw = readl(EIP197_HIA_AIC_G(priv) + EIP197_HIA_OPTIONS);
+-	hdw &= GENMASK(27, 25);
+-	hdw >>= 25;
+-
+-	cd_size_rnd = (priv->config.cd_size + (BIT(hdw) - 1)) >> hdw;
++	cd_size_rnd  = (priv->config.cd_size +
++			(BIT(priv->hwconfig.hwdataw) - 1)) >>
++		       priv->hwconfig.hwdataw;
++	/* determine number of CD's we can fetch into the CD FIFO as 1 block */
++	if (priv->flags & SAFEXCEL_HW_EIP197) {
++		/* EIP197: try to fetch enough in 1 go to keep all pipes busy */
++		cd_fetch_cnt = (1 << priv->hwconfig.hwcfsize) / cd_size_rnd;
++		cd_fetch_cnt = min_t(uint, cd_fetch_cnt,
++				     (priv->config.pes * EIP197_FETCH_DEPTH));
++	} else {
++		/* for the EIP97, just fetch all that fits minus 1 */
++		cd_fetch_cnt = ((1 << priv->hwconfig.hwcfsize) /
++				cd_size_rnd) - 1;
++	}
+ 
+ 	for (i = 0; i < priv->config.rings; i++) {
+ 		/* ring base address */
+@@ -328,8 +337,8 @@ static int safexcel_hw_setup_cdesc_rings(struct safexcel_crypto_priv *priv)
+ 		writel(EIP197_xDR_DESC_MODE_64BIT | (priv->config.cd_offset << 16) |
+ 		       priv->config.cd_size,
+ 		       EIP197_HIA_CDR(priv, i) + EIP197_HIA_xDR_DESC_SIZE);
+-		writel(((EIP197_FETCH_COUNT * (cd_size_rnd << hdw)) << 16) |
+-		       (EIP197_FETCH_COUNT * priv->config.cd_offset),
++		writel(((cd_fetch_cnt * (cd_size_rnd << hdw)) << 16) |
++		       (cd_fetch_cnt * priv->config.cd_offset),
+ 		       EIP197_HIA_CDR(priv, i) + EIP197_HIA_xDR_CFG);
+ 
+ 		/* Configure DMA tx control */
+@@ -1142,7 +1151,7 @@ static int safexcel_probe_generic(void *pdev,
+ 				  int is_pci_dev)
+ {
+ 	struct device *dev = priv->dev;
+-	u32 peid, version, mask, val;
++	u32 peid, version, mask, val, hiaopt;
+ 	int i, ret, hwctg;
+ 
+ 	priv->context_pool = dmam_pool_create("safexcel-context", dev,
+@@ -1226,13 +1235,31 @@ static int safexcel_probe_generic(void *pdev,
+ 	}
+ 	priv->hwconfig.pever = EIP197_VERSION_MASK(version);
+ 
++	hiaopt = readl(EIP197_HIA_AIC(priv) + EIP197_HIA_OPTIONS);
++
++	if (priv->flags & SAFEXCEL_HW_EIP197) {
++		/* EIP197 */
++		priv->hwconfig.hwdataw  = (hiaopt >> EIP197_HWDATAW_OFFSET) &
++					  EIP197_HWDATAW_MASK;
++		priv->hwconfig.hwcfsize = ((hiaopt >> EIP197_CFSIZE_OFFSET) &
++					   EIP197_CFSIZE_MASK) +
++					  EIP197_CFSIZE_ADJUST;
++	} else {
++		/* EIP97 */
++		priv->hwconfig.hwdataw  = (hiaopt >> EIP197_HWDATAW_OFFSET) &
++					  EIP97_HWDATAW_MASK;
++		priv->hwconfig.hwcfsize = (hiaopt >> EIP97_CFSIZE_OFFSET) &
++					  EIP97_CFSIZE_MASK;
++	}
++
+ 	/* Get supported algorithms from EIP96 transform engine */
+ 	priv->hwconfig.algo_flags = readl(EIP197_PE(priv) +
+ 				    EIP197_PE_EIP96_OPTIONS(0));
+ 
+ 	/* Print single info line describing what we just detected */
+-	dev_info(priv->dev, "EIP%d:%x(%d)-HIA:%x,PE:%x,alg:%08x\n", peid,
++	dev_info(priv->dev, "EIP%d:%x(%d)-HIA:%x(%d,%d),PE:%x,alg:%08x\n", peid,
+ 		 priv->hwconfig.hwver, hwctg, priv->hwconfig.hiaver,
++		 priv->hwconfig.hwdataw, priv->hwconfig.hwcfsize,
+ 		 priv->hwconfig.pever, priv->hwconfig.algo_flags);
+ 
+ 	safexcel_configure(priv);
+diff --git a/drivers/crypto/inside-secure/safexcel.h b/drivers/crypto/inside-secure/safexcel.h
+index d06dee21e7d1..2da757d5b404 100644
+--- a/drivers/crypto/inside-secure/safexcel.h
++++ b/drivers/crypto/inside-secure/safexcel.h
+@@ -31,6 +31,7 @@
+ #define EIP197_MAX_TOKENS			18
+ #define EIP197_MAX_RINGS			4
+ #define EIP197_FETCH_COUNT			1
++#define EIP197_FETCH_DEPTH			2
+ #define EIP197_MAX_BATCH_SZ			64
+ 
+ #define EIP197_GFP_FLAGS(base)	((base).flags & CRYPTO_TFM_REQ_MAY_SLEEP ? \
+@@ -225,6 +226,14 @@
+ #define EIP197_N_PES_OFFSET			4
+ #define EIP197_N_PES_MASK			GENMASK(4, 0)
+ #define EIP97_N_PES_MASK			GENMASK(2, 0)
++#define EIP197_HWDATAW_OFFSET			25
++#define EIP197_HWDATAW_MASK			GENMASK(3, 0)
++#define EIP97_HWDATAW_MASK			GENMASK(2, 0)
++#define EIP197_CFSIZE_OFFSET			9
++#define EIP197_CFSIZE_ADJUST			4
++#define EIP97_CFSIZE_OFFSET			8
++#define EIP197_CFSIZE_MASK			GENMASK(3, 0)
++#define EIP97_CFSIZE_MASK			GENMASK(4, 0)
+ 
+ /* EIP197_HIA_AIC_R_ENABLE_CTRL */
+ #define EIP197_CDR_IRQ(n)			BIT((n) * 2)
+@@ -680,6 +689,8 @@ struct safexcel_hwconfig {
+ 	int hwver;
+ 	int hiaver;
+ 	int pever;
++	int hwdataw;
++	int hwcfsize;
+ };
+ 
+ struct safexcel_crypto_priv {
+-- 
+2.31.1
+

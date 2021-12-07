@@ -1,0 +1,236 @@
+From 58d9641c7df660cf1a223b1de1e08659e6a4d195 Mon Sep 17 00:00:00 2001
+From: Kevin Hao <haokexin@gmail.com>
+Date: Sat, 9 May 2020 18:43:10 +0800
+Subject: [PATCH 1234/1921] octeontx2-pf: Use the napi_alloc_frag() to alloc
+ the pool buffers
+
+In the current codes, the octeontx2 uses its own method to allocate
+the pool buffers, but there are some issues in this implementation.
+1. We have to run the otx2_get_page() for each allocation cycle and
+   this is pretty error prone. As I can see there is no invocation
+   of the otx2_get_page() in otx2_pool_refill_task(), this will leave
+   the allocated pages have the wrong refcount and may be freed wrongly.
+2. It wastes memory. For example, if we only receive one packet in a
+   NAPI RX cycle, and then allocate a 2K buffer with otx2_alloc_rbuf()
+   to refill the pool buffers and leave the remain area of the allocated
+   page wasted. On a kernel with 64K page, 62K area is wasted.
+
+IMHO it is really unnecessary to implement our own method for the
+buffers allocate, we can reuse the napi_alloc_frag() to simplify
+our code.
+
+Change-Id: I90ef88556f441ce57d37dfa31ad97c2b3015891c
+Signed-off-by: Kevin Hao <haokexin@gmail.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/45011
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/cn10k.c    |  1 -
+ .../marvell/octeontx2/nic/otx2_common.c       | 53 ++++++++-----------
+ .../marvell/octeontx2/nic/otx2_common.h       | 15 +-----
+ .../marvell/octeontx2/nic/otx2_txrx.c         |  3 +-
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  4 --
+ 5 files changed, 24 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+index 0bc718b774c8..238238b0c1b6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+@@ -155,7 +155,6 @@ void cn10k_refill_pool_ptrs(void *dev, struct otx2_cq_queue *cq)
+ 			num_ptrs = 1;
+ 		}
+ 	}
+-	otx2_get_page(cq->rbpool);
+ }
+ 
+ void cn10k_sqe_flush(void *dev, struct otx2_snd_queue *sq, int size, int qidx)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 4f500e249e81..8df9885015fc 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -504,41 +504,35 @@ void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx)
+ 		     (pfvf->hw.cq_ecount_wait - 1));
+ }
+ 
+-dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+-			   gfp_t gfp)
++dma_addr_t __otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool)
+ {
+ 	dma_addr_t iova;
++	u8 *buf;
+ 
+-	/* Check if request can be accommodated in previous allocated page */
+-	if (!pfvf->xdp_prog && pool->page &&
+-	    ((pool->page_offset + pool->rbsize) <= PAGE_SIZE)) {
+-		pool->pageref++;
+-		goto ret;
+-	}
+-
+-	otx2_get_page(pool);
+-
+-	/* Allocate a new page */
+-	pool->page = alloc_pages(gfp | __GFP_COMP | __GFP_NOWARN,
+-				 pool->rbpage_order);
+-	if (unlikely(!pool->page))
++	buf = napi_alloc_frag(pool->rbsize);
++	if (unlikely(!buf))
+ 		return -ENOMEM;
+ 
+-	pool->page_offset = 0;
+-ret:
+-	iova = (u64)otx2_dma_map_page(pfvf, pool->page, pool->page_offset,
+-				      pool->rbsize, DMA_FROM_DEVICE,
+-				      DMA_ATTR_SKIP_CPU_SYNC);
+-	if (!iova) {
+-		if (!pool->page_offset)
+-			__free_pages(pool->page, pool->rbpage_order);
+-		pool->page = NULL;
++	iova = dma_map_single_attrs(pfvf->dev, buf, pool->rbsize,
++				    DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++	if (unlikely(dma_mapping_error(pfvf->dev, iova))) {
++		page_frag_free(buf);
+ 		return -ENOMEM;
+ 	}
+-	pool->page_offset += pool->rbsize;
++
+ 	return iova;
+ }
+ 
++static dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool)
++{
++	dma_addr_t addr;
++
++	local_bh_disable();
++	addr = __otx2_alloc_rbuf(pfvf, pool);
++	local_bh_enable();
++	return addr;
++}
++
+ void otx2_tx_timeout(struct net_device *netdev)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+@@ -933,7 +927,7 @@ static void otx2_pool_refill_task(struct work_struct *work)
+ 	free_ptrs = cq->pool_ptrs;
+ 
+ 	while (cq->pool_ptrs) {
+-		bufptr = otx2_alloc_rbuf(pfvf, rbpool, GFP_KERNEL);
++		bufptr = otx2_alloc_rbuf(pfvf, rbpool);
+ 		if (bufptr <= 0) {
+ 			/* Schedule a WQ if we fails to free atleast half of the
+ 			 * pointers else enable napi for this RQ.
+@@ -1208,7 +1202,6 @@ static int otx2_pool_init(struct otx2_nic *pfvf, u16 pool_id,
+ 		return err;
+ 
+ 	pool->rbsize = buf_size;
+-	pool->rbpage_order = get_order(buf_size);
+ 
+ 	/* Set LMTST addr for NPA batch free */
+ 	if (test_bit(CN10K_LMTST, &pfvf->hw.cap_flag))
+@@ -1301,13 +1294,12 @@ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf)
+ 			return -ENOMEM;
+ 
+ 		for (ptr = 0; ptr < num_sqbs; ptr++) {
+-			bufptr = otx2_alloc_rbuf(pfvf, pool, GFP_KERNEL);
++			bufptr = otx2_alloc_rbuf(pfvf, pool);
+ 			if (bufptr <= 0)
+ 				return bufptr;
+ 			pfvf->hw_ops->aura_freeptr(pfvf, pool_id, bufptr);
+ 			sq->sqb_ptrs[sq->sqb_count++] = (u64)bufptr;
+ 		}
+-		otx2_get_page(pool);
+ 	}
+ 
+ 	return 0;
+@@ -1353,13 +1345,12 @@ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf)
+ 	for (pool_id = 0; pool_id < hw->rqpool_cnt; pool_id++) {
+ 		pool = &pfvf->qset.pool[pool_id];
+ 		for (ptr = 0; ptr < num_ptrs; ptr++) {
+-			bufptr = otx2_alloc_rbuf(pfvf, pool, GFP_KERNEL);
++			bufptr = otx2_alloc_rbuf(pfvf, pool);
+ 			if (bufptr <= 0)
+ 				return bufptr;
+ 			pfvf->hw_ops->aura_freeptr(pfvf, pool_id,
+ 						   bufptr + OTX2_HEAD_ROOM);
+ 		}
+-		otx2_get_page(pool);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 1088cc02a7bd..0ba5b5fa1517 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -674,18 +674,6 @@ static inline void otx2_aura_freeptr(void *dev, int aura, s64 buf)
+ 		      otx2_get_regaddr(pfvf, NPA_LF_AURA_OP_FREE0));
+ }
+ 
+-/* Update page ref count */
+-static inline void otx2_get_page(struct otx2_pool *pool)
+-{
+-	if (!pool->page)
+-		return;
+-
+-	if (pool->pageref)
+-		page_ref_add(pool->page, pool->pageref);
+-	pool->pageref = 0;
+-	pool->page = NULL;
+-}
+-
+ static inline int otx2_get_pool_idx(struct otx2_nic *pfvf, int type, int idx)
+ {
+ 	if (type == AURA_NIX_SQ)
+@@ -840,8 +828,7 @@ int otx2_txschq_stop(struct otx2_nic *pfvf);
+ void otx2_sqb_flush(struct otx2_nic *pfvf);
+ int otx2_sq_aq_init(void *dev, u16 qidx, u16 sqb_aura);
+ int cn10k_sq_aq_init(void *dev, u16 qidx, u16 sqb_aura);
+-dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+-			   gfp_t gfp);
++dma_addr_t __otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool);
+ 
+ s64 otx2_alloc_buffer(struct otx2_nic *pfvf, struct otx2_cq_queue *cq);
+ int otx2_rxtx_enable(struct otx2_nic *pfvf, bool enable);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index b28efe7edc40..602209d85ed6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -407,7 +407,7 @@ s64 otx2_alloc_buffer(struct otx2_nic *pfvf, struct otx2_cq_queue *cq)
+ {
+ 	s64 bufptr;
+ 
+-	bufptr = otx2_alloc_rbuf(pfvf, cq->rbpool, GFP_ATOMIC);
++	bufptr = __otx2_alloc_rbuf(pfvf, cq->rbpool);
+ 	if (unlikely(bufptr <= 0)) {
+ 		struct refill_work *work;
+ 		struct delayed_work *dwork;
+@@ -436,7 +436,6 @@ void otx2_refill_pool_ptrs(void *dev, struct otx2_cq_queue *cq)
+ 		otx2_aura_freeptr(pfvf, cq->cq_idx, bufptr + OTX2_HEAD_ROOM);
+ 		cq->pool_ptrs--;
+ 	}
+-	otx2_get_page(cq->rbpool);
+ }
+ 
+ static int otx2_tx_napi_handler(struct otx2_nic *pfvf,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index 84f19755cae8..b192df779ca2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -114,12 +114,8 @@ struct otx2_cq_poll {
+ struct otx2_pool {
+ 	struct qmem		*stack;
+ 	struct qmem		*fc_addr;
+-	u8			rbpage_order;
+ 	u16			rbsize;
+-	u32			page_offset;
+-	u16			pageref;
+ 	u64			*lmt_addr;
+-	struct page		*page;
+ };
+ 
+ #define CQ_OP_ERROR	BIT_ULL(63)
+-- 
+2.31.1
+

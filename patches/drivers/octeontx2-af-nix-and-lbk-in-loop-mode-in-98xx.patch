@@ -1,0 +1,139 @@
+From c3e692137e7679ae13274345167a2c50bfb0cadb Mon Sep 17 00:00:00 2001
+From: Harman Kalra <hkalra@marvell.com>
+Date: Tue, 13 Jul 2021 19:03:27 +0530
+Subject: [PATCH 1643/1921] octeontx2-af: nix and lbk in loop mode in 98xx
+
+In 98xx, there are 2 NIX blocks and 4 LBK blocks present. The way
+these NIX-LBK should be configured depends on the use case. By
+default loopback functionality is supported in AF VF pairs which
+are attached to NIX0 and NIX1 LFs alternatively to ensure load
+balancing. NIX0 transmits a packet to LBK1 which will be received
+by NIX1 and packet transmitted by NIX1 will get received by NIX0 via
+LBK2.
+
+There are some requirements where only one AF VF is used and respective
+NIX is expected to operate in a mode where it can receive it own packet
+back. This can be achieved if NIX0 sends packet to LBK0 and not LBK1.
+Adding a flag in LF alloc request mailbox which can setup NIX0 to use
+LBK0 and NIX1 can use LBK3.
+
+Change-Id: I81e23bc3aab65267885a7389e9883a855521af4c
+Signed-off-by: Harman Kalra <hkalra@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/56437
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  1 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  3 +-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 29 +++++++++++++++++--
+ 3 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 1fcbc6b96af4..d257deac88d5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -817,6 +817,7 @@ struct nix_lf_alloc_req {
+ 	u64 rx_cfg;   /* See NIX_AF_LF(0..127)_RX_CFG */
+ 	u64 way_mask;
+ #define NIX_LF_RSS_TAG_LSB_AS_ADDER BIT_ULL(0)
++#define NIX_LF_LBK_BLK_SEL	    BIT_ULL(1)
+ 	u64 flags;
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index db904377bccd..202cee1e91b3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -293,10 +293,11 @@ struct rvu_pfvf {
+ 	bool	cgx_in_use; /* this PF/VF using CGX? */
+ 	int	cgx_users;  /* number of cgx users - used only by PFs */
+ 
+-	u8	nix_blkaddr; /* BLKADDR_NIX0/1 assigned to this PF */
+ 	int     intf_mode;
++	u8	nix_blkaddr; /* BLKADDR_NIX0/1 assigned to this PF */
+ 	u8	nix_rx_intf; /* NIX0_RX/NIX1_RX interface to NPC */
+ 	u8	nix_tx_intf; /* NIX0_TX/NIX1_TX interface to NPC */
++	u8	lbkid;	     /* NIX0/1 lbk link ID */
+ 	u64     lmt_base_addr; /* Preseving the pcifunc's lmtst base addr*/
+ 	u64     lmt_map_ent_w1; /*Preseving the word1 of lmtst map table entry*/
+ 	unsigned long flags;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index a5b3d0b78280..f060393aae1e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -246,7 +246,7 @@ static bool is_valid_txschq(struct rvu *rvu, int blkaddr,
+ }
+ 
+ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf,
+-			      struct nix_lf_alloc_rsp *rsp)
++			      struct nix_lf_alloc_rsp *rsp, bool loop)
+ {
+ 	struct rvu_pfvf *parent_pf, *pfvf = rvu_get_pfvf(rvu, pcifunc);
+ 	u16 req_chan_base, req_chan_end, req_chan_cnt;
+@@ -307,6 +307,25 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf,
+ 		if (rvu->hw->lbk_links > 1)
+ 			lbkid = vf & 0x1 ? 0 : 1;
+ 
++		/* By default NIX0 is configured to send packet on lbk link 1
++		 * (which corresponds to LBK1), same packet will receive on
++		 * NIX1 over lbk link 0. If NIX1 sends packet on lbk link 0
++		 * (which corresponds to LBK2) packet will receive on NIX0 lbk
++		 * link 1.
++		 * But if lbk links for NIX0 and NIX1 are negated, i.e NIX0
++		 * transmits and receives on lbk link 0, whick corresponds
++		 * to LBK1 block, back to back connectivity between NIX and
++		 * LBK can be achieved (which is similar to 96xx)
++		 *
++		 *			RX		TX
++		 * NIX0 lbk link	1 (LBK2)	1 (LBK1)
++		 * NIX0 lbk link	0 (LBK0)	0 (LBK0)
++		 * NIX1 lbk link	0 (LBK1)	0 (LBK2)
++		 * NIX1 lbk link	1 (LBK3)	1 (LBK3)
++		 */
++		if (loop)
++			lbkid = !lbkid;
++
+ 		/* Note that AF's VFs work in pairs and talk over consecutive
+ 		 * loopback channels.Therefore if odd number of AF VFs are
+ 		 * enabled then the last VF remains with no pair.
+@@ -318,6 +337,7 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf,
+ 		pfvf->rx_chan_cnt = 1;
+ 		pfvf->tx_chan_cnt = 1;
+ 		rsp->tx_link = hw->cgx_links + lbkid;
++		pfvf->lbkid = lbkid;
+ 		rvu_npc_set_pkind(rvu, NPC_RX_LBK_PKIND, pfvf);
+ 		rvu_npc_install_promisc_entry(rvu, pcifunc, nixlf,
+ 					      pfvf->rx_chan_base,
+@@ -1320,7 +1340,8 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	if (is_sdp_pfvf(pcifunc))
+ 		intf = NIX_INTF_TYPE_SDP;
+ 
+-	err = nix_interface_init(rvu, pcifunc, intf, nixlf, rsp);
++	err = nix_interface_init(rvu, pcifunc, intf, nixlf, rsp,
++				 !!(req->flags & NIX_LF_LBK_BLK_SEL));
+ 	if (err)
+ 		goto free_mem;
+ 
+@@ -3851,6 +3872,7 @@ int rvu_mbox_handler_nix_set_hw_frs(struct rvu *rvu, struct nix_frs_cfg *req,
+ 	struct nix_txsch *txsch;
+ 	u64 cfg, lmac_fifo_len;
+ 	struct nix_hw *nix_hw;
++	struct rvu_pfvf *pfvf;
+ 	u8 cgx = 0, lmac = 0;
+ 	u16 max_mtu;
+ 
+@@ -3907,7 +3929,8 @@ int rvu_mbox_handler_nix_set_hw_frs(struct rvu *rvu, struct nix_frs_cfg *req,
+ 		link = (cgx * hw->lmac_per_cgx) + lmac;
+ 	} else if (pf == 0) {
+ 		/* For VFs of PF0 ingress is LBK port, so config LBK link */
+-		link = hw->cgx_links;
++		pfvf = rvu_get_pfvf(rvu, pcifunc);
++		link = hw->cgx_links + pfvf->lbkid;
+ 	}
+ 
+ 	if (link < 0)
+-- 
+2.31.1
+

@@ -1,0 +1,211 @@
+From 2a3a7c6a0ad66afaa4fd03ccfae6d8a853a9eb73 Mon Sep 17 00:00:00 2001
+From: Bhaskara Budiredla <bbudiredla@marvell.com>
+Date: Mon, 12 Oct 2020 18:40:58 +0530
+Subject: [PATCH 0886/1921] drivers: mmc: enables mmc polling for pstore path
+
+This patch adds DMA polling functionality to MMC host driver.
+Pstore backend driver makes use of this method as it can't use
+normal interrupt path. It runs with interrupts disabled.
+
+Change-Id: I1cade0d9041812feaacdb78a7e93a08647af5e52
+Signed-off-by: Bhaskara Budiredla <bbudiredla@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/38231
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/mmc/core/core.c            | 11 +++--
+ drivers/mmc/host/cavium-thunderx.c | 14 +++++-
+ drivers/mmc/host/cavium.c          | 75 ++++++++++++++++++++++++++++++
+ drivers/mmc/host/cavium.h          |  3 ++
+ include/linux/mmc/host.h           |  5 ++
+ 5 files changed, 102 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index bce3061e4448..ca9bdbbb30f9 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -597,12 +597,15 @@ EXPORT_SYMBOL(mmc_cqe_recovery);
+  */
+ void mmc_wait_for_oops_req(struct mmc_host *host, struct mmc_request *mrq)
+ {
+-	mmc_start_request(host, mrq);
++	unsigned int timeout;
+ 
+-	if (mrq->data)
+-		mdelay((mrq->data->timeout_ns) / NSEC_PER_MSEC);
++	host->ops->req_cleanup_pending(host);
++	mmc_start_request(host, mrq);
+ 
+-	local_irq_enable();
++	if (mrq->data) {
++		timeout = mrq->data->timeout_ns / NSEC_PER_MSEC;
++		host->ops->req_completion_poll(host, timeout);
++	}
+ }
+ #endif
+ 
+diff --git a/drivers/mmc/host/cavium-thunderx.c b/drivers/mmc/host/cavium-thunderx.c
+index b1923ed2a357..caeb161b5ad4 100644
+--- a/drivers/mmc/host/cavium-thunderx.c
++++ b/drivers/mmc/host/cavium-thunderx.c
+@@ -21,12 +21,22 @@
+ 
+ static void thunder_mmc_acquire_bus(struct cvm_mmc_host *host)
+ {
+-	down(&host->mmc_serializer);
++#ifdef CONFIG_MMC_OOPS
++	if (!host->pstore)
++		down(&host->mmc_serializer);
++#else
++		down(&host->mmc_serializer);
++#endif
+ }
+ 
+ static void thunder_mmc_release_bus(struct cvm_mmc_host *host)
+ {
+-	up(&host->mmc_serializer);
++#ifdef CONFIG_MMC_OOPS
++	if (!host->pstore)
++		up(&host->mmc_serializer);
++#else
++		up(&host->mmc_serializer);
++#endif
+ }
+ 
+ static void thunder_mmc_int_enable(struct cvm_mmc_host *host, u64 val)
+diff --git a/drivers/mmc/host/cavium.c b/drivers/mmc/host/cavium.c
+index e80c1e42d6a1..7e5526d346c9 100644
+--- a/drivers/mmc/host/cavium.c
++++ b/drivers/mmc/host/cavium.c
+@@ -842,6 +842,74 @@ irqreturn_t cvm_mmc_interrupt(int irq, void *dev_id)
+ 	return IRQ_RETVAL(emm_int != 0);
+ }
+ 
++#ifdef CONFIG_MMC_OOPS
++static int cvm_req_completion_poll(struct mmc_host *host, unsigned long msecs)
++{
++	struct cvm_mmc_slot *slot = mmc_priv(host);
++	struct cvm_mmc_host *cvm_host = slot->host;
++	u64 emm_int;
++
++	while (msecs) {
++		emm_int = readq(cvm_host->base + MIO_EMM_INT(cvm_host));
++
++		if (emm_int & MIO_EMM_INT_DMA_DONE)
++			return 0;
++		else if (emm_int & MIO_EMM_INT_DMA_ERR)
++			return -EIO;
++		mdelay(1);
++		msecs--;
++	}
++
++	return -ETIMEDOUT;
++}
++
++static void cvm_req_cleanup_pending(struct mmc_host *host)
++{
++	struct cvm_mmc_slot *slot = mmc_priv(host);
++	struct cvm_mmc_host *cvm_host = slot->host;
++	u64 fifo_cfg;
++	u64 dma_cfg;
++	u64 emm_int;
++	int cnt;
++
++	cvm_host->pstore = 1;
++
++	/* Clear pending DMA FIFO queue */
++	fifo_cfg = readq(cvm_host->dma_base + MIO_EMM_DMA_FIFO_CFG(cvm_host));
++	if (FIELD_GET(MIO_EMM_DMA_FIFO_CFG_COUNT, fifo_cfg))
++		writeq(MIO_EMM_DMA_FIFO_CFG_CLR,
++			cvm_host->dma_base + MIO_EMM_DMA_FIFO_CFG(cvm_host));
++
++	/* Clear ongoing DMA, if there is any */
++	dma_cfg = readq(cvm_host->dma_base + MIO_EMM_DMA_CFG(cvm_host));
++	if (dma_cfg & MIO_EMM_DMA_CFG_EN) {
++		dma_cfg |= MIO_EMM_DMA_CFG_CLR;
++		writeq(dma_cfg, cvm_host->dma_base +
++				MIO_EMM_DMA_CFG(cvm_host));
++		do {
++			dma_cfg = readq(cvm_host->dma_base +
++					MIO_EMM_DMA_CFG(cvm_host));
++		} while (dma_cfg & MIO_EMM_DMA_CFG_EN);
++	}
++
++	/* Clear pending DMA interrupts */
++	emm_int = readq(cvm_host->base + MIO_EMM_INT(cvm_host));
++	if (emm_int)
++		writeq(emm_int, cvm_host->base + MIO_EMM_INT(cvm_host));
++
++	/* Clear prepared and yet to be fired DMA requests */
++	for (cnt = 0; cnt < CAVIUM_MAX_MMC; cnt++) {
++		if (cvm_host->slot[cnt]) {
++			if (cvm_host->slot[cnt]->current_req) {
++				cvm_host->slot[cnt]->current_req = NULL;
++				cvm_host->slot[cnt]->dma_active = false;
++				break;
++			}
++		}
++	}
++}
++#endif
++
+ /*
+  * Program DMA_CFG and if needed DMA_ADR.
+  * Returns 0 on error, DMA address otherwise.
+@@ -1979,6 +2047,10 @@ static const struct mmc_host_ops cvm_mmc_ops = {
+ 	.hw_reset	= cvm_mmc_reset,
+ 	.execute_tuning = cvm_execute_tuning,
+ 	.prepare_hs400_tuning = cvm_prepare_hs400_tuning,
++#ifdef CONFIG_MMC_OOPS
++	.req_cleanup_pending = cvm_req_cleanup_pending,
++	.req_completion_poll = cvm_req_completion_poll,
++#endif
+ };
+ 
+ static void cvm_mmc_set_clock(struct cvm_mmc_slot *slot, unsigned int clock)
+@@ -2198,6 +2270,9 @@ int cvm_mmc_of_slot_probe(struct device *dev, struct cvm_mmc_host *host)
+ 	slot->bus_id = id;
+ 	slot->cached_rca = 1;
+ 
++#ifdef CONFIG_MMC_OOPS
++	host->pstore = 0;
++#endif
+ 	host->acquire_bus(host);
+ 	host->slot[id] = slot;
+ 	host->use_vqmmc |= !IS_ERR_OR_NULL(slot->mmc->supply.vqmmc);
+diff --git a/drivers/mmc/host/cavium.h b/drivers/mmc/host/cavium.h
+index 8bc698f38b0b..37a3138ee076 100644
+--- a/drivers/mmc/host/cavium.h
++++ b/drivers/mmc/host/cavium.h
+@@ -134,6 +134,9 @@ struct cvm_mmc_host {
+ 	bool tap_requires_noclk;
+ 	bool calibrate_glitch;
+ 	bool cond_clock_glitch;
++#ifdef CONFIG_MMC_OOPS
++	bool pstore;
++#endif
+ 	spinlock_t irq_handler_lock;
+ 	struct semaphore mmc_serializer;
+ 
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 4a4a64834d8e..82faea0d1acc 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -168,6 +168,11 @@ struct mmc_host_ops {
+ 	 */
+ 	int	(*multi_io_quirk)(struct mmc_card *card,
+ 				  unsigned int direction, int blk_size);
++#ifdef CONFIG_MMC_OOPS
++	void	(*req_cleanup_pending)(struct mmc_host *host);
++	int	(*req_completion_poll)(struct mmc_host *host,
++					unsigned long timeout);
++#endif
+ };
+ 
+ struct mmc_cqe_ops {
+-- 
+2.31.1
+

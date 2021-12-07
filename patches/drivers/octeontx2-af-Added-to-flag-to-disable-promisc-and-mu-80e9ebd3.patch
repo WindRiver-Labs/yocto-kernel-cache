@@ -1,0 +1,199 @@
+From 15bc51b3c00ef0f461df210cc23b24b8fef0809e Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Sat, 1 May 2021 22:38:27 +0530
+Subject: [PATCH 1520/1921] octeontx2-af: Added to flag to disable promisc and
+ multicast MCE entry
+
+The promisc MCE entry feature is significantly degrading the performance
+of dataplane application because of temporary copy of multicast buffers.
+This patch adds a flag which indicates to AF driver not to use MCE
+feature while installing promisc/multicast entries. This flag will be
+disabled for dataplace applications and enabled for kernel PF/VF drivers.
+Also modified NIX_RX_MCE_S op to RSS.
+
+Change-Id: I025c982fd3c3ef071e5df116ec6331245db2704f
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/51140
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h   |  1 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h    |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c    | 18 ++++++++++--------
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c    | 13 ++++++++++---
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c   |  2 ++
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c   |  2 ++
+ 6 files changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index ea898ffe62c0..b30053adfff7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -1109,6 +1109,7 @@ struct nix_rx_mode {
+ #define NIX_RX_MODE_UCAST	BIT(0)
+ #define NIX_RX_MODE_PROMISC	BIT(1)
+ #define NIX_RX_MODE_ALLMULTI	BIT(2)
++#define NIX_RX_MODE_USE_MCE	BIT(3)
+ 	u16	mode;
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index e0d362c63675..db904377bccd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -282,6 +282,7 @@ struct rvu_pfvf {
+ 	struct nix_mce_list	bcast_mce_list;
+ 	struct nix_mce_list	mcast_mce_list;
+ 	struct nix_mce_list	promisc_mce_list;
++	bool			use_mce_list;
+ 
+ 	/* For resource limits */
+ 	struct pci_dev	*pdev;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 3aef3707dde6..7ecf1d1355e0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -2598,8 +2598,8 @@ static int nix_blk_setup_mce(struct rvu *rvu, struct nix_hw *nix_hw,
+ 	aq_req.op = op;
+ 	aq_req.qidx = mce;
+ 
+-	/* Forward bcast pkts to RQ0, RSS not needed */
+-	aq_req.mce.op = 0;
++	/* Use RSS with RSS index 0 */
++	aq_req.mce.op = 1;
+ 	aq_req.mce.index = 0;
+ 	aq_req.mce.eol = eol;
+ 	aq_req.mce.pf_func = pcifunc;
+@@ -3629,17 +3629,19 @@ int rvu_mbox_handler_nix_get_mac_addr(struct rvu *rvu,
+ int rvu_mbox_handler_nix_set_rx_mode(struct rvu *rvu, struct nix_rx_mode *req,
+ 				     struct msg_rsp *rsp)
+ {
+-	struct rvu_hwinfo *hw = rvu->hw;
++	bool allmulti, promisc, nix_rx_multicast;
+ 	u16 pcifunc = req->hdr.pcifunc;
+-	bool allmulti, promisc;
+ 	struct rvu_pfvf *pfvf;
+ 	int nixlf, err;
+ 
+ 	pfvf = rvu_get_pfvf(rvu, pcifunc);
+ 	promisc = req->mode & NIX_RX_MODE_PROMISC ? true : false;
+ 	allmulti = req->mode & NIX_RX_MODE_ALLMULTI ? true : false;
++	pfvf->use_mce_list = req->mode & NIX_RX_MODE_USE_MCE ? true : false;
++
++	nix_rx_multicast = rvu->hw->cap.nix_rx_multicast & pfvf->use_mce_list;
+ 
+-	if (is_vf(pcifunc) && !rvu->hw->cap.nix_rx_multicast &&
++	if (is_vf(pcifunc) && !nix_rx_multicast &&
+ 	    (promisc || allmulti)) {
+ 		dev_warn_ratelimited(rvu->dev,
+ 				     "VF promisc/multicast not supported\n");
+@@ -3655,7 +3657,7 @@ int rvu_mbox_handler_nix_set_rx_mode(struct rvu *rvu, struct nix_rx_mode *req,
+ 	if (err)
+ 		return err;
+ 
+-	if (hw->cap.nix_rx_multicast) {
++	if (nix_rx_multicast) {
+ 		/* add/del this PF_FUNC to/from mcast pkt replication list */
+ 		err = nix_update_mce_rule(rvu, pcifunc, NIXLF_ALLMULTI_ENTRY,
+ 					  allmulti);
+@@ -3682,7 +3684,7 @@ int rvu_mbox_handler_nix_set_rx_mode(struct rvu *rvu, struct nix_rx_mode *req,
+ 		rvu_npc_install_allmulti_entry(rvu, pcifunc, nixlf,
+ 					       pfvf->rx_chan_base);
+ 	} else {
+-		if (!hw->cap.nix_rx_multicast)
++		if (!nix_rx_multicast)
+ 			rvu_npc_enable_allmulti_entry(rvu, pcifunc, nixlf, false);
+ 	}
+ 
+@@ -3692,7 +3694,7 @@ int rvu_mbox_handler_nix_set_rx_mode(struct rvu *rvu, struct nix_rx_mode *req,
+ 					      pfvf->rx_chan_base,
+ 					      pfvf->rx_chan_cnt);
+ 	} else {
+-		if (!hw->cap.nix_rx_multicast)
++		if (!nix_rx_multicast)
+ 			rvu_npc_enable_promisc_entry(rvu, pcifunc, nixlf, false);
+ 	}
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 7c6373879cb7..b952e2a3eab6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -710,7 +710,7 @@ void rvu_npc_install_promisc_entry(struct rvu *rvu, u16 pcifunc,
+ 	}
+ 
+ 	/* RX_ACTION set to MCAST for CGX PF's */
+-	if (hw->cap.nix_rx_multicast &&
++	if (hw->cap.nix_rx_multicast && pfvf->use_mce_list &&
+ 	    is_pf_cgxmapped(rvu, rvu_get_pf(pcifunc))) {
+ 		*(u64 *)&action = 0x00;
+ 		action.op = NIX_RX_ACTIONOP_MCAST;
+@@ -886,7 +886,7 @@ void rvu_npc_install_allmulti_entry(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 	}
+ 
+ 	/* RX_ACTION set to MCAST for CGX PF's */
+-	if (hw->cap.nix_rx_multicast) {
++	if (hw->cap.nix_rx_multicast && pfvf->use_mce_list) {
+ 		*(u64 *)&action = 0x00;
+ 		action.op = NIX_RX_ACTIONOP_MCAST;
+ 		action.index = pfvf->mcast_mce_idx;
+@@ -1035,7 +1035,7 @@ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 	/* If PF's promiscuous entry is enabled,
+ 	 * Set RSS action for that entry as well
+ 	 */
+-	if (!hw->cap.nix_rx_multicast &&
++	if ((!hw->cap.nix_rx_multicast || !pfvf->use_mce_list) &&
+ 	    is_mcam_entry_enabled(rvu, mcam, blkaddr, index)) {
+ 		bank = npc_get_bank(mcam, index);
+ 		index &= (mcam->banksize - 1);
+@@ -1053,6 +1053,7 @@ void npc_enadis_default_mce_entry(struct rvu *rvu, u16 pcifunc,
+ 	struct rvu_hwinfo *hw = rvu->hw;
+ 	struct nix_mce_list *mce_list;
+ 	int index, blkaddr, mce_idx;
++	struct rvu_pfvf *pfvf;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+ 	if (blkaddr < 0)
+@@ -1067,6 +1068,12 @@ void npc_enadis_default_mce_entry(struct rvu *rvu, u16 pcifunc,
+ 		return;
+ 	}
+ 
++	/* return incase mce list is not enabled */
++	pfvf = rvu_get_pfvf(rvu, pcifunc & ~RVU_PFVF_FUNC_MASK);
++	if (hw->cap.nix_rx_multicast && is_vf(pcifunc) &&
++	    type != NIXLF_BCAST_ENTRY && !pfvf->use_mce_list)
++		return;
++
+ 	nix_get_mce_list(rvu, pcifunc, type, &mce_list, &mce_idx);
+ 
+ 	nix_update_mce_list(rvu, pcifunc, mce_list,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index fdde96bf5f94..d22f2c969386 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1930,6 +1930,8 @@ void otx2_do_set_rx_mode(struct work_struct *work)
+ 	if (netdev->flags & (IFF_ALLMULTI | IFF_MULTICAST))
+ 		req->mode |= NIX_RX_MODE_ALLMULTI;
+ 
++	req->mode |= NIX_RX_MODE_USE_MCE;
++
+ 	otx2_sync_mbox_msg(&pf->mbox);
+ 	mutex_unlock(&pf->mbox.lock);
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index b78d8f62b53a..8eedf818659b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -449,6 +449,8 @@ static void otx2vf_do_set_rx_mode(struct work_struct *work)
+ 	if (flags & (IFF_ALLMULTI | IFF_MULTICAST))
+ 		req->mode |= NIX_RX_MODE_ALLMULTI;
+ 
++	req->mode |= NIX_RX_MODE_USE_MCE;
++
+ 	otx2_sync_mbox_msg(&vf->mbox);
+ 
+ 	mutex_unlock(&vf->mbox.lock);
+-- 
+2.31.1
+

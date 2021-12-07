@@ -1,0 +1,157 @@
+From 475ee0d3777c6416fc78c71f331efb8638812377 Mon Sep 17 00:00:00 2001
+From: Alex Belits <abelits@marvell.com>
+Date: Thu, 9 May 2019 17:19:48 -0700
+Subject: [PATCH 0441/1921] arm64: Add support for ASID locking
+
+This patch adds support for ASID locking to be used with firmware
+assisted interrupts.
+
+Change-Id: I82a99848bdecb8a7a6f62b4e0cb8fd3b070e2a3e
+Signed-off-by: Alex Belits <abelits@marvell.com>
+Signed-off-by: Sujeet Baranwal <sbaranwal@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/8805
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Reviewed-by: Sujeet Kumar Baranwal <Sujeet.Baranwal@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/26936
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ arch/arm64/include/asm/mmu_context.h |  6 +++
+ arch/arm64/mm/context.c              | 79 +++++++++++++++++++++++++++-
+ 2 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/include/asm/mmu_context.h b/arch/arm64/include/asm/mmu_context.h
+index 7ed0adb187a8..d6f46d8a72be 100644
+--- a/arch/arm64/include/asm/mmu_context.h
++++ b/arch/arm64/include/asm/mmu_context.h
+@@ -248,6 +248,12 @@ switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ void verify_cpu_asid_bits(void);
+ void post_ttbr_update_workaround(void);
+ 
++#ifdef CONFIG_MRVL_OCTEONTX_EL0_INTR
++int lock_context(struct mm_struct *mm, int index);
++int unlock_context_by_index(int index);
++bool unlock_context_by_mm(struct mm_struct *mm);
++#endif
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* !__ASM_MMU_CONTEXT_H */
+diff --git a/arch/arm64/mm/context.c b/arch/arm64/mm/context.c
+index b5e329fde2dd..aa3e43e87dab 100644
+--- a/arch/arm64/mm/context.c
++++ b/arch/arm64/mm/context.c
+@@ -24,6 +24,13 @@ static unsigned long *asid_map;
+ 
+ static DEFINE_PER_CPU(atomic64_t, active_asids);
+ static DEFINE_PER_CPU(u64, reserved_asids);
++
++#ifdef CONFIG_MRVL_OCTEONTX_EL0_INTR
++#define LOCKED_ASIDS_COUNT	128
++
++static u64 locked_asids[LOCKED_ASIDS_COUNT];
++#endif
++
+ static cpumask_t tlb_flush_pending;
+ 
+ #define ASID_MASK		(~GENMASK(asid_bits - 1, 0))
+@@ -100,6 +107,14 @@ static void flush_context(void)
+ 		per_cpu(reserved_asids, i) = asid;
+ 	}
+ 
++#ifdef CONFIG_MRVL_OCTEONTX_EL0_INTR
++	/* Set bits for locked ASIDs. */
++	for (i = 0; i < LOCKED_ASIDS_COUNT; i++) {
++		asid = locked_asids[i];
++		if (asid != 0)
++			__set_bit(asid & ~ASID_MASK, asid_map);
++	}
++#endif
+ 	/*
+ 	 * Queue a TLB invalidation for each CPU to perform on next
+ 	 * context-switch
+@@ -107,9 +122,61 @@ static void flush_context(void)
+ 	cpumask_setall(&tlb_flush_pending);
+ }
+ 
++#ifdef CONFIG_MRVL_OCTEONTX_EL0_INTR
++int lock_context(struct mm_struct *mm, int index)
++{
++	unsigned long flags;
++	u64 asid;
++
++	if ((index < 0) || (index >= LOCKED_ASIDS_COUNT))
++		return -1;
++	raw_spin_lock_irqsave(&cpu_asid_lock, flags);
++	asid = atomic64_read(&mm->context.id);
++	locked_asids[index] = asid;
++	raw_spin_unlock_irqrestore(&cpu_asid_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL(lock_context);
++
++int unlock_context_by_index(int index)
++{
++	unsigned long flags;
++
++	if ((index < 0) || (index >= LOCKED_ASIDS_COUNT))
++		return -1;
++	raw_spin_lock_irqsave(&cpu_asid_lock, flags);
++	locked_asids[index] = 0;
++	raw_spin_unlock_irqrestore(&cpu_asid_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL(unlock_context_by_index);
++
++bool unlock_context_by_mm(struct mm_struct *mm)
++{
++	int i;
++	unsigned long flags;
++	bool hit = false;
++	u64 asid;
++
++	raw_spin_lock_irqsave(&cpu_asid_lock, flags);
++	asid = atomic64_read(&mm->context.id);
++
++	for (i = 0; i < LOCKED_ASIDS_COUNT; i++) {
++		if (locked_asids[i] == asid) {
++			hit = true;
++			locked_asids[i] = 0;
++		}
++	}
++
++	raw_spin_unlock_irqrestore(&cpu_asid_lock, flags);
++
++	return hit;
++}
++#endif
++
+ static bool check_update_reserved_asid(u64 asid, u64 newasid)
+ {
+-	int cpu;
++	int i, cpu;
+ 	bool hit = false;
+ 
+ 	/*
+@@ -128,6 +195,16 @@ static bool check_update_reserved_asid(u64 asid, u64 newasid)
+ 		}
+ 	}
+ 
++#ifdef CONFIG_MRVL_OCTEONTX_EL0_INTR
++	/* Same mechanism for locked ASIDs */
++	for (i = 0; i < LOCKED_ASIDS_COUNT; i++) {
++		if (locked_asids[i] == asid) {
++			hit = true;
++			locked_asids[i] = newasid;
++		}
++	}
++#endif
++
+ 	return hit;
+ }
+ 
+-- 
+2.31.1
+

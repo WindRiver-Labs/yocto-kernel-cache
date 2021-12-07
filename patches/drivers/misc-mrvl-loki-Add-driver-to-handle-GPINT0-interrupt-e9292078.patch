@@ -1,0 +1,189 @@
+From 3badaee59d87b3255f77b6631f633b2119d7f044 Mon Sep 17 00:00:00 2001
+From: Radha Mohan Chintakuntla <radhac@marvell.com>
+Date: Mon, 2 Mar 2020 15:26:03 -0800
+Subject: [PATCH 0443/1921] misc: mrvl-loki: Add driver to handle GPINT0
+ interrupt
+
+The GPINT0 on Loki SoC needs to be handled in the kernel. This patch
+adds support for it.
+
+Change-Id: I74f58cb98bb18b05593bbf9a8a1c525c69fc1909
+Signed-off-by: Radha Mohan Chintakuntla <radhac@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/24335
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/26938
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/misc/Kconfig     |   7 +++
+ drivers/misc/Makefile    |   1 +
+ drivers/misc/mrvl-loki.c | 124 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 132 insertions(+)
+ create mode 100644 drivers/misc/mrvl-loki.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 836be9398328..65908314b7c6 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -497,11 +497,18 @@ config MARVELL_OTX_BPHY_CTR
+ 	bool "Marvell OcteonTX BPHY Control driver"
+ 	select MRVL_OCTEONTX_EL0_INTR
+ 	help
++	default y
+ 	  Enables BPHY control driver which handles ioctl calls
+ 	  to set/clear IRQ handlers in EL3 using SMC calls.
+ 	  The purpose of this is to handle some BPHY Interrupts in
+ 	  user space directly without kernel's intervention.
+ 
++config MARVELL_LOKI
++	bool "Marvell Loki driver"
++	default y
++	help
++	  Handles GPINT0 interrupt on Loki SoC.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 71cbbd1e480f..6c74934eb677 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -60,3 +60,4 @@ obj-y				+= cardreader/
+ obj-$(CONFIG_PVPANIC)   	+= pvpanic.o
+ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
+ obj-$(CONFIG_MARVELL_OTX_BPHY_CTR)	+= otx_bphy_ctr.o
++obj-$(CONFIG_MARVELL_LOKI)	+= mrvl-loki.o
+diff --git a/drivers/misc/mrvl-loki.c b/drivers/misc/mrvl-loki.c
+new file mode 100644
+index 000000000000..b6f67c1061b6
+--- /dev/null
++++ b/drivers/misc/mrvl-loki.c
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell Loki driver
++ *
++ * Copyright (C) 2018 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_irq.h>
++#include <linux/platform_device.h>
++#include <linux/pci.h>
++
++#define PCI_DEVICE_ID_BPHY	0xA089
++
++struct mrvl_loki {
++	void __iomem *msix;
++	struct pci_dev *pdev;
++	struct msix_entry msix_ent;
++	int intr_num;
++};
++
++static irqreturn_t mrvl_loki_handler(int irq, void *dev)
++{
++	return IRQ_HANDLED;
++};
++
++static inline void msix_enable_ctrl(struct pci_dev *dev)
++{
++	u16 control;
++
++	pci_read_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, &control);
++	control |= PCI_MSIX_FLAGS_ENABLE;
++	pci_write_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, control);
++}
++
++static int mrvl_loki_probe(struct platform_device *pdev)
++{
++	struct mrvl_loki *ml;
++	struct device *dev = &pdev->dev;
++	struct pci_dev *bphy_pdev;
++	uint64_t regval;
++	int ret = 0;
++
++	ml = devm_kzalloc(dev, sizeof(*ml), GFP_KERNEL);
++	if (!ml)
++		return -ENOMEM;
++
++	platform_set_drvdata(pdev, ml);
++
++	/*
++	 * BPHY is a PCI device and the kernel resets the MSIXEN bit during
++	 * enumeration. So enable it back for interrupts to be generated.
++	 */
++	bphy_pdev = pci_get_device(PCI_VENDOR_ID_CAVIUM, PCI_DEVICE_ID_BPHY,
++				  NULL);
++	if (!bphy_pdev) {
++		dev_err(dev, "Couldn't find BPHY PCI device %x\n",
++			PCI_DEVICE_ID_BPHY);
++		ret = -ENODEV;
++		goto err;
++	}
++
++	ml->pdev = bphy_pdev;
++	ml->msix_ent.entry = 0;
++
++	msix_enable_ctrl(bphy_pdev);
++
++	/* register interrupt */
++	ml->intr_num = irq_of_parse_and_map(dev->of_node, 0);
++
++	if (request_irq(ml->intr_num, mrvl_loki_handler, 0,
++			"mrvl loki handler", pdev)) {
++		dev_err(dev, "failed to register irq handler\n");
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	dev_info(dev, "Registered interrupt handler for %d\n", ml->intr_num);
++
++	return 0;
++
++err:
++	devm_kfree(&pdev->dev, ml);
++	return ret;
++}
++
++static int mrvl_loki_remove(struct platform_device *pdev)
++{
++	struct mrvl_loki *ml = platform_get_drvdata(pdev);
++
++	free_irq(ml->intr_num, pdev);
++	devm_kfree(&pdev->dev, ml);
++
++	return 0;
++}
++
++static const struct of_device_id mrvl_loki_of_match[] = {
++	{ .compatible = "marvell,loki", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, mrvl_loki_of_match);
++
++static struct platform_driver mrvl_loki_driver = {
++	.probe = mrvl_loki_probe,
++	.remove = mrvl_loki_remove,
++	.driver = {
++		.name = "mrvl-loki",
++		.of_match_table = of_match_ptr(mrvl_loki_of_match),
++	},
++};
++
++module_platform_driver(mrvl_loki_driver);
++
++MODULE_DESCRIPTION("Marvell Loki Driver");
++MODULE_AUTHOR("Radha Mohan Chintakuntla");
++MODULE_LICENSE("GPL v2");
+-- 
+2.31.1
+

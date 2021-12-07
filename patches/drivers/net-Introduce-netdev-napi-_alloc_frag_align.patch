@@ -1,0 +1,150 @@
+From 4e6a17da1995fff10fa211306eb11cf22b8198ff Mon Sep 17 00:00:00 2001
+From: Kevin Hao <haokexin@gmail.com>
+Date: Fri, 16 Jul 2021 12:01:20 +0530
+Subject: [PATCH 1646/1921] net: Introduce {netdev,napi}_alloc_frag_align()
+
+In the current implementation of {netdev,napi}_alloc_frag(), it doesn't
+have any align guarantee for the returned buffer address, But for some
+hardwares they do require the DMA buffer to be aligned correctly,
+so we would have to use some workarounds like below if the buffers
+allocated by the {netdev,napi}_alloc_frag() are used by these hardwares
+for DMA.
+buf = napi_alloc_frag(really_needed_size + align);
+buf = PTR_ALIGN(buf, align);
+
+These codes seems ugly and would waste a lot of memories if the buffers
+are used in a network driver for the TX/RX. We have added the align
+support for the page_frag functions, so add the corresponding
+{netdev,napi}_frag functions.
+
+Change-Id: I6e9a363ea7578df93c8c996fb0338ec28342d21f
+Signed-off-by: Kevin Hao <haokexin@gmail.com>
+Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/56456
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ include/linux/skbuff.h | 36 ++++++++++++++++++++++++++++++++++--
+ net/core/skbuff.c      | 26 ++++++++++----------------
+ 2 files changed, 44 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 95f83139835b..92949e5de46c 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2750,7 +2750,26 @@ void skb_queue_purge(struct sk_buff_head *list);
+ 
+ unsigned int skb_rbtree_purge(struct rb_root *root);
+ 
+-void *netdev_alloc_frag(unsigned int fragsz);
++void *__netdev_alloc_frag_align(unsigned int fragsz, unsigned int align_mask);
++
++/**
++ * netdev_alloc_frag - allocate a page fragment
++ * @fragsz: fragment size
++ *
++ * Allocates a frag from a page for receive buffer.
++ * Uses GFP_ATOMIC allocations.
++ */
++static inline void *netdev_alloc_frag(unsigned int fragsz)
++{
++	return __netdev_alloc_frag_align(fragsz, ~0u);
++}
++
++static inline void *netdev_alloc_frag_align(unsigned int fragsz,
++					    unsigned int align)
++{
++	WARN_ON_ONCE(!is_power_of_2(align));
++	return __netdev_alloc_frag_align(fragsz, -align);
++}
+ 
+ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int length,
+ 				   gfp_t gfp_mask);
+@@ -2809,7 +2828,20 @@ static inline void skb_free_frag(void *addr)
+ 	page_frag_free(addr);
+ }
+ 
+-void *napi_alloc_frag(unsigned int fragsz);
++void *__napi_alloc_frag_align(unsigned int fragsz, unsigned int align_mask);
++
++static inline void *napi_alloc_frag(unsigned int fragsz)
++{
++	return __napi_alloc_frag_align(fragsz, ~0u);
++}
++
++static inline void *napi_alloc_frag_align(unsigned int fragsz,
++					  unsigned int align)
++{
++	WARN_ON_ONCE(!is_power_of_2(align));
++	return __napi_alloc_frag_align(fragsz, -align);
++}
++
+ struct sk_buff *__napi_alloc_skb(struct napi_struct *napi,
+ 				 unsigned int length, gfp_t gfp_mask);
+ static inline struct sk_buff *napi_alloc_skb(struct napi_struct *napi,
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 271f26a58a8b..d7f66c69efac 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -365,29 +365,23 @@ struct napi_alloc_cache {
+ static DEFINE_PER_CPU(struct page_frag_cache, netdev_alloc_cache);
+ static DEFINE_PER_CPU(struct napi_alloc_cache, napi_alloc_cache);
+ 
+-static void *__napi_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
++static void *__alloc_frag_align(unsigned int fragsz, gfp_t gfp_mask,
++				unsigned int align_mask)
+ {
+ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ 
+-	return page_frag_alloc(&nc->page, fragsz, gfp_mask);
++	return page_frag_alloc_align(&nc->page, fragsz, gfp_mask, align_mask);
+ }
+ 
+-void *napi_alloc_frag(unsigned int fragsz)
++void *__napi_alloc_frag_align(unsigned int fragsz, unsigned int align_mask)
+ {
+ 	fragsz = SKB_DATA_ALIGN(fragsz);
+ 
+-	return __napi_alloc_frag(fragsz, GFP_ATOMIC);
++	return __alloc_frag_align(fragsz, GFP_ATOMIC, align_mask);
+ }
+-EXPORT_SYMBOL(napi_alloc_frag);
++EXPORT_SYMBOL(__napi_alloc_frag_align);
+ 
+-/**
+- * netdev_alloc_frag - allocate a page fragment
+- * @fragsz: fragment size
+- *
+- * Allocates a frag from a page for receive buffer.
+- * Uses GFP_ATOMIC allocations.
+- */
+-void *netdev_alloc_frag(unsigned int fragsz)
++void *__netdev_alloc_frag_align(unsigned int fragsz, unsigned int align_mask)
+ {
+ 	struct page_frag_cache *nc;
+ 	void *data;
+@@ -395,15 +389,15 @@ void *netdev_alloc_frag(unsigned int fragsz)
+ 	fragsz = SKB_DATA_ALIGN(fragsz);
+ 	if (in_irq() || irqs_disabled()) {
+ 		nc = this_cpu_ptr(&netdev_alloc_cache);
+-		data = page_frag_alloc(nc, fragsz, GFP_ATOMIC);
++		data = page_frag_alloc_align(nc, fragsz, GFP_ATOMIC, align_mask);
+ 	} else {
+ 		local_bh_disable();
+-		data = __napi_alloc_frag(fragsz, GFP_ATOMIC);
++		data = __alloc_frag_align(fragsz, GFP_ATOMIC, align_mask);
+ 		local_bh_enable();
+ 	}
+ 	return data;
+ }
+-EXPORT_SYMBOL(netdev_alloc_frag);
++EXPORT_SYMBOL(__netdev_alloc_frag_align);
+ 
+ /**
+  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
+-- 
+2.31.1
+

@@ -1,0 +1,787 @@
+From cf29df42f7653933459825657a26c0cff44f019a Mon Sep 17 00:00:00 2001
+From: Vincent Cheng <vincent.cheng.xh@renesas.com>
+Date: Mon, 26 Jul 2021 12:49:30 +0530
+Subject: [PATCH 1658/1921] misc: Add renesas SMU driver to misc
+
+add renesas SMU driver to misc framework
+
+Signed-off-by: Vincent Cheng <vincent.cheng.xh@renesas.com>
+Signed-off-by: Yi Guo <yig@marvell.com>
+Change-Id: I35069a045f3079ee3e5cca7cb49d4c586650d383
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/57206
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/misc/Kconfig      |   9 +
+ drivers/misc/Makefile     |   2 +
+ drivers/misc/rsmu_cdev.c  | 336 ++++++++++++++++++++++++++++++++++++++
+ drivers/misc/rsmu_cdev.h  |  72 ++++++++
+ drivers/misc/rsmu_cm.c    | 166 +++++++++++++++++++
+ drivers/misc/rsmu_sabre.c | 128 +++++++++++++++
+ 6 files changed, 713 insertions(+)
+ create mode 100644 drivers/misc/rsmu_cdev.c
+ create mode 100644 drivers/misc/rsmu_cdev.h
+ create mode 100644 drivers/misc/rsmu_cm.c
+ create mode 100644 drivers/misc/rsmu_sabre.c
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 5cce3c0cca64..ce9db59dbeff 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -509,6 +509,15 @@ config MARVELL_LOKI
+ 	help
+ 	  Handles GPINT0 interrupt on Loki SoC.
+ 
++config RSMU
++	tristate "Renesas Synchronization Management Unit (SMU)"
++	depends on MFD_RSMU_I2C
++	help
++	  This option enables support for Renesas SMU, such as Clockmatrix and
++	  82P33XXX series. It will be used by Renesas PTP Clock Manager for
++	  Linux (pcm4l) software to provide support to GNSS assisted partial
++	  timing support (APTS) and other networking timing functions.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 6c74934eb677..7b68d3ae4100 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -61,3 +61,5 @@ obj-$(CONFIG_PVPANIC)   	+= pvpanic.o
+ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
+ obj-$(CONFIG_MARVELL_OTX_BPHY_CTR)	+= otx_bphy_ctr.o
+ obj-$(CONFIG_MARVELL_LOKI)	+= mrvl-loki.o
++rsmu-objs			:= rsmu_cdev.o rsmu_cm.o rsmu_sabre.o
++obj-$(CONFIG_RSMU)		+= rsmu.o
+diff --git a/drivers/misc/rsmu_cdev.c b/drivers/misc/rsmu_cdev.c
+new file mode 100644
+index 000000000000..8fbe095860b8
+--- /dev/null
++++ b/drivers/misc/rsmu_cdev.c
+@@ -0,0 +1,336 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * This driver is developed for the IDT ClockMatrix(TM) and 82P33xxx families
++ * of timing and synchronization devices. It will be used by Renesas PTP Clock
++ * Manager for Linux (pcm4l) software to provide support to GNSS assisted
++ * partial timing support (APTS) and other networking timing functions.
++ *
++ * Please note it must work with Renesas MFD driver to access device through
++ * I2C/SPI.
++ *
++ * Copyright (C) 2019 Integrated Device Technology, Inc., a Renesas Company.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/mfd/rsmu.h>
++#include <uapi/linux/rsmu.h>
++
++#include "rsmu_cdev.h"
++
++#define DRIVER_NAME	"rsmu"
++#define DRIVER_MAX_DEV	BIT(MINORBITS)
++
++static struct class *rsmu_class;
++static dev_t rsmu_cdevt;
++static struct rsmu_ops *ops_array[] = {
++	[RSMU_CM] = &cm_ops,
++	[RSMU_SABRE] = &sabre_ops,
++};
++
++static int
++rsmu_set_combomode(struct rsmu_cdev *rsmu, void __user *arg)
++{
++	struct rsmu_ops *ops = rsmu->ops;
++	struct rsmu_combomode mode;
++	int err;
++
++	if (copy_from_user(&mode, arg, sizeof(mode)))
++		return -EFAULT;
++
++	if (ops->set_combomode == NULL)
++		return -ENOTSUPP;
++
++	mutex_lock(rsmu->lock);
++	err = ops->set_combomode(rsmu, mode.dpll, mode.mode);
++	mutex_unlock(rsmu->lock);
++
++	return err;
++}
++
++static int
++rsmu_get_dpll_state(struct rsmu_cdev *rsmu, void __user *arg)
++{
++	struct rsmu_ops *ops = rsmu->ops;
++	struct rsmu_get_state state_request;
++	u8 state;
++	int err;
++
++	if (copy_from_user(&state_request, arg, sizeof(state_request)))
++		return -EFAULT;
++
++	if (ops->get_dpll_state == NULL)
++		return -ENOTSUPP;
++
++	mutex_lock(rsmu->lock);
++	err = ops->get_dpll_state(rsmu, state_request.dpll, &state);
++	mutex_unlock(rsmu->lock);
++
++	state_request.state = state;
++	if (copy_to_user(arg, &state_request, sizeof(state_request)))
++		return -EFAULT;
++
++	return err;
++}
++
++static int
++rsmu_get_dpll_ffo(struct rsmu_cdev *rsmu, void __user *arg)
++{
++	struct rsmu_ops *ops = rsmu->ops;
++	struct rsmu_get_ffo ffo_request;
++	int err;
++
++	if (copy_from_user(&ffo_request, arg, sizeof(ffo_request)))
++		return -EFAULT;
++
++	if (ops->get_dpll_ffo == NULL)
++		return -ENOTSUPP;
++
++	mutex_lock(rsmu->lock);
++	err = ops->get_dpll_ffo(rsmu, ffo_request.dpll, &ffo_request);
++	mutex_unlock(rsmu->lock);
++
++	if (copy_to_user(arg, &ffo_request, sizeof(ffo_request)))
++		return -EFAULT;
++
++	return err;
++}
++
++static int
++rsmu_open(struct inode *iptr, struct file *fptr)
++{
++	struct rsmu_cdev *rsmu;
++
++	rsmu = container_of(iptr->i_cdev, struct rsmu_cdev, rsmu_cdev);
++	if (!rsmu)
++		return -EAGAIN;
++
++	fptr->private_data = rsmu;
++	return 0;
++}
++
++static int
++rsmu_release(struct inode *iptr, struct file *fptr)
++{
++	struct rsmu_cdev *rsmu;
++
++	rsmu = container_of(iptr->i_cdev, struct rsmu_cdev, rsmu_cdev);
++	if (!rsmu)
++		return -EAGAIN;
++
++	return 0;
++}
++
++static long
++rsmu_ioctl(struct file *fptr, unsigned int cmd, unsigned long data)
++{
++	struct rsmu_cdev *rsmu = fptr->private_data;
++	void __user *arg = (void __user *)data;
++	int err = 0;
++
++	if (!rsmu)
++		return -EINVAL;
++
++	switch (cmd) {
++	case RSMU_SET_COMBOMODE:
++		err = rsmu_set_combomode(rsmu, arg);
++		break;
++	case RSMU_GET_STATE:
++		err = rsmu_get_dpll_state(rsmu, arg);
++		break;
++	case RSMU_GET_FFO:
++		err = rsmu_get_dpll_ffo(rsmu, arg);
++		break;
++	default:
++		/* Should not get here */
++		dev_err(rsmu->dev, "Undefined RSMU IOCTL");
++		err = -EINVAL;
++		break;
++	}
++
++	return err;
++}
++
++static long rsmu_compat_ioctl(struct file *fptr, unsigned int cmd,
++			      unsigned long data)
++{
++	return rsmu_ioctl(fptr, cmd, data);
++}
++
++static const struct file_operations rsmu_fops = {
++	.owner = THIS_MODULE,
++	.open = rsmu_open,
++	.release = rsmu_release,
++	.unlocked_ioctl = rsmu_ioctl,
++	.compat_ioctl =	rsmu_compat_ioctl,
++};
++
++static int rsmu_init_ops(struct rsmu_cdev *rsmu)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(ops_array); i++)
++		if (ops_array[i]->type == rsmu->type)
++			break;
++
++	if (i == ARRAY_SIZE(ops_array))
++		return -EINVAL;
++
++	rsmu->ops = ops_array[i];
++	return 0;
++}
++
++static int
++rsmu_probe(struct platform_device *pdev)
++{
++	struct rsmu_pdata *pdata = dev_get_platdata(&pdev->dev);
++	struct rsmu_cdev *rsmu;
++	struct device *rsmu_cdev;
++	int err;
++
++	rsmu = devm_kzalloc(&pdev->dev, sizeof(*rsmu), GFP_KERNEL);
++	if (!rsmu)
++		return -ENOMEM;
++
++	rsmu->dev = &pdev->dev;
++	rsmu->mfd = pdev->dev.parent;
++	rsmu->type = pdata->type;
++	rsmu->lock = pdata->lock;
++	rsmu->index = pdata->index;
++
++	/* Save driver private data */
++	platform_set_drvdata(pdev, rsmu);
++
++	cdev_init(&rsmu->rsmu_cdev, &rsmu_fops);
++	rsmu->rsmu_cdev.owner = THIS_MODULE;
++	err = cdev_add(&rsmu->rsmu_cdev,
++		       MKDEV(MAJOR(rsmu_cdevt), 0), 1);
++	if (err < 0) {
++		dev_err(rsmu->dev, "cdev_add failed");
++		err = -EIO;
++		goto err_rsmu_dev;
++	}
++
++	if (!rsmu_class) {
++		err = -EIO;
++		dev_err(rsmu->dev, "rsmu class not created correctly");
++		goto err_rsmu_cdev;
++	}
++
++	rsmu_cdev = device_create(rsmu_class, rsmu->dev,
++				  MKDEV(MAJOR(rsmu_cdevt), 0),
++				  rsmu, "rsmu%d", rsmu->index);
++	if (IS_ERR(rsmu_cdev)) {
++		dev_err(rsmu->dev, "Unable to create char device");
++		err = PTR_ERR(rsmu_cdev);
++		goto err_rsmu_cdev;
++	}
++
++	err = rsmu_init_ops(rsmu);
++	if (err) {
++		dev_err(rsmu->dev, "Unable to match type %d", rsmu->type);
++		goto err_rsmu_cdev;
++	}
++
++	dev_info(rsmu->dev, "Probe SMU type %d successful\n", rsmu->type);
++	return 0;
++
++	/* Failure cleanup */
++err_rsmu_cdev:
++	cdev_del(&rsmu->rsmu_cdev);
++err_rsmu_dev:
++	return err;
++}
++
++static int
++rsmu_remove(struct platform_device *pdev)
++{
++	struct rsmu_cdev *rsmu = platform_get_drvdata(pdev);
++	struct device *dev = &pdev->dev;
++
++	if (!rsmu)
++		return -ENODEV;
++
++	if (!rsmu_class) {
++		dev_err(dev, "rsmu_class is NULL");
++		return -EIO;
++	}
++
++	device_destroy(rsmu_class, MKDEV(MAJOR(rsmu_cdevt), 0));
++	cdev_del(&rsmu->rsmu_cdev);
++
++	return 0;
++}
++
++static const struct platform_device_id rsmu_id_table[] = {
++	{ "rsmu-cdev0", },
++	{ "rsmu-cdev1", },
++	{ "rsmu-cdev2", },
++	{ "rsmu-cdev3", },
++	{}
++};
++MODULE_DEVICE_TABLE(platform, rsmu_id_table);
++
++static struct platform_driver rsmu_driver = {
++	.driver = {
++		.name = DRIVER_NAME,
++	},
++	.probe = rsmu_probe,
++	.remove =  rsmu_remove,
++	.id_table = rsmu_id_table,
++};
++
++static int __init rsmu_init(void)
++{
++	int err;
++
++	rsmu_class = class_create(THIS_MODULE, DRIVER_NAME);
++	if (IS_ERR(rsmu_class)) {
++		err = PTR_ERR(rsmu_class);
++		pr_err("Unable to register rsmu class");
++		return err;
++	}
++
++	err = alloc_chrdev_region(&rsmu_cdevt, 0, DRIVER_MAX_DEV, DRIVER_NAME);
++	if (err < 0) {
++		pr_err("Unable to get major number");
++		goto err_rsmu_class;
++	}
++
++	err = platform_driver_register(&rsmu_driver);
++	if (err < 0) {
++		pr_err("Unabled to register %s driver", DRIVER_NAME);
++		goto err_rsmu_drv;
++	}
++	return 0;
++
++	/* Error Path */
++err_rsmu_drv:
++	unregister_chrdev_region(rsmu_cdevt, DRIVER_MAX_DEV);
++err_rsmu_class:
++	class_destroy(rsmu_class);
++	return err;
++}
++
++static void __exit rsmu_exit(void)
++{
++	platform_driver_unregister(&rsmu_driver);
++	unregister_chrdev_region(rsmu_cdevt, DRIVER_MAX_DEV);
++	class_destroy(rsmu_class);
++	rsmu_class = NULL;
++}
++
++module_init(rsmu_init);
++module_exit(rsmu_exit);
++
++MODULE_DESCRIPTION("Renesas SMU character device driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/misc/rsmu_cdev.h b/drivers/misc/rsmu_cdev.h
+new file mode 100644
+index 000000000000..3ced817ce3df
+--- /dev/null
++++ b/drivers/misc/rsmu_cdev.h
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * This driver is developed for the IDT ClockMatrix(TM) of
++ * timing and synchronization devices.
++ *
++ * Copyright (C) 2019 Integrated Device Technology, Inc., a Renesas Company.
++ */
++#ifndef __LINUX_RSMU_CDEV_H
++#define __LINUX_RSMU_CDEV_H
++
++#include <linux/cdev.h>
++
++struct rsmu_ops;
++
++/**
++ * struct rsmu_cdev - Driver data for RSMU character device
++ * @dev: pointer to platform device
++ * @mfd: pointer to MFD device
++ * @rsmu_cdev: character device handle
++ * @lock: mutex to protect operations from being interrupted
++ * @type: rsmu device type
++ * @ops: rsmu device methods
++ * @index: rsmu device index
++ */
++struct rsmu_cdev {
++	struct device *dev;
++	struct device *mfd;
++	struct cdev rsmu_cdev;
++	struct mutex *lock;
++	enum rsmu_type type;
++	struct rsmu_ops *ops;
++	u8 index;
++};
++
++extern struct rsmu_ops cm_ops;
++extern struct rsmu_ops sabre_ops;
++
++struct rsmu_ops {
++	enum rsmu_type type;
++	int (*set_combomode)(struct rsmu_cdev *rsmu, u8 dpll, u8 mode);
++	int (*get_dpll_state)(struct rsmu_cdev *rsmu, u8 dpll, u8 *state);
++	int (*get_dpll_ffo)(struct rsmu_cdev *rsmu, u8 dpll,
++			    struct rsmu_get_ffo *ffo);
++};
++
++/**
++ * Enumerated type listing DPLL combination modes
++ */
++enum rsmu_dpll_combomode {
++	E_COMBOMODE_CURRENT = 0,
++	E_COMBOMODE_FASTAVG,
++	E_COMBOMODE_SLOWAVG,
++	E_COMBOMODE_HOLDOVER,
++	E_COMBOMODE_MAX
++};
++
++/**
++ * An id used to identify the respective child class states.
++ */
++enum rsmu_class_state {
++	E_SRVLOINITIALSTATE = 0,
++	E_SRVLOUNQUALIFIEDSTATE = 1,
++	E_SRVLOLOCKACQSTATE = 2,
++	E_SRVLOFREQUENCYLOCKEDSTATE = 3,
++	E_SRVLOTIMELOCKEDSTATE = 4,
++	E_SRVLOHOLDOVERINSPECSTATE = 5,
++	E_SRVLOHOLDOVEROUTOFSPECSTATE = 6,
++	E_SRVLOFREERUNSTATE = 7,
++	E_SRVNUMBERLOSTATES = 8,
++	E_SRVLOSTATEINVALID = 9,
++};
++#endif
+diff --git a/drivers/misc/rsmu_cm.c b/drivers/misc/rsmu_cm.c
+new file mode 100644
+index 000000000000..d5af624badff
+--- /dev/null
++++ b/drivers/misc/rsmu_cm.c
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * This driver is developed for the IDT ClockMatrix(TM) of
++ * timing and synchronization devices.
++ *
++ * Copyright (C) 2019 Integrated Device Technology, Inc., a Renesas Company.
++ */
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/device.h>
++#include <linux/mfd/idt8a340_reg.h>
++#include <linux/mfd/rsmu.h>
++#include <uapi/linux/rsmu.h>
++#include <asm/unaligned.h>
++
++#include "rsmu_cdev.h"
++
++static int rsmu_cm_set_combomode(struct rsmu_cdev *rsmu, u8 dpll, u8 mode)
++{
++	u16 dpll_ctrl_n;
++	u8 cfg;
++	int err;
++
++	switch (dpll) {
++	case 0:
++		dpll_ctrl_n = DPLL_CTRL_0;
++		break;
++	case 1:
++		dpll_ctrl_n = DPLL_CTRL_1;
++		break;
++	case 2:
++		dpll_ctrl_n = DPLL_CTRL_2;
++		break;
++	case 3:
++		dpll_ctrl_n = DPLL_CTRL_3;
++		break;
++	case 4:
++		dpll_ctrl_n = DPLL_CTRL_4;
++		break;
++	case 5:
++		dpll_ctrl_n = DPLL_CTRL_5;
++		break;
++	case 6:
++		dpll_ctrl_n = DPLL_CTRL_6;
++		break;
++	case 7:
++		dpll_ctrl_n = DPLL_CTRL_7;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (mode >= E_COMBOMODE_MAX)
++		return -EINVAL;
++
++	err = rsmu_read(rsmu->mfd, dpll_ctrl_n + DPLL_CTRL_COMBO_MASTER_CFG,
++			&cfg, sizeof(cfg));
++	if (err)
++		return err;
++
++	/* Only need to enable/disable COMBO_MODE_HOLD. */
++	if (mode)
++		cfg |= COMBO_MASTER_HOLD;
++	else
++		cfg &= ~COMBO_MASTER_HOLD;
++
++	return rsmu_write(rsmu->mfd, dpll_ctrl_n + DPLL_CTRL_COMBO_MASTER_CFG,
++			  &cfg, sizeof(cfg));
++}
++
++static int rsmu_cm_get_dpll_state(struct rsmu_cdev *rsmu, u8 dpll, u8 *state)
++{
++	u8 cfg;
++	int err;
++
++	/* 8 is sys dpll */
++	if (dpll > 8)
++		return -EINVAL;
++
++	err = rsmu_read(rsmu->mfd,
++			  STATUS + DPLL0_STATUS + dpll,
++			  &cfg, sizeof(cfg));
++	if (err)
++		return err;
++
++	switch (cfg & DPLL_STATE_MASK) {
++	case DPLL_STATE_FREERUN:
++		*state = E_SRVLOUNQUALIFIEDSTATE;
++		break;
++	case DPLL_STATE_LOCKACQ:
++	case DPLL_STATE_LOCKREC:
++		*state = E_SRVLOLOCKACQSTATE;
++		break;
++	case DPLL_STATE_LOCKED:
++		*state = E_SRVLOTIMELOCKEDSTATE;
++		break;
++	case DPLL_STATE_HOLDOVER:
++		*state = E_SRVLOHOLDOVERINSPECSTATE;
++		break;
++	default:
++		*state = E_SRVLOSTATEINVALID;
++		break;
++	}
++
++	return 0;
++}
++
++static int rsmu_cm_get_dpll_ffo(struct rsmu_cdev *rsmu, u8 dpll,
++				struct rsmu_get_ffo *ffo)
++{
++	u8 buf[8] = {0};
++	s64 fcw = 0;
++	u16 dpll_filter_status;
++	int err;
++
++	switch (dpll) {
++	case 0:
++		dpll_filter_status = DPLL0_FILTER_STATUS;
++		break;
++	case 1:
++		dpll_filter_status = DPLL1_FILTER_STATUS;
++		break;
++	case 2:
++		dpll_filter_status = DPLL2_FILTER_STATUS;
++		break;
++	case 3:
++		dpll_filter_status = DPLL3_FILTER_STATUS;
++		break;
++	case 4:
++		dpll_filter_status = DPLL4_FILTER_STATUS;
++		break;
++	case 5:
++		dpll_filter_status = DPLL5_FILTER_STATUS;
++		break;
++	case 6:
++		dpll_filter_status = DPLL6_FILTER_STATUS;
++		break;
++	case 7:
++		dpll_filter_status = DPLL7_FILTER_STATUS;
++		break;
++	case 8:
++		dpll_filter_status = DPLLSYS_FILTER_STATUS;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	err = rsmu_read(rsmu->mfd, STATUS + dpll_filter_status, buf, 6);
++	if (err)
++		return err;
++
++	/* Convert to frequency control word */
++	fcw = sign_extend64(get_unaligned_le64(buf), 47);
++
++	/* FCW unit is 2 ^ -53 = 1.1102230246251565404236316680908e-16 */
++	ffo->ffo = fcw * 111;
++
++	return 0;
++}
++
++struct rsmu_ops cm_ops = {
++	.type = RSMU_CM,
++	.set_combomode = rsmu_cm_set_combomode,
++	.get_dpll_state = rsmu_cm_get_dpll_state,
++	.get_dpll_ffo = rsmu_cm_get_dpll_ffo,
++};
+diff --git a/drivers/misc/rsmu_sabre.c b/drivers/misc/rsmu_sabre.c
+new file mode 100644
+index 000000000000..aa772f1c0854
+--- /dev/null
++++ b/drivers/misc/rsmu_sabre.c
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * This driver is developed for the IDT 82P33XXX series of
++ * timing and synchronization devices.
++ *
++ * Copyright (C) 2019 Integrated Device Technology, Inc., a Renesas Company.
++ */
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/device.h>
++#include <linux/mfd/idt82p33_reg.h>
++#include <linux/mfd/rsmu.h>
++#include <uapi/linux/rsmu.h>
++#include <asm/unaligned.h>
++
++#include "rsmu_cdev.h"
++
++static int rsmu_sabre_set_combomode(struct rsmu_cdev *rsmu, u8 dpll, u8 mode)
++{
++	u16 dpll_ctrl_n;
++	u8 cfg;
++	int err;
++
++	switch (dpll) {
++	case 0:
++		dpll_ctrl_n = DPLL1_OPERATING_MODE_CNFG;
++		break;
++	case 1:
++		dpll_ctrl_n = DPLL2_OPERATING_MODE_CNFG;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (mode >= E_COMBOMODE_MAX)
++		return -EINVAL;
++
++	err = rsmu_read(rsmu->mfd, dpll_ctrl_n, &cfg, sizeof(cfg));
++	if (err)
++		return err;
++
++	cfg &= ~(COMBO_MODE_MASK << COMBO_MODE_SHIFT);
++	cfg |= mode << COMBO_MODE_SHIFT;
++
++	return rsmu_write(rsmu->mfd, dpll_ctrl_n, &cfg, sizeof(cfg));
++}
++
++static int rsmu_sabre_get_dpll_state(struct rsmu_cdev *rsmu, u8 dpll, u8 *state)
++{
++	u16 dpll_sts_n;
++	u8 cfg;
++	int err;
++
++	switch (dpll) {
++	case 0:
++		dpll_sts_n = DPLL1_OPERATING_STS;
++		break;
++	case 1:
++		dpll_sts_n = DPLL2_OPERATING_STS;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	err = rsmu_read(rsmu->mfd, dpll_sts_n, &cfg, sizeof(cfg));
++	if (err)
++		return err;
++
++	switch (cfg & OPERATING_STS_MASK) {
++	case DPLL_STATE_FREERUN:
++		*state = E_SRVLOUNQUALIFIEDSTATE;
++		break;
++	case DPLL_STATE_PRELOCKED2:
++	case DPLL_STATE_PRELOCKED:
++		*state = E_SRVLOLOCKACQSTATE;
++		break;
++	case DPLL_STATE_LOCKED:
++		*state = E_SRVLOTIMELOCKEDSTATE;
++		break;
++	case DPLL_STATE_HOLDOVER:
++		*state = E_SRVLOHOLDOVERINSPECSTATE;
++		break;
++	default:
++		*state = E_SRVLOSTATEINVALID;
++		break;
++	}
++
++	return 0;
++}
++
++static int rsmu_sabre_get_dpll_ffo(struct rsmu_cdev *rsmu, u8 dpll,
++				   struct rsmu_get_ffo *ffo)
++{
++	u8 buf[8] = {0};
++	s64 fcw = 0;
++	u16 dpll_freq_n;
++	int err;
++
++	switch (dpll) {
++	case 0:
++		dpll_freq_n = DPLL1_CURRENT_FREQ_STS;
++		break;
++	case 1:
++		dpll_freq_n = DPLL2_CURRENT_FREQ_STS;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	err = rsmu_read(rsmu->mfd, dpll_freq_n, buf, 5);
++	if (err)
++		return err;
++
++	/* Convert to frequency control word */
++	fcw = sign_extend64(get_unaligned_le64(buf), 39);
++
++	/* FCW unit is 77760 / ( 1638400 * 2^48) = 1.68615121864946 * 10^-16 */
++	ffo->ffo = div_s64(fcw * 168615, 1000);
++
++	return 0;
++}
++
++struct rsmu_ops sabre_ops = {
++	.type = RSMU_SABRE,
++	.set_combomode = rsmu_sabre_set_combomode,
++	.get_dpll_state = rsmu_sabre_get_dpll_state,
++	.get_dpll_ffo = rsmu_sabre_get_dpll_ffo,
++};
+-- 
+2.31.1
+

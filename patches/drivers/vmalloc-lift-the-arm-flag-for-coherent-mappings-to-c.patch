@@ -1,0 +1,142 @@
+From 592805a12f09487b74df81fa1291c7bcec9e68f1 Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 3 Jun 2019 08:55:13 +0200
+Subject: [PATCH 1139/1921] vmalloc: lift the arm flag for coherent mappings to
+ common code
+
+The arm architecture had a VM_ARM_DMA_CONSISTENT flag to mark DMA
+coherent remapping for a while.  Lift this flag to common code so
+that we can use it generically.  We also check it in the only place
+VM_USERMAP is directly check so that we can entirely replace that
+flag as well (although I'm not even sure why we'd want to allow
+remapping DMA appings, but I'd rather not change behavior).
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ arch/arm/mm/dma-mapping.c | 22 +++++++---------------
+ arch/arm/mm/mm.h          |  3 ---
+ include/linux/vmalloc.h   |  2 ++
+ mm/vmalloc.c              |  5 ++++-
+ 4 files changed, 13 insertions(+), 19 deletions(-)
+
+diff --git a/arch/arm/mm/dma-mapping.c b/arch/arm/mm/dma-mapping.c
+index dc4c7c35a5fd..db1a3644d187 100644
+--- a/arch/arm/mm/dma-mapping.c
++++ b/arch/arm/mm/dma-mapping.c
+@@ -343,19 +343,13 @@ static void *
+ __dma_alloc_remap(struct page *page, size_t size, gfp_t gfp, pgprot_t prot,
+ 	const void *caller)
+ {
+-	/*
+-	 * DMA allocation can be mapped to user space, so lets
+-	 * set VM_USERMAP flags too.
+-	 */
+-	return dma_common_contiguous_remap(page, size,
+-			VM_ARM_DMA_CONSISTENT | VM_USERMAP,
++	return dma_common_contiguous_remap(page, size, VM_DMA_COHERENT,
+ 			prot, caller);
+ }
+ 
+ static void __dma_free_remap(void *cpu_addr, size_t size)
+ {
+-	dma_common_free_remap(cpu_addr, size,
+-			VM_ARM_DMA_CONSISTENT | VM_USERMAP);
++	dma_common_free_remap(cpu_addr, size, VM_DMA_COHERENT);
+ }
+ 
+ #define DEFAULT_DMA_COHERENT_POOL_SIZE	SZ_256K
+@@ -1371,8 +1365,8 @@ static void *
+ __iommu_alloc_remap(struct page **pages, size_t size, gfp_t gfp, pgprot_t prot,
+ 		    const void *caller)
+ {
+-	return dma_common_pages_remap(pages, size,
+-			VM_ARM_DMA_CONSISTENT | VM_USERMAP, prot, caller);
++	return dma_common_pages_remap(pages, size, VM_DMA_COHERENT, prot,
++			caller);
+ }
+ 
+ /*
+@@ -1456,7 +1450,7 @@ static struct page **__iommu_get_pages(void *cpu_addr, unsigned long attrs)
+ 		return cpu_addr;
+ 
+ 	area = find_vm_area(cpu_addr);
+-	if (area && (area->flags & VM_ARM_DMA_CONSISTENT))
++	if (area && (area->flags & VM_DMA_COHERENT))
+ 		return area->pages;
+ 	return NULL;
+ }
+@@ -1614,10 +1608,8 @@ void __arm_iommu_free_attrs(struct device *dev, size_t size, void *cpu_addr,
+ 		return;
+ 	}
+ 
+-	if ((attrs & DMA_ATTR_NO_KERNEL_MAPPING) == 0) {
+-		dma_common_free_remap(cpu_addr, size,
+-			VM_ARM_DMA_CONSISTENT | VM_USERMAP);
+-	}
++	if ((attrs & DMA_ATTR_NO_KERNEL_MAPPING) == 0)
++		dma_common_free_remap(cpu_addr, size, VM_DMA_COHERENT);
+ 
+ 	__iommu_remove_mapping(dev, handle, size);
+ 	__iommu_free_buffer(dev, pages, size, attrs);
+diff --git a/arch/arm/mm/mm.h b/arch/arm/mm/mm.h
+index 6b045c6653ea..6ec48188ef9f 100644
+--- a/arch/arm/mm/mm.h
++++ b/arch/arm/mm/mm.h
+@@ -68,9 +68,6 @@ extern void __flush_dcache_page(struct address_space *mapping, struct page *page
+ #define VM_ARM_MTYPE(mt)		((mt) << 20)
+ #define VM_ARM_MTYPE_MASK	(0x1f << 20)
+ 
+-/* consistent regions used by dma_alloc_attrs() */
+-#define VM_ARM_DMA_CONSISTENT	0x20000000
+-
+ 
+ struct static_vm {
+ 	struct vm_struct vm;
+diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+index dda1f04b766f..ff8479f8957b 100644
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@ -18,6 +18,7 @@ struct notifier_block;		/* in notifier.h */
+ #define VM_ALLOC		0x00000002	/* vmalloc() */
+ #define VM_MAP			0x00000004	/* vmap()ed pages */
+ #define VM_USERMAP		0x00000008	/* suitable for remap_vmalloc_range */
++#define VM_DMA_COHERENT		0x00000010	/* dma_alloc_coherent */
+ #define VM_UNINITIALIZED	0x00000020	/* vm_struct is not fully initialized */
+ #define VM_NO_GUARD		0x00000040      /* don't add guard page */
+ #define VM_KASAN		0x00000080      /* has allocated kasan shadow memory */
+@@ -26,6 +27,7 @@ struct notifier_block;		/* in notifier.h */
+  * vfree_atomic().
+  */
+ #define VM_FLUSH_RESET_PERMS	0x00000100      /* Reset direct map and flush TLB on unmap */
++
+ /* bits [20..32] reserved for arch specific ioremap internals */
+ 
+ /*
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index f38f1dc798a0..a28aa5184470 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2964,7 +2964,7 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
+ 	if (!area)
+ 		return -EINVAL;
+ 
+-	if (!(area->flags & VM_USERMAP))
++	if (!(area->flags & (VM_USERMAP | VM_DMA_COHERENT)))
+ 		return -EINVAL;
+ 
+ 	if (check_add_overflow(size, off, &end_index) ||
+@@ -3472,6 +3472,9 @@ static int s_show(struct seq_file *m, void *p)
+ 	if (v->flags & VM_USERMAP)
+ 		seq_puts(m, " user");
+ 
++	if (v->flags & VM_DMA_COHERENT)
++		seq_puts(m, " dma-coherent");
++
+ 	if (is_vmalloc_addr(v->pages))
+ 		seq_puts(m, " vpages");
+ 
+-- 
+2.31.1
+

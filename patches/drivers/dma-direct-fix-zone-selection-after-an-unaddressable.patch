@@ -1,0 +1,123 @@
+From 4ffa86c9e96d08a5e9e82faea3c910d59ba22f50 Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Tue, 20 Aug 2019 11:45:49 +0900
+Subject: [PATCH 1127/1921] dma-direct: fix zone selection after an
+ unaddressable CMA allocation
+
+The new dma_alloc_contiguous hides if we allocate CMA or regular
+pages, and thus fails to retry a ZONE_NORMAL allocation if the CMA
+allocation succeeds but isn't addressable.  That means we either fail
+outright or dip into a small zone that might not succeed either.
+
+Thanks to Hillf Danton for debugging this issue.
+
+Fixes: b1d2dc009dec ("dma-contiguous: add dma_{alloc,free}_contiguous() helpers")
+Reported-by: Tobias Klausmann <tobias.johannes.klausmann@mni.thm.de>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Tested-by: Tobias Klausmann <tobias.johannes.klausmann@mni.thm.de>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/iommu/dma-iommu.c      |  3 +++
+ include/linux/dma-contiguous.h |  5 +----
+ kernel/dma/contiguous.c        |  8 ++------
+ kernel/dma/direct.c            | 10 +++++++++-
+ 4 files changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/iommu/dma-iommu.c b/drivers/iommu/dma-iommu.c
+index 27ac179806ba..417664c5cb3c 100644
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@ -971,10 +971,13 @@ static void *iommu_dma_alloc_pages(struct device *dev, size_t size,
+ {
+ 	bool coherent = dev_is_dma_coherent(dev);
+ 	size_t alloc_size = PAGE_ALIGN(size);
++	int node = dev_to_node(dev);
+ 	struct page *page = NULL;
+ 	void *cpu_addr;
+ 
+ 	page = dma_alloc_contiguous(dev, alloc_size, gfp);
++	if (!page)
++		page = alloc_pages_node(node, gfp, get_order(alloc_size));
+ 	if (!page)
+ 		return NULL;
+ 
+diff --git a/include/linux/dma-contiguous.h b/include/linux/dma-contiguous.h
+index c05d4e661489..03f8e98e3bcc 100644
+--- a/include/linux/dma-contiguous.h
++++ b/include/linux/dma-contiguous.h
+@@ -160,10 +160,7 @@ bool dma_release_from_contiguous(struct device *dev, struct page *pages,
+ static inline struct page *dma_alloc_contiguous(struct device *dev, size_t size,
+ 		gfp_t gfp)
+ {
+-	int node = dev ? dev_to_node(dev) : NUMA_NO_NODE;
+-	size_t align = get_order(PAGE_ALIGN(size));
+-
+-	return alloc_pages_node(node, gfp, align);
++	return NULL;
+ }
+ 
+ static inline void dma_free_contiguous(struct device *dev, struct page *page,
+diff --git a/kernel/dma/contiguous.c b/kernel/dma/contiguous.c
+index 2bd410f934b3..69cfb4345388 100644
+--- a/kernel/dma/contiguous.c
++++ b/kernel/dma/contiguous.c
+@@ -230,9 +230,7 @@ bool dma_release_from_contiguous(struct device *dev, struct page *pages,
+  */
+ struct page *dma_alloc_contiguous(struct device *dev, size_t size, gfp_t gfp)
+ {
+-	int node = dev ? dev_to_node(dev) : NUMA_NO_NODE;
+-	size_t count = PAGE_ALIGN(size) >> PAGE_SHIFT;
+-	size_t align = get_order(PAGE_ALIGN(size));
++	size_t count = size >> PAGE_SHIFT;
+ 	struct page *page = NULL;
+ 	struct cma *cma = NULL;
+ 
+@@ -243,14 +241,12 @@ struct page *dma_alloc_contiguous(struct device *dev, size_t size, gfp_t gfp)
+ 
+ 	/* CMA can be used only in the context which permits sleeping */
+ 	if (cma && gfpflags_allow_blocking(gfp)) {
++		size_t align = get_order(size);
+ 		size_t cma_align = min_t(size_t, align, CONFIG_CMA_ALIGNMENT);
+ 
+ 		page = cma_alloc(cma, count, cma_align, gfp & __GFP_NOWARN);
+ 	}
+ 
+-	/* Fallback allocation of normal pages */
+-	if (!page)
+-		page = alloc_pages_node(node, gfp, align);
+ 	return page;
+ }
+ 
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index e7ef0b1d241f..af7f3d8f72fe 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -86,6 +86,8 @@ static bool dma_coherent_ok(struct device *dev, phys_addr_t phys, size_t size)
+ struct page *__dma_direct_alloc_pages(struct device *dev, size_t size,
+ 		dma_addr_t *dma_handle, gfp_t gfp, unsigned long attrs)
+ {
++	size_t alloc_size = PAGE_ALIGN(size);
++	int node = dev_to_node(dev);
+ 	struct page *page = NULL;
+ 	u64 phys_mask;
+ 
+@@ -96,8 +98,14 @@ struct page *__dma_direct_alloc_pages(struct device *dev, size_t size,
+ 	gfp &= ~__GFP_ZERO;
+ 	gfp |= __dma_direct_optimal_gfp_mask(dev, dev->coherent_dma_mask,
+ 			&phys_mask);
++	page = dma_alloc_contiguous(dev, alloc_size, gfp);
++	if (page && !dma_coherent_ok(dev, page_to_phys(page), size)) {
++		dma_free_contiguous(dev, page, alloc_size);
++		page = NULL;
++	}
+ again:
+-	page = dma_alloc_contiguous(dev, size, gfp);
++	if (!page)
++		page = alloc_pages_node(node, gfp, get_order(alloc_size));
+ 	if (page && !dma_coherent_ok(dev, page_to_phys(page), size)) {
+ 		dma_free_contiguous(dev, page, size);
+ 		page = NULL;
+-- 
+2.31.1
+

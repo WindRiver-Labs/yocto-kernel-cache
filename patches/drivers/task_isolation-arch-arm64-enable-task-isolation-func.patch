@@ -1,0 +1,407 @@
+From 6a64591c0c0b813b6184bf9b1bbbe4c9dcc206d9 Mon Sep 17 00:00:00 2001
+From: Chris Metcalf <cmetcalf@mellanox.com>
+Date: Fri, 4 Sep 2020 16:00:23 -0700
+Subject: [PATCH 0878/1921] task_isolation: arch/arm64: enable task isolation
+ functionality
+
+In do_notify_resume(), call task_isolation_start() for
+TIF_TASK_ISOLATION tasks. Add _TIF_TASK_ISOLATION to _TIF_WORK_MASK,
+and define a local NOTIFY_RESUME_LOOP_FLAGS to check in the loop,
+since we don't clear _TIF_TASK_ISOLATION in the loop.
+
+We instrument the smp_send_reschedule() routine so that it checks for
+isolated tasks and generates a suitable warning if needed.
+
+Finally, report on page faults in task-isolation processes in
+do_page_faults().
+
+Early kernel entry code calls task_isolation_kernel_enter().
+
+There is a separate patch for irqchips that do not follow common rules.
+
+Signed-off-by: Chris Metcalf <cmetcalf@mellanox.com>
+[abelits@marvell.com: simplified to match kernel 5.4]
+Signed-off-by: Alex Belits <abelits@marvell.com>
+
+Change-Id: Ie878ebb27d9eb5876948b1986bae983b53fe130f
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/36007
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ arch/arm64/Kconfig                   |  1 +
+ arch/arm64/include/asm/barrier.h     |  2 ++
+ arch/arm64/include/asm/thread_info.h |  5 ++++-
+ arch/arm64/kernel/fpsimd.c           |  7 +++++++
+ arch/arm64/kernel/ptrace.c           | 16 +++++++++++++++-
+ arch/arm64/kernel/sdei.c             |  2 ++
+ arch/arm64/kernel/signal.c           | 13 ++++++++++++-
+ arch/arm64/kernel/smp.c              |  9 +++++++++
+ arch/arm64/kernel/traps.c            | 11 +++++++++++
+ arch/arm64/mm/fault.c                | 11 +++++++++++
+ 10 files changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index b3e7dcf9ebb3..27d4db57530f 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -125,6 +125,7 @@ config ARM64
+ 	select HAVE_ARCH_PREL32_RELOCATIONS
+ 	select HAVE_ARCH_SECCOMP_FILTER
+ 	select HAVE_ARCH_STACKLEAK
++	select HAVE_ARCH_TASK_ISOLATION
+ 	select HAVE_ARCH_THREAD_STRUCT_WHITELIST
+ 	select HAVE_ARCH_TRACEHOOK
+ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+diff --git a/arch/arm64/include/asm/barrier.h b/arch/arm64/include/asm/barrier.h
+index e0e2b1946f42..eef2e2f1e41e 100644
+--- a/arch/arm64/include/asm/barrier.h
++++ b/arch/arm64/include/asm/barrier.h
+@@ -36,6 +36,8 @@
+ #define dma_rmb()	dmb(oshld)
+ #define dma_wmb()	dmb(oshst)
+ 
++#define instr_sync()	isb()
++
+ /*
+  * Generate a mask for array_index__nospec() that is ~0UL when 0 <= idx < sz
+  * and 0 otherwise.
+diff --git a/arch/arm64/include/asm/thread_info.h b/arch/arm64/include/asm/thread_info.h
+index 00a1a2673557..fae0ae55cfcc 100644
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -65,6 +65,7 @@ void arch_release_task_struct(struct task_struct *tsk);
+ #define TIF_FOREIGN_FPSTATE	3	/* CPU's FP state is not current's */
+ #define TIF_UPROBE		4	/* uprobe breakpoint or singlestep */
+ #define TIF_FSCHECK		5	/* Check FS is USER_DS on return */
++#define TIF_TASK_ISOLATION	6	/* task isolation enabled for task */
+ #define TIF_NOHZ		7
+ #define TIF_SYSCALL_TRACE	8	/* syscall trace active */
+ #define TIF_SYSCALL_AUDIT	9	/* syscall auditing */
+@@ -85,6 +86,7 @@ void arch_release_task_struct(struct task_struct *tsk);
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+ #define _TIF_FOREIGN_FPSTATE	(1 << TIF_FOREIGN_FPSTATE)
++#define _TIF_TASK_ISOLATION	(1 << TIF_TASK_ISOLATION)
+ #define _TIF_NOHZ		(1 << TIF_NOHZ)
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+@@ -99,7 +101,8 @@ void arch_release_task_struct(struct task_struct *tsk);
+ 
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
+ 				 _TIF_NOTIFY_RESUME | _TIF_FOREIGN_FPSTATE | \
+-				 _TIF_UPROBE | _TIF_FSCHECK)
++				 _TIF_UPROBE | _TIF_FSCHECK | \
++				 _TIF_TASK_ISOLATION)
+ 
+ #define _TIF_SYSCALL_WORK	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
+ 				 _TIF_SYSCALL_TRACEPOINT | _TIF_SECCOMP | \
+diff --git a/arch/arm64/kernel/fpsimd.c b/arch/arm64/kernel/fpsimd.c
+index eef3dc2488e2..431b3deb3724 100644
+--- a/arch/arm64/kernel/fpsimd.c
++++ b/arch/arm64/kernel/fpsimd.c
+@@ -29,6 +29,7 @@
+ #include <linux/stddef.h>
+ #include <linux/sysctl.h>
+ #include <linux/swab.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/esr.h>
+ #include <asm/fpsimd.h>
+@@ -923,6 +924,8 @@ void fpsimd_release_task(struct task_struct *dead_task)
+  */
+ asmlinkage void do_sve_acc(unsigned int esr, struct pt_regs *regs)
+ {
++	task_isolation_kernel_enter();
++
+ 	/* Even if we chose not to use SVE, the hardware could still trap: */
+ 	if (unlikely(!system_supports_sve()) || WARN_ON(is_compat_task())) {
+ 		force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc);
+@@ -950,6 +953,8 @@ asmlinkage void do_sve_acc(unsigned int esr, struct pt_regs *regs)
+  */
+ asmlinkage void do_fpsimd_acc(unsigned int esr, struct pt_regs *regs)
+ {
++	task_isolation_kernel_enter();
++
+ 	/* TODO: implement lazy context saving/restoring */
+ 	WARN_ON(1);
+ }
+@@ -961,6 +966,8 @@ asmlinkage void do_fpsimd_exc(unsigned int esr, struct pt_regs *regs)
+ {
+ 	unsigned int si_code = FPE_FLTUNK;
+ 
++	task_isolation_kernel_enter();
++
+ 	if (esr & ESR_ELx_FP_EXC_TFV) {
+ 		if (esr & FPEXC_IOF)
+ 			si_code = FPE_FLTINV;
+diff --git a/arch/arm64/kernel/ptrace.c b/arch/arm64/kernel/ptrace.c
+index f0420bbd5a8f..79b871a9dc95 100644
+--- a/arch/arm64/kernel/ptrace.c
++++ b/arch/arm64/kernel/ptrace.c
+@@ -29,6 +29,7 @@
+ #include <linux/regset.h>
+ #include <linux/tracehook.h>
+ #include <linux/elf.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/compat.h>
+ #include <asm/cpufeature.h>
+@@ -1840,7 +1841,11 @@ static void tracehook_report_syscall(struct pt_regs *regs,
+ 
+ int syscall_trace_enter(struct pt_regs *regs)
+ {
+-	unsigned long flags = READ_ONCE(current_thread_info()->flags);
++	unsigned long flags;
++
++	task_isolation_kernel_enter();
++
++	flags = READ_ONCE(current_thread_info()->flags);
+ 
+ 	if (flags & (_TIF_SYSCALL_EMU | _TIF_SYSCALL_TRACE)) {
+ 		tracehook_report_syscall(regs, PTRACE_SYSCALL_ENTER);
+@@ -1848,6 +1853,15 @@ int syscall_trace_enter(struct pt_regs *regs)
+ 			return -1;
+ 	}
+ 
++	/*
++	 * In task isolation mode, we may prevent the syscall from
++	 * running, and if so we also deliver a signal to the process.
++	 */
++	if (test_thread_flag(TIF_TASK_ISOLATION)) {
++		if (task_isolation_syscall(regs->syscallno) == -1)
++			return -1;
++	}
++
+ 	/* Do the secure computing after ptrace; failures should be fast. */
+ 	if (secure_computing(NULL) == -1)
+ 		return -1;
+diff --git a/arch/arm64/kernel/sdei.c b/arch/arm64/kernel/sdei.c
+index ea94cf8f9dc6..879f9c47672b 100644
+--- a/arch/arm64/kernel/sdei.c
++++ b/arch/arm64/kernel/sdei.c
+@@ -7,6 +7,7 @@
+ #include <linux/irqflags.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/uaccess.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/alternative.h>
+ #include <asm/kprobes.h>
+@@ -208,6 +209,7 @@ static __kprobes unsigned long _sdei_handler(struct pt_regs *regs,
+ 	__uaccess_enable_hw_pan();
+ 
+ 	err = sdei_event_handler(regs, arg);
++	task_isolation_interrupt("SDEI handled");
+ 	if (err)
+ 		return SDEI_EV_FAILED;
+ 
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index ddb757b2c3e5..b33a9611595c 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -20,6 +20,7 @@
+ #include <linux/tracehook.h>
+ #include <linux/ratelimit.h>
+ #include <linux/syscalls.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/daifflags.h>
+ #include <asm/debug-monitors.h>
+@@ -889,6 +890,11 @@ static void do_signal(struct pt_regs *regs)
+ 	restore_saved_sigmask();
+ }
+ 
++#define NOTIFY_RESUME_LOOP_FLAGS \
++	(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
++	_TIF_NOTIFY_RESUME | _TIF_FOREIGN_FPSTATE | \
++	_TIF_UPROBE | _TIF_FSCHECK)
++
+ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 				 unsigned long thread_flags)
+ {
+@@ -899,6 +905,8 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 	 */
+ 	trace_hardirqs_off();
+ 
++	task_isolation_check_run_cleanup();
++
+ 	do {
+ 		/* Check valid user FS if needed */
+ 		addr_limit_user_check();
+@@ -929,7 +937,10 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 
+ 		local_daif_mask();
+ 		thread_flags = READ_ONCE(current_thread_info()->flags);
+-	} while (thread_flags & _TIF_WORK_MASK);
++	} while (thread_flags & NOTIFY_RESUME_LOOP_FLAGS);
++
++	if (thread_flags & _TIF_TASK_ISOLATION)
++		task_isolation_start();
+ }
+ 
+ unsigned long __ro_after_init signal_minsigstksz;
+diff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c
+index 538b4ba66f5f..7de07b8d51de 100644
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -31,6 +31,7 @@
+ #include <linux/of.h>
+ #include <linux/irq_work.h>
+ #include <linux/kexec.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/alternative.h>
+ #include <asm/atomic.h>
+@@ -824,6 +825,7 @@ void arch_send_call_function_single_ipi(int cpu)
+ #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
+ void arch_send_wakeup_ipi_mask(const struct cpumask *mask)
+ {
++	task_isolation_remote_cpumask(mask, "wakeup IPI");
+ 	smp_cross_call(mask, IPI_WAKEUP);
+ }
+ #endif
+@@ -882,11 +884,16 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
+ 	unsigned int cpu = smp_processor_id();
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+ 
++	task_isolation_kernel_enter();
++
+ 	if ((unsigned)ipinr < NR_IPI) {
+ 		trace_ipi_entry_rcuidle(ipi_types[ipinr]);
+ 		__inc_irq_stat(cpu, ipi_irqs[ipinr]);
+ 	}
+ 
++	task_isolation_interrupt("IPI type %d (%s)", ipinr,
++				 ipinr < NR_IPI ? ipi_types[ipinr] : "unknown");
++
+ 	switch (ipinr) {
+ 	case IPI_RESCHEDULE:
+ 		scheduler_ipi();
+@@ -949,12 +956,14 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
+ 
+ void smp_send_reschedule(int cpu)
+ {
++	task_isolation_remote(cpu, "reschedule IPI");
+ 	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);
+ }
+ 
+ #ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
+ void tick_broadcast(const struct cpumask *mask)
+ {
++	task_isolation_remote_cpumask(mask, "timer IPI");
+ 	smp_cross_call(mask, IPI_TIMER);
+ }
+ #endif
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 0d1cd268ee6e..73372da98fdf 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -27,6 +27,7 @@
+ #include <linux/syscalls.h>
+ #include <linux/mm_types.h>
+ #include <linux/kasan.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/atomic.h>
+ #include <asm/bug.h>
+@@ -405,6 +406,8 @@ void arm64_notify_segfault(unsigned long addr)
+ 
+ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ {
++	task_isolation_kernel_enter();
++
+ 	/* check for AArch32 breakpoint instructions */
+ 	if (!aarch32_break_handler(regs))
+ 		return;
+@@ -699,6 +702,8 @@ asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
+ 		return;
+ 	}
+ 
++	task_isolation_kernel_enter();
++
+ 	switch (ESR_ELx_EC(esr)) {
+ 	case ESR_ELx_EC_CP15_32:
+ 		hook_base = cp15_32_hooks;
+@@ -730,6 +735,8 @@ asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
+ {
+ 	const struct sys64_hook *hook;
+ 
++	task_isolation_kernel_enter();
++
+ 	for (hook = sys64_hooks; hook->handler; hook++)
+ 		if ((hook->esr_mask & esr) == hook->esr_val) {
+ 			hook->handler(esr, regs);
+@@ -796,6 +803,8 @@ const char *esr_get_class_string(u32 esr)
+  */
+ asmlinkage void bad_mode(struct pt_regs *regs, int reason, unsigned int esr)
+ {
++	task_isolation_kernel_enter();
++
+ 	console_verbose();
+ 
+ 	pr_crit("Bad mode in %s handler detected on CPU%d, code 0x%08x -- %s\n",
+@@ -814,6 +823,8 @@ asmlinkage void bad_el0_sync(struct pt_regs *regs, int reason, unsigned int esr)
+ {
+ 	void __user *pc = (void __user *)instruction_pointer(regs);
+ 
++	task_isolation_kernel_enter();
++
+ 	current->thread.fault_address = 0;
+ 	current->thread.fault_code = esr;
+ 
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index b071c6cdf999..d4676e9c6d1f 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -22,6 +22,7 @@
+ #include <linux/perf_event.h>
+ #include <linux/preempt.h>
+ #include <linux/hugetlb.h>
++#include <linux/isolation.h>
+ 
+ #include <asm/acpi.h>
+ #include <asm/bug.h>
+@@ -530,6 +531,10 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
+ 	 */
+ 	if (likely(!(fault & (VM_FAULT_ERROR | VM_FAULT_BADMAP |
+ 			      VM_FAULT_BADACCESS)))) {
++		/* No signal was generated, but notify task-isolation tasks. */
++		if (user_mode(regs))
++			task_isolation_interrupt("page fault at %#lx", addr);
++
+ 		/*
+ 		 * Major/minor page fault accounting is only done
+ 		 * once. If we go through a retry, it is extremely
+@@ -719,6 +724,8 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
+ {
+ 	const struct fault_info *inf = esr_to_fault_info(esr);
+ 
++	task_isolation_kernel_enter();
++
+ 	if (!inf->fn(addr, esr, regs))
+ 		return;
+ 
+@@ -759,6 +766,8 @@ asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
+ 					   unsigned int esr,
+ 					   struct pt_regs *regs)
+ {
++	task_isolation_kernel_enter();
++
+ 	if (user_mode(regs)) {
+ 		if (!is_ttbr0_addr(instruction_pointer(regs)))
+ 			arm64_apply_bp_hardening();
+@@ -884,6 +893,8 @@ asmlinkage void __exception do_debug_exception(unsigned long addr_if_watchpoint,
+ 	const struct fault_info *inf = esr_to_debug_fault_info(esr);
+ 	unsigned long pc = instruction_pointer(regs);
+ 
++	task_isolation_kernel_enter();
++
+ 	if (cortex_a76_erratum_1463225_debug_handler(regs))
+ 		return;
+ 
+-- 
+2.31.1
+

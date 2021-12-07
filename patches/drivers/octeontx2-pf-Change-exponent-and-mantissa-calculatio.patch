@@ -1,0 +1,139 @@
+From 4154b8ff8b6b4367ec77762102e9debd9cda08ab Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Thu, 13 May 2021 12:22:18 +0530
+Subject: [PATCH 1553/1921] octeontx2-pf: Change exponent and mantissa
+ calculation
+
+The existing algorithm to calculate mantissa and
+exponent values for a given ingress rate does not
+work for a higher bps value and lower pps value.
+Hence change it to work for values in the range of
+1PPS to 100Gbps. To support wider ranges policer
+time unit is changed to 2 usecs from 1 usec.
+
+Change-Id: I303f73671b2825104915c7c12e1d32a1db4217b4
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/52095
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  4 +-
+ .../ethernet/marvell/octeontx2/nic/cn10k.c    | 60 +++++++------------
+ 2 files changed, 24 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 2047a90cc228..1a0cd3066b19 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -4843,8 +4843,8 @@ static int nix_setup_ipolicers(struct rvu *rvu,
+ 						   sizeof(u16), GFP_KERNEL);
+ 	}
+ 
+-	/* Set policer timeunit to 1us ie  (9 + 1) * 100 nsec = 1us */
+-	rvu_write64(rvu, blkaddr, NIX_AF_PL_TS, 0x09);
++	/* Set policer timeunit to 2us ie  (19 + 1) * 100 nsec = 2us */
++	rvu_write64(rvu, blkaddr, NIX_AF_PL_TS, 19);
+ 
+ 	nix_config_rx_pkt_policer_precolor(rvu, blkaddr);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+index 355bd887461d..768199708cc5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+@@ -246,10 +246,7 @@ static void cn10k_get_ingress_burst_cfg(u32 burst, u32 *burst_exp,
+ 	/* Burst is calculated as
+ 	 * (1+[BURST_MANTISSA]/256)*2^[BURST_EXPONENT]
+ 	 * This is the upper limit on number tokens (bytes) that
+-	 * can be accumilated in the bucket.
+-	 *
+-	 * Max burst exponent is 31, so need to check for the max
+-	 * burst size since size of 'police.burst' is also 32bit.
++	 * can be accumulated in the bucket.
+ 	 */
+ 	*burst_exp = ilog2(burst);
+ 	if (burst < 256) {
+@@ -258,6 +255,9 @@ static void cn10k_get_ingress_burst_cfg(u32 burst, u32 *burst_exp,
+ 		return;
+ 	}
+ 
++	if (*burst_exp > MAX_RATE_EXP)
++		*burst_exp = MAX_RATE_EXP;
++
+ 	/* Calculate mantissa
+ 	 * Find remaining bytes 'burst - 2^burst_exp'
+ 	 * mantissa = (remaining bytes) / 2^ (burst_exp - 8)
+@@ -269,51 +269,35 @@ static void cn10k_get_ingress_burst_cfg(u32 burst, u32 *burst_exp,
+ static void cn10k_get_ingress_rate_cfg(u64 rate, u32 *rate_exp,
+ 				       u32 *rate_mantissa, u32 *rdiv)
+ {
+-	int tmp, comp, mul = 1000;
+-	int div = 0, exp;
+-
+-	/* Policer timeunit is configured as 1usec
+-	 *
+-	 * tmp = rate * T * 32;
+-	 * For rate in bps, T is timeunit in seconds
+-	 * For rate in Kbps, T is timeunit in msecs
+-	 * For rate in Mbps, T is timeunit in usecs
+-	 * For rate in Gbps, T is timeunit in nsecs
+-	 *
+-	 * Since the rate passed to this fn() is in bps, T would be 0.000001
+-	 * (1usec in secs). Since float cannot be used, convert rate to kbps
+-	 * and hike the comparator by 1000, so that T becomes 1.
+-	 */
+-	rate = (rate < 1000) ? 1000 : rate;
+-	rate = rate / mul;
+-	tmp = rate * POLICER_TIMESTAMP * 32;
+-	comp = 256 * mul;
++	u32 div = 0;
++	u32 exp = 0;
++	u64 tmp;
+ 
+ 	/* Figure out mantissa, exponent and divider from given max pkt rate
+ 	 *
+ 	 * To achieve desired rate HW adds
+ 	 * (1+[RATE_MANTISSA]/256)*2^[RATE_EXPONENT] tokens (bytes) at every
+-	 * policer timeunit * 2^rdiv ie 2^rdiv usecs, to the token bucket.
++	 * policer timeunit * 2^rdiv ie 2 * 2^rdiv usecs, to the token bucket.
++	 * Here policer timeunit is 2 usecs and rate is in bits per sec.
++	 * Since floating point cannot be used below algorithm uses 1000000
++	 * scale factor to support rates upto 100Gbps.
+ 	 */
+-	if (tmp < comp) {
+-		while (tmp < comp) {
++	tmp = rate * 32 * 2;
++	if (tmp < 256000000) {
++		while (tmp < 256000000) {
++			tmp = tmp * 2;
+ 			div++;
+-			tmp *= 2;
+ 		}
+-		*rate_exp = 0;
+-		goto done;
+-	}
++	} else {
++		for (exp = 0; tmp >= 512000000 && exp <= MAX_RATE_EXP; exp++)
++			tmp = tmp / 2;
+ 
+-	comp = 512 * mul;
+-	for (exp = 0; exp <= MAX_RATE_EXP && tmp >= comp; exp++)
+-		tmp = tmp / 2;
++		if (exp > MAX_RATE_EXP)
++			exp = MAX_RATE_EXP;
++	}
+ 
+-	if (exp > MAX_RATE_EXP)
+-		exp = MAX_RATE_EXP;
++	*rate_mantissa = (tmp - 256000000) / 1000000;
+ 	*rate_exp = exp;
+-done:
+-	tmp = tmp / mul;
+-	*rate_mantissa = tmp - 256;
+ 	*rdiv = div;
+ }
+ 
+-- 
+2.31.1
+

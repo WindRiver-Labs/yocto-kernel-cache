@@ -1,0 +1,285 @@
+From 2b7e3c5798e616100ec3ca241d1c3fd5254b8b81 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Wed, 2 Jan 2019 17:16:52 +0530
+Subject: [PATCH 0049/1921] octeontx2-pf: Alloc and config transmit scheduler
+ queues
+
+Transmit schedulers is also a admin function resource, hence
+request AF to alloc one scheduler queue at each transmit level.
+One queue is sufficient since transmit queue priorities are
+not yet supported. Also config parent topology, min/max pkt
+lengths e.t.c for these queues.
+
+Change-Id: I2292c838476df76616e9ac3a56a6223ce535293e
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Tomasz Duszynski <tduszynski@marvell.com>
+Signed-off-by: Nithin Dabilpuram <ndabilpuram@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 123 +++++++++++++++++-
+ .../marvell/octeontx2/nic/otx2_common.h       |  10 ++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  16 ++-
+ .../ethernet/marvell/octeontx2/nic/otx2_reg.h |  13 ++
+ 4 files changed, 160 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index 96f862c17422..fd91cf46af20 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -49,6 +49,114 @@ static dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 	return iova;
+ }
+ 
++static int otx2_get_link(struct otx2_nic *pfvf)
++{
++	int link = 0;
++	u16 map;
++
++	/* cgx lmac link */
++	if (pfvf->tx_chan_base >= CGX_CHAN_BASE) {
++		map = pfvf->tx_chan_base & 0x7FF;
++		link = 4 * ((map >> 8) & 0xF) + ((map >> 4) & 0xF);
++	}
++	/* LBK channel */
++	if (pfvf->tx_chan_base < SDP_CHAN_BASE)
++		link = 12;
++
++	return link;
++}
++
++int otx2_txschq_config(struct otx2_nic *pfvf, int lvl)
++{
++	struct nix_txschq_config *req;
++	struct otx2_hw *hw = &pfvf->hw;
++	u64 schq, parent;
++
++	req = otx2_mbox_alloc_msg_nix_txschq_cfg(&pfvf->mbox);
++	if (!req)
++		return -ENOMEM;
++
++	req->lvl = lvl;
++	req->num_regs = 1;
++
++	schq = hw->txschq_list[lvl][0];
++	/* Set topology e.t.c configuration */
++	if (lvl == NIX_TXSCH_LVL_SMQ) {
++		/* Set min and max Tx packet lengths */
++		req->reg[0] = NIX_AF_SMQX_CFG(schq);
++		req->regval[0] = (pfvf->netdev->mtu << 8) | NIC_HW_MIN_FRS;
++
++		req->regval[0] |= (0x20ULL << 51) | (0x80ULL << 39);
++		req->num_regs++;
++		/* MDQ config */
++		parent =  hw->txschq_list[NIX_TXSCH_LVL_TL4][0];
++		req->reg[1] = NIX_AF_MDQX_PARENT(schq);
++		req->regval[1] = parent << 16;
++		req->num_regs++;
++		/* Set DWRR quantum */
++		req->reg[2] = NIX_AF_MDQX_SCHEDULE(schq);
++		req->regval[2] = pfvf->netdev->mtu;
++	} else if (lvl == NIX_TXSCH_LVL_TL4) {
++		parent =  hw->txschq_list[NIX_TXSCH_LVL_TL3][0];
++		req->reg[0] = NIX_AF_TL4X_PARENT(schq);
++		req->regval[0] = parent << 16;
++	} else if (lvl == NIX_TXSCH_LVL_TL3) {
++		parent = hw->txschq_list[NIX_TXSCH_LVL_TL2][0];
++		req->reg[0] = NIX_AF_TL3X_PARENT(schq);
++		req->regval[0] = parent << 16;
++	} else if (lvl == NIX_TXSCH_LVL_TL2) {
++		parent =  hw->txschq_list[NIX_TXSCH_LVL_TL1][0];
++		req->reg[0] = NIX_AF_TL2X_PARENT(schq);
++		req->regval[0] = parent << 16;
++
++		req->num_regs++;
++		req->reg[1] = NIX_AF_TL2X_SCHEDULE(schq);
++		req->regval[1] = TXSCH_TL1_DFLT_RR_PRIO << 24;
++
++		req->num_regs++;
++		req->reg[2] = NIX_AF_TL3_TL2X_LINKX_CFG(schq,
++							otx2_get_link(pfvf));
++		/* Enable this queue and backpressure */
++		req->regval[2] = BIT_ULL(13) | BIT_ULL(12);
++
++	} else if (lvl == NIX_TXSCH_LVL_TL1) {
++		/* Default config for TL1.
++		 * For VF this is always ignored.
++		 */
++
++		/* Set DWRR quantum */
++		req->reg[0] = NIX_AF_TL1X_SCHEDULE(schq);
++		req->regval[0] = TXSCH_TL1_DFLT_RR_QTM;
++
++		req->num_regs++;
++		req->reg[1] = NIX_AF_TL1X_TOPOLOGY(schq);
++		req->regval[1] = (TXSCH_TL1_DFLT_RR_PRIO << 1);
++
++		req->num_regs++;
++		req->reg[2] = NIX_AF_TL1X_CIR(schq);
++		req->regval[2] = 0;
++	}
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
++
++int otx2_txsch_alloc(struct otx2_nic *pfvf)
++{
++	struct nix_txsch_alloc_req *req;
++	int lvl;
++
++	/* Get memory to put this msg */
++	req = otx2_mbox_alloc_msg_nix_txsch_alloc(&pfvf->mbox);
++	if (!req)
++		return -ENOMEM;
++
++	/* Request one schq per level */
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++)
++		req->schq[lvl] = 1;
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
++
+ static int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx, u16 lpb_aura)
+ {
+ 	struct nix_aq_enq_req *aq;
+@@ -86,7 +194,8 @@ static int otx2_sq_init(struct otx2_nic *pfvf, u16 qidx, u16 sqb_aura)
+ 	aq->sq.max_sqe_size = NIX_MAXSQESZ_W16; /* 128 byte */
+ 	aq->sq.cq_ena = 1;
+ 	aq->sq.ena = 1;
+-	aq->sq.smq = 0;
++	/* Only one SMQ is allocated, map all SQ's to that SMQ  */
++	aq->sq.smq = pfvf->hw.txschq_list[NIX_TXSCH_LVL_SMQ][0];
+ 	aq->sq.smq_rr_quantum = DMA_BUFFER_LEN / 4;
+ 	aq->sq.default_chan = pfvf->tx_chan_base;
+ 	aq->sq.sqe_stype = NIX_STYPE_STF; /* Cache SQB */
+@@ -493,6 +602,18 @@ int otx2_attach_npa_nix(struct otx2_nic *pfvf)
+ }
+ 
+ /* Mbox message handlers */
++void mbox_handler_nix_txsch_alloc(struct otx2_nic *pf,
++				  struct nix_txsch_alloc_rsp *rsp)
++{
++	int lvl, schq;
++
++	/* Setup transmit scheduler list */
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++)
++		for (schq = 0; schq < rsp->schq[lvl]; schq++)
++			pf->hw.txschq_list[lvl][schq] =
++				rsp->schq_list[lvl][schq];
++}
++
+ void mbox_handler_npa_lf_alloc(struct otx2_nic *pfvf,
+ 			       struct npa_lf_alloc_rsp *rsp)
+ {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 2d8c8aab3172..07f33c2deafb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -32,6 +32,10 @@ enum arua_mapped_qtypes {
+ #define RQ_QLEN		1024
+ #define SQ_QLEN		1024
+ 
++#define LBK_CHAN_BASE  0x000
++#define SDP_CHAN_BASE  0x700
++#define CGX_CHAN_BASE  0x800
++
+ #define DMA_BUFFER_LEN	1536 /* In multiples of 128bytes */
+ #define OTX2_DATA_ALIGN(X)	ALIGN(X, OTX2_ALIGN)
+ #define RCV_FRAG_LEN		\
+@@ -86,6 +90,8 @@ struct otx2_hw {
+ 	u16			nix_msixoff; /* Offset of NIX vectors */
+ 	char			*irq_name;
+ 	cpumask_var_t           *affinity_mask;
++
++	u16		txschq_list[NIX_TXSCH_LVL_CNT][MAX_TXSCHQ_PER_FUNC];
+ };
+ 
+ struct otx2_nic {
+@@ -286,6 +292,8 @@ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf);
+ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf);
+ int otx2_config_nix(struct otx2_nic *pfvf);
+ int otx2_config_nix_queues(struct otx2_nic *pfvf);
++int otx2_txschq_config(struct otx2_nic *pfvf, int lvl);
++int otx2_txsch_alloc(struct otx2_nic *pfvf);
+ 
+ /* Mbox handlers */
+ void mbox_handler_msix_offset(struct otx2_nic *pfvf,
+@@ -294,5 +302,7 @@ void mbox_handler_npa_lf_alloc(struct otx2_nic *pfvf,
+ 			       struct npa_lf_alloc_rsp *rsp);
+ void mbox_handler_nix_lf_alloc(struct otx2_nic *pfvf,
+ 			       struct nix_lf_alloc_rsp *rsp);
++void mbox_handler_nix_txsch_alloc(struct otx2_nic *pf,
++				  struct nix_txsch_alloc_rsp *rsp);
+ 
+ #endif /* OTX2_COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index ef6a2739ff1d..f869b536101b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -64,6 +64,10 @@ static void otx2_process_pfaf_mbox_msg(struct otx2_nic *pf,
+ 	case MBOX_MSG_NIX_LF_ALLOC:
+ 		mbox_handler_nix_lf_alloc(pf, (struct nix_lf_alloc_rsp *)msg);
+ 		break;
++	case MBOX_MSG_NIX_TXSCH_ALLOC:
++		mbox_handler_nix_txsch_alloc(pf,
++					     (struct nix_txsch_alloc_rsp *)msg);
++		break;
+ 	default:
+ 		if (msg->rc)
+ 			dev_err(pf->dev,
+@@ -259,7 +263,7 @@ static int otx2_set_real_num_queues(struct net_device *netdev,
+ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ {
+ 	struct otx2_hw *hw = &pf->hw;
+-	int err;
++	int err, lvl;
+ 
+ 	/* Set required NPA LF's pool counts
+ 	 * Auras and Pools are used in a 1:1 mapping,
+@@ -289,10 +293,20 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	if (err)
+ 		return err;
+ 
++	err = otx2_txsch_alloc(pf);
++	if (err)
++		return err;
++
+ 	err = otx2_config_nix_queues(pf);
+ 	if (err)
+ 		return err;
+ 
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
++		err = otx2_txschq_config(pf, lvl);
++		if (err)
++			return err;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_reg.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_reg.h
+index dd01b6dba0a6..f0985bc4d1e3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_reg.h
+@@ -89,4 +89,17 @@
+ #define NPA_LF_QINTX_ENA_W1S(a)         (NPA_LFBASE | 0x320 | (a) << 12)
+ #define NPA_LF_QINTX_ENA_W1C(a)         (NPA_LFBASE | 0x330 | (a) << 12)
+ 
++/* NIX AF transmit scheduler registers */
++#define NIX_AF_SMQX_CFG(a)		(0x700 | (a) << 16)
++#define NIX_AF_TL1X_SCHEDULE(a)		(0xC00 | (a) << 16)
++#define NIX_AF_TL1X_CIR(a)		(0xC20 | (a) << 16)
++#define NIX_AF_TL1X_TOPOLOGY(a)		(0xC80 | (a) << 16)
++#define NIX_AF_TL2X_PARENT(a)		(0xE88 | (a) << 16)
++#define NIX_AF_TL2X_SCHEDULE(a)		(0xE00 | (a) << 16)
++#define NIX_AF_TL3X_PARENT(a)		(0x1088 | (a) << 16)
++#define NIX_AF_TL4X_PARENT(a)		(0x1288 | (a) << 16)
++#define NIX_AF_MDQX_SCHEDULE(a)		(0x1400 | (a) << 16)
++#define NIX_AF_MDQX_PARENT(a)		(0x1480 | (a) << 16)
++#define NIX_AF_TL3_TL2X_LINKX_CFG(a, b)	(0x1700 | (a) << 16 | (b) << 3)
++
+ #endif /* OTX2_REG_H */
+-- 
+2.31.1
+

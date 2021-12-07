@@ -1,0 +1,137 @@
+From d05112d771469642d53a66012a6215ab3e8a916e Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Tue, 1 Sep 2020 17:45:40 +0530
+Subject: [PATCH 0767/1921] octeontx2-af: Added mbox message to retrieve VF's
+ base steering rule
+
+Unlike kernel VF netdev driver, userspace application drivers support
+installing MCAM rules from VFs as well. This could cause conflicting
+behavior when both PF and VFs install similar rules. To avoid that,
+VF would have to install the traffic rules using the base steering
+rule fields installed by PF as minimum matching creteria. To facilitate
+this requirement, a new mailbox message has been added that returns
+the base steering rule installed by its parent PF when VF requests.
+If there is no base steering rule installed by PF then VF's default
+unicast entry will be returned. It is the responsibility of VF userspace
+driver to do the concatenation of it's rules with base steering rule.
+
+When PF sends this mailbox message then the base channel number
+of the port to which the PF is mapped to, will be returned.
+
+Change-Id: Ie2d8954c4f365d50c72e4b893ae1a021bfb04661
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/35781
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  9 +++-
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 46 +++++++++++++++++++
+ .../marvell/octeontx2/af/rvu_npc_fs.c         |  2 +
+ 3 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 4cb99a376351..7e91fddae271 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -86,7 +86,7 @@ struct mbox_msghdr {
+ #define OTX2_MBOX_REQ_SIG (0xdead)
+ #define OTX2_MBOX_RSP_SIG (0xbeef)
+ 	u16 sig;         /* Signature, for validating corrupted msgs */
+-#define OTX2_MBOX_VERSION (0x0008)
++#define OTX2_MBOX_VERSION (0x0009)
+ 	u16 ver;         /* Version of msg's structure for this ID */
+ 	u16 next_msgoff; /* Offset of next msg within mailbox region */
+ 	int rc;          /* Msg process'ed response code */
+@@ -262,6 +262,8 @@ M(NPC_MCAM_READ_ENTRY,	  0x600f, npc_mcam_read_entry,			\
+ 				  npc_mcam_read_entry_rsp)		\
+ M(NPC_SET_PKIND,        0x6010,   npc_set_pkind,                        \
+ 				  npc_set_pkind, msg_rsp)               \
++M(NPC_MCAM_READ_BASE_RULE, 0x6011, npc_read_base_steer_rule,            \
++				   msg_req, npc_mcam_read_base_rule_rsp)  \
+ /* NIX mbox IDs (range 0x8000 - 0xFFFF) */				\
+ M(NIX_LF_ALLOC,		0x8000, nix_lf_alloc,				\
+ 				 nix_lf_alloc_req, nix_lf_alloc_rsp)	\
+@@ -1450,6 +1452,11 @@ struct npc_mcam_read_entry_rsp {
+ 	u8 enable;
+ };
+ 
++struct npc_mcam_read_base_rule_rsp {
++	struct mbox_msghdr hdr;
++	struct mcam_entry entry;
++};
++
+ /* TIM mailbox error codes
+  * Range 801 - 900.
+  */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index af778c461e15..fa288c544a33 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -2950,3 +2950,49 @@ int rvu_mbox_handler_npc_set_pkind(struct rvu *rvu,
+ 	return rvu_npc_set_parse_mode(rvu, req->hdr.pcifunc, req->mode,
+ 				      req->dir, req->pkind);
+ }
++
++int rvu_mbox_handler_npc_read_base_steer_rule(struct rvu *rvu,
++					      struct msg_req *req,
++					      struct npc_mcam_read_base_rule_rsp *rsp)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int index, blkaddr, nixlf, rc = 0;
++	u16 pcifunc = req->hdr.pcifunc;
++	struct rvu_pfvf *pfvf;
++	u8 intf, enable;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return NPC_MCAM_INVALID_REQ;
++
++	/* Return the channel number in case of PF */
++	if (!(pcifunc & RVU_PFVF_FUNC_MASK)) {
++		pfvf = rvu_get_pfvf(rvu, pcifunc);
++		rsp->entry.kw[0] = pfvf->rx_chan_base;
++		rsp->entry.kw_mask[0] = 0xFFFULL;
++		goto out;
++	}
++
++	/* Find the pkt steering rule installed by PF to this VF */
++	mutex_lock(&mcam->lock);
++	for (index = 0; index < mcam->bmap_entries; index++) {
++		if (mcam->entry2target_pffunc[index] == pcifunc)
++			goto read_entry;
++	}
++
++	rc = nix_get_nixlf(rvu, pcifunc, &nixlf, NULL);
++	if (rc < 0) {
++		mutex_unlock(&mcam->lock);
++		goto out;
++	}
++	/* Read the default ucast entry if there is no pkt steering rule */
++	index = npc_get_nixlf_mcam_index(mcam, pcifunc, nixlf,
++					 NIXLF_UCAST_ENTRY);
++read_entry:
++	/* Read the mcam entry */
++	npc_read_mcam_entry(rvu, mcam, blkaddr, index, &rsp->entry, &intf,
++			    &enable);
++	mutex_unlock(&mcam->lock);
++out:
++	return rc;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 274ace6fb271..8956d98a69a5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -1157,6 +1157,8 @@ int rvu_mbox_handler_npc_delete_flow(struct rvu *rvu,
+ 		if (npc_delete_flow(rvu, iter, pcifunc))
+ 			dev_err(rvu->dev, "rule deletion failed for entry:%d",
+ 				iter->entry);
++		/* clear the mcam entry target pcifunc */
++		mcam->entry2target_pffunc[iter->entry] = 0x0;
+ 	}
+ 
+ 	return 0;
+-- 
+2.31.1
+

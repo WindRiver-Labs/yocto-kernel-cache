@@ -1,0 +1,222 @@
+From f6ad8b7eaf07a36f5c4faeda67d72ef87e8cb4ea Mon Sep 17 00:00:00 2001
+From: Srujana Challa <schalla@marvell.com>
+Date: Thu, 12 Nov 2020 20:36:36 +0530
+Subject: [PATCH 0940/1921] crypto: cn10k: Handle VF function level reset
+
+Add support to handle VF function level reset.
+Upon receiving the FLR, PF sends a message to
+admin function (AF), which then cleans up all
+resources attached to that VF.
+
+Change-Id: I8e0cae96454bfff9c2a4c121e2e00311c8a6258b
+Signed-off-by: Srujana Challa <schalla@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/40420
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/crypto/marvell/cn10k/cn10k_cptpf.h    |   8 ++
+ .../crypto/marvell/cn10k/cn10k_cptpf_main.c   | 119 ++++++++++++++++--
+ .../crypto/marvell/cn10k/cn10k_cptpf_mbox.c   |   1 +
+ 3 files changed, 115 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/crypto/marvell/cn10k/cn10k_cptpf.h b/drivers/crypto/marvell/cn10k/cn10k_cptpf.h
+index b1e5bc76fdd5..d95ef169badb 100644
+--- a/drivers/crypto/marvell/cn10k/cn10k_cptpf.h
++++ b/drivers/crypto/marvell/cn10k/cn10k_cptpf.h
+@@ -40,6 +40,11 @@ union cn10k_cpt_eng_caps {
+ 	};
+ };
+ 
++struct cptpf_flr_work {
++	struct work_struct work;
++	struct cn10k_cptpf_dev *pf;
++};
++
+ struct cn10k_cptpf_dev {
+ 	void __iomem *reg_base;		/* CPT PF registers start address */
+ 	void __iomem *afpf_mbox_base;	/* PF-AF mbox start address */
+@@ -62,6 +67,9 @@ struct cn10k_cptpf_dev {
+ 	struct otx2_mbox	vfpf_mbox;
+ 	struct workqueue_struct *vfpf_mbox_wq;
+ 
++	struct workqueue_struct	*flr_wq;
++	struct cptpf_flr_work   *flr_wrk;
++
+ 	u8 pf_id;		/* RVU PF number */
+ 	u8 max_vfs;		/* Maximum number of VFs supported by CPT */
+ 	u8 enabled_vfs;		/* Number of enabled VFs */
+diff --git a/drivers/crypto/marvell/cn10k/cn10k_cptpf_main.c b/drivers/crypto/marvell/cn10k/cn10k_cptpf_main.c
+index 4784d6238197..9e31fb8b38d9 100644
+--- a/drivers/crypto/marvell/cn10k/cn10k_cptpf_main.c
++++ b/drivers/crypto/marvell/cn10k/cn10k_cptpf_main.c
+@@ -100,22 +100,72 @@ static void cptpf_disable_vfpf_mbox_intrs(struct cn10k_cptpf_dev *cptpf)
+ 			  RVU_PF_VFPF_MBOX_INTX(1), ~0x0ULL);
+ }
+ 
+-static irqreturn_t cptpf_vf_flr_intr(int __always_unused irq, void *arg)
++static void cptpf_flr_wq_handler(struct work_struct *work)
+ {
+-	struct cn10k_cptpf_dev *cptpf = arg;
++	struct cptpf_flr_work *flrwork;
++	struct cn10k_cptpf_dev *pf;
++	struct mbox_msghdr *req;
++	struct otx2_mbox *mbox;
++	int vf, reg = 0;
+ 
+-	/* Clear transaction pending register */
+-	cn10k_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0, RVU_PF_VFTRPENDX(0),
+-			  ~0x0ULL);
+-	cn10k_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0, RVU_PF_VFTRPENDX(1),
+-			  ~0x0ULL);
++	flrwork = container_of(work, struct cptpf_flr_work, work);
++	pf = flrwork->pf;
++	mbox = &pf->afpf_mbox;
+ 
+-	/* Clear interrupt if any */
+-	cn10k_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0,
+-			  RVU_PF_VFFLR_INTX(0), ~0x0ULL);
+-	cn10k_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0,
+-			  RVU_PF_VFFLR_INTX(1), ~0x0ULL);
++	vf = flrwork - pf->flr_wrk;
++
++	req = otx2_mbox_alloc_msg_rsp(mbox, 0, sizeof(*req),
++				      sizeof(struct msg_rsp));
++	if (!req)
++		return;
++
++	req->sig = OTX2_MBOX_REQ_SIG;
++	req->id = MBOX_MSG_VF_FLR;
++	req->pcifunc &= RVU_PFVF_FUNC_MASK;
++	req->pcifunc |= (vf + 1) & RVU_PFVF_FUNC_MASK;
+ 
++	cn10k_cpt_send_mbox_msg(pf->pdev);
++
++	if (vf >= 64) {
++		reg = 1;
++		vf = vf - 64;
++	}
++	/* clear transcation pending bit */
++	cn10k_cpt_write64(pf->reg_base, BLKADDR_RVUM, 0,
++			  RVU_PF_VFTRPENDX(reg), BIT_ULL(vf));
++	cn10k_cpt_write64(pf->reg_base, BLKADDR_RVUM, 0,
++			  RVU_PF_VFFLR_INT_ENA_W1SX(reg), BIT_ULL(vf));
++}
++
++static irqreturn_t cptpf_vf_flr_intr(int __always_unused irq, void *arg)
++{
++	int reg, dev, vf, start_vf, num_reg = 1;
++	struct cn10k_cptpf_dev *cptpf = arg;
++	u64 intr;
++
++	if (cptpf->max_vfs > 64)
++		num_reg = 2;
++
++	for (reg = 0; reg < num_reg; reg++) {
++		intr = cn10k_cpt_read64(cptpf->reg_base, BLKADDR_RVUM, 0,
++					RVU_PF_VFFLR_INTX(reg));
++		if (!intr)
++			continue;
++		start_vf = 64 * reg;
++		for (vf = 0; vf < 64; vf++) {
++			if (!(intr & BIT_ULL(vf)))
++				continue;
++			dev = vf + start_vf;
++			queue_work(cptpf->flr_wq, &cptpf->flr_wrk[dev].work);
++			/* Clear interrupt */
++			cn10k_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0,
++					  RVU_PF_VFFLR_INTX(reg), BIT_ULL(vf));
++			/* Disable the interrupt */
++			cn10k_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0,
++					  RVU_PF_VFFLR_INT_ENA_W1CX(reg),
++					  BIT_ULL(vf));
++		}
++	}
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -168,6 +218,43 @@ static int cptpf_register_interrupts(struct cn10k_cptpf_dev *cptpf)
+ 	return ret;
+ }
+ 
++static void cptpf_flr_wq_destroy(struct cn10k_cptpf_dev *pf)
++{
++	if (!pf->flr_wq)
++		return;
++	destroy_workqueue(pf->flr_wq);
++	pf->flr_wq = NULL;
++	devm_kfree(&pf->pdev->dev, pf->flr_wrk);
++}
++
++static int cptpf_flr_wq_init(struct cn10k_cptpf_dev *cptpf)
++{
++	int num_vfs = cptpf->max_vfs;
++	int vf;
++
++	cptpf->flr_wq = alloc_workqueue("cptpf_flr_wq",
++					WQ_UNBOUND | WQ_HIGHPRI, 1);
++	if (!cptpf->flr_wq)
++		return -ENOMEM;
++
++	cptpf->flr_wrk = devm_kcalloc(&cptpf->pdev->dev, num_vfs,
++				      sizeof(struct cptpf_flr_work),
++				      GFP_KERNEL);
++	if (!cptpf->flr_wrk)
++		goto destroy_wq;
++
++	for (vf = 0; vf < num_vfs; vf++) {
++		cptpf->flr_wrk[vf].pf = cptpf;
++		INIT_WORK(&cptpf->flr_wrk[vf].work, cptpf_flr_wq_handler);
++	}
++
++	return 0;
++
++destroy_wq:
++	destroy_workqueue(cptpf->flr_wq);
++	return -ENOMEM;
++}
++
+ static int cptpf_afpf_mbox_init(struct cn10k_cptpf_dev *cptpf)
+ {
+ 	int err;
+@@ -512,10 +599,14 @@ static int cn10k_cptpf_probe(struct pci_dev *pdev,
+ 	if (err)
+ 		goto destroy_afpf_mbox;
+ 
++	err = cptpf_flr_wq_init(cptpf);
++	if (err)
++		goto destroy_vfpf_mbox;
++
+ 	/* Register interrupts */
+ 	err = cptpf_register_interrupts(cptpf);
+ 	if (err)
+-		goto destroy_vfpf_mbox;
++		goto destroy_flr;
+ 
+ 	/* Enable VF FLR interrupts */
+ 	cptpf_enable_vf_flr_intrs(cptpf);
+@@ -551,6 +642,8 @@ static int cn10k_cptpf_probe(struct pci_dev *pdev,
+ 	cptpf_disable_vfpf_mbox_intrs(cptpf);
+ 	cptpf_disable_afpf_mbox_intrs(cptpf);
+ 	cptpf_disable_vf_flr_intrs(cptpf);
++destroy_flr:
++	cptpf_flr_wq_destroy(cptpf);
+ destroy_vfpf_mbox:
+ 	cptpf_vfpf_mbox_destroy(cptpf);
+ destroy_afpf_mbox:
+diff --git a/drivers/crypto/marvell/cn10k/cn10k_cptpf_mbox.c b/drivers/crypto/marvell/cn10k/cn10k_cptpf_mbox.c
+index 22da4c2242cb..cba28f17cb57 100644
+--- a/drivers/crypto/marvell/cn10k/cn10k_cptpf_mbox.c
++++ b/drivers/crypto/marvell/cn10k/cn10k_cptpf_mbox.c
+@@ -606,6 +606,7 @@ void cn10k_cptpf_afpf_mbox_handler(struct work_struct *work)
+ 				break;
+ 			case MBOX_MSG_CPT_INLINE_IPSEC_CFG:
+ 			case MBOX_MSG_NIX_INLINE_IPSEC_CFG:
++			case MBOX_MSG_VF_FLR:
+ 				break;
+ 			default:
+ 				dev_err(&cptpf->pdev->dev,
+-- 
+2.31.1
+

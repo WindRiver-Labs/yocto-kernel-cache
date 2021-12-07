@@ -1,0 +1,628 @@
+From 36e0643440bc7f5bf00c31c7a352430a9cbab1ff Mon Sep 17 00:00:00 2001
+From: Hariprasad Kelam <hkelam@marvell.com>
+Date: Wed, 21 Apr 2021 17:45:40 +0530
+Subject: [PATCH 1499/1921] octeontx2-pf: offload DMAC filters to CGX/RPM block
+
+DMAC filtering can be achieved by either NPC MCAM rules or
+CGX/RPM MAC filters. Currently we are achieving this by NPC
+MCAM rules. This patch offloads DMAC filters to CGX/RPM MAC
+filters instead of NPC MCAM rules. Offloading DMAC filter to
+CGX/RPM block helps in reducing traffic to NPC block and
+save MCAM rules.
+
+Change-Id: I49f6638daebf0f7e4c4d2dc55bd3a949a9e94f6c
+Signed-off-by: Hariprasad Kelam <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/50693
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/Makefile   |   2 +-
+ .../marvell/octeontx2/nic/otx2_common.c       |   3 +
+ .../marvell/octeontx2/nic/otx2_common.h       |  11 +
+ .../marvell/octeontx2/nic/otx2_dmac_flt.c     | 173 ++++++++++++++
+ .../marvell/octeontx2/nic/otx2_flows.c        | 223 +++++++++++++++++-
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |   9 +
+ 6 files changed, 412 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/nic/otx2_dmac_flt.c
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/Makefile b/drivers/net/ethernet/marvell/octeontx2/nic/Makefile
+index 8ef1821181a9..270249145c27 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/Makefile
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/Makefile
+@@ -7,7 +7,7 @@ obj-$(CONFIG_OCTEONTX2_PF) += rvu_nicpf.o
+ obj-$(CONFIG_OCTEONTX2_VF) += rvu_nicvf.o
+ 
+ rvu_nicpf-y := otx2_pf.o otx2_common.o otx2_txrx.o otx2_ethtool.o \
+-       otx2_ptp.o otx2_flows.o otx2_tc.o cn10k.o
++       otx2_ptp.o otx2_flows.o otx2_tc.o cn10k.o otx2_dmac_flt.o
+ rvu_nicvf-y := otx2_vf.o otx2_smqvf.o
+ 
+ ccflags-y += -I$(srctree)/drivers/net/ethernet/marvell/octeontx2/af
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index e6cd6ef8233c..bec250e48ce3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -215,6 +215,9 @@ int otx2_set_mac_address(struct net_device *netdev, void *p)
+ 		/* update dmac field in vlan offload rule */
+ 		if (pfvf->flags & OTX2_FLAG_RX_VLAN_SUPPORT)
+ 			otx2_install_rxvlan_offload_flow(pfvf);
++		/* update dmac address in ntuple and DMAC filter list */
++		if (pfvf->flags & OTX2_FLAG_DMACFLTR_SUPPORT)
++			otx2_dmacflt_update_pfmac_flow(pfvf);
+ 	} else {
+ 		return -EPERM;
+ 	}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index d2204542582d..9721fa37ec4e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -298,6 +298,9 @@ struct otx2_flow_config {
+ 	u32			tc_flower_offset;
+ 	u32                     ntuple_max_flows;
+ 	u32			tc_max_flows;
++	u8			dmacflt_max_flows;
++	u8			*bmap_to_dmacindex;
++	unsigned long		dmacflt_bmap;
+ 	struct list_head	flow_list;
+ };
+ 
+@@ -340,6 +343,7 @@ struct otx2_nic {
+ #define OTX2_FLAG_TC_FLOWER_SUPPORT		BIT_ULL(11)
+ #define OTX2_FLAG_TC_MATCHALL_EGRESS_ENABLED	BIT_ULL(12)
+ #define OTX2_FLAG_TC_MATCHALL_INGRESS_ENABLED	BIT_ULL(13)
++#define OTX2_FLAG_DMACFLTR_SUPPORT		BIT_ULL(14)
+ 	u64			flags;
+ 
+ 	struct bpf_prog		*xdp_prog;
+@@ -936,4 +940,11 @@ int otx2_init_tc(struct otx2_nic *nic);
+ void otx2_shutdown_tc(struct otx2_nic *nic);
+ int otx2_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+ 		  void *type_data);
++/* CGX/RPM DMAC filters support */
++int otx2_dmacflt_get_max_cnt(struct otx2_nic *pf);
++int otx2_dmacflt_add(struct otx2_nic *pf, const u8 *mac, u8 bit_pos);
++int otx2_dmacflt_remove(struct otx2_nic *pf, const u8 *mac, u8 bit_pos);
++int otx2_dmacflt_update(struct otx2_nic *pf, u8 *mac, u8 bit_pos);
++void otx2_dmacflt_reinstall_flows(struct otx2_nic *pf);
++void otx2_dmacflt_update_pfmac_flow(struct otx2_nic *pfvf);
+ #endif /* OTX2_COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_dmac_flt.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_dmac_flt.c
+new file mode 100644
+index 000000000000..db28e0e3f4c0
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_dmac_flt.c
+@@ -0,0 +1,173 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 RVU Physcial Function ethernet driver
++ *
++ * Copyright (C) 2021 Marvell.
++ */
++
++#include "otx2_common.h"
++
++static int otx2_dmacflt_do_add(struct otx2_nic *pf, const u8 *mac,
++			       u8 *dmac_index)
++{
++	struct cgx_mac_addr_add_req *req;
++	struct cgx_mac_addr_add_rsp *rsp;
++	int err;
++
++	mutex_lock(&pf->mbox.lock);
++
++	req = otx2_mbox_alloc_msg_cgx_mac_addr_add(&pf->mbox);
++	if (!req) {
++		mutex_unlock(&pf->mbox.lock);
++		return -ENOMEM;
++	}
++
++	ether_addr_copy(req->mac_addr, mac);
++	err = otx2_sync_mbox_msg(&pf->mbox);
++
++	if (!err) {
++		rsp = (struct cgx_mac_addr_add_rsp *)
++			 otx2_mbox_get_rsp(&pf->mbox.mbox, 0, &req->hdr);
++		*dmac_index = rsp->index;
++	}
++
++	mutex_unlock(&pf->mbox.lock);
++	return err;
++}
++
++static int otx2_dmacflt_add_pfmac(struct otx2_nic *pf)
++{
++	struct cgx_mac_addr_set_or_get *req;
++	int err;
++
++	mutex_lock(&pf->mbox.lock);
++
++	req = otx2_mbox_alloc_msg_cgx_mac_addr_set(&pf->mbox);
++	if (!req) {
++		mutex_unlock(&pf->mbox.lock);
++		return -ENOMEM;
++	}
++
++	ether_addr_copy(req->mac_addr, pf->netdev->dev_addr);
++	err = otx2_sync_mbox_msg(&pf->mbox);
++
++	mutex_unlock(&pf->mbox.lock);
++	return err;
++}
++
++int otx2_dmacflt_add(struct otx2_nic *pf, const u8 *mac, u8 bit_pos)
++{
++	u8 *dmacindex;
++
++	/* Store dmacindex returned by CGX/RPM driver which will
++	 * be used for macaddr update/remove
++	 */
++	dmacindex =  &pf->flow_cfg->bmap_to_dmacindex[bit_pos];
++
++	if (ether_addr_equal(mac, pf->netdev->dev_addr))
++		return otx2_dmacflt_add_pfmac(pf);
++	else
++		return otx2_dmacflt_do_add(pf, mac, dmacindex);
++}
++
++static int otx2_dmacflt_do_remove(struct otx2_nic *pfvf, const u8 *mac,
++				  u8 dmac_index)
++{
++	struct cgx_mac_addr_del_req *req;
++	int err;
++
++	mutex_lock(&pfvf->mbox.lock);
++	req = otx2_mbox_alloc_msg_cgx_mac_addr_del(&pfvf->mbox);
++	if (!req) {
++		mutex_unlock(&pfvf->mbox.lock);
++		return -ENOMEM;
++	}
++
++	req->index = dmac_index;
++
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	mutex_unlock(&pfvf->mbox.lock);
++
++	return err;
++}
++
++static int otx2_dmacflt_remove_pfmac(struct otx2_nic *pf)
++{
++	struct msg_req *req;
++	int err;
++
++	mutex_lock(&pf->mbox.lock);
++	req = otx2_mbox_alloc_msg_cgx_mac_addr_reset(&pf->mbox);
++	if (!req) {
++		mutex_unlock(&pf->mbox.lock);
++		return -ENOMEM;
++	}
++
++	err = otx2_sync_mbox_msg(&pf->mbox);
++
++	mutex_unlock(&pf->mbox.lock);
++	return err;
++}
++
++int otx2_dmacflt_remove(struct otx2_nic *pf, const u8 *mac,
++			u8 bit_pos)
++{
++	u8 dmacindex = pf->flow_cfg->bmap_to_dmacindex[bit_pos];
++
++	if (ether_addr_equal(mac, pf->netdev->dev_addr))
++		return otx2_dmacflt_remove_pfmac(pf);
++	else
++		return otx2_dmacflt_do_remove(pf, mac, dmacindex);
++}
++
++/* CGX/RPM blocks support max unicast entries of 32.
++ * on typical configuration MAC block associated
++ * with 4 lmacs, each lmac will have 8 dmac entries
++ */
++int otx2_dmacflt_get_max_cnt(struct otx2_nic *pf)
++{
++	struct cgx_max_dmac_entries_get_rsp *rsp;
++	struct msg_req *msg;
++	int err;
++
++	mutex_lock(&pf->mbox.lock);
++	msg = otx2_mbox_alloc_msg_cgx_mac_max_entries_get(&pf->mbox);
++
++	if (!msg) {
++		mutex_unlock(&pf->mbox.lock);
++		return -ENOMEM;
++	}
++
++	err = otx2_sync_mbox_msg(&pf->mbox);
++	if (err)
++		goto out;
++
++	rsp = (struct cgx_max_dmac_entries_get_rsp *)
++		     otx2_mbox_get_rsp(&pf->mbox.mbox, 0, &msg->hdr);
++	pf->flow_cfg->dmacflt_max_flows = rsp->max_dmac_filters;
++
++out:
++	mutex_unlock(&pf->mbox.lock);
++	return err;
++}
++
++int otx2_dmacflt_update(struct otx2_nic *pf, u8 *mac, u8 bit_pos)
++{
++	struct cgx_mac_addr_update_req *req;
++	int rc;
++
++	mutex_lock(&pf->mbox.lock);
++
++	req = otx2_mbox_alloc_msg_cgx_mac_addr_update(&pf->mbox);
++
++	if (!req) {
++		mutex_unlock(&pf->mbox.lock);
++		rc = -ENOMEM;
++	}
++
++	ether_addr_copy(req->mac_addr, mac);
++	req->index = pf->flow_cfg->bmap_to_dmacindex[bit_pos];
++	rc = otx2_sync_mbox_msg(&pf->mbox);
++
++	mutex_unlock(&pf->mbox.lock);
++	return rc;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+index 7e6924013f34..5f9c623db598 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+@@ -24,6 +24,12 @@ struct otx2_flow {
+ 	bool is_vf;
+ 	u8 rss_ctx_id;
+ 	int vf;
++	bool dmac_filter;
++};
++
++enum dmac_req {
++	DMAC_ADDR_UPDATE,
++	DMAC_ADDR_DEL
+ };
+ 
+ int otx2_alloc_mcam_entries(struct otx2_nic *pfvf)
+@@ -115,6 +121,21 @@ int otx2_mcam_flow_init(struct otx2_nic *pf)
+ 	if (!pf->mac_table)
+ 		return -ENOMEM;
+ 
++	otx2_dmacflt_get_max_cnt(pf);
++
++	/* DMAC filters are not allocated */
++	if (!pf->flow_cfg->dmacflt_max_flows)
++		return 0;
++
++	pf->flow_cfg->bmap_to_dmacindex = devm_kzalloc(pf->dev, sizeof(u8)
++						       * pf->flow_cfg->dmacflt_max_flows,
++						       GFP_KERNEL);
++
++	if (!pf->flow_cfg->bmap_to_dmacindex)
++		return -ENOMEM;
++
++	pf->flags |= OTX2_FLAG_DMACFLTR_SUPPORT;
++
+ 	return 0;
+ }
+ 
+@@ -176,6 +197,12 @@ int otx2_add_macfilter(struct net_device *netdev, const u8 *mac)
+ {
+ 	struct otx2_nic *pf = netdev_priv(netdev);
+ 
++	if (bitmap_weight(&pf->flow_cfg->dmacflt_bmap,
++			  pf->flow_cfg->dmacflt_max_flows))
++		netdev_warn(netdev,
++			    "Add %pM to CGX/RPM DMAC filters list as well\n",
++			    mac);
++
+ 	return otx2_do_add_macfilter(pf, mac);
+ }
+ 
+@@ -247,12 +274,22 @@ static void otx2_add_flow_to_list(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ 	list_add(&flow->list, head);
+ }
+ 
++static int otx2_get_maxflows(struct otx2_flow_config *flow_cfg)
++{
++	if (flow_cfg->nr_flows == flow_cfg->ntuple_max_flows ||
++	    bitmap_weight(&flow_cfg->dmacflt_bmap,
++			  flow_cfg->dmacflt_max_flows))
++		return flow_cfg->ntuple_max_flows + flow_cfg->dmacflt_max_flows;
++	else
++		return flow_cfg->ntuple_max_flows;
++}
++
+ int otx2_get_flow(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc,
+ 		  u32 location)
+ {
+ 	struct otx2_flow *iter;
+ 
+-	if (location >= pfvf->flow_cfg->ntuple_max_flows)
++	if (location >= otx2_get_maxflows(pfvf->flow_cfg))
+ 		return -EINVAL;
+ 
+ 	list_for_each_entry(iter, &pfvf->flow_cfg->flow_list, list) {
+@@ -274,7 +311,7 @@ int otx2_get_all_flows(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc,
+ 	int idx = 0;
+ 	int err = 0;
+ 
+-	nfc->data = pfvf->flow_cfg->ntuple_max_flows;
++	nfc->data = otx2_get_maxflows(pfvf->flow_cfg);
+ 	while ((!err || err == -ENOENT) && idx < rule_cnt) {
+ 		err = otx2_get_flow(pfvf, nfc, location);
+ 		if (!err)
+@@ -696,6 +733,32 @@ static int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+ 	return 0;
+ }
+ 
++static int otx2_is_flow_rule_dmacfilter(struct otx2_nic *pfvf,
++					struct ethtool_rx_flow_spec *fsp)
++{
++	struct ethhdr *eth_mask = &fsp->m_u.ether_spec;
++	struct ethhdr *eth_hdr = &fsp->h_u.ether_spec;
++	u64 ring_cookie = fsp->ring_cookie;
++	u32 flow_type;
++
++	if (!(pfvf->flags & OTX2_FLAG_DMACFLTR_SUPPORT))
++		return false;
++
++	flow_type = fsp->flow_type & ~(FLOW_EXT | FLOW_MAC_EXT | FLOW_RSS);
++
++	/* CGX/RPM block dmac filtering configured for white listing
++	 * check for action other than DROP
++	 */
++	if (flow_type == ETHER_FLOW && ring_cookie != RX_CLS_FLOW_DISC &&
++	    !ethtool_get_flow_spec_ring_vf(ring_cookie)) {
++		if (is_zero_ether_addr(eth_mask->h_dest) &&
++		    is_valid_ether_addr(eth_hdr->h_dest))
++			return true;
++	}
++
++	return false;
++}
++
+ static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ {
+ 	u64 ring_cookie = flow->flow_spec.ring_cookie;
+@@ -754,14 +817,45 @@ static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ 	return err;
+ }
+ 
++static int otx2_add_flow_with_pfmac(struct otx2_nic *pfvf, struct otx2_flow *flow)
++{
++	struct ethhdr *eth_hdr;
++	struct otx2_flow *pf_mac;
++
++	pf_mac = kzalloc(sizeof(*pf_mac), GFP_KERNEL);
++	if (!pf_mac)
++		return -ENOMEM;
++
++	pf_mac->entry = 0;
++	pf_mac->dmac_filter = true;
++	pf_mac->location = pfvf->flow_cfg->ntuple_max_flows;
++	memcpy(&pf_mac->flow_spec, &flow->flow_spec,
++	       sizeof(struct ethtool_rx_flow_spec));
++	pf_mac->flow_spec.location = pf_mac->location;
++
++	/* Copy PF mac address */
++	eth_hdr = &pf_mac->flow_spec.h_u.ether_spec;
++	ether_addr_copy(eth_hdr->h_dest, pfvf->netdev->dev_addr);
++
++	/* Install DMAC filter with PF mac address */
++	otx2_dmacflt_add(pfvf, eth_hdr->h_dest, 0);
++
++	otx2_add_flow_to_list(pfvf, pf_mac);
++	pfvf->flow_cfg->nr_flows++;
++	set_bit(0, &pfvf->flow_cfg->dmacflt_bmap);
++
++	return 0;
++}
++
+ int otx2_add_flow(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc)
+ {
+ 	struct otx2_flow_config *flow_cfg = pfvf->flow_cfg;
+ 	struct ethtool_rx_flow_spec *fsp = &nfc->fs;
+ 	struct otx2_flow *flow;
++	struct ethhdr *eth_hdr;
+ 	bool new = false;
++	int err = 0;
+ 	u32 ring;
+-	int err;
+ 
+ 	ring = ethtool_get_flow_spec_ring(fsp->ring_cookie);
+ 	if (!(pfvf->flags & OTX2_FLAG_NTUPLE_SUPPORT))
+@@ -770,12 +864,12 @@ int otx2_add_flow(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc)
+ 	if (ring >= pfvf->hw.rx_queues && fsp->ring_cookie != RX_CLS_FLOW_DISC)
+ 		return -EINVAL;
+ 
+-	if (fsp->location >= flow_cfg->ntuple_max_flows)
++	if (fsp->location >= otx2_get_maxflows(flow_cfg))
+ 		return -EINVAL;
+ 
+ 	flow = otx2_find_flow(pfvf, fsp->location);
+ 	if (!flow) {
+-		flow = kzalloc(sizeof(*flow), GFP_ATOMIC);
++		flow = kzalloc(sizeof(*flow), GFP_KERNEL);
+ 		if (!flow)
+ 			return -ENOMEM;
+ 		flow->location = fsp->location;
+@@ -789,7 +883,51 @@ int otx2_add_flow(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc)
+ 	if (fsp->flow_type & FLOW_RSS)
+ 		flow->rss_ctx_id = nfc->rss_context;
+ 
+-	err = otx2_add_flow_msg(pfvf, flow);
++	if (otx2_is_flow_rule_dmacfilter(pfvf, &flow->flow_spec)) {
++		eth_hdr = &flow->flow_spec.h_u.ether_spec;
++
++		/* Sync dmac filter table with updated fields */
++		if (flow->dmac_filter)
++			return otx2_dmacflt_update(pfvf, eth_hdr->h_dest,
++						   flow->entry);
++
++		if (bitmap_full(&flow_cfg->dmacflt_bmap,
++				flow_cfg->dmacflt_max_flows)) {
++			netdev_warn(pfvf->netdev,
++				    "Can't insert the rule %d as max allowed dmac filters are %d\n",
++				    flow->location + flow_cfg->dmacflt_max_flows,
++				    flow_cfg->dmacflt_max_flows);
++			err = -EINVAL;
++			if (new)
++				kfree(flow);
++			return err;
++		}
++
++		/* Install PF mac address to DMAC filter list */
++		if (!test_bit(0, &flow_cfg->dmacflt_bmap))
++			otx2_add_flow_with_pfmac(pfvf, flow);
++
++		flow->dmac_filter = true;
++		flow->entry = find_first_zero_bit(&flow_cfg->dmacflt_bmap,
++						  flow_cfg->dmacflt_max_flows);
++		fsp->location = flow_cfg->ntuple_max_flows + flow->entry;
++		flow->flow_spec.location = fsp->location;
++		flow->location = fsp->location;
++
++		set_bit(flow->entry, &flow_cfg->dmacflt_bmap);
++		otx2_dmacflt_add(pfvf, eth_hdr->h_dest, flow->entry);
++
++	} else {
++		if (flow->location >= pfvf->flow_cfg->ntuple_max_flows) {
++			netdev_warn(pfvf->netdev,
++				    "Can't insert non dmac ntuple rule at %d, allowed range %d-0\n",
++				    flow->location, flow_cfg->ntuple_max_flows - 1);
++			err = -EINVAL;
++		} else {
++			err = otx2_add_flow_msg(pfvf, flow);
++		}
++	}
++
+ 	if (err) {
+ 		if (new)
+ 			kfree(flow);
+@@ -827,20 +965,70 @@ static int otx2_remove_flow_msg(struct otx2_nic *pfvf, u16 entry, bool all)
+ 	return err;
+ }
+ 
++static void otx2_update_rem_pfmac(struct otx2_nic *pfvf, int req)
++{
++	struct otx2_flow *iter;
++	struct ethhdr *eth_hdr;
++	bool found = false;
++
++	list_for_each_entry(iter, &pfvf->flow_cfg->flow_list, list) {
++		if (iter->dmac_filter && iter->entry == 0) {
++			eth_hdr = &iter->flow_spec.h_u.ether_spec;
++			if (req == DMAC_ADDR_DEL) {
++				otx2_dmacflt_remove(pfvf, eth_hdr->h_dest,
++						    0);
++				clear_bit(0, &pfvf->flow_cfg->dmacflt_bmap);
++				found = true;
++			} else {
++				ether_addr_copy(eth_hdr->h_dest,
++						pfvf->netdev->dev_addr);
++				otx2_dmacflt_update(pfvf, eth_hdr->h_dest, 0);
++			}
++			break;
++		}
++	}
++
++	if (found) {
++		list_del(&iter->list);
++		kfree(iter);
++		pfvf->flow_cfg->nr_flows--;
++	}
++}
++
+ int otx2_remove_flow(struct otx2_nic *pfvf, u32 location)
+ {
+ 	struct otx2_flow_config *flow_cfg = pfvf->flow_cfg;
+ 	struct otx2_flow *flow;
+ 	int err;
+ 
+-	if (location >= flow_cfg->ntuple_max_flows)
++	if (location >= otx2_get_maxflows(flow_cfg))
+ 		return -EINVAL;
+ 
+ 	flow = otx2_find_flow(pfvf, location);
+ 	if (!flow)
+ 		return -ENOENT;
+ 
+-	err = otx2_remove_flow_msg(pfvf, flow->entry, false);
++	if (flow->dmac_filter) {
++		struct ethhdr *eth_hdr = &flow->flow_spec.h_u.ether_spec;
++
++		/* user not allowed to remove dmac filter with interface mac */
++		if (ether_addr_equal(pfvf->netdev->dev_addr, eth_hdr->h_dest))
++			return -EPERM;
++
++		err = otx2_dmacflt_remove(pfvf, eth_hdr->h_dest,
++					  flow->entry);
++		clear_bit(flow->entry, &flow_cfg->dmacflt_bmap);
++		/* If all dmac filters are removed delete macfilter with
++		 * interface mac address and configure CGX/RPM block in
++		 * promiscuous mode
++		 */
++		if (bitmap_weight(&flow_cfg->dmacflt_bmap,
++				  flow_cfg->dmacflt_max_flows) == 1)
++			otx2_update_rem_pfmac(pfvf, DMAC_ADDR_DEL);
++	} else {
++		err = otx2_remove_flow_msg(pfvf, flow->entry, false);
++	}
++
+ 	if (err)
+ 		return err;
+ 
+@@ -1042,3 +1230,22 @@ int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable)
+ 	mutex_unlock(&pf->mbox.lock);
+ 	return rsp_hdr->rc;
+ }
++
++void otx2_dmacflt_reinstall_flows(struct otx2_nic *pf)
++{
++	struct otx2_flow *iter;
++	struct ethhdr *eth_hdr;
++
++	list_for_each_entry(iter, &pf->flow_cfg->flow_list, list) {
++		if (iter->dmac_filter) {
++			eth_hdr = &iter->flow_spec.h_u.ether_spec;
++			otx2_dmacflt_add(pf, eth_hdr->h_dest,
++					 iter->entry);
++		}
++	}
++}
++
++void otx2_dmacflt_update_pfmac_flow(struct otx2_nic *pfvf)
++{
++	otx2_update_rem_pfmac(pfvf, DMAC_ADDR_UPDATE);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 7eb358d5c3d1..c187202fd900 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1177,6 +1177,11 @@ static int otx2_cgx_config_loopback(struct otx2_nic *pf, bool enable)
+ 	struct msg_req *msg;
+ 	int err;
+ 
++	if (enable && bitmap_weight(&pf->flow_cfg->dmacflt_bmap,
++				    pf->flow_cfg->dmacflt_max_flows))
++		netdev_warn(pf->netdev,
++			    "CGX/RPM internal loopback might not work as DMAC filters are active\n");
++
+ 	mutex_lock(&pf->mbox.lock);
+ 	if (enable)
+ 		msg = otx2_mbox_alloc_msg_cgx_intlbk_enable(&pf->mbox);
+@@ -1759,6 +1764,10 @@ int otx2_open(struct net_device *netdev)
+ 	/* Set NPC parsing mode */
+ 	otx2_set_npc_parse_mode(pf, false);
+ 
++	/* Install DMAC Filters */
++	if (pf->flags & OTX2_FLAG_DMACFLTR_SUPPORT)
++		otx2_dmacflt_reinstall_flows(pf);
++
+ 	err = otx2_rxtx_enable(pf, true);
+ 	if (err)
+ 		goto err_tx_stop_queues;
+-- 
+2.31.1
+

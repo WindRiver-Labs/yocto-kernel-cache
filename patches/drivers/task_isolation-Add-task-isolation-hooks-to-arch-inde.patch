@@ -1,0 +1,233 @@
+From 6e38f38bcff896c6e8515b053eec6e6b135a8c2e Mon Sep 17 00:00:00 2001
+From: Alex Belits <abelits@marvell.com>
+Date: Wed, 16 Sep 2020 08:33:44 -0700
+Subject: [PATCH 0869/1921] task_isolation: Add task isolation hooks to
+ arch-independent code
+
+This commit adds task isolation hooks as follows:
+
+- __handle_domain_irq() and handle_domain_nmi() generate an
+  isolation warning for the local task
+
+- irq_work_queue_on() generates an isolation warning for the remote
+  task being interrupted for irq_work (through
+  __smp_call_single_queue())
+
+- generic_exec_single() generates a remote isolation warning for
+  the remote cpu being IPI'd (through __smp_call_single_queue())
+
+- smp_call_function_many() generates a remote isolation warning for
+  the set of remote cpus being IPI'd (through
+  smp_call_function_many_cond())
+
+- on_each_cpu_cond_mask() generates a remote isolation warning for
+  the set of remote cpus being IPI'd (through
+  smp_call_function_many_cond())
+
+- __ttwu_queue_wakelist() generates a remote isolation warning for
+  the remote cpu being IPI'd (through __smp_call_single_queue())
+
+- nmi_enter(), __context_tracking_exit(), __handle_domain_irq(),
+  handle_domain_nmi() and scheduler_ipi() clear low-level flags and
+  synchronize CPUs by calling task_isolation_kernel_enter()
+
+Calls to task_isolation_remote() or task_isolation_interrupt() can
+be placed in the platform-independent code like this when doing so
+results in fewer lines of code changes, as for example is true of
+the users of the arch_send_call_function_*() APIs. Or, they can be
+placed in the per-architecture code when there are many callers,
+as for example is true of the smp_send_reschedule() call.
+
+A further cleanup might be to create an intermediate layer, so that
+for example smp_send_reschedule() is a single generic function that
+just calls arch_smp_send_reschedule(), allowing generic code to be
+called every time smp_send_reschedule() is invoked. But for now, we
+just update either callers or callees as makes most sense.
+
+Calls to task_isolation_kernel_enter() are intended for early
+kernel entry code. They may be called in platform-independent or
+platform-specific code.
+
+It may be possible to clean up low-level entry code and somehow
+organize calls to task_isolation_kernel_enter() to avoid multiple
+per-architecture or driver-specific calls to it. RCU initialization
+may be a good reference point for those places in kernel
+(task_isolation_kernel_enter() should precede it), however right now
+it is not unified between architectures.
+
+Signed-off-by: Chris Metcalf <cmetcalf@mellanox.com>
+[abelits@marvell.com: adapted for kernel 5.8, added low-level flags handling]
+Signed-off-by: Alex Belits <abelits@marvell.com>
+
+Change-Id: I8d80f719fde2d1a0dea4001d6baad8f44a65b907
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/36004
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ include/linux/hardirq.h   |  2 ++
+ kernel/context_tracking.c |  4 ++++
+ kernel/irq/irqdesc.c      | 13 +++++++++++++
+ kernel/sched/core.c       |  3 +++
+ kernel/smp.c              |  6 +++++-
+ 5 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/hardirq.h b/include/linux/hardirq.h
+index da0af631ded5..adc8c4a052fe 100644
+--- a/include/linux/hardirq.h
++++ b/include/linux/hardirq.h
+@@ -6,6 +6,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/ftrace_irq.h>
+ #include <linux/vtime.h>
++#include <linux/isolation.h>
+ #include <asm/hardirq.h>
+ 
+ 
+@@ -68,6 +69,7 @@ extern void irq_exit(void);
+ #define nmi_enter()						\
+ 	do {							\
+ 		arch_nmi_enter();				\
++		task_isolation_kernel_enter();			\
+ 		printk_nmi_enter();				\
+ 		lockdep_off();					\
+ 		ftrace_nmi_enter();				\
+diff --git a/kernel/context_tracking.c b/kernel/context_tracking.c
+index be01a4d627c9..8708d61a4a78 100644
+--- a/kernel/context_tracking.c
++++ b/kernel/context_tracking.c
+@@ -21,6 +21,7 @@
+ #include <linux/hardirq.h>
+ #include <linux/export.h>
+ #include <linux/kprobes.h>
++#include <linux/isolation.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/context_tracking.h>
+@@ -147,6 +148,8 @@ void __context_tracking_exit(enum ctx_state state)
+ 	if (!context_tracking_recursion_enter())
+ 		return;
+ 
++	task_isolation_kernel_enter();
++
+ 	if (__this_cpu_read(context_tracking.state) == state) {
+ 		if (__this_cpu_read(context_tracking.active)) {
+ 			/*
+@@ -157,6 +160,7 @@ void __context_tracking_exit(enum ctx_state state)
+ 			if (state == CONTEXT_USER) {
+ 				vtime_user_exit(current);
+ 				trace_user_exit(0);
++				task_isolation_user_exit();
+ 			}
+ 		}
+ 		__this_cpu_write(context_tracking.state, CONTEXT_KERNEL);
+diff --git a/kernel/irq/irqdesc.c b/kernel/irq/irqdesc.c
+index 6a27603fe1cf..41c75e2f6ec2 100644
+--- a/kernel/irq/irqdesc.c
++++ b/kernel/irq/irqdesc.c
+@@ -16,6 +16,7 @@
+ #include <linux/bitmap.h>
+ #include <linux/irqdomain.h>
+ #include <linux/sysfs.h>
++#include <linux/isolation.h>
+ 
+ #include "internals.h"
+ 
+@@ -669,6 +670,8 @@ int __handle_domain_irq(struct irq_domain *domain, unsigned int hwirq,
+ 	unsigned int irq = hwirq;
+ 	int ret = 0;
+ 
++	task_isolation_kernel_enter();
++
+ 	irq_enter();
+ 
+ #ifdef CONFIG_IRQ_DOMAIN
+@@ -676,6 +679,10 @@ int __handle_domain_irq(struct irq_domain *domain, unsigned int hwirq,
+ 		irq = irq_find_mapping(domain, hwirq);
+ #endif
+ 
++	task_isolation_interrupt((irq == hwirq) ?
++				 "irq %d (%s)" : "irq %d (%s hwirq %d)",
++				 irq, domain ? domain->name : "", hwirq);
++
+ 	/*
+ 	 * Some hardware gives randomly wrong interrupts.  Rather
+ 	 * than crashing, do something sensible.
+@@ -710,6 +717,8 @@ int handle_domain_nmi(struct irq_domain *domain, unsigned int hwirq,
+ 	unsigned int irq;
+ 	int ret = 0;
+ 
++	task_isolation_kernel_enter();
++
+ 	/*
+ 	 * NMI context needs to be setup earlier in order to deal with tracing.
+ 	 */
+@@ -717,6 +726,10 @@ int handle_domain_nmi(struct irq_domain *domain, unsigned int hwirq,
+ 
+ 	irq = irq_find_mapping(domain, hwirq);
+ 
++	task_isolation_interrupt((irq == hwirq) ?
++				 "NMI irq %d (%s)" : "NMI irq %d (%s hwirq %d)",
++				 irq, domain ? domain->name : "", hwirq);
++
+ 	/*
+ 	 * ack_bad_irq is not NMI-safe, just report
+ 	 * an invalid interrupt.
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index dcc54d44fcde..28f4d73f1a07 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -12,6 +12,8 @@
+ 
+ #include <linux/kcov.h>
+ 
++#include <linux/isolation.h>
++
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+ 
+@@ -1784,6 +1786,7 @@ void sched_ttwu_pending(void)
+ 
+ void scheduler_ipi(void)
+ {
++	task_isolation_kernel_enter();
+ 	/*
+ 	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
+ 	 * TIF_NEED_RESCHED remotely (for the first time) will also send
+diff --git a/kernel/smp.c b/kernel/smp.c
+index d155374632eb..4c564c11e896 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -20,6 +20,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/idle.h>
+ #include <linux/hypervisor.h>
++#include <linux/isolation.h>
+ 
+ #include "smpboot.h"
+ 
+@@ -176,8 +177,10 @@ static int generic_exec_single(int cpu, call_single_data_t *csd,
+ 	 * locking and barrier primitives. Generic code isn't really
+ 	 * equipped to do the right thing...
+ 	 */
+-	if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
++	if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu))) {
++		task_isolation_remote(cpu, "IPI function");
+ 		arch_send_call_function_single_ipi(cpu);
++	}
+ 
+ 	return 0;
+ }
+@@ -459,6 +462,7 @@ void smp_call_function_many(const struct cpumask *mask,
+ 	}
+ 
+ 	/* Send a message to all CPUs in the map */
++	task_isolation_remote_cpumask(cfd->cpumask_ipi, "IPI function");
+ 	arch_send_call_function_ipi_mask(cfd->cpumask_ipi);
+ 
+ 	if (wait) {
+-- 
+2.31.1
+

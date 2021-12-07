@@ -1,0 +1,614 @@
+From 2c561ae684a6af633ed8133fb16cf96769e99df1 Mon Sep 17 00:00:00 2001
+From: Pavan Nikhilesh <pbhagavatula@marvell.com>
+Date: Tue, 23 Mar 2021 17:40:27 +0530
+Subject: [PATCH 1519/1921] octeontx2-af: drain XAQ buffers before lf teardown
+
+Drain XAQ buffers before SSO HWGRP LF teardown.
+XAQ buffers are used by HWGRPs to store in-flight events before admitting
+events into internal SRAM entries.
+Multiple SSO HWGRPs might use the same XAQ pool.
+Before tearing down the XAQ AURA we need to make sure that all the XAQ
+buffers that are cached or in-use by SSO are freed back to the AURA, to
+ensure this we need to drain all the SSO queues i.e. AQ/CQ/DQ.
+
+If XAQ_GMCTL/XAQ_AURA are modified before SSO flushes its internal XAQ FIFO
+to NPA, SSO might endup freeing XAQ buffers to incorrect AURA/PFFUNC.
+To ensure all the XAQ buffers have returned to NPA, we need to check
+NPA_AURA[COUNT] is zero and then modify XAQ_GMCTL/XAQ_AURA.
+
+Signed-off-by: Pavan Nikhilesh <pbhagavatula@marvell.com>
+Change-Id: I968a5a1b711cee88dd3d71f435350995f6f8bca4
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/51105
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |  50 +++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   5 +
+ .../ethernet/marvell/octeontx2/af/rvu_fixes.c |   1 -
+ .../ethernet/marvell/octeontx2/af/rvu_reg.h   |  22 +-
+ .../ethernet/marvell/octeontx2/af/rvu_sso.c   | 275 ++++++++++++------
+ 5 files changed, 246 insertions(+), 107 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 07a140963587..40c4c0e50b41 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -2645,11 +2645,11 @@ static void rvu_npa_lf_mapped_nix_lf_teardown(struct rvu *rvu, u16 pcifunc)
+ 
+ static void rvu_npa_lf_mapped_sso_lf_teardown(struct rvu *rvu, u16 pcifunc)
+ {
+-	u16 *pcifunc_arr;
+ 	u16 sso_pcifunc, match_cnt = 0;
++	int npa_blkaddr, blkaddr, lf;
+ 	struct rvu_block *sso_block;
+ 	struct rsrc_detach detach;
+-	int blkaddr, lf;
++	u16 *pcifunc_arr;
+ 	u64 regval;
+ 
+ 	pcifunc_arr = kcalloc(rvu->hw->total_pfs + rvu->hw->total_vfs,
+@@ -2661,7 +2661,42 @@ static void rvu_npa_lf_mapped_sso_lf_teardown(struct rvu *rvu, u16 pcifunc)
+ 	if (blkaddr < 0)
+ 		return;
+ 
++	npa_blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, 0);
++	if (blkaddr < 0)
++		return;
++
++	regval = BIT_ULL(16) | pcifunc;
++	rvu_write64(rvu, npa_blkaddr, NPA_AF_BAR2_SEL, regval);
++
+ 	sso_block = &rvu->hw->block[blkaddr];
++	for (lf = 0; lf < sso_block->lf.max; lf++) {
++		regval = rvu_read64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf));
++		if ((regval & 0xFFFF) != pcifunc)
++			continue;
++
++		regval = rvu_read64(rvu, blkaddr, sso_block->lfcfg_reg |
++				    (lf << sso_block->lfshift));
++		rvu_sso_lf_drain_queues(rvu, sso_pcifunc, lf, regval & 0xF);
++
++		regval = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf));
++		rvu_sso_deinit_xaq_aura(rvu, sso_pcifunc, pcifunc, regval, lf);
++	}
++
++	for (lf = 0; lf < sso_block->lf.max; lf++) {
++		regval = rvu_read64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf));
++		if ((regval & 0xFFFF) != pcifunc)
++			continue;
++
++		regval = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf));
++		if (rvu_sso_poll_aura_cnt(rvu, npa_blkaddr, regval))
++			dev_err(rvu->dev,
++				"[%d]Failed to free XAQs to aura[%lld]\n",
++				__LINE__, regval);
++
++		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf), 0);
++		rvu_write64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf), 0);
++	}
++
+ 	for (lf = 0; lf < sso_block->lf.max; lf++) {
+ 		regval = rvu_read64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf));
+ 		if ((regval & 0xFFFF) != pcifunc)
+@@ -2698,6 +2733,17 @@ static void rvu_blklf_teardown(struct rvu *rvu, u16 pcifunc, u8 blkaddr)
+ 					block->addr);
+ 	if (!num_lfs)
+ 		return;
++
++	if (block->addr == BLKADDR_SSO) {
++		for (slot = 0; slot < num_lfs; slot++) {
++			lf = rvu_get_lf(rvu, block, pcifunc, slot);
++			if (lf < 0)
++				continue;
++			rvu_sso_lf_drain_queues(rvu, pcifunc, lf, slot);
++		}
++		rvu_sso_cleanup_xaq_aura(rvu, pcifunc, num_lfs);
++	}
++
+ 	for (slot = 0; slot < num_lfs; slot++) {
+ 		lf = rvu_get_lf(rvu, block, pcifunc, slot);
+ 		if (lf < 0)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 5ab39df06a89..e0d362c63675 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -785,6 +785,11 @@ int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot_id);
+ int rvu_ssow_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot_id);
+ void rvu_sso_hwgrp_config_thresh(struct rvu *rvu, int blkaddr, int lf);
+ void rvu_sso_block_cn10k_init(struct rvu *rvu, int blkaddr);
++void rvu_sso_lf_drain_queues(struct rvu *rvu, u16 pcifunc, int lf, int slot);
++int rvu_sso_cleanup_xaq_aura(struct rvu *rvu, u16 pcifunc, int hwgrp);
++int rvu_sso_poll_aura_cnt(struct rvu *rvu, int npa_blkaddr, int aura);
++void rvu_sso_deinit_xaq_aura(struct rvu *rvu, int blkaddr, int npa_blkaddr,
++			     int aura, int lf);
+ 
+ /* NPA APIs */
+ int rvu_npa_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c
+index 05f1bdc0555b..08e3188f1f7e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_fixes.c
+@@ -338,7 +338,6 @@ static void rvu_nix_scan_txsch_hierarchy(struct rvu *rvu,
+ 
+ #define TX_OCTS 4
+ #define RVU_AF_BAR2_SEL			(0x9000000ull)
+-#define RVU_AF_BAR2_ALIASX(a, b)	(0x9100000ull | (a) << 12 | (b))
+ #define	NIX_LF_SQ_OP_OCTS		(0xa10)
+ 
+ static bool is_sq_stalled(struct rvu *rvu, struct nix_hw *nix_hw, int smq)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+index 9039352d3d65..ad5cc3791233 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+@@ -55,6 +55,8 @@
+ #define RVU_AF_SMMU_ADDR_TLN		    (0x6018)
+ #define RVU_AF_SMMU_TLN_FLIT1		    (0x6030)
+ 
++#define RVU_AF_BAR2_ALIASX(a, b)	    (0x9100000ull | (a) << 12 | (b))
++
+ /* Admin function's privileged PF/VF registers */
+ #define RVU_PRIV_CONST                      (0x8000000)
+ #define RVU_PRIV_GEN_CFG                    (0x8000010)
+@@ -169,6 +171,9 @@
+ #define NPA_PRIV_LFX_INT_CFG		(0x10020)
+ #define NPA_AF_RVU_LF_CFG_DEBUG         (0x10030)
+ 
++#define NPA_AF_BAR2_SEL			(0x9000000ull)
++#define NPA_AF_BAR2_ALIASX(a, b)	RVU_AF_BAR2_ALIASX(a, b)
++
+ /* NIX block's admin function registers */
+ #define NIX_AF_CFG			(0x0000)
+ #define NIX_AF_STATUS			(0x0010)
+@@ -584,6 +589,7 @@
+ #define SSO_HWGRP_AW_CFG_LDT		BIT_ULL(2)
+ #define SSO_HWGRP_AW_CFG_STT		BIT_ULL(3)
+ #define SSO_HWGRP_AW_CFG_XAQ_BYP_DIS	BIT_ULL(4)
++#define SSO_HWGRP_AW_CFG_XAQ_ALLOC_DIS	BIT_ULL(6)
+ 
+ #define SSO_HWGRP_AW_STS_TPTR_VLD	BIT_ULL(8)
+ #define SSO_HWGRP_AW_STS_NPA_FETCH	BIT_ULL(9)
+@@ -636,6 +642,12 @@
+ #define SSOW_LF_GWS_TAG_PEND_SWITCH	BIT_ULL(62)
+ #define SSOW_LF_GWS_TAG_PEND_GET_WORK	BIT_ULL(63)
+ 
++#define SSOW_AF_BAR2_SEL		(0x9000000ull)
++#define SSOW_AF_BAR2_ALIASX(a, b)	RVU_AF_BAR2_ALIASX(a, b)
++
++#define SSO_AF_BAR2_SEL			(0x9000000ull)
++#define SSO_AF_BAR2_ALIASX(a, b)	RVU_AF_BAR2_ALIASX(a, b)
++
+ /* TIM */
+ #define TIM_AF_CONST			(0x90)
+ #define TIM_PRIV_LFX_CFG		(0x20000)
+@@ -735,7 +747,7 @@
+ #define CPT_AF_X2PX_LINK_CFG(a)         (0x51000ull | (u64)(a) << 3)
+ 
+ #define CPT_AF_BAR2_SEL                 0x9000000
+-#define CPT_AF_BAR2_ALIASX(a, b)        AF_BAR2_ALIASX(a, b)
++#define CPT_AF_BAR2_ALIASX(a, b)        RVU_AF_BAR2_ALIASX(a, b)
+ 
+ #define CPT_AF_LF_CTL2_SHIFT		3
+ #define CPT_AF_LF_SSO_PF_FUNC_SHIFT	32
+@@ -885,14 +897,6 @@
+ #define NDC_AF_BANKX_HIT_PC(a)		(0x01000 | (a) << 3)
+ #define NDC_AF_BANKX_MISS_PC(a)		(0x01100 | (a) << 3)
+ 
+-#define AF_BAR2_ALIASX_SIZE		(0x100000ull)
+-#define SSOW_AF_BAR2_SEL		(0x9000000ull)
+-#define SSO_AF_BAR2_SEL			(0x9000000ull)
+-
+-#define AF_BAR2_ALIASX(a, b)		(0x9100000ull | (a) << 12 | b)
+-#define SSOW_AF_BAR2_ALIASX(a, b)	AF_BAR2_ALIASX(a, b)
+-#define SSO_AF_BAR2_ALIASX(a, b)	AF_BAR2_ALIASX(a, b)
+-
+ /* REE */
+ #define REE_AF_CMD_CTL			(0x00ull)
+ #define REE_AF_CONSTANTS		(0x0A0ull)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c
+index 0455946fd4fa..b19ba020ad54 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sso.c
+@@ -17,6 +17,9 @@
+ #include "rvu_reg.h"
+ #include "rvu.h"
+ 
++#define NPA_LF_AURA_OP_FREE0	0x20
++#define NPA_LF_AURA_OP_CNT	0x30
++
+ #if defined(CONFIG_ARM64)
+ #define rvu_sso_store_pair(val0, val1, addr) ({				\
+ 	__asm__ volatile("stp %x[x0], %x[x1], [%x[p1]]"			\
+@@ -285,15 +288,14 @@ static void rvu_ssow_clean_prefetch(struct rvu *rvu, int slot)
+ 	reg = rvu_read64(rvu, ssow_blkaddr,
+ 			 SSOW_AF_BAR2_ALIASX(slot, SSOW_LF_GWS_PRF_TAG));
+ 	if (((reg >> 32) & SSO_TT_EMPTY) != SSO_TT_EMPTY) {
+-		val = slot; /* GGRP ID */
+-		val |= SSOW_LF_GWS_OP_GET_WORK_GROUPED;
++		val = 0x0;
+ 		val |= SSOW_LF_GWS_OP_GET_WORK_WAIT;
+ 		rvu_write64(rvu, ssow_blkaddr,
+ 			    SSOW_AF_BAR2_ALIASX(slot, SSOW_LF_GWS_OP_GET_WORK),
+ 			    val);
+ 		err = rvu_poll_reg(rvu, ssow_blkaddr,
+ 				   SSOW_AF_BAR2_ALIASX(slot,
+-						       SSOW_LF_GWS_PENDSTATE),
++						       SSOW_LF_GWS_TAG),
+ 				   SSOW_LF_GWS_TAG_PEND_GET_WORK, true);
+ 		if (err)
+ 			dev_warn(rvu->dev,
+@@ -306,17 +308,17 @@ static void rvu_ssow_clean_prefetch(struct rvu *rvu, int slot)
+ 	}
+ }
+ 
+-int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
++void rvu_sso_lf_drain_queues(struct rvu *rvu, u16 pcifunc, int lf, int slot)
+ {
+-	int ssow_lf, blkaddr, ssow_blkaddr, err;
+ 	bool has_prefetch, has_nsched, has_lsw;
++	int ssow_lf, blkaddr, ssow_blkaddr;
+ 	struct rvu_hwinfo *hw = rvu->hw;
+ 	u64 aq_cnt, ds_cnt, cq_ds_cnt;
+-	u64 reg, add, val;
++	u64 reg, val;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_SSO, 0);
+ 	if (blkaddr < 0)
+-		return SSO_AF_ERR_LF_INVALID;
++		return;
+ 
+ 	/* Read hardware capabilities */
+ 	reg = rvu_read64(rvu, blkaddr, SSO_AF_CONST1);
+@@ -324,31 +326,17 @@ int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
+ 	has_nsched = !!!(reg & SSO_AF_CONST1_NO_NSCHED);
+ 	has_prefetch = !!(reg & SSO_AF_CONST1_PRF_PRESENT);
+ 
+-	/* Enable BAR2 ALIAS for this pcifunc. */
+-	reg = BIT_ULL(16) | pcifunc;
+-	rvu_write64(rvu, blkaddr, SSO_AF_BAR2_SEL, reg);
+-
+-	rvu_write64(rvu, blkaddr,
+-		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_INT_THR), 0x0);
+-	rvu_write64(rvu, blkaddr,
+-		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_AQ_THR),
+-		    SSO_LF_GGRP_AQ_THR_MASK);
+-
+-	rvu_write64(rvu, blkaddr,
+-		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_INT),
+-		    SSO_LF_GGRP_INT_MASK);
+-	rvu_write64(rvu, blkaddr,
+-		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_INT_ENA_W1C),
+-		    SSO_LF_GGRP_INT_MASK);
+-
+ 	ssow_blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_SSOW, 0);
+ 	if (ssow_blkaddr < 0)
+-		goto af_cleanup;
++		return;
+ 	/* Check if LF is in slot 0, if not no HWS are attached. */
+ 	ssow_lf = rvu_get_lf(rvu, &hw->block[ssow_blkaddr], pcifunc, 0);
+ 	if (ssow_lf < 0)
+-		goto af_cleanup;
++		return;
+ 
++	/* Enable BAR2 ALIAS for this pcifunc. */
++	reg = BIT_ULL(16) | pcifunc;
++	rvu_write64(rvu, blkaddr, SSO_AF_BAR2_SEL, reg);
+ 	rvu_write64(rvu, ssow_blkaddr, SSOW_AF_BAR2_SEL, reg);
+ 
+ 	/* Ignore all interrupts */
+@@ -468,10 +456,45 @@ int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
+ 		dev_warn(rvu->dev,
+ 			 "SSO_AF_HWGRP[%d]_IAQ_THR is %lld expected 0", lf,
+ 			 reg);
+-	rvu_write64(rvu, ssow_blkaddr, SSOW_AF_BAR2_SEL, 0);
+ 	rvu_write64(rvu, blkaddr, SSO_AF_HWSX_INV(ssow_lf), 0x1);
+ 
+-af_cleanup:
++	rvu_write64(rvu, blkaddr, SSO_AF_BAR2_SEL, 0);
++	rvu_write64(rvu, ssow_blkaddr, SSOW_AF_BAR2_SEL, 0);
++}
++
++int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
++{
++	u64 reg, add;
++	bool has_lsw;
++	int blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_SSO, 0);
++	if (blkaddr < 0)
++		return SSO_AF_ERR_LF_INVALID;
++
++	/* Read hardware capabilities */
++	reg = rvu_read64(rvu, blkaddr, SSO_AF_CONST1);
++	has_lsw = !!(reg & SSO_AF_CONST1_LSW_PRESENT);
++
++	/* Enable BAR2 ALIAS for this pcifunc. */
++	reg = BIT_ULL(16) | pcifunc;
++	rvu_write64(rvu, blkaddr, SSO_AF_BAR2_SEL, reg);
++
++	rvu_write64(rvu, blkaddr,
++		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_INT_THR), 0x0);
++	rvu_write64(rvu, blkaddr,
++		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_AQ_THR),
++		    SSO_LF_GGRP_AQ_THR_MASK);
++
++	rvu_write64(rvu, blkaddr,
++		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_INT),
++		    SSO_LF_GGRP_INT_MASK);
++	rvu_write64(rvu, blkaddr,
++		    SSO_AF_BAR2_ALIASX(slot, SSO_LF_GGRP_INT_ENA_W1C),
++		    SSO_LF_GGRP_INT_MASK);
++
++	rvu_write64(rvu, blkaddr, SSO_AF_BAR2_SEL, 0x0);
++
+ 	reg = rvu_read64(rvu, blkaddr, SSO_AF_UNMAP_INFO);
+ 	if ((reg & 0xFFF) == pcifunc)
+ 		rvu_write64(rvu, blkaddr, SSO_AF_ERR0, SSO_AF_ERR0_MASK);
+@@ -487,40 +510,6 @@ int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
+ 	rvu_write64(rvu, blkaddr, SSO_AF_POISONX(lf / 64), lf % 64);
+ 	rvu_write64(rvu, blkaddr, SSO_AF_IU_ACCNTX_RST(lf), 0x1);
+ 
+-	err = rvu_poll_reg(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-			   SSO_HWGRP_AW_STS_NPA_FETCH, true);
+-	if (err)
+-		dev_warn(rvu->dev,
+-			 "SSO_HWGRP(%d)_AW_STATUS[NPA_FETCH] not cleared", lf);
+-
+-	/* Remove all pointers from XAQ, HRM 14.13.6 */
+-	rvu_write64(rvu, blkaddr, SSO_AF_ERR0_ENA_W1C, ~0ULL);
+-	reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf));
+-	reg = (reg & ~SSO_HWGRP_AW_CFG_RWEN) | SSO_HWGRP_AW_CFG_XAQ_BYP_DIS;
+-	rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf), reg);
+-	if (has_prefetch) {
+-		reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf));
+-		if (reg & SSO_HWGRP_AW_STS_TPTR_NEXT_VLD) {
+-			rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-				    SSO_HWGRP_AW_STS_TPTR_NEXT_VLD);
+-		}
+-	}
+-	reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf));
+-	if (reg & SSO_HWGRP_AW_STS_TPTR_VLD) {
+-		/* aura will be torn down, no need to free the pointer. */
+-		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-			    SSO_HWGRP_AW_STS_TPTR_VLD);
+-	}
+-
+-	err = rvu_poll_reg(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-			   SSO_HWGRP_AW_STS_XAQ_BUFSC_MASK, true);
+-	if (err) {
+-		dev_warn(rvu->dev,
+-			 "SSO_HWGRP(%d)_AW_STATUS[XAQ_BUF_CACHED] not cleared",
+-			 lf);
+-		return err;
+-	}
+-
+ 	rvu_write64(rvu, blkaddr, SSO_AF_ERR0, ~0ULL);
+ 	/* Re-enable error reporting once we're finished */
+ 	rvu_write64(rvu, blkaddr, SSO_AF_ERR0_ENA_W1S, ~0ULL);
+@@ -577,8 +566,6 @@ int rvu_sso_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
+ 	rvu_write64(rvu, blkaddr, SSO_AF_XAQX_HEAD_NEXT(lf), 0x0);
+ 	rvu_write64(rvu, blkaddr, SSO_AF_XAQX_TAIL_NEXT(lf), 0x0);
+ 
+-	rvu_write64(rvu, blkaddr, SSO_AF_BAR2_SEL, 0);
+-
+ 	return 0;
+ }
+ 
+@@ -671,62 +658,150 @@ int rvu_ssow_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
+ 	return 0;
+ }
+ 
+-static void rvu_sso_deinit_xaq_aura(struct rvu *rvu, int blkaddr, int lf,
+-				    int hwgrp)
++int rvu_sso_poll_aura_cnt(struct rvu *rvu, int npa_blkaddr, int aura)
++{
++	unsigned long timeout = jiffies + usecs_to_jiffies(20000);
++	bool twice = false;
++	u64 __iomem *addr;
++	u64 res, wdata;
++
++	wdata = (u64)aura << 44;
++	addr = rvu->afreg_base + ((npa_blkaddr << 28) |
++				  NPA_AF_BAR2_ALIASX(0, NPA_LF_AURA_OP_CNT));
++again:
++	res = atomic64_fetch_add_relaxed(wdata, (atomic64_t *)addr);
++	if (res & BIT_ULL(42))
++		return 0;
++	if (!(res & 0xFFFFFFFFF))
++		return 0;
++	if (time_before(jiffies, timeout)) {
++		usleep_range(1, 5);
++		goto again;
++	}
++	/* In scenarios where CPU is scheduled out before checking
++	 * 'time_before' (above) and gets scheduled in such that
++	 * jiffies are beyond timeout value, then check again if HW is
++	 * done with the operation in the meantime.
++	 */
++	if (!twice) {
++		twice = true;
++		goto again;
++	}
++	return -EBUSY;
++}
++
++void rvu_sso_deinit_xaq_aura(struct rvu *rvu, int blkaddr, int npa_blkaddr,
++			     int aura, int lf)
+ {
++	void *free_addr;
+ 	u64 reg;
+ 
++	reg = rvu_read64(rvu, blkaddr, SSO_AF_CONST1);
++	free_addr = rvu->afreg_base + ((npa_blkaddr << 28) |
++			NPA_AF_BAR2_ALIASX(0, NPA_LF_AURA_OP_FREE0));
++	reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf));
++	reg &= ~SSO_HWGRP_AW_CFG_RWEN;
++	reg |= SSO_HWGRP_AW_CFG_XAQ_ALLOC_DIS;
++	rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf), reg);
++
++	rvu_poll_reg(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
++		     SSO_HWGRP_AW_STS_XAQ_BUFSC_MASK, true);
++	rvu_poll_reg(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
++		     SSO_HWGRP_AW_STS_NPA_FETCH, true);
++
+ 	reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf));
+-	if (reg & SSO_HWGRP_AW_STS_XAQ_BUFSC_MASK || reg & BIT_ULL(3)) {
+-		reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf));
+-		reg = (reg & ~SSO_HWGRP_AW_CFG_RWEN) |
+-			SSO_HWGRP_AW_CFG_XAQ_BYP_DIS;
+-		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf), reg);
++	if (reg & SSO_HWGRP_AW_STS_TPTR_NEXT_VLD) {
++		reg = rvu_read64(rvu, blkaddr, SSO_AF_XAQX_TAIL_NEXT(lf));
++		reg &= ~0x7F;
++		if (npa_blkaddr && reg)
++			rvu_sso_store_pair(reg, (u64)aura, free_addr);
+ 
+-		reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf));
+-		if (reg & SSO_HWGRP_AW_STS_TPTR_VLD) {
+-			rvu_poll_reg(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-				     SSO_HWGRP_AW_STS_NPA_FETCH, true);
++		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
++			    SSO_HWGRP_AW_STS_TPTR_NEXT_VLD);
+ 
+-			rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-				    SSO_HWGRP_AW_STS_TPTR_VLD);
+-		}
++		rvu_write64(rvu, blkaddr, SSO_AF_XAQX_TAIL_NEXT(lf), 0x0);
++	}
++	reg = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf));
++	if (reg & SSO_HWGRP_AW_STS_TPTR_VLD) {
++		reg = rvu_read64(rvu, blkaddr, SSO_AF_XAQX_TAIL_PTR(lf));
++		reg &= ~0x7F;
++		if (npa_blkaddr && reg)
++			rvu_sso_store_pair(reg, (u64)aura, free_addr);
+ 
+-		if (rvu_poll_reg(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
+-				 SSO_HWGRP_AW_STS_XAQ_BUFSC_MASK, true))
+-			dev_warn(rvu->dev,
+-				 "SSO_HWGRP(%d)_AW_STATUS[XAQ_BUF_CACHED] not cleared",
+-				 lf);
++		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_STATUS(lf),
++			    SSO_HWGRP_AW_STS_TPTR_VLD);
++
++		rvu_write64(rvu, blkaddr, SSO_AF_XAQX_TAIL_PTR(lf), 0x0);
+ 	}
+ }
+ 
+-int rvu_mbox_handler_sso_hw_release_xaq_aura(struct rvu *rvu,
+-					     struct sso_release_xaq *req,
+-					     struct msg_rsp *rsp)
++int rvu_sso_cleanup_xaq_aura(struct rvu *rvu, u16 pcifunc, int nb_hwgrps)
+ {
++	int hwgrp, lf, blkaddr, npa_blkaddr, npa_pcifunc, aura, err;
+ 	struct rvu_hwinfo *hw = rvu->hw;
+-	u16 pcifunc = req->hdr.pcifunc;
+-	int hwgrp, lf, blkaddr;
++	u64 reg;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_SSO, pcifunc);
+ 	if (blkaddr < 0)
+ 		return SSO_AF_ERR_LF_INVALID;
+ 
+-	for (hwgrp = 0; hwgrp < req->hwgrps; hwgrp++) {
++	lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, 0);
++	if (lf < 0)
++		return SSO_AF_ERR_LF_INVALID;
++
++	reg = rvu_read64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf));
++	npa_pcifunc = reg & 0xFFFF;
++	npa_blkaddr = 0;
++
++	if (npa_pcifunc) {
++		npa_blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, npa_pcifunc);
++		if (blkaddr < 0)
++			return SSO_AF_INVAL_NPA_PF_FUNC;
++
++		reg = BIT_ULL(16) | npa_pcifunc;
++		rvu_write64(rvu, npa_blkaddr, NPA_AF_BAR2_SEL, reg);
++		aura = rvu_read64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf));
++	}
++
++	for (hwgrp = 0; hwgrp < nb_hwgrps; hwgrp++) {
+ 		lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, hwgrp);
+-		if (lf < 0)
+-			return SSO_AF_ERR_LF_INVALID;
++		if (lf < 0) {
++			err = SSO_AF_ERR_LF_INVALID;
++			goto fail;
++		}
+ 
+-		rvu_sso_deinit_xaq_aura(rvu, blkaddr, lf, hwgrp);
++		rvu_sso_deinit_xaq_aura(rvu, blkaddr, npa_blkaddr, aura, lf);
+ 		/* disable XAQ */
+ 		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_AW_CFG(lf),
+ 			    SSO_HWGRP_AW_CFG_LDWB | SSO_HWGRP_AW_CFG_LDT |
+ 			    SSO_HWGRP_AW_CFG_STT);
++	}
++
++	if (npa_pcifunc) {
++		err = rvu_sso_poll_aura_cnt(rvu, npa_blkaddr, aura);
++		if (err)
++			dev_err(rvu->dev, "[%d]Failed to free XAQs to aura[%d]\n",
++				__LINE__, aura);
++	}
++
++	for (hwgrp = 0; hwgrp < nb_hwgrps; hwgrp++) {
+ 		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf), 0);
+ 		rvu_write64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf), 0);
+ 	}
++	err = 0;
++fail:
++	if (npa_pcifunc)
++		rvu_write64(rvu, npa_blkaddr, NPA_AF_BAR2_SEL, 0x0);
++	return err;
++}
+ 
+-	return 0;
++int rvu_mbox_handler_sso_hw_release_xaq_aura(struct rvu *rvu,
++					     struct sso_release_xaq *req,
++					     struct msg_rsp *rsp)
++{
++	u16 pcifunc = req->hdr.pcifunc;
++
++	return rvu_sso_cleanup_xaq_aura(rvu, pcifunc, req->hwgrps);
+ }
+ 
+ int rvu_mbox_handler_sso_hw_setconfig(struct rvu *rvu,
+@@ -754,14 +829,16 @@ int rvu_mbox_handler_sso_hw_setconfig(struct rvu *rvu,
+ 			return SSO_AF_INVAL_NPA_PF_FUNC;
+ 	}
+ 
++	err = rvu_sso_cleanup_xaq_aura(rvu, pcifunc, req->hwgrps);
++	if (err < 0)
++		return err;
++
+ 	/* Initialize XAQ ring */
+ 	for (hwgrp = 0; hwgrp < req->hwgrps; hwgrp++) {
+ 		lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, hwgrp);
+ 		if (lf < 0)
+ 			return SSO_AF_ERR_LF_INVALID;
+ 
+-		rvu_sso_deinit_xaq_aura(rvu, blkaddr, lf, hwgrp);
+-
+ 		rvu_write64(rvu, blkaddr, SSO_AF_HWGRPX_XAQ_AURA(lf),
+ 			    npa_aura_id);
+ 		rvu_write64(rvu, blkaddr, SSO_AF_XAQX_GMCTL(lf),
+@@ -1009,6 +1086,14 @@ int rvu_mbox_handler_sso_lf_free(struct rvu *rvu, struct sso_lf_free_req *req,
+ 	if (blkaddr < 0)
+ 		return SSO_AF_ERR_LF_INVALID;
+ 
++	for (hwgrp = 0; hwgrp < req->hwgrps; hwgrp++) {
++		lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, hwgrp);
++		if (lf < 0)
++			continue;
++		rvu_sso_lf_drain_queues(rvu, pcifunc, lf, hwgrp);
++	}
++	rvu_sso_cleanup_xaq_aura(rvu, pcifunc, req->hwgrps);
++
+ 	/* Perform reset of SSO HW GRPs */
+ 	for (hwgrp = 0; hwgrp < req->hwgrps; hwgrp++) {
+ 		lf = rvu_get_lf(rvu, &hw->block[blkaddr], pcifunc, hwgrp);
+-- 
+2.31.1
+

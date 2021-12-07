@@ -1,0 +1,136 @@
+From 8d2eec66c76347e482e9013699d6930f620cf659 Mon Sep 17 00:00:00 2001
+From: Mike Leach <mike.leach@linaro.org>
+Date: Mon, 18 May 2020 12:02:42 -0600
+Subject: [PATCH 1717/1921] coresight: cti: Add CPU idle pm notifer to CTI
+ devices
+
+Adds a notify callback for CPU PM events to the CTI driver - for
+CPU bound CTI devices.
+
+Signed-off-by: Mike Leach <mike.leach@linaro.org>
+Signed-off-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+Link: https://lore.kernel.org/r/20200518180242.7916-24-mathieu.poirier@linaro.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/hwtracing/coresight/coresight-cti.c | 69 +++++++++++++++++++++
+ include/linux/cpuhotplug.h                  |  1 +
+ 2 files changed, 70 insertions(+)
+
+diff --git a/drivers/hwtracing/coresight/coresight-cti.c b/drivers/hwtracing/coresight/coresight-cti.c
+index 7e7ec6dd93c0..40387d58c8e7 100644
+--- a/drivers/hwtracing/coresight/coresight-cti.c
++++ b/drivers/hwtracing/coresight/coresight-cti.c
+@@ -8,6 +8,7 @@
+ #include <linux/atomic.h>
+ #include <linux/bits.h>
+ #include <linux/coresight.h>
++#include <linux/cpu_pm.h>
+ #include <linux/cpuhotplug.h>
+ #include <linux/device.h>
+ #include <linux/io.h>
+@@ -656,6 +657,70 @@ static void cti_remove_conn_xrefs(struct cti_drvdata *drvdata)
+ 	}
+ }
+ 
++/** cti PM callbacks **/
++static int cti_cpu_pm_notify(struct notifier_block *nb, unsigned long cmd,
++			     void *v)
++{
++	struct cti_drvdata *drvdata;
++	unsigned int cpu = smp_processor_id();
++	int notify_res = NOTIFY_OK;
++
++	if (!cti_cpu_drvdata[cpu])
++		return NOTIFY_OK;
++
++	drvdata = cti_cpu_drvdata[cpu];
++
++	if (WARN_ON_ONCE(drvdata->ctidev.cpu != cpu))
++		return NOTIFY_BAD;
++
++	spin_lock(&drvdata->spinlock);
++
++	switch (cmd) {
++	case CPU_PM_ENTER:
++		/* CTI regs all static - we have a copy & nothing to save */
++		drvdata->config.hw_powered = false;
++		if (drvdata->config.hw_enabled)
++			coresight_disclaim_device(drvdata->base);
++		break;
++
++	case CPU_PM_ENTER_FAILED:
++		drvdata->config.hw_powered = true;
++		if (drvdata->config.hw_enabled) {
++			if (coresight_claim_device(drvdata->base))
++				drvdata->config.hw_enabled = false;
++		}
++		break;
++
++	case CPU_PM_EXIT:
++		/* write hardware registers to re-enable. */
++		drvdata->config.hw_powered = true;
++		drvdata->config.hw_enabled = false;
++
++		/* check enable reference count to enable HW */
++		if (atomic_read(&drvdata->config.enable_req_count)) {
++			/* check we can claim the device as we re-power */
++			if (coresight_claim_device(drvdata->base))
++				goto cti_notify_exit;
++
++			drvdata->config.hw_enabled = true;
++			cti_write_all_hw_regs(drvdata);
++		}
++		break;
++
++	default:
++		notify_res = NOTIFY_DONE;
++		break;
++	}
++
++cti_notify_exit:
++	spin_unlock(&drvdata->spinlock);
++	return notify_res;
++}
++
++static struct notifier_block cti_cpu_pm_nb = {
++	.notifier_call = cti_cpu_pm_notify,
++};
++
+ /* CPU HP handlers */
+ static int cti_starting_cpu(unsigned int cpu)
+ {
+@@ -687,6 +752,8 @@ static void cti_pm_release(struct cti_drvdata *drvdata)
+ {
+ 	if (drvdata->ctidev.cpu >= 0) {
+ 		if (--nr_cti_cpu == 0) {
++			cpu_pm_unregister_notifier(&cti_cpu_pm_nb);
++
+ 			cpuhp_remove_state_nocalls(
+ 				CPUHP_AP_ARM_CORESIGHT_CTI_STARTING);
+ 		}
+@@ -815,6 +882,8 @@ static int cti_probe(struct amba_device *adev, const struct amba_id *id)
+ 				"arm/coresight_cti:starting",
+ 				cti_starting_cpu, cti_dying_cpu);
+ 
++			if (!ret)
++				ret = cpu_pm_register_notifier(&cti_cpu_pm_nb);
+ 			cpus_read_unlock();
+ 			if (ret)
+ 				goto err_out;
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 33dcef949781..bcadcf20ef53 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -137,6 +137,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_DUMMY_TIMER_STARTING,
+ 	CPUHP_AP_ARM_XEN_STARTING,
+ 	CPUHP_AP_ARM_CORESIGHT_STARTING,
++	CPUHP_AP_ARM_CORESIGHT_CTI_STARTING,
+ 	CPUHP_AP_ARM64_ISNDEP_STARTING,
+ 	CPUHP_AP_SMPCFD_DYING,
+ 	CPUHP_AP_X86_TBOOT_DYING,
+-- 
+2.31.1
+

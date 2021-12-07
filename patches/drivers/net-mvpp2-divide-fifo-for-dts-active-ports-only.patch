@@ -1,0 +1,245 @@
+From 229eefebdb1a7fdbf68502f3d20b5e0e43a7425d Mon Sep 17 00:00:00 2001
+From: Stefan Chulski <stefanc@marvell.com>
+Date: Wed, 18 Nov 2020 19:54:05 +0200
+Subject: [PATCH 0977/1921] net: mvpp2: divide fifo for dts-active ports only
+
+Tx/Rx FIFO is a HW resource limited by total size, but shared
+by all ports of same CP110 and impacting port-performance.
+Do not divide the FIFO for ports which are not enabled in DTS,
+so active ports could have more FIFO.
+
+The active port mapping should be done in probe before FIFO-init.
+
+Change-Id: I4f119f1a8a0b9462768c62b3c960908d5a005a77
+Signed-off-by: Stefan Chulski <stefanc@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/42379
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h    |  25 ++--
+ .../net/ethernet/marvell/mvpp2/mvpp2_main.c   | 129 +++++++++++++-----
+ 2 files changed, 110 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+index 6171270a016c..ecc4346db011 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -549,6 +549,9 @@
+ /* Maximum number of supported ports */
+ #define MVPP2_MAX_PORTS			4
+ 
++/* Loopback port index */
++#define MVPP2_LOOPBACK_PORT_INDEX	3
++
+ /* Maximum number of TXQs used by single port */
+ #define MVPP2_MAX_TXQ			8
+ 
+@@ -583,22 +586,21 @@
+ #define MVPP2_TX_DESC_ALIGN		(MVPP2_DESC_ALIGNED_SIZE - 1)
+ 
+ /* RX FIFO constants */
++#define MVPP2_RX_FIFO_PORT_DATA_SIZE_44KB	0xb000
+ #define MVPP2_RX_FIFO_PORT_DATA_SIZE_32KB	0x8000
+ #define MVPP2_RX_FIFO_PORT_DATA_SIZE_8KB	0x2000
+ #define MVPP2_RX_FIFO_PORT_DATA_SIZE_4KB	0x1000
+-#define MVPP2_RX_FIFO_PORT_ATTR_SIZE_32KB	0x200
+-#define MVPP2_RX_FIFO_PORT_ATTR_SIZE_8KB	0x80
++#define MVPP2_RX_FIFO_PORT_ATTR_SIZE(data_size)	((data_size) >> 6)
+ #define MVPP2_RX_FIFO_PORT_ATTR_SIZE_4KB	0x40
+ #define MVPP2_RX_FIFO_PORT_MIN_PKT		0x80
+ 
+ /* TX FIFO constants */
+-#define MVPP22_TX_FIFO_DATA_SIZE_10KB		0xa
+-#define MVPP22_TX_FIFO_DATA_SIZE_3KB		0x3
+-#define MVPP2_TX_FIFO_THRESHOLD_MIN		256
+-#define MVPP2_TX_FIFO_THRESHOLD_10KB	\
+-	(MVPP22_TX_FIFO_DATA_SIZE_10KB * 1024 - MVPP2_TX_FIFO_THRESHOLD_MIN)
+-#define MVPP2_TX_FIFO_THRESHOLD_3KB	\
+-	(MVPP22_TX_FIFO_DATA_SIZE_3KB * 1024 - MVPP2_TX_FIFO_THRESHOLD_MIN)
++#define MVPP22_TX_FIFO_DATA_SIZE_16KB		16
++#define MVPP22_TX_FIFO_DATA_SIZE_10KB		10
++#define MVPP22_TX_FIFO_DATA_SIZE_3KB		3
++#define MVPP2_TX_FIFO_THRESHOLD_MIN		256 /* Bytes */
++#define MVPP2_TX_FIFO_THRESHOLD(kb)	\
++		((kb) * 1024 - MVPP2_TX_FIFO_THRESHOLD_MIN)
+ 
+ /* RX buffer constants */
+ #define MVPP2_SKB_SHINFO_SIZE \
+@@ -754,6 +756,11 @@ struct mvpp2 {
+ 	int port_count;
+ 	struct mvpp2_port *port_list[MVPP2_MAX_PORTS];
+ 
++	/* Map of enabled ports */
++	unsigned long port_map;
++
++	struct mvpp2_tai *tai;
++
+ 	/* Number of Tx threads used */
+ 	unsigned int nthreads;
+ 	/* Map of threads needing locking */
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 3f6e2d66a7c7..59d17f321270 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -5184,32 +5184,56 @@ static void mvpp2_rx_fifo_init(struct mvpp2 *priv)
+ 	mvpp2_write(priv, MVPP2_RX_FIFO_INIT_REG, 0x1);
+ }
+ 
+-static void mvpp22_rx_fifo_init(struct mvpp2 *priv)
++static void mvpp22_rx_fifo_set_hw(struct mvpp2 *priv, int port, int data_size)
+ {
+-	int port;
++	int attr_size = MVPP2_RX_FIFO_PORT_ATTR_SIZE(data_size);
+ 
+-	/* The FIFO size parameters are set depending on the maximum speed a
+-	 * given port can handle:
+-	 * - Port 0: 10Gbps
+-	 * - Port 1: 2.5Gbps
+-	 * - Ports 2 and 3: 1Gbps
+-	 */
++	mvpp2_write(priv, MVPP2_RX_DATA_FIFO_SIZE_REG(port), data_size);
++	mvpp2_write(priv, MVPP2_RX_ATTR_FIFO_SIZE_REG(port), attr_size);
++}
+ 
+-	mvpp2_write(priv, MVPP2_RX_DATA_FIFO_SIZE_REG(0),
+-		    MVPP2_RX_FIFO_PORT_DATA_SIZE_32KB);
+-	mvpp2_write(priv, MVPP2_RX_ATTR_FIFO_SIZE_REG(0),
+-		    MVPP2_RX_FIFO_PORT_ATTR_SIZE_32KB);
++/* Initialize TX FIFO's: the total FIFO size is 48kB on PPv2.2.
++ * 4kB fixed space must be assigned for the loopback port.
++ * Redistribute remaining avialable 44kB space among all active ports.
++ * Guarantee minimum 32kB for 10G port and 8kB for port 1, capable of 2.5G
++ * SGMII link.
++ */
++static void mvpp22_rx_fifo_init(struct mvpp2 *priv)
++{
++	int remaining_ports_count;
++	unsigned long port_map;
++	int size_remainder;
++	int port, size;
++
++	/* The loopback requires fixed 4kB of the FIFO space assignment. */
++	mvpp22_rx_fifo_set_hw(priv, MVPP2_LOOPBACK_PORT_INDEX,
++			      MVPP2_RX_FIFO_PORT_DATA_SIZE_4KB);
++	port_map = priv->port_map & ~BIT(MVPP2_LOOPBACK_PORT_INDEX);
++
++	/* Set RX FIFO size to 0 for inactive ports. */
++	for_each_clear_bit(port, &port_map, MVPP2_LOOPBACK_PORT_INDEX)
++		mvpp22_rx_fifo_set_hw(priv, port, 0);
++
++	/* Assign remaining RX FIFO space among all active ports. */
++	size_remainder = MVPP2_RX_FIFO_PORT_DATA_SIZE_44KB;
++	remaining_ports_count = hweight_long(port_map);
++
++	for_each_set_bit(port, &port_map, MVPP2_LOOPBACK_PORT_INDEX) {
++		if (remaining_ports_count == 1)
++			size = size_remainder;
++		else if (port == 0)
++			size = max(size_remainder / remaining_ports_count,
++				   MVPP2_RX_FIFO_PORT_DATA_SIZE_32KB);
++		else if (port == 1)
++			size = max(size_remainder / remaining_ports_count,
++				   MVPP2_RX_FIFO_PORT_DATA_SIZE_8KB);
++		else
++			size = size_remainder / remaining_ports_count;
+ 
+-	mvpp2_write(priv, MVPP2_RX_DATA_FIFO_SIZE_REG(1),
+-		    MVPP2_RX_FIFO_PORT_DATA_SIZE_8KB);
+-	mvpp2_write(priv, MVPP2_RX_ATTR_FIFO_SIZE_REG(1),
+-		    MVPP2_RX_FIFO_PORT_ATTR_SIZE_8KB);
++		size_remainder -= size;
++		remaining_ports_count--;
+ 
+-	for (port = 2; port < MVPP2_MAX_PORTS; port++) {
+-		mvpp2_write(priv, MVPP2_RX_DATA_FIFO_SIZE_REG(port),
+-			    MVPP2_RX_FIFO_PORT_DATA_SIZE_4KB);
+-		mvpp2_write(priv, MVPP2_RX_ATTR_FIFO_SIZE_REG(port),
+-			    MVPP2_RX_FIFO_PORT_ATTR_SIZE_4KB);
++		mvpp22_rx_fifo_set_hw(priv, port, size);
+ 	}
+ 
+ 	mvpp2_write(priv, MVPP2_RX_MIN_PKT_SIZE_REG,
+@@ -5217,24 +5241,53 @@ static void mvpp22_rx_fifo_init(struct mvpp2 *priv)
+ 	mvpp2_write(priv, MVPP2_RX_FIFO_INIT_REG, 0x1);
+ }
+ 
+-/* Initialize Tx FIFO's: the total FIFO size is 19kB on PPv2.2 and 10G
+- * interfaces must have a Tx FIFO size of 10kB. As only port 0 can do 10G,
+- * configure its Tx FIFO size to 10kB and the others ports Tx FIFO size to 3kB.
++static void mvpp22_tx_fifo_set_hw(struct mvpp2 *priv, int port, int size)
++{
++	int threshold = MVPP2_TX_FIFO_THRESHOLD(size);
++
++	mvpp2_write(priv, MVPP22_TX_FIFO_SIZE_REG(port), size);
++	mvpp2_write(priv, MVPP22_TX_FIFO_THRESH_REG(port), threshold);
++}
++
++/* Initialize TX FIFO's: the total FIFO size is 19kB on PPv2.2.
++ * 3kB fixed space must be assigned for the loopback port.
++ * Redistribute remaining avialable 16kB space among all active ports.
++ * The 10G interface should use 10kB (which is maximum possible size
++ * per single port).
+  */
+ static void mvpp22_tx_fifo_init(struct mvpp2 *priv)
+ {
+-	int port, size, thrs;
+-
+-	for (port = 0; port < MVPP2_MAX_PORTS; port++) {
+-		if (port == 0) {
++	int remaining_ports_count;
++	unsigned long port_map;
++	int size_remainder;
++	int port, size;
++
++	/* The loopback requires fixed 3kB of the FIFO space assignment. */
++	mvpp22_tx_fifo_set_hw(priv, MVPP2_LOOPBACK_PORT_INDEX,
++			      MVPP22_TX_FIFO_DATA_SIZE_3KB);
++	port_map = priv->port_map & ~BIT(MVPP2_LOOPBACK_PORT_INDEX);
++
++	/* Set TX FIFO size to 0 for inactive ports. */
++	for_each_clear_bit(port, &port_map, MVPP2_LOOPBACK_PORT_INDEX)
++		mvpp22_tx_fifo_set_hw(priv, port, 0);
++
++	/* Assign remaining TX FIFO space among all active ports. */
++	size_remainder = MVPP22_TX_FIFO_DATA_SIZE_16KB;
++	remaining_ports_count = hweight_long(port_map);
++
++	for_each_set_bit(port, &port_map, MVPP2_LOOPBACK_PORT_INDEX) {
++		if (remaining_ports_count == 1)
++			size = min(size_remainder,
++				   MVPP22_TX_FIFO_DATA_SIZE_10KB);
++		else if (port == 0)
+ 			size = MVPP22_TX_FIFO_DATA_SIZE_10KB;
+-			thrs = MVPP2_TX_FIFO_THRESHOLD_10KB;
+-		} else {
+-			size = MVPP22_TX_FIFO_DATA_SIZE_3KB;
+-			thrs = MVPP2_TX_FIFO_THRESHOLD_3KB;
+-		}
+-		mvpp2_write(priv, MVPP22_TX_FIFO_SIZE_REG(port), size);
+-		mvpp2_write(priv, MVPP22_TX_FIFO_THRESH_REG(port), thrs);
++		else
++			size = size_remainder / remaining_ports_count;
++
++		size_remainder -= size;
++		remaining_ports_count--;
++
++		mvpp22_tx_fifo_set_hw(priv, port, size);
+ 	}
+ }
+ 
+@@ -5533,6 +5586,12 @@ static int mvpp2_probe(struct platform_device *pdev)
+ 			goto err_axi_clk;
+ 	}
+ 
++	/* Map DTS-active ports. Should be done before FIFO mvpp2_init */
++	fwnode_for_each_available_child_node(fwnode, port_fwnode) {
++		if (!fwnode_property_read_u32(port_fwnode, "port-id", &i))
++			priv->port_map |= BIT(i);
++	}
++
+ 	/* Initialize network controller */
+ 	err = mvpp2_init(pdev, priv);
+ 	if (err < 0) {
+-- 
+2.31.1
+

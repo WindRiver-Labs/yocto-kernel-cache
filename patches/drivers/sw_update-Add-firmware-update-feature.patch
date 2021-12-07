@@ -1,0 +1,483 @@
+From 423ed139cc0b15d2845399bc205e36709d3a5472 Mon Sep 17 00:00:00 2001
+From: Witold Sadowski <wsadowski@marvell.com>
+Date: Tue, 15 Jun 2021 00:17:03 -0700
+Subject: [PATCH 1614/1921] sw_update: Add firmware update feature
+
+Adding new IOCTL calls:
+1. receive buffers:
+	Send physical addresses and sizes of
+	preallocated contigious buffers. Application
+	can map it and upload update files there.
+2. Run update:
+	Start firmware update
+	Run SMC call, firmware will be updated by ATF.
+	All data is passed via preallocated contigious
+	buffers.
+
+Both calls are used to perform secure firmware update.
+Application must receive memory buffers, and write CPIO
+update file into them.
+Then with separate IOCTL update is started.
+
+Signed-off-by: Witold Sadowski <wsadowski@marvell.com>
+Change-Id: I9bed72d215fa1b9c543e66370029024445cb512b
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/54120
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/soc/marvell/cn10ka-swup/mrvl_swup.c | 191 ++++++++++++++++++--
+ drivers/soc/marvell/cn10ka-swup/mrvl_swup.h | 131 +++++++++++++-
+ 2 files changed, 301 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c
+index de98f8c3c246..fb260dca24e8 100644
+--- a/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c
++++ b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c
+@@ -18,12 +18,28 @@
+ #include <linux/bitops.h>
+ #include <linux/debugfs.h>
+ 
++#include <linux/dma-mapping.h>
++#include <linux/dmapool.h>
++#include <linux/device.h>
++
+ #include "mrvl_swup.h"
+ 
+-/* Buffer for SMC call */
+-struct smc_version_info swup_info;
++/*Debugfs interface root */;
+ struct dentry *mrvl_swup_root;
+ 
++/* Buffers for SMC call
++ * 0 -> 25MB for SW update CPIO blob
++ * 1 -> 1MB for passing data structures
++ */
++#define BUF_CPIO 0
++#define BUF_DATA 1
++#define BUF_SIGNATURE 2
++static struct memory_desc memdesc[] = {
++	{0, 0, 25*1024*1024, "cpio buffer"},
++	{0, 0, 1*1024*1024,  "data buffer"},
++	{0, 0, 1*1024*1024,  "signature buffer"},
++};
++
+ /* IOCTL mapping to fw name */
+ const struct {
+ 	const char *str;
+@@ -76,12 +92,23 @@ void prepare_names(struct smc_version_info *info, uint32_t objects)
+ 	}
+ }
+ 
+-enum smc_version_entry_retcode get_version(unsigned long arg, uint8_t calculate_hash)
++static void mrvl_fw_dev_release(struct device *dev)
++{
++	pr_info("releasing firmware device\n");
++}
++
++static struct device dev = {
++	.release = mrvl_fw_dev_release
++};
++
++
++enum smc_version_entry_retcode mrvl_get_version(unsigned long arg, uint8_t calculate_hash)
+ {
+ 	int i, ret = 0;
+ 	uint64_t x0_addr, x1_size;
+ 	struct marlin_bootflash_get_versions *user_desc;
+ 	struct arm_smccc_res res;
++	struct smc_version_info *swup_info = (struct smc_version_info *)memdesc[BUF_DATA].virt;
+ 
+ 	user_desc = kzalloc(sizeof(struct marlin_bootflash_get_versions), GFP_KERNEL);
+ 	if (!user_desc)
+@@ -96,27 +123,28 @@ enum smc_version_entry_retcode get_version(unsigned long arg, uint8_t calculate_
+ 	}
+ 
+ 	/* We have to perform conversion from IOCTL interface to smc */
+-	memset(&swup_info, 0x00, sizeof(struct smc_version_info));
++	memset(swup_info, 0x00, sizeof(struct smc_version_info));
+ 
+-	swup_info.magic_number = VERSION_MAGIC;
+-	swup_info.version      = VERSION_INFO_VERSION;
+-	swup_info.bus          = user_desc->bus;
+-	swup_info.cs           = user_desc->cs;
++	swup_info->magic_number = VERSION_MAGIC;
++	swup_info->version      = VERSION_INFO_VERSION;
++	swup_info->bus          = user_desc->bus;
++	swup_info->cs           = user_desc->cs;
+ 
+ 	if (calculate_hash)
+-		swup_info.version_flags |= SMC_VERSION_CHECK_VALIDATE_HASH;
++		swup_info->version_flags |= SMC_VERSION_CHECK_VALIDATE_HASH;
+ 
+ 	if (user_desc->version_flags & MARLIN_CHECK_PREDEFINED_OBJ) {
+-		swup_info.version_flags |= SMC_VERSION_CHECK_SPECIFIC_OBJECTS;
+-		prepare_names(&swup_info, user_desc->selected_objects);
+-		swup_info.num_objects = hweight_long(user_desc->selected_objects);
++		swup_info->version_flags |= SMC_VERSION_CHECK_SPECIFIC_OBJECTS;
++		prepare_names(swup_info, user_desc->selected_objects);
++		swup_info->num_objects = hweight_long(user_desc->selected_objects);
+ 	} else {
+-		swup_info.num_objects = SMC_MAX_OBJECTS;
++		swup_info->num_objects = SMC_MAX_OBJECTS;
+ 	}
+ 
+ 	//SMC call
+-	x0_addr = virt_to_phys(&swup_info);
+-	x1_size = sizeof(swup_info);
++	x0_addr = memdesc[BUF_DATA].phys;
++	x1_size = sizeof(struct smc_version_info);
++
+ 	arm_smccc_smc(PLAT_CN10K_VERIFY_FIRMWARE, x0_addr, x1_size, 0, 0, 0, 0, 0, &res);
+ 
+ 	if (res.a0) {
+@@ -125,10 +153,10 @@ enum smc_version_entry_retcode get_version(unsigned long arg, uint8_t calculate_
+ 		goto mem_error;
+ 	}
+ 
+-	user_desc->retcode = swup_info.retcode;
++	user_desc->retcode = swup_info->retcode;
+ 	for (i = 0; i < SMC_MAX_VERSION_ENTRIES; i++)
+ 		memcpy(&user_desc->desc[i],
+-		       &swup_info.objects[i],
++		       &swup_info->objects[i],
+ 		       sizeof(struct smc_version_info_entry));
+ 
+ 	if (copy_to_user((struct marlin_bootflash_get_versions *)arg,
+@@ -143,13 +171,102 @@ enum smc_version_entry_retcode get_version(unsigned long arg, uint8_t calculate_
+ 	return ret;
+ }
+ 
++static int mrvl_get_membuf(unsigned long arg)
++{
++	struct marlin_bootflash_phys_buffer buf;
++
++	buf.cpio_buf = memdesc[BUF_CPIO].phys;
++	buf.cpio_buf_size = memdesc[BUF_CPIO].size;
++	buf.sign_buf = memdesc[BUF_SIGNATURE].phys;
++	buf.sign_buf_size = memdesc[BUF_SIGNATURE].size;
++	buf.reserved_buf = 0;
++	buf.reserved_buf_size = 0;
++
++
++	if (copy_to_user((struct marlin_bootflash_phys_buffer *)arg,
++			  &buf,
++			  sizeof(struct marlin_bootflash_phys_buffer))) {
++		pr_err("Data Write Error\n");
++		return -EFAULT;
++	}
++	return 0;
++}
++
++static int mrvl_run_fw_update(unsigned long arg)
++{
++	struct marlin_bootflash_update ioctl_desc = {0};
++	struct smc_update_descriptor *smc_desc;
++	struct arm_smccc_res res;
++
++	smc_desc = (struct smc_update_descriptor *)memdesc[BUF_DATA].virt;
++	memset(smc_desc, 0x00, sizeof(struct smc_update_descriptor));
++
++	if (copy_from_user(&ioctl_desc,
++			  (struct marlin_bootflash_update *)arg,
++			  sizeof(struct marlin_bootflash_update))) {
++		pr_err("Data Read Error\n");
++		return -EFAULT;
++	}
++
++	pr_info("Update request: SPI: %d, CS: %d, image size: %lld\n",
++							ioctl_desc.bus,
++							ioctl_desc.cs,
++							ioctl_desc.image_size);
++
++	/*Verify data size*/
++	if (ioctl_desc.image_size > memdesc[BUF_CPIO].size) {
++		pr_err("Incorrect CPIO data size\n");
++		return -EFAULT;
++	}
++
++	/* Verify userdata */
++	if (ioctl_desc.user_size > memdesc[BUF_SIGNATURE].size) {
++		pr_err("Incorrect user data size\n");
++		return -EFAULT;
++	}
++
++	smc_desc->magic      = UPDATE_MAGIC;
++	smc_desc->version    = UPDATE_VERSION;
++
++	/* Set addresses and flags*/
++	smc_desc->image_addr = memdesc[BUF_CPIO].phys;
++	smc_desc->image_size = ioctl_desc.image_size;
++	if (ioctl_desc.user_size != 0) {
++		smc_desc->user_addr = memdesc[BUF_SIGNATURE].phys;
++		smc_desc->user_size = ioctl_desc.user_size;
++	}
++	smc_desc->user_flags = ioctl_desc.user_flags;
++	smc_desc->update_flags = ioctl_desc.flags;
++
++	/* SPI config */
++	smc_desc->bus        = ioctl_desc.bus;
++	smc_desc->cs	     = ioctl_desc.cs;
++
++	arm_smccc_smc(PLAT_OCTEONTX_SPI_SECURE_UPDATE, memdesc[BUF_DATA].phys,
++			sizeof(struct smc_update_descriptor),
++			0, 0, 0, 0, 0, &res);
++
++	ioctl_desc.ret = res.a0;
++	if (copy_to_user((struct marlin_bootflash_update *)arg,
++			 &ioctl_desc,
++			 sizeof(struct marlin_bootflash_update))) {
++		pr_err("Data Write Error\n");
++		return -EFAULT;
++	}
++	return 0;
++}
++
+ static long mrvl_swup_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+ 	switch (cmd) {
+ 	case GET_VERSION:
+-		return get_version(arg, 0);
++		return mrvl_get_version(arg, 0);
+ 	case VERIFY_HASH:
+-		return get_version(arg, 1);
++		return mrvl_get_version(arg, 1);
++	case GET_MEMBUF:
++		return mrvl_get_membuf(arg);
++	case RUN_UPDATE:
++		return mrvl_run_fw_update(arg);
+ 	default:
+ 		pr_err("Not supported IOCTL\n");
+ 		return -ENXIO;
+@@ -163,6 +280,18 @@ static const struct file_operations mrvl_fops = {
+ 	.llseek			= no_llseek,
+ };
+ 
++static int setup_cma(struct device *dev, struct memory_desc *memdesc)
++{
++	memdesc->virt = dma_alloc_coherent(dev, memdesc->size, &memdesc->phys, GFP_KERNEL);
++	memset(memdesc->virt, 0x01, memdesc->size);
++	pr_info("Allocated %llx b for pool: %s. Virt: %llx. Phys: %llx\n",
++						memdesc->size,
++						memdesc->pool_name,
++						(uint64_t)memdesc->virt,
++						(uint64_t)memdesc->phys);
++
++	return 0;
++}
+ static int mrvl_swup_setup_debugfs(void)
+ {
+ 	struct dentry *pfile;
+@@ -184,12 +313,36 @@ static int mrvl_swup_setup_debugfs(void)
+ 
+ static int __init mrvl_swup_init(void)
+ {
++	int i, ret;
++
++	dev_set_name(&dev, "mrvl_swup_dev");
++	ret = device_register(&dev);
++
++	if (ret) {
++		pr_err("Failed to register device\n");
++		return ret;
++	}
++
++	/* Will not be used bt any HW, so use mask with ones only */
++	dev.coherent_dma_mask = ~0;
++
++	/* Allocate memory */
++	for (i = 0; i < ARRAY_SIZE(memdesc); i++)
++		setup_cma(&dev, &memdesc[i]);
++
+ 	return mrvl_swup_setup_debugfs();
+ }
+ 
+ static void __exit mrvl_swup_exit(void)
+ {
++	int i;
++
+ 	debugfs_remove_recursive(mrvl_swup_root);
++	for (i = 0; i < ARRAY_SIZE(memdesc); i++) {
++		if (memdesc[i].phys != 0)
++			dma_free_coherent(&dev, memdesc[i].size,
++					  memdesc[i].virt, memdesc[i].phys);
++	}
+ }
+ 
+ module_init(mrvl_swup_init)
+diff --git a/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h
+index a81b9dc97d15..df08e2a1162d 100644
+--- a/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h
++++ b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h
+@@ -10,6 +10,7 @@
+ #ifndef __MRVL_SWUP_H__
+ #define __MRVL_SWUP_H__
+ 
++#define PLAT_OCTEONTX_SPI_SECURE_UPDATE         0xc2000b05
+ #define PLAT_CN10K_VERIFY_FIRMWARE		0xc2000b0c
+ 
+ #define VER_MAX_NAME_LENGTH	32
+@@ -30,6 +31,13 @@
+ #define VERSION_MAGIC		0x4e535256	/** VRSN */
+ #define VERSION_INFO_VERSION	0x0100	/** 1.0.0.0 */
+ 
++struct memory_desc {
++	void	   *virt;
++	dma_addr_t phys;
++	uint64_t   size;
++	char	   pool_name[32];
++};
++
+ struct tim_opaque_data_version_info {
+ 	uint8_t     major_version;  /** Major version number */
+ 	uint8_t     minor_version;  /** Minor version number */
+@@ -43,7 +51,11 @@ struct tim_opaque_data_version_info {
+ 	uint16_t    flags;          /** Flags (TBD) */
+ 	uint32_t    customer_version;/** Customer defined version number */
+ 	uint8_t     version_string[VERSION_STRING_LENGTH];
+-} __packed4;
++} __packed;
++
++/* VERSION INFO
++ * HASH VERIFICATION
++ */
+ 
+ /** Return code for version info */
+ enum smc_version_ret {
+@@ -102,6 +114,98 @@ struct smc_version_info {
+ 	struct smc_version_info_entry objects[SMC_MAX_VERSION_ENTRIES];
+ };
+ 
++/* UPDATE
++ */
++
++enum update_ret {
++	/** No errors */
++	UPDATE_OK = 0,
++	/** Error with the CPIO image */
++	UPDATE_CPIO_ERROR = -1,
++	/** Invalid TIM found in update */
++	UPDATE_TIM_ERROR = -2,
++	/** One or more files failed hash check */
++	UPDATE_HASH_ERROR = -3,
++	/** Update authentication error */
++	UPDATE_AUTH_ERROR = -4,
++	/** I/O error reading or writing to the flash */
++	UPDATE_IO_ERROR = -5,
++	/**
++	 * Error found that requires all objects to be updated,
++	 * i.e. a corrupt object found in the existing flash
++	 */
++	UPDATE_REQUIRE_FULL = -6,
++	/** Out of resources, too many files, etc. */
++	UPDATE_NO_MEM = -7,
++	/** Problem found with device tree firmware-update section */
++	UPDATE_DT_ERROR = -8,
++	/** Incomplete file grouping found */
++	UPDATE_GROUP_ERROR = -9,
++	/** Location or size of an object invalid */
++	UPDATE_LOCATION_ERROR = -10,
++	/** Unsupported media */
++	UPDATE_INVALID_MEDIA = -11,
++	/** Invalid alignment of update file */
++	UPDATE_BAD_ALIGNMENT = -12,
++	/** TIM is missing in an object */
++	UPDATE_MISSING_TIM = -13,
++	/** File is missing in an object */
++	UPDATE_MISSING_FILE = -14,
++	/** TIM is missing in flash */
++	UPDATE_TIM_MISSING = -15,
++	/** I/O issue with eHSM component */
++	UPDATE_EHSM_ERROR = -16,
++	/** Update rejected due to version check */
++	UPDATE_VERSION_CHECK_FAIL = -17,
++	/** Bad magic number in update descriptor */
++	UPDATE_BAD_DESC_MAGIC = -18,
++	/** Unsupported version in update descriptor */
++	UPDATE_BAD_DESC_VERSION = -19,
++	/** Error mapping update to secure memory */
++	UPDATE_MMAP_ERROR = -20,
++
++	UPDATE_WORK_BUFFER_TOO_SMALL = -21,
++	/** Unknown error */
++	UPDATE_UNKNOWN_ERROR = -1000,
++};
++
++struct smc_update_obj_info {
++
++};
++
++#define UPDATE_MAGIC		0x55504454	/* UPDT */
++/** Current smc_update_descriptor version */
++#define UPDATE_VERSION		0x0001
++
++#define UPDATE_FLAG_BACKUP	0x0001	/** Set to update secondary location */
++#define UPDATE_FLAG_EMMC	0x0002	/** Set to update eMMC instead of SPI */
++#define UPDATE_FLAG_ERASE_PART	0x0004	/** Erase eMMC partition data */
++#define UPDATE_FLAG_IGNORE_VERSION 0x0008 /** Don't perform version check */
++/** Set when user parameters are passed */
++#define UPDATE_FLAG_USER_PARMS	0x8000
++
++/** Offset from the beginning of the flash where the backup image is located */
++#define BACKUP_IMAGE_OFFSET	0x2000000
++/**
++ * This descriptor is passed by U-Boot or other software performing an update
++ */
++struct smc_update_descriptor {
++	uint32_t	magic;		/** UPDATE_MAGIC */
++	uint16_t	version;	/** Version of descriptor */
++	uint16_t	update_flags;	/** Flags passed to update process */
++	uint64_t	image_addr;	/** Address of image (CPIO file) */
++	uint64_t	image_size;	/** Size of image (CPIO file) */
++	uint32_t	bus;		/** SPI BUS number */
++	uint32_t	cs;		/** SPI chip select number */
++	uint64_t	reserved;	/** Space to add stuff */
++	uint64_t	user_addr;	/** Passed to customer function */
++	uint64_t	user_size;	/** Passed to customer function */
++	uint64_t	user_flags;	/** Passed to customer function */
++	uintptr_t	work_buffer;	/** Used for compressed objects */
++	uint64_t	work_buffer_size;/** Size of work buffer */
++	struct smc_update_obj_info object_retinfo[SMC_MAX_OBJECTS];
++};
++
+ /* IOCTL interface
+  * Use same data structure for:
+  * get_version
+@@ -118,9 +222,32 @@ struct marlin_bootflash_get_versions {
+ 	uint64_t  reserved[5];	    /** Reserved for future growth */
+ 	enum smc_version_ret	retcode;
+ 	struct smc_version_info_entry desc[SMC_MAX_VERSION_ENTRIES];
+-};
++} __packed;
++
++struct marlin_bootflash_phys_buffer {
++	uint64_t cpio_buf;
++	uint64_t cpio_buf_size;
++	uint64_t sign_buf;
++	uint64_t sign_buf_size;
++	uint64_t reserved_buf;
++	uint64_t reserved_buf_size;
++} __packed;
++
++struct marlin_bootflash_update {
++	uint32_t bus;
++	uint32_t cs;
++	uint64_t image_size;
++	uint64_t flags;
++	uint64_t user_flags;
++	uint64_t user_size;
++	uint16_t timeout;
++	enum update_ret ret;
++} __packed;
++
+ 
+ #define GET_VERSION _IOWR('a', 'a', struct marlin_bootflash_get_versions*)
+ #define VERIFY_HASH _IOWR('a', 'b', struct marlin_bootflash_get_versions*)
++#define GET_MEMBUF  _IOWR('a', 'c', struct marlin_bootflash_phys_buffer*)
++#define RUN_UPDATE  _IOWR('a', 'd', struct marlin_bootflash_update*)
+ 
+ #endif	/* __TIM_UPDATE_H__ */
+-- 
+2.31.1
+

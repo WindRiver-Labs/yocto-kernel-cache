@@ -1,0 +1,150 @@
+From 2d1a9199202332cdb34a36b094c9f0cda2ab28e4 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Mon, 4 Feb 2019 22:53:23 +0530
+Subject: [PATCH 0076/1921] octeontx2-af: Add support to verify channel
+
+Channel received in mailbox needs to be verified for
+valid range. Hence added a function for it and verified
+channel before writing an entry to MCAM.
+
+Change-Id: I2a3eb1735827bf24ae9c1dbf6871af5bf0e77e49
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |  4 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 44 +++++++++++++++++++
+ 3 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 4a704c8c61aa..2686fa1d59ec 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -2418,7 +2418,7 @@ static void rvu_enable_afvf_intr(struct rvu *rvu)
+ 
+ #define PCI_DEVID_OCTEONTX2_LBK 0xA061
+ 
+-static int lbk_get_num_chans(void)
++int rvu_get_num_lbk_chans(void)
+ {
+ 	struct pci_dev *pdev;
+ 	void __iomem *base;
+@@ -2453,7 +2453,7 @@ static int rvu_enable_sriov(struct rvu *rvu)
+ 		return 0;
+ 	}
+ 
+-	chans = lbk_get_num_chans();
++	chans = rvu_get_num_lbk_chans();
+ 	if (chans < 0)
+ 		return chans;
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index e22f6841dbb1..43bc94a5d211 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -340,6 +340,7 @@ int rvu_lf_reset(struct rvu *rvu, struct rvu_block *block, int lf);
+ int rvu_get_blkaddr(struct rvu *rvu, int blktype, u16 pcifunc);
+ int rvu_poll_reg(struct rvu *rvu, u64 block, u64 offset, u64 mask, bool zero);
+ u16 rvu_get_rsrc_mapcount(struct rvu_pfvf *pfvf, int blkid);
++int rvu_get_num_lbk_chans(void);
+ 
+ /* RVU HW reg validation */
+ enum regmap_block {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 7580bba15fec..b706d005f591 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -28,11 +28,37 @@
+ 
+ #define NPC_PARSE_RESULT_DMAC_OFFSET	8
+ 
++#define NPC_KEX_CHAN_MASK	0xFFFULL
++
+ static void npc_mcam_free_all_entries(struct rvu *rvu, struct npc_mcam *mcam,
+ 				      int blkaddr, u16 pcifunc);
+ static void npc_mcam_free_all_counters(struct rvu *rvu, struct npc_mcam *mcam,
+ 				       u16 pcifunc);
+ 
++static int npc_mcam_verify_channel(struct rvu *rvu, u16 pcifunc, u8 intf,
++				   u16 channel)
++{
++	int pf = rvu_get_pf(pcifunc);
++	u8 cgx_id, lmac_id;
++	int base = 0, end;
++
++	if (is_afvf(pcifunc)) {
++		end = rvu_get_num_lbk_chans();
++		if (end < 0)
++			return -EINVAL;
++	} else {
++		rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++		base = NIX_CHAN_CGX_LMAC_CHX(cgx_id, lmac_id, 0x0);
++		/* CGX mapped functions has maximum of 16 channels */
++		end = NIX_CHAN_CGX_LMAC_CHX(cgx_id, lmac_id, 0xF);
++	}
++
++	if (channel < base || channel > end)
++		return -EINVAL;
++
++	return 0;
++}
++
+ void rvu_npc_set_pkind(struct rvu *rvu, int pkind, struct rvu_pfvf *pfvf)
+ {
+ 	int blkaddr;
+@@ -1756,12 +1782,17 @@ int rvu_mbox_handler_npc_mcam_write_entry(struct rvu *rvu,
+ {
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	u16 pcifunc = req->hdr.pcifunc;
++	u16 channel, chan_mask;
+ 	int blkaddr, rc;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+ 	if (blkaddr < 0)
+ 		return NPC_MCAM_INVALID_REQ;
+ 
++	chan_mask = req->entry_data.kw_mask[0] & NPC_KEX_CHAN_MASK;
++	channel = req->entry_data.kw[0] & NPC_KEX_CHAN_MASK;
++	channel &= chan_mask;
++
+ 	mutex_lock(&mcam->lock);
+ 	rc = npc_mcam_verify_entry(mcam, pcifunc, req->entry);
+ 	if (rc)
+@@ -1778,6 +1809,11 @@ int rvu_mbox_handler_npc_mcam_write_entry(struct rvu *rvu,
+ 		goto exit;
+ 	}
+ 
++	if (npc_mcam_verify_channel(rvu, pcifunc, req->intf, channel)) {
++		rc = NPC_MCAM_INVALID_REQ;
++		goto exit;
++	}
++
+ 	npc_config_mcam_entry(rvu, mcam, blkaddr, req->entry, req->intf,
+ 			      &req->entry_data, req->enable_entry);
+ 
+@@ -2113,6 +2149,7 @@ int rvu_mbox_handler_npc_mcam_alloc_and_write_entry(struct rvu *rvu,
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	u16 entry = NPC_MCAM_ENTRY_INVALID;
+ 	u16 cntr = NPC_MCAM_ENTRY_INVALID;
++	u16 channel, chan_mask;
+ 	int blkaddr, rc;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+@@ -2122,6 +2159,13 @@ int rvu_mbox_handler_npc_mcam_alloc_and_write_entry(struct rvu *rvu,
+ 	if (req->intf != NIX_INTF_RX && req->intf != NIX_INTF_TX)
+ 		return NPC_MCAM_INVALID_REQ;
+ 
++	chan_mask = req->entry_data.kw_mask[0] & NPC_KEX_CHAN_MASK;
++	channel = req->entry_data.kw[0] & NPC_KEX_CHAN_MASK;
++	channel &= chan_mask;
++
++	if (npc_mcam_verify_channel(rvu, req->hdr.pcifunc, req->intf, channel))
++		return NPC_MCAM_INVALID_REQ;
++
+ 	/* Try to allocate a MCAM entry */
+ 	entry_req.hdr.pcifunc = req->hdr.pcifunc;
+ 	entry_req.contig = true;
+-- 
+2.31.1
+

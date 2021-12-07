@@ -1,0 +1,274 @@
+From 641033a5448692a3dfc9ec41043e9e0d2cdf0d78 Mon Sep 17 00:00:00 2001
+From: Damian Eppel <deppel@marvell.com>
+Date: Sun, 11 Apr 2021 10:38:09 -0700
+Subject: [PATCH 1417/1921] soc: marvell: MDIO uio driver
+
+Marvell's MDIO userspace interface driver.
+Provides an interface for userspace PHY drivers
+to access MDIO bus.
+
+Signed-off-by: Damian Eppel <deppel@marvell.com>
+Change-Id: Ia33df98f602d07f1e4b19625a87ab7469613b21f
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/49671
+Reviewed-by: Felix Manlunas <fmanlunas@marvell.com>
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Reviewed-by: Yi Guo <yi.guo@cavium.com>
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ MAINTAINERS                      |   5 +
+ drivers/soc/marvell/Kconfig      |   8 ++
+ drivers/soc/marvell/Makefile     |   1 +
+ drivers/soc/marvell/mvmdio_uio.c | 195 +++++++++++++++++++++++++++++++
+ 4 files changed, 209 insertions(+)
+ create mode 100644 drivers/soc/marvell/mvmdio_uio.c
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index a828f747eb67..6d5e4fd91886 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -9463,6 +9463,11 @@ L:	linux-arm-kernel@lists.infradead.org
+ S:	Maintained
+ F:	arch/arm64/boot/dts/marvell/armada-8040-mcbin.dts
+ 
++MARVELL MDIO UIO DRIVER
++M:	Damian Eppel <deppel@marvell.com>
++S:	Maintained
++F:	drivers/soc/marvell/mvmdio_uio.c
++
+ MARVELL MV643XX ETHERNET DRIVER
+ M:	Sebastian Hesselbarth <sebastian.hesselbarth@gmail.com>
+ L:	netdev@vger.kernel.org
+diff --git a/drivers/soc/marvell/Kconfig b/drivers/soc/marvell/Kconfig
+index 3e61633d721a..4a6d4e377208 100644
+--- a/drivers/soc/marvell/Kconfig
++++ b/drivers/soc/marvell/Kconfig
+@@ -121,6 +121,14 @@ config OCTEONTX_INFO
+ 	mac addresses, board serial number and more. These are boards housing Marvell
+ 	OcteonTX family chipsets.
+ 
++config MVMDIO_UIO
++	tristate "Marvell MDIO interface driver"
++	  default m
++	select MDIO_THUNDER
++	help
++	  Select this option if you want to provide an interface for userspace
++	  PHY drivers to access Marvell's MDIO bus.
++
+ config HW_CSR_ACCESS
+        tristate "Access HW Device Config Space Registers"
+         default m
+diff --git a/drivers/soc/marvell/Makefile b/drivers/soc/marvell/Makefile
+index cfd20b3a13da..90bc8a5bb032 100644
+--- a/drivers/soc/marvell/Makefile
++++ b/drivers/soc/marvell/Makefile
+@@ -8,3 +8,4 @@ obj-y		+= octeontx2-llc/
+ obj-y 		+= csr-access/
+ 
+ obj-$(CONFIG_OCTEONTX_INFO) += octeontx_info.o
++obj-$(CONFIG_MVMDIO_UIO) += mvmdio_uio.o
+diff --git a/drivers/soc/marvell/mvmdio_uio.c b/drivers/soc/marvell/mvmdio_uio.c
+new file mode 100644
+index 000000000000..ef32418e0a81
+--- /dev/null
++++ b/drivers/soc/marvell/mvmdio_uio.c
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell's MDIO bus uio driver
++ *
++ * Copyright (C) 2021 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#define pr_fmt(fmt) "mvmdio-uio: " fmt
++
++#include <linux/of_mdio.h>
++#include <linux/device.h>
++#include <linux/fs.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/uaccess.h>
++
++#define MVMDIO_DEV_NAME "mvmdio-uio"
++#define MVMDIO_CLASS_NAME "mvmdio-uio-class"
++#define MAX_MDIO_BUS 8
++
++static struct mii_bus *mv_mii_buses[MAX_MDIO_BUS];
++static struct class *mv_cl;
++static int major;
++
++struct mii_data {
++	int bus_id;
++	int phy_id;
++	int reg;
++	u16 data;
++};
++
++/* Create character device */
++static int mv_mdio_device_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static ssize_t mv_mdio_device_read(struct file *file,
++		char *buf, size_t count, loff_t *f_pos)
++{
++	int ret;
++	struct mii_data mii;
++
++	if (copy_from_user(&mii, (struct mii_data *)buf, sizeof(struct mii_data))) {
++		pr_err("copy_from_user failed\n");
++		return -EFAULT;
++	}
++
++	if (mv_mii_buses[mii.bus_id] == NULL) {
++		pr_err("invalid bus_id\n");
++		return -EINVAL;
++	}
++
++	ret = mv_mii_buses[mii.bus_id]->read(mv_mii_buses[mii.bus_id],
++		mii.phy_id, mii.reg);
++
++	if (ret < 0) {
++		pr_err("smi read failed at Bus: %X, devAddr: %X, regAddr: %X\n",
++			mii.bus_id, mii.phy_id, mii.reg);
++		return ret;
++	}
++	mii.data = (u16)ret;
++
++	if (copy_to_user((struct mii_data *)buf, &mii, sizeof(struct mii_data))) {
++		pr_err("copy_to_user failed\n");
++		return -EFAULT;
++	}
++
++	return 0;
++}
++
++static ssize_t mv_mdio_device_write(struct file *file,
++		const char *buf, size_t count, loff_t *f_pos)
++{
++	int ret;
++	struct mii_data mii;
++
++	if (copy_from_user(&mii, (struct mii_data *)buf, sizeof(struct mii_data))) {
++		pr_err("copy_from_user failed\n");
++		return -EFAULT;
++	}
++
++	if (mv_mii_buses[mii.bus_id] == NULL) {
++		pr_err("invalid bus_id\n");
++		return -EINVAL;
++	}
++
++	ret = mv_mii_buses[mii.bus_id]->write(mv_mii_buses[mii.bus_id],
++		mii.phy_id, mii.reg, mii.data);
++
++	if (ret < 0) {
++		pr_err("smi write failed at bus: %X, devAddr: %X, regAddr: %X\n",
++			mii.bus_id, mii.phy_id, mii.reg);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int mv_mdio_device_close(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static const struct file_operations mvmdio_fops = {
++	.owner                = THIS_MODULE,
++	.open                 = mv_mdio_device_open,
++	.read                 = mv_mdio_device_read,
++	.write                = mv_mdio_device_write,
++	.release              = mv_mdio_device_close,
++};
++
++static int __init mv_mdio_device_init(void)
++{
++	struct device_node *np;
++	struct device_node *mdio;
++	struct mii_bus *mv_mii_bus;
++	static struct device *mvmdio_dev;
++	int bus_count = 0;
++	int ret;
++
++	memset(mv_mii_buses, 0, sizeof(mv_mii_buses));
++	for_each_compatible_node(np, NULL, "marvell,mvmdio-uio") {
++		if (bus_count == MAX_MDIO_BUS)
++			break;
++
++		mdio = of_parse_phandle(np, "mii-bus", 0);
++		if (mdio == NULL) {
++			pr_err("parse handle failed\n");
++			continue;
++		}
++		mv_mii_bus = of_mdio_find_bus(mdio);
++		if (mv_mii_bus == NULL) {
++			pr_err("mdio find bus failed\n");
++			continue;
++		}
++		pr_info("bus %d added at %s\n",
++			bus_count, mdio->name);
++		mv_mii_buses[bus_count++] = mv_mii_bus;
++	}
++
++	if (bus_count == 0) {
++		pr_err("no useful mdio bus found\n");
++		return -ENODEV;
++	}
++
++
++	ret = register_chrdev(0, MVMDIO_DEV_NAME, &mvmdio_fops);
++	if (ret < 0) {
++		pr_err("failed to register a char device\n");
++		return ret;
++	}
++
++	major = ret;
++
++	mv_cl = class_create(THIS_MODULE, MVMDIO_CLASS_NAME);
++	if (IS_ERR(mv_cl)) {
++		ret = PTR_ERR(mv_cl);
++		goto error_class;
++	}
++
++	mvmdio_dev = device_create(mv_cl, NULL,
++		MKDEV(major, 0), NULL, MVMDIO_DEV_NAME);
++
++	if (IS_ERR(mvmdio_dev)) {
++		ret = PTR_ERR(mvmdio_dev);
++		goto error_device;
++	}
++
++	return 0;
++
++error_device:
++	class_destroy(mv_cl);
++error_class:
++	unregister_chrdev(major, MVMDIO_DEV_NAME);
++
++	pr_err("driver registration failed\n");
++	return ret;
++}
++
++static void __exit mv_mdio_device_exit(void)
++{
++	device_destroy(mv_cl, MKDEV(major, 0));
++	class_destroy(mv_cl);
++	unregister_chrdev(major, MVMDIO_DEV_NAME);
++}
++
++late_initcall(mv_mdio_device_init);
++module_exit(mv_mdio_device_exit);
++
++MODULE_DESCRIPTION("Marvell MDIO uio driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.31.1
+

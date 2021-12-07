@@ -1,0 +1,201 @@
+From 3a5ac5baf248d7f2dc80a206becadd037c6450a1 Mon Sep 17 00:00:00 2001
+From: hariprasad <hkelam@marvell.com>
+Date: Wed, 16 Oct 2019 18:00:51 +0530
+Subject: [PATCH 0302/1921] octeontx2-af: Support for parsing pkts with switch
+ headers
+
+Switch headers are designed to support better flow control and
+loadbalancing etc. When switch headers like EDSA, Higig2 etc are
+present in ingress or egress pkts default iKPU index (or PKIND)
+used by NPC to parse pkts will not work as there are additional
+headers appended to the pkt. Hence a separate Pkind is chosen on
+Rx and/or Tx sides to tell to KPU to parse the pkts accordingly.
+
+Changes to NPC KPU parse profile to parse headers using these iKPU
+indices will be pushed as a separate patch
+
+Change-Id: I1796bafadb507a528d41f96376bf44eb33cc4bb3
+Signed-off-by: hariprasad <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/17520
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  | 16 +++++-
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |  7 +++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_cgx.c   |  2 +-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  4 +-
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 52 +++++++++++++++++++
+ 6 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 75ae4840d438..d568fb07fc51 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -86,7 +86,7 @@ struct mbox_msghdr {
+ #define OTX2_MBOX_REQ_SIG (0xdead)
+ #define OTX2_MBOX_RSP_SIG (0xbeef)
+ 	u16 sig;         /* Signature, for validating corrupted msgs */
+-#define OTX2_MBOX_VERSION (0x0002)
++#define OTX2_MBOX_VERSION (0x0003)
+ 	u16 ver;         /* Version of msg's structure for this ID */
+ 	u16 next_msgoff; /* Offset of next msg within mailbox region */
+ 	int rc;          /* Msg process'ed response code */
+@@ -247,6 +247,8 @@ M(NPC_DELETE_FLOW,	  0x600e, npc_delete_flow,			\
+ M(NPC_MCAM_READ_ENTRY,	  0x600f, npc_mcam_read_entry,			\
+ 				  npc_mcam_read_entry_req,		\
+ 				  npc_mcam_read_entry_rsp)		\
++M(NPC_SET_PKIND,        0x6010,   npc_set_pkind,                        \
++				  npc_set_pkind, msg_rsp)               \
+ /* NIX mbox IDs (range 0x8000 - 0xFFFF) */				\
+ M(NIX_LF_ALLOC,		0x8000, nix_lf_alloc,				\
+ 				 nix_lf_alloc_req, nix_lf_alloc_rsp)	\
+@@ -535,6 +537,18 @@ struct cgx_phy_mod_type {
+ 	int mod;
+ };
+ 
++struct npc_set_pkind {
++	struct mbox_msghdr hdr;
++#define OTX2_PRIV_FLAGS_DEFAULT  BIT_ULL(0)
++#define OTX2_PRIV_FLAGS_EDSA     BIT_ULL(1)
++#define OTX2_PRIV_FLAGS_HIGIG    BIT_ULL(2)
++#define OTX2_PRIV_FLAGS_CUSTOM   BIT_ULL(63)
++	u64 mode;
++#define PKIND_TX		BIT_ULL(0)
++#define PKIND_RX		BIT_ULL(1)
++	u8 dir;
++	u8 pkind; /* valid only in case custom flag */
++};
+ struct cgx_set_link_mode_args {
+ 	u32 speed;
+ 	u8 duplex;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index a54539fdfb7b..26c9706f7941 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -137,6 +137,13 @@ enum npc_kpu_lh_ltype {
+ 	NPC_LT_LH_CUSTOM1 = 0xF,
+ };
+ 
++enum npc_pkind_type {
++	NPC_TX_HIGIG_PKIND = 60ULL,
++	NPC_RX_HIGIG_PKIND,
++	NPC_RX_EDSA_PKIND,
++	NPC_TX_DEF_PKIND,
++};
++
+ struct npc_kpu_profile_cam {
+ 	u8 state;
+ 	u8 state_mask;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 3ae785a624bd..0d6e6cd3e678 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -584,6 +584,7 @@ void rvu_cgx_disable_dmac_entries(struct rvu *rvu, u16 pcifunc);
+ int rvu_cgx_start_stop_io(struct rvu *rvu, u16 pcifunc, bool start);
+ int rvu_cgx_nix_cuml_stats(struct rvu *rvu, void *cgxd, int lmac_id, int index,
+ 			   int rxtxflag, u64 *stat);
++bool is_cgx_config_permitted(struct rvu *rvu, u16 pcifunc);
+ 
+ /* SSO APIs */
+ int rvu_sso_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+index a4d9848bb4db..e7f2a5678d57 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+@@ -350,7 +350,7 @@ int rvu_cgx_exit(struct rvu *rvu)
+  * VF's of mapped PF and other PFs are not allowed. This fn() checks
+  * whether a PFFUNC is permitted to do the config or not.
+  */
+-static inline bool is_cgx_config_permitted(struct rvu *rvu, u16 pcifunc)
++inline bool is_cgx_config_permitted(struct rvu *rvu, u16 pcifunc)
+ {
+ 	if ((pcifunc & RVU_PFVF_FUNC_MASK) ||
+ 	    !is_pf_cgxmapped(rvu, rvu_get_pf(pcifunc)))
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index e6f7c66277f6..9803908debc3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -60,8 +60,6 @@ enum nix_makr_fmt_indexes {
+ 	NIX_MARK_CFG_MAX,
+ };
+ 
+-#define NIX_TX_PKIND	63ULL
+-
+ /* For now considering MC resources needed for broadcast
+  * pkt replication only. i.e 256 HWVFs + 12 PFs.
+  */
+@@ -1125,7 +1123,7 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	rvu_write64(rvu, blkaddr, NIX_AF_LFX_RX_CFG(nixlf), req->rx_cfg);
+ 
+ 	/* Configure pkind for TX parse config, 63 from npc_profile */
+-	cfg = NIX_TX_PKIND;
++	cfg = NPC_TX_DEF_PKIND;
+ 	rvu_write64(rvu, blkaddr, NIX_AF_LFX_TX_PARSE_CFG(nixlf), cfg);
+ 
+ 	intf = is_afvf(pcifunc) ? NIX_INTF_TYPE_LBK : NIX_INTF_TYPE_CGX;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 771b42a14d86..2f9f09ce7b1b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -2615,3 +2615,55 @@ bool rvu_npc_write_default_rule(struct rvu *rvu, int blkaddr, int nixlf,
+ 
+ 	return enable;
+ }
++
++int rvu_mbox_handler_npc_set_pkind(struct rvu *rvu,
++				   struct npc_set_pkind *req,
++				   struct msg_rsp *rsp)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, req->hdr.pcifunc);
++	int pf = rvu_get_pf(req->hdr.pcifunc);
++	int blkaddr, nixlf, rc;
++	u64 rxpkind, txpkind;
++	u8 cgx_id, lmac_id;
++
++	/* use default pkind to disable edsa/higig */
++	rxpkind = rvu_npc_get_pkind(rvu, pf);
++	txpkind = NPC_TX_DEF_PKIND;
++
++	if (req->mode & OTX2_PRIV_FLAGS_EDSA) {
++		rxpkind = NPC_RX_EDSA_PKIND;
++	} else if (req->mode & OTX2_PRIV_FLAGS_HIGIG) {
++		rxpkind = NPC_RX_HIGIG_PKIND;
++		txpkind = NPC_TX_HIGIG_PKIND;
++	} else if (req->mode & OTX2_PRIV_FLAGS_CUSTOM) {
++		rxpkind = req->pkind;
++		txpkind = req->pkind;
++	}
++
++	if (req->dir & PKIND_RX) {
++		/* rx pkind set req valid only for cgx mapped PFs */
++		if (!is_cgx_config_permitted(rvu, req->hdr.pcifunc))
++			return -EPERM;
++		rvu_get_cgx_lmac_id(pfvf->cgx_lmac, &cgx_id, &lmac_id);
++
++		rc = cgx_set_pkind(rvu_cgx_pdata(cgx_id, rvu),
++				   lmac_id, rxpkind);
++		if (rc)
++			return rc;
++	}
++
++	if (req->dir & PKIND_TX) {
++		blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, req->hdr.pcifunc);
++
++		/* tx pkind set req valid if NIXLF attached */
++		if (!pfvf->nixlf || blkaddr < 0)
++			return NIX_AF_ERR_AF_LF_INVALID;
++
++		nixlf = rvu_get_lf(rvu, &rvu->hw->block[blkaddr],
++				   req->hdr.pcifunc, 0);
++
++		rvu_write64(rvu, blkaddr, NIX_AF_LFX_TX_PARSE_CFG(nixlf),
++			    txpkind);
++	}
++	return 0;
++}
+-- 
+2.31.1
+

@@ -1,0 +1,1056 @@
+From cee7ac30111092ff500822ae170cc5e846b74b7e Mon Sep 17 00:00:00 2001
+From: hariprasad <hkelam@marvell.com>
+Date: Mon, 15 Jul 2019 14:43:15 +0530
+Subject: [PATCH 0234/1921] octeontx2-pf: Add unicast filter support
+
+Add unicasat filter support and use deferred function ndo_set_rx_mode
+
+Change-Id: I855a3151124cfb3a81eca7dcb42161f05fd13651
+Signed-off-by: hariprasad <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/12561
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/Makefile   |   3 +-
+ .../marvell/octeontx2/nic/otx2_common.h       |  48 +-
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 302 +----------
+ .../marvell/octeontx2/nic/otx2_flows.c        | 494 ++++++++++++++++++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  31 +-
+ 5 files changed, 567 insertions(+), 311 deletions(-)
+ create mode 100644 drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/Makefile b/drivers/net/ethernet/marvell/octeontx2/nic/Makefile
+index f6980968a957..90dd78505cdf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/Makefile
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/Makefile
+@@ -6,7 +6,8 @@
+ obj-$(CONFIG_OCTEONTX2_PF) += octeontx2_nicpf.o
+ obj-$(CONFIG_OCTEONTX2_VF) += octeontx2_nicvf.o
+ 
+-octeontx2_nicpf-y := otx2_pf.o otx2_common.o otx2_txrx.o otx2_ethtool.o otx2_ptp.o
++octeontx2_nicpf-y := otx2_pf.o otx2_common.o otx2_txrx.o otx2_ethtool.o \
++       otx2_ptp.o otx2_flows.o
+ octeontx2_nicvf-y := otx2_vf.o
+ 
+ ccflags-y += -I$(srctree)/drivers/net/ethernet/marvell/octeontx2/af
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 15bd50d17fd7..c5c36c39001a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -165,6 +165,12 @@ struct refill_work {
+ 	struct otx2_nic *pf;
+ };
+ 
++struct otx2_mac_table {
++	u8 addr[ETH_ALEN];
++	u16 mcam_entry;
++	bool inuse;
++};
++
+ struct otx2_nic {
+ 	void __iomem		*reg_base;
+ 	struct pci_dev		*pdev;
+@@ -194,8 +200,11 @@ struct otx2_nic {
+ 	struct cgx_link_user_info linfo;
+ 
+ 	bool			entries_alloc;
+-	u32			max_flows;
+ 	u32			nr_flows;
++	u32                     ntuple_max_flows;
++#define OTX2_NTUPLE_FILTER_CAPABLE		0
++#define OTX2_UNICAST_FILTER_CAPABLE		1
++	unsigned long           priv_flags;
+ 	u16			entry_list[NPC_MAX_NONCONTIG_ENTRIES];
+ 	struct list_head	flows;
+ 	struct workqueue_struct	*flr_wq;
+@@ -205,6 +214,9 @@ struct otx2_nic {
+ 	u8			hw_rx_tstamp;
+ 	u8			hw_tx_tstamp;
+ 	struct otx2_ptp		*ptp;
++	struct otx2_mac_table	*mac_table;
++	struct workqueue_struct	*otx2_ndo_wq;
++	struct work_struct	otx2_rx_mode_work;
+ };
+ 
+ static inline bool is_96xx_A0(struct pci_dev *pdev)
+@@ -529,10 +541,42 @@ int otx2_update_rq_stats(struct otx2_nic *pfvf, int qidx);
+ int otx2_update_sq_stats(struct otx2_nic *pfvf, int qidx);
+ void otx2_set_ethtool_ops(struct net_device *netdev);
+ void otx2vf_set_ethtool_ops(struct net_device *netdev);
+-int otx2_destroy_ethtool_flows(struct otx2_nic *pfvf);
+ 
+ int otx2_open(struct net_device *netdev);
+ int otx2_stop(struct net_device *netdev);
+ int otx2_set_real_num_queues(struct net_device *netdev,
+ 			     int tx_queues, int rx_queues);
++/* MCAM filter related APIs */
++void otx2_do_set_rx_mode(struct work_struct *work);
++int otx2_add_macfilter(struct net_device *netdev, const u8 *mac);
++int otx2_mcam_flow_init(struct otx2_nic *pf);
++int otx2_del_macfilter(struct net_device *netdev, const u8 *mac);
++void otx2_mcam_flow_del(struct otx2_nic *pf);
++int otx2_destroy_ntuple_flows(struct otx2_nic *pf);
++int otx2_destroy_mcam_flows(struct otx2_nic *pfvf);
++int otx2_get_flow(struct otx2_nic *pfvf,
++		  struct ethtool_rxnfc *nfc, u32 location);
++int otx2_get_all_flows(struct otx2_nic *pfvf,
++		       struct ethtool_rxnfc *nfc, u32 *rule_locs);
++int otx2_add_flow(struct otx2_nic *pfvf,
++		  struct ethtool_rx_flow_spec *fsp);
++int otx2_remove_flow(struct otx2_nic *pfvf, u32 location);
++int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
++			      struct npc_install_flow_req *req);
++
++/* OTX2_NIC access priv_flags */
++static inline void otx2_nic_enable_feature(struct otx2_nic *pf,
++					   unsigned long nr) {
++	set_bit(nr, &pf->priv_flags);
++}
++
++static inline void otx2_nic_disable_feature(struct otx2_nic *pf,
++					    unsigned long nr) {
++	clear_bit(nr, &pf->priv_flags);
++}
++
++static inline int otx2_nic_is_feature_enabled(struct otx2_nic *pf,
++					      unsigned long nr) {
++	return test_bit(nr, &pf->priv_flags);
++}
+ #endif /* OTX2_COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index b0a560556c42..a944891a753f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -541,77 +541,6 @@ static int otx2_set_rss_hash_opts(struct otx2_nic *pfvf,
+ 	return 0;
+ }
+ 
+-struct otx2_flow {
+-	struct ethtool_rx_flow_spec flow_spec;
+-	struct list_head list;
+-	u32 location;
+-	u16 entry;
+-	bool is_vf;
+-	int vf;
+-};
+-
+-static struct otx2_flow *otx2_find_flow(struct otx2_nic *pfvf, u32 location)
+-{
+-	struct otx2_flow *iter;
+-
+-	list_for_each_entry(iter, &pfvf->flows, list) {
+-		if (iter->location == location)
+-			return iter;
+-	}
+-
+-	return NULL;
+-}
+-
+-static void otx2_add_flow_to_list(struct otx2_nic *pfvf, struct otx2_flow *flow)
+-{
+-	struct list_head *head = &pfvf->flows;
+-	struct otx2_flow *iter;
+-
+-	list_for_each_entry(iter, &pfvf->flows, list) {
+-		if (iter->location > flow->location)
+-			break;
+-		head = &iter->list;
+-	}
+-
+-	list_add(&flow->list, head);
+-}
+-
+-static int otx2_get_flow(struct otx2_nic *pfvf,
+-			 struct ethtool_rxnfc *nfc, u32 location)
+-{
+-	struct otx2_flow *iter;
+-
+-	if (location >= pfvf->max_flows)
+-		return -EINVAL;
+-
+-	list_for_each_entry(iter, &pfvf->flows, list) {
+-		if (iter->location == location) {
+-			nfc->fs = iter->flow_spec;
+-			return 0;
+-		}
+-	}
+-
+-	return -ENOENT;
+-}
+-
+-static int otx2_get_all_flows(struct otx2_nic *pfvf,
+-			      struct ethtool_rxnfc *nfc, u32 *rule_locs)
+-{
+-	u32 location = 0;
+-	int idx = 0;
+-	int err = 0;
+-
+-	nfc->data = pfvf->max_flows;
+-	while ((!err || err == -ENOENT) && idx < nfc->rule_cnt) {
+-		err = otx2_get_flow(pfvf, nfc, location);
+-		if (!err)
+-			rule_locs[idx++] = location;
+-		location++;
+-	}
+-
+-	return err;
+-}
+-
+ static int otx2_get_rxnfc(struct net_device *dev,
+ 			  struct ethtool_rxnfc *nfc, u32 *rules)
+ {
+@@ -641,8 +570,8 @@ static int otx2_get_rxnfc(struct net_device *dev,
+ 	return ret;
+ }
+ 
+-static int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+-				     struct npc_install_flow_req *req)
++int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
++			      struct npc_install_flow_req *req)
+ {
+ 	struct ethtool_tcpip4_spec *l4_mask = &fsp->m_u.tcp_ip4_spec;
+ 	struct ethtool_tcpip4_spec *l4_hdr = &fsp->h_u.tcp_ip4_spec;
+@@ -744,192 +673,6 @@ static int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+ 	return 0;
+ }
+ 
+-static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+-{
+-	u64 ring_cookie = flow->flow_spec.ring_cookie;
+-	struct npc_install_flow_req *req;
+-	int err, vf = 0;
+-
+-	otx2_mbox_lock(&pfvf->mbox);
+-	req = otx2_mbox_alloc_msg_npc_install_flow(&pfvf->mbox);
+-	if (!req) {
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return -ENOMEM;
+-	}
+-
+-	err = otx2_prepare_flow_request(&flow->flow_spec, req);
+-	if (err) {
+-		/* free the allocated msg above */
+-		otx2_mbox_reset(&pfvf->mbox.mbox, 0);
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return err;
+-	}
+-
+-	req->entry = flow->entry;
+-	req->intf = NIX_INTF_RX;
+-	req->set_cntr = 1;
+-	req->channel = pfvf->rx_chan_base;
+-	if (ring_cookie == RX_CLS_FLOW_DISC) {
+-		req->op = NIX_RX_ACTIONOP_DROP;
+-	} else {
+-		/* change to unicast only if action of default entry is not
+-		 * requested by user
+-		 */
+-		if (req->op != NIX_RX_ACTION_DEFAULT)
+-			req->op = NIX_RX_ACTIONOP_UCAST;
+-		req->index = ethtool_get_flow_spec_ring(ring_cookie);
+-		vf = ethtool_get_flow_spec_ring_vf(ring_cookie);
+-		if (vf > pci_num_vf(pfvf->pdev)) {
+-			otx2_mbox_unlock(&pfvf->mbox);
+-			return -EINVAL;
+-		}
+-	}
+-
+-	/* ethtool ring_cookie has (VF + 1) for VF */
+-	if (vf) {
+-		req->vf = vf;
+-		flow->is_vf = true;
+-		flow->vf = vf;
+-	}
+-
+-	/* Send message to AF */
+-	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	otx2_mbox_unlock(&pfvf->mbox);
+-	return err;
+-}
+-
+-static int otx2_alloc_mcam_entries(struct otx2_nic *pfvf)
+-{
+-	struct npc_mcam_alloc_entry_req *req;
+-	struct npc_mcam_alloc_entry_rsp *rsp;
+-	int i;
+-
+-	otx2_mbox_lock(&pfvf->mbox);
+-	req = otx2_mbox_alloc_msg_npc_mcam_alloc_entry(&pfvf->mbox);
+-	if (!req) {
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return -ENOMEM;
+-	}
+-
+-	req->contig = false;
+-	req->count = pfvf->max_flows;
+-
+-	/* Send message to AF */
+-	if (otx2_sync_mbox_msg(&pfvf->mbox)) {
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return -EINVAL;
+-	}
+-
+-	rsp = (struct npc_mcam_alloc_entry_rsp *)otx2_mbox_get_rsp
+-	       (&pfvf->mbox.mbox, 0, &req->hdr);
+-
+-	otx2_mbox_unlock(&pfvf->mbox);
+-
+-	if (rsp->count != pfvf->max_flows)
+-		netdev_info(pfvf->netdev, "number of rules truncated to %d\n",
+-			    rsp->count);
+-	pfvf->max_flows = rsp->count;
+-	for (i = 0; i < rsp->count; i++)
+-		pfvf->entry_list[i] = rsp->entry_list[i];
+-
+-	pfvf->entries_alloc = true;
+-
+-	return 0;
+-}
+-
+-static int otx2_add_flow(struct otx2_nic *pfvf,
+-			 struct ethtool_rx_flow_spec *fsp)
+-{
+-	u32 ring = ethtool_get_flow_spec_ring(fsp->ring_cookie);
+-	struct otx2_flow *flow;
+-	bool new = false;
+-	int err;
+-
+-	if (ring >= pfvf->hw.rx_queues && fsp->ring_cookie != RX_CLS_FLOW_DISC)
+-		return -EINVAL;
+-
+-	if (!pfvf->entries_alloc) {
+-		err = otx2_alloc_mcam_entries(pfvf);
+-		if (err)
+-			return err;
+-	}
+-
+-	if (fsp->location >= pfvf->max_flows)
+-		return -EINVAL;
+-
+-	flow = otx2_find_flow(pfvf, fsp->location);
+-	if (!flow) {
+-		flow = kzalloc(sizeof(*flow), GFP_ATOMIC);
+-		if (!flow)
+-			return -ENOMEM;
+-		flow->location = fsp->location;
+-		flow->entry = pfvf->entry_list[flow->location];
+-		new = true;
+-	}
+-	/* struct copy */
+-	flow->flow_spec = *fsp;
+-
+-	err = otx2_add_flow_msg(pfvf, flow);
+-	if (err) {
+-		if (new)
+-			kfree(flow);
+-		return err;
+-	}
+-
+-	/* add the new flow installed to list */
+-	if (new) {
+-		otx2_add_flow_to_list(pfvf, flow);
+-		pfvf->nr_flows++;
+-	}
+-
+-	return 0;
+-}
+-
+-static int otx2_remove_flow_msg(struct otx2_nic *pfvf, u16 entry, bool all)
+-{
+-	struct npc_delete_flow_req *req;
+-	int err;
+-
+-	otx2_mbox_lock(&pfvf->mbox);
+-	req = otx2_mbox_alloc_msg_npc_delete_flow(&pfvf->mbox);
+-	if (!req) {
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return -ENOMEM;
+-	}
+-
+-	req->entry = entry;
+-	if (all)
+-		req->all = 1;
+-
+-	/* Send message to AF */
+-	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	otx2_mbox_unlock(&pfvf->mbox);
+-	return err;
+-}
+-
+-static int otx2_remove_flow(struct otx2_nic *pfvf, u32 location)
+-{
+-	struct otx2_flow *flow;
+-	int err;
+-
+-	if (location >= pfvf->max_flows)
+-		return -EINVAL;
+-
+-	flow = otx2_find_flow(pfvf, location);
+-	if (!flow)
+-		return -ENOENT;
+-
+-	err = otx2_remove_flow_msg(pfvf, flow->entry, false);
+-	if (err)
+-		return err;
+-
+-	list_del(&flow->list);
+-	kfree(flow);
+-	pfvf->nr_flows--;
+-
+-	return 0;
+-}
+-
+ static int otx2_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *nfc)
+ {
+ 	bool ntuple = !!(dev->features & NETIF_F_NTUPLE);
+@@ -1524,44 +1267,3 @@ void otx2vf_set_ethtool_ops(struct net_device *netdev)
+ 	netdev->ethtool_ops = &otx2vf_ethtool_ops;
+ }
+ EXPORT_SYMBOL(otx2vf_set_ethtool_ops);
+-
+-int otx2_destroy_ethtool_flows(struct otx2_nic *pfvf)
+-{
+-	struct npc_mcam_free_entry_req *req;
+-	struct otx2_flow *iter, *tmp;
+-	int err;
+-
+-	if (!pfvf->entries_alloc)
+-		return 0;
+-
+-	/* remove all flows */
+-	err = otx2_remove_flow_msg(pfvf, 0, true);
+-	if (err)
+-		return err;
+-
+-	list_for_each_entry_safe(iter, tmp, &pfvf->flows, list) {
+-		list_del(&iter->list);
+-		kfree(iter);
+-		pfvf->nr_flows--;
+-	}
+-
+-	otx2_mbox_lock(&pfvf->mbox);
+-	req = otx2_mbox_alloc_msg_npc_mcam_free_entry(&pfvf->mbox);
+-	if (!req) {
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return -ENOMEM;
+-	}
+-
+-	req->all = 1;
+-	/* Send message to AF to free MCAM entries */
+-	err = otx2_sync_mbox_msg(&pfvf->mbox);
+-	if (err) {
+-		otx2_mbox_unlock(&pfvf->mbox);
+-		return err;
+-	}
+-
+-	pfvf->entries_alloc = false;
+-	otx2_mbox_unlock(&pfvf->mbox);
+-
+-	return 0;
+-}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+new file mode 100644
+index 000000000000..95cf8d7400ce
+--- /dev/null
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+@@ -0,0 +1,494 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell OcteonTx2 RVU Physcial Function ethernet driver
++ *
++ * Copyright (C) 2019 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include "otx2_common.h"
++
++/* helper macros to support mcam flows */
++#define OTX2_MAX_NTUPLE_FLOWS	32
++#define OTX2_MAX_UNICAST_FLOWS	8
++
++enum mcam_offset {
++	NTUPLE_OFFSET     = 0,
++	UNICAST_OFFSET    = NTUPLE_OFFSET  + OTX2_MAX_NTUPLE_FLOWS,
++};
++
++struct otx2_flow {
++	struct ethtool_rx_flow_spec flow_spec;
++	struct list_head list;
++	u32 location;
++	u16 entry;
++	bool is_vf;
++	int vf;
++};
++
++int otx2_mcam_flow_init(struct otx2_nic *pf)
++{
++	INIT_LIST_HEAD(&pf->flows);
++
++	pf->ntuple_max_flows = OTX2_MAX_NTUPLE_FLOWS;
++
++	/* support ntuple,mac filters */
++	otx2_nic_enable_feature(pf, OTX2_NTUPLE_FILTER_CAPABLE);
++	otx2_nic_enable_feature(pf, OTX2_UNICAST_FILTER_CAPABLE);
++
++	pf->mac_table = devm_kzalloc(pf->dev, sizeof(struct otx2_mac_table)
++					* OTX2_MAX_UNICAST_FLOWS, GFP_KERNEL);
++
++	if (!pf->mac_table)
++		return -ENOMEM;
++
++	/* register work queue for ndo callbacks */
++	pf->otx2_ndo_wq = create_singlethread_workqueue("otx2_ndo_work_queue");
++	if (!pf->otx2_ndo_wq)
++		return -ENOMEM;
++	INIT_WORK(&pf->otx2_rx_mode_work, otx2_do_set_rx_mode);
++	return 0;
++}
++
++void otx2_mcam_flow_del(struct otx2_nic *pf)
++{
++	otx2_destroy_mcam_flows(pf);
++	if (pf->otx2_ndo_wq) {
++		flush_workqueue(pf->otx2_ndo_wq);
++		destroy_workqueue(pf->otx2_ndo_wq);
++	}
++}
++
++static int otx2_alloc_mcam_entries(struct otx2_nic *pfvf)
++{
++	struct npc_mcam_alloc_entry_req *req;
++	struct npc_mcam_alloc_entry_rsp *rsp;
++	int i;
++
++	otx2_mbox_lock(&pfvf->mbox);
++
++	if (pfvf->entries_alloc) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return 0;
++	}
++
++	req = otx2_mbox_alloc_msg_npc_mcam_alloc_entry(&pfvf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return -ENOMEM;
++	}
++
++	req->contig = false;
++	req->count = pfvf->ntuple_max_flows + OTX2_MAX_UNICAST_FLOWS;
++
++	/* Send message to AF */
++	if (otx2_sync_mbox_msg(&pfvf->mbox)) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return -EINVAL;
++	}
++
++	rsp = (struct npc_mcam_alloc_entry_rsp *)otx2_mbox_get_rsp
++	       (&pfvf->mbox.mbox, 0, &req->hdr);
++
++	if (rsp->count != req->count) {
++		netdev_info(pfvf->netdev, "number of rules truncated to %d\n",
++			    rsp->count);
++		/* support only ntuples here */
++		pfvf->ntuple_max_flows = rsp->count;
++		pfvf->netdev->priv_flags &= ~IFF_UNICAST_FLT;
++		pfvf->priv_flags &= ~(BIT(OTX2_UNICAST_FILTER_CAPABLE));
++	}
++
++	for (i = 0; i < rsp->count; i++)
++		pfvf->entry_list[i] = rsp->entry_list[i];
++
++	pfvf->entries_alloc = true;
++	otx2_mbox_unlock(&pfvf->mbox);
++
++	return 0;
++}
++
++/*  On success adds mcam entry
++ *  On failure enable promisous mode
++ */
++static int otx2_do_add_macfilter(struct otx2_nic *pf, const u8 *mac)
++{
++	struct npc_install_flow_req *req;
++	int err, i;
++
++	if (!pf->entries_alloc) {
++		err = otx2_alloc_mcam_entries(pf);
++		if (err)
++			return err;
++	}
++	if (!otx2_nic_is_feature_enabled(pf, OTX2_UNICAST_FILTER_CAPABLE))
++		return -ENOMEM;
++	/* dont have free mcam entries or uc list is greater than alloted */
++	if (netdev_uc_count(pf->netdev) > OTX2_MAX_UNICAST_FLOWS)
++		return -ENOMEM;
++
++	otx2_mbox_lock(&pf->mbox);
++	req = otx2_mbox_alloc_msg_npc_install_flow(&pf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pf->mbox);
++		return -ENOMEM;
++	}
++
++	/* unicast offset starts with 32 0..31 for ntuple */
++	for (i = 0; i <  OTX2_MAX_UNICAST_FLOWS; i++) {
++		if (pf->mac_table[i].inuse)
++			continue;
++		ether_addr_copy(pf->mac_table[i].addr, mac);
++		pf->mac_table[i].inuse = true;
++		pf->mac_table[i].mcam_entry =
++			pf->entry_list[i + UNICAST_OFFSET];
++		req->entry =  pf->mac_table[i].mcam_entry;
++		break;
++	}
++
++	ether_addr_copy(req->packet.dmac, mac);
++	u64_to_ether_addr(0xffffffffffffull, req->mask.dmac);
++	req->features = BIT_ULL(NPC_DMAC);
++	req->channel = pf->rx_chan_base;
++	req->intf = NIX_INTF_RX;
++	req->op = NIX_RX_ACTION_DEFAULT;
++	req->set_cntr = 1;
++
++	err = otx2_sync_mbox_msg(&pf->mbox);
++	otx2_mbox_unlock(&pf->mbox);
++
++	return err;
++}
++
++int otx2_add_macfilter(struct net_device *netdev, const u8 *mac)
++{
++	struct otx2_nic *pf = netdev_priv(netdev);
++	int err;
++
++	err = otx2_do_add_macfilter(pf, mac);
++	if (err) {
++		netdev->flags |= IFF_PROMISC;
++		return err;
++	}
++	return 0;
++}
++
++static bool otx2_get_mcamentry_for_mac(struct otx2_nic *pf, const u8 *mac,
++				       int *mcam_entry)
++{
++	int i;
++
++	for (i = 0; i < OTX2_MAX_UNICAST_FLOWS; i++) {
++		if (!pf->mac_table[i].inuse)
++			continue;
++
++		if (ether_addr_equal(pf->mac_table[i].addr, mac)) {
++			*mcam_entry = pf->mac_table[i].mcam_entry;
++			pf->mac_table[i].inuse = false;
++			return true;
++		}
++	}
++	return false;
++}
++
++int otx2_del_macfilter(struct net_device *netdev, const u8 *mac)
++{
++	struct otx2_nic *pf = netdev_priv(netdev);
++	struct npc_delete_flow_req *req;
++	int err, mcam_entry;
++
++	/* check does mcam entry exists for given mac */
++	if (!otx2_get_mcamentry_for_mac(pf, mac, &mcam_entry))
++		return 0;
++
++	otx2_mbox_lock(&pf->mbox);
++	req = otx2_mbox_alloc_msg_npc_delete_flow(&pf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pf->mbox);
++		return -ENOMEM;
++	}
++	req->entry = mcam_entry;
++	/* Send message to AF */
++	err = otx2_sync_mbox_msg(&pf->mbox);
++	otx2_mbox_unlock(&pf->mbox);
++
++	return err;
++}
++
++static struct otx2_flow *otx2_find_flow(struct otx2_nic *pfvf, u32 location)
++{
++	struct otx2_flow *iter;
++
++	list_for_each_entry(iter, &pfvf->flows, list) {
++		if (iter->location == location)
++			return iter;
++	}
++
++	return NULL;
++}
++
++static void otx2_add_flow_to_list(struct otx2_nic *pfvf, struct otx2_flow *flow)
++{
++	struct list_head *head = &pfvf->flows;
++	struct otx2_flow *iter;
++
++	list_for_each_entry(iter, &pfvf->flows, list) {
++		if (iter->location > flow->location)
++			break;
++		head = &iter->list;
++	}
++
++	list_add(&flow->list, head);
++}
++
++int otx2_get_flow(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc,
++		  u32 location)
++{
++	struct otx2_flow *iter;
++
++	if (location >= pfvf->ntuple_max_flows)
++		return -EINVAL;
++
++	list_for_each_entry(iter, &pfvf->flows, list) {
++		if (iter->location == location) {
++			nfc->fs = iter->flow_spec;
++			return 0;
++		}
++	}
++
++	return -ENOENT;
++}
++
++int otx2_get_all_flows(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc,
++		       u32 *rule_locs)
++{
++	u32 location = 0;
++	int idx = 0;
++	int err = 0;
++
++	nfc->data = pfvf->ntuple_max_flows;
++	while ((!err || err == -ENOENT) && idx < nfc->rule_cnt) {
++		err = otx2_get_flow(pfvf, nfc, location);
++		if (!err)
++			rule_locs[idx++] = location;
++		location++;
++	}
++
++	return err;
++}
++
++static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
++{
++	u64 ring_cookie = flow->flow_spec.ring_cookie;
++	struct npc_install_flow_req *req;
++	int err, vf = 0;
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_npc_install_flow(&pfvf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return -ENOMEM;
++	}
++
++	err = otx2_prepare_flow_request(&flow->flow_spec, req);
++	if (err) {
++		/* free the allocated msg above */
++		otx2_mbox_reset(&pfvf->mbox.mbox, 0);
++		otx2_mbox_unlock(&pfvf->mbox);
++		return err;
++	}
++
++	req->entry = flow->entry;
++	req->intf = NIX_INTF_RX;
++	req->set_cntr = 1;
++	req->channel = pfvf->rx_chan_base;
++	if (ring_cookie == RX_CLS_FLOW_DISC) {
++		req->op = NIX_RX_ACTIONOP_DROP;
++	} else {
++		/* change to unicast only if action of default entry is not
++		 * requested by user
++		 */
++		if (req->op != NIX_RX_ACTION_DEFAULT)
++			req->op = NIX_RX_ACTIONOP_UCAST;
++		req->index = ethtool_get_flow_spec_ring(ring_cookie);
++		vf = ethtool_get_flow_spec_ring_vf(ring_cookie);
++		if (vf > pci_num_vf(pfvf->pdev)) {
++			otx2_mbox_unlock(&pfvf->mbox);
++			return -EINVAL;
++		}
++	}
++
++	/* ethtool ring_cookie has (VF + 1) for VF */
++	if (vf) {
++		req->vf = vf;
++		flow->is_vf = true;
++		flow->vf = vf;
++	}
++
++	/* Send message to AF */
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
++}
++
++int otx2_add_flow(struct otx2_nic *pfvf, struct ethtool_rx_flow_spec *fsp)
++{
++	u32 ring = ethtool_get_flow_spec_ring(fsp->ring_cookie);
++	struct otx2_flow *flow;
++	bool new = false;
++	int err;
++
++	if (ring >= pfvf->hw.rx_queues && fsp->ring_cookie != RX_CLS_FLOW_DISC)
++		return -EINVAL;
++
++	if (!pfvf->entries_alloc) {
++		err = otx2_alloc_mcam_entries(pfvf);
++		if (err)
++			return err;
++	}
++
++	if (fsp->location >= pfvf->ntuple_max_flows)
++		return -EINVAL;
++
++	flow = otx2_find_flow(pfvf, fsp->location);
++	if (!flow) {
++		flow = kzalloc(sizeof(*flow), GFP_ATOMIC);
++		if (!flow)
++			return -ENOMEM;
++		flow->location = fsp->location;
++		flow->entry = pfvf->entry_list[flow->location];
++		new = true;
++	}
++	/* struct copy */
++	flow->flow_spec = *fsp;
++
++	err = otx2_add_flow_msg(pfvf, flow);
++	if (err) {
++		if (new)
++			kfree(flow);
++		return err;
++	}
++
++	/* add the new flow installed to list */
++	if (new) {
++		otx2_add_flow_to_list(pfvf, flow);
++		pfvf->nr_flows++;
++	}
++
++	return 0;
++}
++
++static int otx2_remove_flow_msg(struct otx2_nic *pfvf, u16 entry, bool all)
++{
++	struct npc_delete_flow_req *req;
++	int err;
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_npc_delete_flow(&pfvf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return -ENOMEM;
++	}
++
++	req->entry = entry;
++	if (all)
++		req->all = 1;
++
++	/* Send message to AF */
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++	return err;
++}
++
++int otx2_remove_flow(struct otx2_nic *pfvf, u32 location)
++{
++	struct otx2_flow *flow;
++	int err;
++
++	if (location >= pfvf->ntuple_max_flows)
++		return -EINVAL;
++
++	flow = otx2_find_flow(pfvf, location);
++	if (!flow)
++		return -ENOENT;
++
++	err = otx2_remove_flow_msg(pfvf, flow->entry, false);
++	if (err)
++		return err;
++
++	list_del(&flow->list);
++	kfree(flow);
++	pfvf->nr_flows--;
++
++	return 0;
++}
++
++int otx2_destroy_ntuple_flows(struct otx2_nic *pfvf)
++{
++	struct npc_delete_flow_req *req;
++	struct otx2_flow *iter, *tmp;
++	int err;
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_npc_delete_flow(&pfvf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return -ENOMEM;
++	}
++
++	req->start = pfvf->entry_list[NTUPLE_OFFSET];
++	req->end   = pfvf->entry_list[NTUPLE_OFFSET +
++				      OTX2_MAX_NTUPLE_FLOWS - 1];
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	otx2_mbox_unlock(&pfvf->mbox);
++
++	list_for_each_entry_safe(iter, tmp, &pfvf->flows, list) {
++		list_del(&iter->list);
++		kfree(iter);
++		pfvf->nr_flows--;
++	}
++	return err;
++}
++
++int otx2_destroy_mcam_flows(struct otx2_nic *pfvf)
++{
++	struct npc_mcam_free_entry_req *req;
++	struct otx2_flow *iter, *tmp;
++	int err;
++
++	if (!pfvf->entries_alloc)
++		return 0;
++
++	/* remove all flows */
++	err = otx2_remove_flow_msg(pfvf, 0, true);
++	if (err)
++		return err;
++
++	list_for_each_entry_safe(iter, tmp, &pfvf->flows, list) {
++		list_del(&iter->list);
++		kfree(iter);
++		pfvf->nr_flows--;
++	}
++
++	otx2_mbox_lock(&pfvf->mbox);
++	req = otx2_mbox_alloc_msg_npc_mcam_free_entry(&pfvf->mbox);
++	if (!req) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return -ENOMEM;
++	}
++
++	req->all = 1;
++	/* Send message to AF to free MCAM entries */
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	if (err) {
++		otx2_mbox_unlock(&pfvf->mbox);
++		return err;
++	}
++
++	pfvf->entries_alloc = false;
++	otx2_mbox_unlock(&pfvf->mbox);
++
++	return 0;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index f0ecd8b8ebc9..f303d3742c8d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -27,8 +27,6 @@
+ #define DRV_STRING	"Marvell OcteonTX2 NIC Physical Function Driver"
+ #define DRV_VERSION	"1.0"
+ 
+-#define MAX_ETHTOOL_FLOWS	36
+-
+ /* Supported devices */
+ static const struct pci_device_id otx2_pf_id_table[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_CAVIUM, PCI_DEVID_OCTEONTX2_RVU_PF) },
+@@ -1689,11 +1687,24 @@ static netdev_features_t otx2_fix_features(struct net_device *dev,
+ static void otx2_set_rx_mode(struct net_device *netdev)
+ {
+ 	struct otx2_nic *pf = netdev_priv(netdev);
++
++	queue_work(pf->otx2_ndo_wq, &pf->otx2_rx_mode_work);
++}
++
++void otx2_do_set_rx_mode(struct work_struct *work)
++{
++	struct otx2_nic *pf = container_of(work, struct otx2_nic,
++					   otx2_rx_mode_work);
++	struct net_device *netdev = pf->netdev;
+ 	struct nix_rx_mode *req;
+ 
+ 	if (!(netdev->flags & IFF_UP))
+ 		return;
+ 
++	/* Write unicast address to mcam entries or del from mcam */
++	if (netdev->priv_flags & IFF_UNICAST_FLT)
++		__dev_uc_sync(netdev, otx2_add_macfilter, otx2_del_macfilter);
++
+ 	otx2_mbox_lock(&pf->mbox);
+ 	req = otx2_mbox_alloc_msg_nix_set_rx_mode(&pf->mbox);
+ 	if (!req) {
+@@ -1703,13 +1714,12 @@ static void otx2_set_rx_mode(struct net_device *netdev)
+ 
+ 	req->mode = NIX_RX_MODE_UCAST;
+ 
+-	/* We don't support MAC address filtering yet */
+ 	if (netdev->flags & IFF_PROMISC)
+ 		req->mode |= NIX_RX_MODE_PROMISC;
+ 	else if (netdev->flags & (IFF_ALLMULTI | IFF_MULTICAST))
+ 		req->mode |= NIX_RX_MODE_ALLMULTI;
+ 
+-	otx2_sync_mbox_msg_busy_poll(&pf->mbox);
++	otx2_sync_mbox_msg(&pf->mbox);
+ 	otx2_mbox_unlock(&pf->mbox);
+ }
+ 
+@@ -1738,7 +1748,7 @@ static int otx2_set_features(struct net_device *netdev,
+ 						features & NETIF_F_LOOPBACK);
+ 
+ 	if ((changed & NETIF_F_NTUPLE) && !ntuple)
+-		otx2_destroy_ethtool_flows(pf);
++		otx2_destroy_ntuple_flows(pf);
+ 
+ 	return 0;
+ }
+@@ -2162,6 +2172,7 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);
+ 	netdev->features |= netdev->hw_features;
+ 	netdev->hw_features |= NETIF_F_LOOPBACK | NETIF_F_NTUPLE;
++	netdev->priv_flags |= IFF_UNICAST_FLT;
+ 
+ 	netdev->gso_max_segs = OTX2_MAX_GSO_SEGS;
+ 	netdev->watchdog_timeo = OTX2_TX_TIMEOUT;
+@@ -2180,8 +2191,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_ptp_destroy;
+ 	}
+ 
+-	INIT_LIST_HEAD(&pf->flows);
+-	pf->max_flows = MAX_ETHTOOL_FLOWS;
++	err = otx2_mcam_flow_init(pf);
++	if (err)
++		goto err_unreg_netdev;
++
+ 	otx2_set_ethtool_ops(netdev);
+ 
+ 	/* Enable link notifications */
+@@ -2189,6 +2202,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	return 0;
+ 
++err_unreg_netdev:
++	unregister_netdev(netdev);
+ err_ptp_destroy:
+ 	otx2_ptp_destroy(pf);
+ err_detach_rsrc:
+@@ -2366,7 +2381,7 @@ static void otx2_remove(struct pci_dev *pdev)
+ 
+ 	otx2_sriov_disable(pf->pdev);
+ 	otx2_ptp_destroy(pf);
+-	otx2_destroy_ethtool_flows(pf);
++	otx2_mcam_flow_del(pf);
+ 
+ 	otx2_detach_resources(&pf->mbox);
+ 	otx2_disable_mbox_intr(pf);
+-- 
+2.31.1
+

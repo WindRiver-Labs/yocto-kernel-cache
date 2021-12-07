@@ -1,0 +1,275 @@
+From 6b4a8a09f37b1922f9703ff20653e144775f5439 Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Tue, 11 Aug 2020 18:00:07 +0530
+Subject: [PATCH 0685/1921] octeontx2-af: Update forwarding rule action
+ targeting VF with its default one
+
+Dataplane applications have limitation when installing pkt forwarding
+rules, where they do not support explicit Rx action to the flow rules
+which forward the pkts to VFs. So when RVU PF is attached to a dataplane
+application, all the rules that it installs targeting its VFs will have
+an action as UCAST resulting in all the pkts being forwarded to the RQ0
+of those VFs (i.e. no flow distribution) which will have an effect on
+performance.
+
+This patch solves this by keeping track of all such NPC MCAM entries and
+ensuring that the action part is in sync with whatever VF has configured
+in its reserved default entry. If VF configures the default entry action
+as RSS, the same will be updated to all the MCAM entries that its parent
+PF has installed targeting this VF.
+
+Change-Id: I0751b181d24431e8a1a1699d9279be4dda9dca5d
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/33808
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  2 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  2 +
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 92 +++++++++++++++++++
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 32 ++++++-
+ 4 files changed, 124 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index fb09ad6083fe..151e0613e0be 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -192,6 +192,7 @@ struct npc_mcam {
+ 	u16	*entry2cntr_map;
+ 	u16	*cntr2pfvf_map;
+ 	u16	*cntr_refcnt;
++	u16	*entry2target_pffunc;
+ 	u8	keysize;	/* MCAM keysize 112/224/448 bits */
+ 	u8	banks;		/* Number of MCAM banks */
+ 	u8	banks_per_entry;/* Number of keywords in key */
+@@ -728,6 +729,7 @@ bool rvu_npc_write_default_rule(struct rvu *rvu, int blkaddr, int nixlf,
+ int npc_mcam_verify_channel(struct rvu *rvu, u16 pcifunc, u8 intf, u16 channel);
+ int npc_get_bank(struct npc_mcam *mcam, int index);
+ void npc_mcam_enable_flows(struct rvu *rvu, u16 target);
++void npc_mcam_disable_flows(struct rvu *rvu, u16 target);
+ void npc_enable_mcam_entry(struct rvu *rvu, struct npc_mcam *mcam,
+ 			   int blkaddr, int index, bool enable);
+ void npc_read_mcam_entry(struct rvu *rvu, struct npc_mcam *mcam,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 53b6000d88f0..b3b682eb40e0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -3965,6 +3965,8 @@ int rvu_mbox_handler_nix_lf_stop_rx(struct rvu *rvu, struct msg_req *req,
+ 
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ 
++	npc_mcam_disable_flows(rvu, pcifunc);
++
+ 	return rvu_cgx_start_stop_io(rvu, pcifunc, false);
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 1a94ada09caa..5e05b6490c9f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -401,6 +401,41 @@ static void npc_fill_entryword(struct mcam_entry *entry, int idx,
+ 	}
+ }
+ 
++static void npc_get_default_entry_action(struct rvu *rvu, struct npc_mcam *mcam,
++					 int blkaddr, int index,
++					 struct mcam_entry *entry)
++{
++	u16 owner, target_func;
++	struct rvu_pfvf *pfvf;
++	int bank, nixlf;
++	u64 rx_action;
++
++	owner = mcam->entry2pfvf_map[index];
++	target_func = (entry->action >> 4) & 0xffff;
++	/* return incase target is PF or LBK or rule owner is not PF */
++	if (is_afvf(target_func) || (owner & RVU_PFVF_FUNC_MASK) ||
++	    !(target_func & RVU_PFVF_FUNC_MASK))
++		return;
++
++	pfvf = rvu_get_pfvf(rvu, target_func);
++	mcam->entry2target_pffunc[index] = target_func;
++	/* return if nixlf is not attached or initialized */
++	if (!is_nixlf_attached(rvu, target_func) || !pfvf->def_rule)
++		return;
++
++	/* get VF ucast entry rule */
++	nix_get_nixlf(rvu, target_func, &nixlf, NULL);
++	index = npc_get_nixlf_mcam_index(mcam, target_func,
++					 nixlf, NIXLF_UCAST_ENTRY);
++	bank = npc_get_bank(mcam, index);
++	index &= (mcam->banksize - 1);
++
++	rx_action = rvu_read64(rvu, blkaddr,
++			       NPC_AF_MCAMEX_BANKX_ACTION(index, bank));
++	if (rx_action)
++		entry->action = rx_action;
++}
++
+ static void npc_config_mcam_entry(struct rvu *rvu, struct npc_mcam *mcam,
+ 				  int blkaddr, int index, u8 intf,
+ 				  struct mcam_entry *entry, bool enable)
+@@ -448,6 +483,11 @@ static void npc_config_mcam_entry(struct rvu *rvu, struct npc_mcam *mcam,
+ 			    NPC_AF_MCAMEX_BANKX_CAMX_W1(index, bank, 0), cam0);
+ 	}
+ 
++	/* copy VF default entry action to the VF mcam entry */
++	if (is_npc_intf_rx(intf) && actindex < mcam->bmap_entries)
++		npc_get_default_entry_action(rvu, mcam, blkaddr, actindex,
++					     entry);
++
+ 	/* Set 'action' */
+ 	rvu_write64(rvu, blkaddr,
+ 		    NPC_AF_MCAMEX_BANKX_ACTION(index, actbank), entry->action);
+@@ -749,6 +789,40 @@ void rvu_npc_enable_bcast_entry(struct rvu *rvu, u16 pcifunc, bool enable)
+ 	npc_enable_mcam_entry(rvu, mcam, blkaddr, index, enable);
+ }
+ 
++static void npc_update_vf_flow_entry(struct rvu *rvu, struct npc_mcam *mcam,
++				     int blkaddr, u16 pcifunc, u64 rx_action)
++{
++	int actindex, index, bank;
++	bool enable;
++
++	if (!(pcifunc & RVU_PFVF_FUNC_MASK))
++		return;
++
++	mutex_lock(&mcam->lock);
++	for (index = 0; index < mcam->bmap_entries; index++) {
++		if (mcam->entry2target_pffunc[index] == pcifunc) {
++			bank = npc_get_bank(mcam, index);
++			actindex = index;
++			index &= (mcam->banksize - 1);
++
++			/* read vf flow entry enable status */
++			enable = is_mcam_entry_enabled(rvu, mcam, blkaddr,
++						       actindex);
++			/* disable before mcam entry update */
++			npc_enable_mcam_entry(rvu, mcam, blkaddr, actindex,
++					      false);
++			/* update 'action' */
++			rvu_write64(rvu, blkaddr,
++				    NPC_AF_MCAMEX_BANKX_ACTION(index, bank),
++				    rx_action);
++			if (enable)
++				npc_enable_mcam_entry(rvu, mcam, blkaddr,
++						      actindex, true);
++		}
++	}
++	mutex_unlock(&mcam->lock);
++}
++
+ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 				    int group, int alg_idx, int mcam_index)
+ {
+@@ -792,6 +866,14 @@ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 	rvu_write64(rvu, blkaddr,
+ 		    NPC_AF_MCAMEX_BANKX_ACTION(index, bank), *(u64 *)&action);
+ 
++	/* update the VF flow rule action with the VF default entry action
++	 * due to restriction of the dataplane application PF adding the
++	 * VF flow rule can not specify the rx action explicitly.
++	 */
++	if (mcam_index < 0)
++		npc_update_vf_flow_entry(rvu, mcam, blkaddr, pcifunc,
++					 *(u64 *)&action);
++
+ 	/* update the action change in default rule */
+ 	pfvf = rvu_get_pfvf(rvu, pcifunc);
+ 	if (pfvf->def_rule)
+@@ -902,6 +984,8 @@ void rvu_npc_disable_mcam_entries(struct rvu *rvu, u16 pcifunc, int nixlf)
+ 
+ 	mutex_unlock(&mcam->lock);
+ 
++	npc_mcam_disable_flows(rvu, pcifunc);
++
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ }
+ 
+@@ -1464,6 +1548,12 @@ static int npc_mcam_rsrcs_init(struct rvu *rvu, int blkaddr)
+ 	if (!mcam->cntr_refcnt)
+ 		goto free_mem;
+ 
++	/* Alloc memory for saving target device of mcam rule */
++	mcam->entry2target_pffunc = devm_kcalloc(rvu->dev, mcam->total_entries,
++						 sizeof(u16), GFP_KERNEL);
++	if (!mcam->entry2target_pffunc)
++		goto free_mem;
++
+ 	mutex_init(&mcam->lock);
+ 
+ 	return 0;
+@@ -1816,6 +1906,7 @@ static void npc_mcam_free_all_entries(struct rvu *rvu, struct npc_mcam *mcam,
+ 				npc_unmap_mcam_entry_and_cntr(rvu, mcam,
+ 							      blkaddr, index,
+ 							      cntr);
++			mcam->entry2target_pffunc[index] = 0x0;
+ 		}
+ 	}
+ }
+@@ -2202,6 +2293,7 @@ int rvu_mbox_handler_npc_mcam_free_entry(struct rvu *rvu,
+ 		goto exit;
+ 
+ 	mcam->entry2pfvf_map[req->entry] = 0;
++	mcam->entry2target_pffunc[req->entry] = 0x0;
+ 	npc_mcam_clear_bit(mcam, req->entry);
+ 	npc_enable_mcam_entry(rvu, mcam, blkaddr, req->entry, false);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 209c99b97909..274ace6fb271 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -1198,14 +1198,12 @@ void npc_mcam_enable_flows(struct rvu *rvu, u16 target)
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, target);
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct rvu_npc_mcam_rule *rule;
+-	int blkaddr, bank;
++	int blkaddr, bank, index;
+ 	u64 def_action;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
+-	if (blkaddr < 0) {
+-		dev_err(rvu->dev, "%s: NPC block not implemented\n", __func__);
++	if (blkaddr < 0)
+ 		return;
+-	}
+ 
+ 	mutex_lock(&mcam->lock);
+ 	list_for_each_entry(rule, &mcam->mcam_rules, list) {
+@@ -1238,5 +1236,31 @@ void npc_mcam_enable_flows(struct rvu *rvu, u16 target)
+ 			rule->enable = true;
+ 		}
+ 	}
++
++	/* Enable MCAM entries installed by PF with target as VF pcifunc */
++	for (index = 0; index < mcam->bmap_entries; index++) {
++		if (mcam->entry2target_pffunc[index] == target)
++			npc_enable_mcam_entry(rvu, mcam, blkaddr,
++					      index, true);
++	}
++	mutex_unlock(&mcam->lock);
++}
++
++void npc_mcam_disable_flows(struct rvu *rvu, u16 target)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int blkaddr, index;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return;
++
++	mutex_lock(&mcam->lock);
++	/* Disable MCAM entries installed by PF with target as VF pcifunc */
++	for (index = 0; index < mcam->bmap_entries; index++) {
++		if (mcam->entry2target_pffunc[index] == target)
++			npc_enable_mcam_entry(rvu, mcam, blkaddr,
++					      index, false);
++	}
+ 	mutex_unlock(&mcam->lock);
+ }
+-- 
+2.31.1
+

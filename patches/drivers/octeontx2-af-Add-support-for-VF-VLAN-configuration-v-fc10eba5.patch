@@ -1,0 +1,195 @@
+From 2d5f2328ae8180b4714f0b208ab127cca01d551a Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Wed, 18 Dec 2019 12:10:43 +0530
+Subject: [PATCH 0339/1921] octeontx2-af: Add support for VF VLAN configuration
+ via PF
+
+Reserved RX_VTAG_TYPE7 for VF VLAN vtag actions. Fixed
+TX_VTAG_ACTION LID and RELPTR offset properly. Updating NPC
+flow req destination mac address when ether addr is zero.
+
+Change-Id: I8cee6352021056d648bec3a257abfd1209f0f3e5
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/21013
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  4 ++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  2 +-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 18 ++++++++++---
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   |  4 ++-
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 25 +++++++++++++------
+ 5 files changed, 38 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 02f0f68dffa1..5c0d164d3b8c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -673,6 +673,7 @@ enum nix_af_status {
+ 	NIX_AF_INVAL_NPA_PF_FUNC    = -419,
+ 	NIX_AF_INVAL_SSO_PF_FUNC    = -420,
+ 	NIX_AF_ERR_TX_VTAG_NOSPC    = -421,
++	NIX_AF_ERR_RX_VTAG_INUSE    = -422,
+ };
+ 
+ /* For NIX RX vtag action  */
+@@ -722,7 +723,8 @@ struct nix_lf_alloc_rsp {
+ 
+ struct nix_lf_free_req {
+ 	struct mbox_msghdr hdr;
+-#define NIX_LF_DISABLE_FLOWS	0x1
++#define NIX_LF_DISABLE_FLOWS		BIT_ULL(0)
++#define NIX_LF_DONT_FREE_TX_VTAG	BIT_ULL(1)
+ 	u64 flags;
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 62e881254b8b..723460b6f747 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -266,7 +266,7 @@ struct rvu_pfvf {
+ 	u16		minlen;
+ 
+ 	bool		hw_rx_tstamp_en; /* Is rx_tstamp enabled */
+-	bool		pf_set_vfs_mac;
++	u8		pf_set_vf_cfg;
+ 	u8		mac_addr[ETH_ALEN]; /* MAC address of this PF/VF */
+ 	u8		default_mac[ETH_ALEN]; /* MAC address from FWdata */
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 55304fa55643..cea96aca7fb9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -273,9 +273,6 @@ static void nix_interface_deinit(struct rvu *rvu, u16 pcifunc, u8 nixlf)
+ 			pcifunc);
+ 	}
+ 
+-	/* Free any tx vtag def entries used by this NIX LF */
+-	nix_free_tx_vtag_entries(rvu, pcifunc);
+-
+ 	/* Disable DMAC filters used */
+ 	rvu_cgx_disable_dmac_entries(rvu, pcifunc);
+ }
+@@ -1148,6 +1145,11 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	/* Disable NPC entries as NIXLF's contexts are not initialized yet */
+ 	rvu_npc_disable_default_entries(rvu, pcifunc, nixlf);
+ 
++	/* Configure RX VTAG Type 7 (strip) for vf vlan */
++	rvu_write64(rvu, blkaddr,
++		    NIX_AF_LFX_RX_VTAG_TYPEX(nixlf, NIX_AF_LFX_RX_VTAG_TYPE7),
++		    VTAGSIZE_T4 | BIT_ULL(4));
++
+ 	goto exit;
+ 
+ free_mem:
+@@ -1203,6 +1205,10 @@ int rvu_mbox_handler_nix_lf_free(struct rvu *rvu, struct nix_lf_free_req *req,
+ 	else
+ 		rvu_npc_free_mcam_entries(rvu, pcifunc, nixlf);
+ 
++	/* Free any tx vtag def entries used by this NIX LF */
++	if (!(req->flags & NIX_LF_DONT_FREE_TX_VTAG))
++		nix_free_tx_vtag_entries(rvu, pcifunc);
++
+ 	nix_interface_deinit(rvu, pcifunc, nixlf);
+ 
+ 	/* Reset this NIX LF */
+@@ -1952,6 +1958,10 @@ static int nix_rx_vtag_cfg(struct rvu *rvu, int nixlf, int blkaddr,
+ 	    req->vtag_size > VTAGSIZE_T8)
+ 		return -EINVAL;
+ 
++	/* RX VTAG Type 7 reserved for vf vlan */
++	if (req->rx.vtag_type == NIX_AF_LFX_RX_VTAG_TYPE7)
++		return NIX_AF_ERR_RX_VTAG_INUSE;
++
+ 	if (req->rx.capture_vtag)
+ 		regval |= BIT_ULL(5);
+ 	if (req->rx.strip_vtag)
+@@ -2911,7 +2921,7 @@ int rvu_mbox_handler_nix_set_mac_addr(struct rvu *rvu,
+ 		return NIX_AF_ERR_AF_LF_INVALID;
+ 
+ 	/* VF can't overwrite admin(PF) changes */
+-	if (from_vf && pfvf->pf_set_vfs_mac)
++	if (from_vf && pfvf->pf_set_vf_cfg)
+ 		return -EPERM;
+ 
+ 	ether_addr_copy(pfvf->mac_addr, req->mac_addr);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index b193d4bd3f81..51271a46ac36 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -52,7 +52,9 @@ static int npc_mcam_verify_pf_func(struct rvu *rvu,
+ 	pf_func = (entry_data->kw[0] >> 32) & NPC_KEX_PF_FUNC_MASK;
+ 
+ 	pf_func = htons(pf_func);
+-	if (pf_func_mask != NPC_KEX_PF_FUNC_MASK || pf_func != pcifunc)
++	if (pf_func_mask != NPC_KEX_PF_FUNC_MASK ||
++	    ((pf_func & ~RVU_PFVF_FUNC_MASK) !=
++	     (pcifunc & ~RVU_PFVF_FUNC_MASK)))
+ 		return -EINVAL;
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 212bfca5cf33..3a5e820a9eff 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -830,7 +830,7 @@ static void npc_update_tx_entry(struct rvu *rvu, struct rvu_pfvf *pfvf,
+ {
+ 	struct nix_tx_action action;
+ 
+-	npc_update_entry(rvu, NPC_PF_FUNC, entry, htons(req->hdr.pcifunc),
++	npc_update_entry(rvu, NPC_PF_FUNC, entry, htons(target),
+ 			 0, ~0ULL, 0, NIX_INTF_TX);
+ 
+ 	*(u64 *)&action = 0x00;
+@@ -845,12 +845,12 @@ static void npc_update_tx_entry(struct rvu *rvu, struct rvu_pfvf *pfvf,
+ 	 */
+ 	entry->vtag_action = FIELD_PREP(TX_VTAG0_DEF_MASK, req->vtag0_def) |
+ 			     FIELD_PREP(TX_VTAG0_OP_MASK, req->vtag0_op) |
+-			     FIELD_PREP(TX_VTAG0_LID_MASK, NPC_LID_LB) |
+-			     FIELD_PREP(TX_VTAG0_RELPTR_MASK, 0) |
++			     FIELD_PREP(TX_VTAG0_LID_MASK, NPC_LID_LA) |
++			     FIELD_PREP(TX_VTAG0_RELPTR_MASK, 20) |
+ 			     FIELD_PREP(TX_VTAG1_DEF_MASK, req->vtag1_def) |
+ 			     FIELD_PREP(TX_VTAG1_OP_MASK, req->vtag1_op) |
+-			     FIELD_PREP(TX_VTAG1_LID_MASK, NPC_LID_LB) |
+-			     FIELD_PREP(TX_VTAG1_RELPTR_MASK, 4);
++			     FIELD_PREP(TX_VTAG1_LID_MASK, NPC_LID_LA) |
++			     FIELD_PREP(TX_VTAG1_RELPTR_MASK, 24);
+ }
+ 
+ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+@@ -979,10 +979,8 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 		pfvf->def_rule = rule;
+ 
+ 	/* VF's MAC address is being changed via PF  */
+-	if (pf_set_vfs_mac) {
++	if (pf_set_vfs_mac)
+ 		ether_addr_copy(pfvf->default_mac, req->packet.dmac);
+-		pfvf->pf_set_vfs_mac = true;
+-	}
+ 
+ 	return 0;
+ }
+@@ -1033,6 +1031,17 @@ int rvu_mbox_handler_npc_install_flow(struct rvu *rvu,
+ 
+ 	pfvf = rvu_get_pfvf(rvu, target);
+ 
++	if (!from_vf && req->vf)
++		pfvf->pf_set_vf_cfg = 1;
++
++	/* update req destination mac addr */
++	if ((req->features & BIT_ULL(NPC_DMAC)) &&
++	    req->intf == NIX_INTF_RX &&
++	    is_zero_ether_addr(req->packet.dmac)) {
++		ether_addr_copy(req->packet.dmac, pfvf->default_mac);
++		u64_to_ether_addr(0xffffffffffffull, req->mask.dmac);
++	}
++
+ 	err = nix_get_nixlf(rvu, target, &nixlf);
+ 
+ 	/* If interface is uninitialized then do not enable entry */
+-- 
+2.31.1
+

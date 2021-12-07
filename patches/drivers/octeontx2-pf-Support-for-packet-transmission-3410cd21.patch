@@ -1,0 +1,607 @@
+From fb143147e0341714bbbc739e9a5b420c856e5f44 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 7 Feb 2019 13:42:55 +0530
+Subject: [PATCH 0052/1921] octeontx2-pf: Support for packet transmission
+
+This patch adds support for packet transmission and also
+for processing transmitted packet notifications.
+
+One SQE can fit a max of 9 fragments, if SKB has
+more number of fragments then SKB is linearized.
+
+Change-Id: I915dbd4c5a48d994deff165ca919d2808701b0fb
+Co-developed-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       |  26 +++
+ .../marvell/octeontx2/nic/otx2_common.h       |   2 +
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  58 +++++
+ .../marvell/octeontx2/nic/otx2_struct.h       |  92 ++++++++
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 211 ++++++++++++++++++
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  27 +++
+ 6 files changed, 416 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index f8ef700ac5c0..a87de5bb3877 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -183,7 +183,33 @@ static int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx, u16 lpb_aura)
+ 
+ static int otx2_sq_init(struct otx2_nic *pfvf, u16 qidx, u16 sqb_aura)
+ {
++	struct otx2_qset *qset = &pfvf->qset;
++	struct otx2_snd_queue *sq;
+ 	struct nix_aq_enq_req *aq;
++	struct otx2_pool *pool;
++	int err;
++
++	pool = &pfvf->qset.pool[sqb_aura];
++	sq = &qset->sq[qidx];
++	sq->sqe_size = NIX_SQESZ_W16 ? 64 : 128;
++	sq->sqe_cnt = qset->sqe_cnt;
++
++	err = qmem_alloc(pfvf->dev, &sq->sqe, 1, sq->sqe_size);
++	if (err)
++		return err;
++
++	sq->sqe_base = sq->sqe->base;
++	sq->sg = kcalloc(qset->sqe_cnt, sizeof(struct sg_list), GFP_KERNEL);
++	if (!sq->sg)
++		return -ENOMEM;
++
++	sq->head = 0;
++	sq->num_sqbs = (pfvf->hw.sqb_size / sq->sqe_size) - 1;
++	sq->num_sqbs = (qset->sqe_cnt + sq->num_sqbs) / sq->num_sqbs;
++	sq->aura_id = sqb_aura;
++	sq->aura_fc_addr = pool->fc_addr->base;
++	sq->lmt_addr = (__force u64 *)(pfvf->reg_base + LMT_LF_LMTLINEX(qidx));
++	sq->io_addr = (__force u64)(pfvf->reg_base + NIX_LF_OP_SENDX(0));
+ 
+ 	/* Get memory to put this msg */
+ 	aq = otx2_mbox_alloc_msg_nix_aq_enq(&pfvf->mbox);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index b50bcdd51da6..472ecee35ebe 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -82,6 +82,7 @@ struct otx2_nic {
+ 	struct otx2_hw		hw;
+ 	struct mbox		mbox;
+ 	struct workqueue_struct *mbox_wq;
++	u8			intf_down;
+ 	u16			pcifunc;
+ 	u16			rx_chan_base;
+ 	u16			tx_chan_base;
+@@ -284,6 +285,7 @@ int otx2_txschq_config(struct otx2_nic *pfvf, int lvl);
+ int otx2_txsch_alloc(struct otx2_nic *pfvf);
+ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 			   gfp_t gfp);
++int otx2_rxtx_enable(struct otx2_nic *pfvf, bool enable);
+ 
+ /* Mbox handlers */
+ void mbox_handler_msix_offset(struct otx2_nic *pfvf,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index db312b3ae444..8c0b2de5b1e7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -361,6 +361,41 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	return 0;
+ }
+ 
++static netdev_tx_t otx2_xmit(struct sk_buff *skb, struct net_device *netdev)
++
++{
++	struct otx2_nic *pf = netdev_priv(netdev);
++	struct otx2_snd_queue *sq;
++	int qidx = skb_get_queue_mapping(skb);
++	struct netdev_queue *txq = netdev_get_tx_queue(netdev, qidx);
++
++	/* Check for minimum packet length */
++	if (skb->len <= ETH_HLEN) {
++		dev_kfree_skb(skb);
++		return NETDEV_TX_OK;
++	}
++
++	sq = &pf->qset.sq[qidx];
++
++	if (!netif_tx_queue_stopped(txq) &&
++	    !otx2_sq_append_skb(netdev, sq, skb, qidx)) {
++		netif_tx_stop_queue(txq);
++
++		/* Barrier, for stop_queue to be visible on other cpus */
++		smp_mb();
++		if ((sq->num_sqbs - *sq->aura_fc_addr) > 1)
++			netif_tx_start_queue(txq);
++		else
++			netdev_warn(netdev,
++				    "%s: No free SQE/SQB, stopping SQ%d\n",
++				     netdev->name, qidx);
++
++		return NETDEV_TX_BUSY;
++	}
++
++	return NETDEV_TX_OK;
++}
++
+ static int otx2_open(struct net_device *netdev)
+ {
+ 	struct otx2_nic *pf = netdev_priv(netdev);
+@@ -389,6 +424,11 @@ static int otx2_open(struct net_device *netdev)
+ 	if (!qset->cq)
+ 		goto err_free_mem;
+ 
++	qset->sq = kcalloc(pf->hw.tx_queues,
++			   sizeof(struct otx2_snd_queue), GFP_KERNEL);
++	if (!qset->sq)
++		goto err_free_mem;
++
+ 	err = otx2_init_hw_resources(pf);
+ 	if (err)
+ 		goto err_free_mem;
+@@ -445,12 +485,21 @@ static int otx2_open(struct net_device *netdev)
+ 		otx2_write64(pf, NIX_LF_CINTX_ENA_W1S(qidx), BIT_ULL(0));
+ 	}
+ 
++	err = otx2_rxtx_enable(pf, true);
++	if (err)
++		goto err_free_cints;
++
++	pf->intf_down = false;
++	netif_carrier_on(netdev);
++	netif_tx_start_all_queues(netdev);
++
+ 	return 0;
+ 
+ err_free_cints:
+ 	otx2_free_cints(pf, qidx);
+ 	otx2_disable_napi(pf);
+ err_free_mem:
++	kfree(qset->sq);
+ 	kfree(qset->cq);
+ 	kfree(qset->napi);
+ 	return err;
+@@ -463,6 +512,13 @@ static int otx2_stop(struct net_device *netdev)
+ 	struct otx2_qset *qset = &pf->qset;
+ 	int qidx, vec;
+ 
++	/* First stop packet Rx/Tx */
++	otx2_rxtx_enable(pf, false);
++
++	pf->intf_down = true;
++	/* 'intf_down' may be checked on any cpu */
++	smp_wmb();
++
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
+ 
+@@ -483,6 +539,7 @@ static int otx2_stop(struct net_device *netdev)
+ 
+ 	otx2_free_cints(pf, pf->hw.cint_cnt);
+ 	otx2_disable_napi(pf);
++	kfree(qset->sq);
+ 	kfree(qset->cq);
+ 	kfree(qset->napi);
+ 	memset(qset, 0, sizeof(*qset));
+@@ -492,6 +549,7 @@ static int otx2_stop(struct net_device *netdev)
+ static const struct net_device_ops otx2_netdev_ops = {
+ 	.ndo_open		= otx2_open,
+ 	.ndo_stop		= otx2_stop,
++	.ndo_start_xmit		= otx2_xmit,
+ };
+ 
+ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+index 8fc156721bf2..212ce914c7f3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_struct.h
+@@ -17,6 +17,17 @@ enum nix_cqesz_e {
+ 	NIX_XQESZ_W16 = 0x1,
+ };
+ 
++enum nix_sqes_e {
++	NIX_SQESZ_W16 = 0x0,
++	NIX_SQESZ_W8 = 0x1,
++};
++
++enum nix_send_ldtype {
++	NIX_SEND_LDTYPE_LDD  = 0x0,
++	NIX_SEND_LDTYPE_LDT  = 0x1,
++	NIX_SEND_LDTYPE_LDWB = 0x2,
++};
++
+ /* NIX wqe/cqe types */
+ enum nix_xqe_type {
+ 	NIX_XQE_TYPE_INVALID   = 0x0,
+@@ -203,4 +214,85 @@ struct nix_rx_sg_s {
+ #endif
+ };
+ 
++struct nix_send_comp_s {
++#if defined(__BIG_ENDIAN_BITFIELD)	/* W0 */
++	u64 rsvd_24_63  : 40;
++	u64 sqe_id	: 16;
++	u64 status	: 8;
++#else
++	u64 status	: 8;
++	u64 sqe_id	: 16;
++	u64 rsvd_24_63	: 40;
++#endif
++};
++
++/* NIX SQE header structure */
++struct nix_sqe_hdr_s {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u64 sq			: 20; /* W0 */
++	u64 pnc			: 1;
++	u64 sizem1		: 3;
++	u64 aura		: 20;
++	u64 df			: 1;
++	u64 reserved_18		: 1;
++	u64 total		: 18;
++#else
++	u64 total		: 18;
++	u64 reserved_18		: 1;
++	u64 df			: 1;
++	u64 aura		: 20;
++	u64 sizem1		: 3;
++	u64 pnc			: 1;
++	u64 sq			: 20;
++#endif
++#if defined(__BIG_ENDIAN_BITFIELD)    /* W1 */
++	u64 sqe_id		:16;
++	u64 il4type		:4;
++	u64 il3type		:4;
++	u64 ol4type		:4;
++	u64 ol3type		:4;
++	u64 il4ptr		:8;
++	u64 il3ptr		:8;
++	u64 ol4ptr		:8;
++	u64 ol3ptr		:8;
++#else
++	u64 ol3ptr		:8;
++	u64 ol4ptr		:8;
++	u64 il3ptr		:8;
++	u64 il4ptr		:8;
++	u64 ol3type		:4;
++	u64 ol4type		:4;
++	u64 il3type		:4;
++	u64 il4type		:4;
++	u64 sqe_id		:16;
++
++#endif
++};
++
++struct nix_sqe_sg_s {
++#if defined(__BIG_ENDIAN_BITFIELD)  /* W0 */
++	u64 subdc	: 4;
++	u64 ld_type	: 2;
++	u64 i3		: 1;
++	u64 i2		: 1;
++	u64 i1		: 1;
++	u64 rsvd_54_50	: 5;
++	u64 segs	: 2;
++	u64 seg3_size	: 16;
++	u64 seg2_size	: 16;
++	u64 seg1_size	: 16;
++#else
++	u64 seg1_size	: 16;
++	u64 seg2_size	: 16;
++	u64 seg3_size	: 16;
++	u64 segs	: 2;
++	u64 rsvd_54_50	: 5;
++	u64 i1		: 1;
++	u64 i2		: 1;
++	u64 i3		: 1;
++	u64 ld_type	: 2;
++	u64 subdc	: 4;
++#endif
++};
++
+ #endif /* OTX2_STRUCT_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index b568900a6097..1b6c73f2239a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -16,6 +16,12 @@
+ #include "otx2_struct.h"
+ #include "otx2_txrx.h"
+ 
++/* Flush SQE written to LMT to SQB */
++static inline u64 otx2_lmt_flush(uint64_t addr)
++{
++	return atomic64_fetch_xor_relaxed(0, (atomic64_t *)addr);
++}
++
+ static inline u64 otx2_nix_cq_op_status(struct otx2_nic *pfvf, int cq_idx)
+ {
+ 	u64 incr = (u64)cq_idx << 32;
+@@ -43,6 +49,69 @@ static inline unsigned int frag_num(unsigned int i)
+ #endif
+ }
+ 
++static dma_addr_t otx2_dma_map_skb_frag(struct otx2_nic *pfvf,
++					struct sk_buff *skb, int seg, int *len)
++{
++	const struct skb_frag_struct *frag;
++	struct page *page;
++	int offset;
++
++	/* First segment is always skb->data */
++	if (!seg) {
++		page = virt_to_page(skb->data);
++		offset = offset_in_page(skb->data);
++		*len = skb_headlen(skb);
++	} else {
++		frag = &skb_shinfo(skb)->frags[seg - 1];
++		page = skb_frag_page(frag);
++		offset = frag->page_offset;
++		*len = skb_frag_size(frag);
++	}
++	return dma_map_page_attrs(pfvf->dev, page, offset, *len,
++				  DMA_TO_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++}
++
++static void otx2_dma_unmap_skb_frags(struct otx2_nic *pfvf, struct sg_list *sg)
++{
++	int seg;
++
++	for (seg = 0; seg < sg->num_segs; seg++) {
++		dma_unmap_page_attrs(pfvf->dev, sg->dma_addr[seg],
++				     sg->size[seg], DMA_TO_DEVICE,
++				     DMA_ATTR_SKIP_CPU_SYNC);
++	}
++}
++
++static void otx2_snd_pkt_handler(struct otx2_nic *pfvf,
++				 struct otx2_cq_queue *cq, void *cqe,
++				 int budget)
++{
++	struct nix_cqe_hdr_s *cqe_hdr = (struct nix_cqe_hdr_s *)cqe;
++	struct nix_send_comp_s *snd_comp;
++	struct sk_buff *skb = NULL;
++	struct otx2_snd_queue *sq;
++	struct sg_list *sg;
++
++	snd_comp = (struct nix_send_comp_s *)(cqe + sizeof(*cqe_hdr));
++	if (snd_comp->status) {
++		/* tx packet error handling*/
++		dev_info(pfvf->dev, "TX%d: Error in send CQ entry\n",
++			 cq->cint_idx);
++	}
++
++	/* Barrier, so that update to sq by other cpus is visible */
++	smp_mb();
++	sq = &pfvf->qset.sq[cq->cint_idx];
++	sg = &sq->sg[snd_comp->sqe_id];
++
++	skb = (struct sk_buff *)sg->skb;
++	if (skb) {
++		otx2_dma_unmap_skb_frags(pfvf, sg);
++		napi_consume_skb(skb, budget);
++		sg->skb = (u64)NULL;
++	}
++}
++
+ static void otx2_skb_add_frag(struct otx2_nic *pfvf,
+ 			      struct sk_buff *skb, u64 iova, int len)
+ {
+@@ -197,6 +266,8 @@ static int otx2_napi_handler(struct otx2_cq_queue *cq, struct otx2_nic *pfvf,
+ 			otx2_rcv_pkt_handler(pfvf, cq, cqe_hdr, &pool_ptrs);
+ 			workdone++;
+ 			break;
++		case NIX_XQE_TYPE_SEND:
++			otx2_snd_pkt_handler(pfvf, cq, cqe_hdr, budget);
+ 		}
+ 		processed_cqe++;
+ 	}
+@@ -252,9 +323,149 @@ int otx2_poll(struct napi_struct *napi, int budget)
+ 		/* Exit polling */
+ 		napi_complete(napi);
+ 
++		/* If interface is going down, don't re-enable IRQ */
++		if (pfvf->intf_down)
++			return workdone;
++
+ 		/* Re-enable interrupts */
+ 		otx2_write64(pfvf, NIX_LF_CINTX_ENA_W1S(cq_poll->cint_idx),
+ 			     BIT_ULL(0));
+ 	}
+ 	return workdone;
+ }
++
++#define MAX_SEGS_PER_SG	3
++/* Add SQE scatter/gather subdescriptor structure */
++static bool otx2_sqe_add_sg(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
++			    struct sk_buff *skb, int num_segs, int *offset)
++{
++	struct nix_sqe_sg_s *sg = NULL;
++	u64 dma_addr, *iova = NULL;
++	u16 *sg_lens = NULL;
++	int seg, len;
++
++	sq->sg[sq->head].num_segs = 0;
++
++	for (seg = 0; seg < num_segs; seg++) {
++		if ((seg % MAX_SEGS_PER_SG) == 0) {
++			sg = (struct nix_sqe_sg_s *)(sq->sqe_base + *offset);
++			sg->ld_type = NIX_SEND_LDTYPE_LDD;
++			sg->subdc = NIX_SUBDC_SG;
++			sg->segs = 0;
++			sg_lens = (void *)sg;
++			iova = (void *)sg + sizeof(*sg);
++			/* Next subdc always starts at a 16byte boundary.
++			 * So if sg->segs is whether 2 or 3, offset += 16bytes.
++			 */
++			if ((num_segs - seg) >= (MAX_SEGS_PER_SG - 1))
++				*offset += sizeof(*sg) + (3 * sizeof(u64));
++			else
++				*offset += sizeof(*sg) + sizeof(u64);
++		}
++		dma_addr = otx2_dma_map_skb_frag(pfvf, skb, seg, &len);
++		if (dma_mapping_error(pfvf->dev, dma_addr))
++			return false;
++
++		sg_lens[frag_num(seg % MAX_SEGS_PER_SG)] = len;
++		sg->segs++;
++		*iova++ = dma_addr;
++
++		/* Save DMA mapping info for later unmapping */
++		sq->sg[sq->head].dma_addr[seg] = dma_addr;
++		sq->sg[sq->head].size[seg] = len;
++		sq->sg[sq->head].num_segs++;
++	}
++
++	sq->sg[sq->head].skb = (u64)skb;
++	return true;
++}
++
++/* Add SQE header subdescriptor structure */
++static void otx2_sqe_add_hdr(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
++			     struct nix_sqe_hdr_s *sqe_hdr, int len, u16 qidx)
++{
++	sqe_hdr->total = len;
++	/* Don't free Tx buffers to Aura */
++	sqe_hdr->df = 1;
++	sqe_hdr->aura = sq->aura_id;
++	/* Post a CQE Tx after pkt transmission */
++	sqe_hdr->pnc = 1;
++	sqe_hdr->sq = qidx;
++	/* Set SQE identifier which will be used later for freeing SKB */
++	sqe_hdr->sqe_id = sq->head;
++}
++
++bool otx2_sq_append_skb(struct net_device *netdev, struct otx2_snd_queue *sq,
++			struct sk_buff *skb, u16 qidx)
++{
++	struct otx2_nic *pfvf = netdev_priv(netdev);
++	struct nix_sqe_hdr_s *sqe_hdr;
++	int offset, num_segs;
++	u64 status;
++
++	/* Check if there is room for new SQE.
++	 * 'Num of SQBs freed to SQ's pool - SQ's Aura count'
++	 * will give free SQE count.
++	 */
++	if (!(sq->num_sqbs - *sq->aura_fc_addr))
++		goto fail;
++
++	/* Set SQE's SEND_HDR */
++	memset(sq->sqe_base, 0, sq->sqe_size);
++	sqe_hdr = (struct nix_sqe_hdr_s *)(sq->sqe_base);
++	otx2_sqe_add_hdr(pfvf, sq, sqe_hdr, skb->len, qidx);
++	offset = sizeof(*sqe_hdr);
++
++	num_segs = skb_shinfo(skb)->nr_frags + 1;
++
++	/* If SKB doesn't fit in a single SQE, linearize it.
++	 * TODO: Consider adding JUMP descriptor instead.
++	 */
++	if (num_segs > OTX2_MAX_FRAGS_IN_SQE) {
++		if (__skb_linearize(skb)) {
++			dev_kfree_skb_any(skb);
++			return true;
++		}
++		num_segs = skb_shinfo(skb)->nr_frags + 1;
++	}
++
++	/* Add SG subdesc with data frags */
++	if (!otx2_sqe_add_sg(pfvf, sq, skb, num_segs, &offset)) {
++		otx2_dma_unmap_skb_frags(pfvf, &sq->sg[sq->head]);
++		return false;
++	}
++
++	sqe_hdr->sizem1 = (offset / 16) - 1;
++
++	/* Packet data stores should finish before SQE is flushed to HW */
++	dma_wmb();
++
++	do {
++		memcpy(sq->lmt_addr, sqe_hdr, offset);
++		status = otx2_lmt_flush(sq->io_addr);
++	} while (status == 0);
++
++	sq->head++;
++	sq->head &= (sq->sqe_cnt - 1);
++
++	return true;
++fail:
++	netdev_warn(pfvf->netdev, "SQ%d full, SQB count %d Aura count %lld\n",
++		    qidx, sq->num_sqbs, *sq->aura_fc_addr);
++	return false;
++}
++
++int otx2_rxtx_enable(struct otx2_nic *pfvf, bool enable)
++{
++	struct msg_req *msg;
++
++	if (enable)
++		msg = otx2_mbox_alloc_msg_nix_lf_start_rx(&pfvf->mbox);
++	else
++		msg = otx2_mbox_alloc_msg_nix_lf_stop_rx(&pfvf->mbox);
++
++	if (!msg)
++		return -ENOMEM;
++
++	return otx2_sync_mbox_msg(&pfvf->mbox);
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index deffaf881f13..f66f407b506f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -11,6 +11,7 @@
+ #ifndef OTX2_TXRX_H
+ #define OTX2_TXRX_H
+ 
++#include <linux/etherdevice.h>
+ #include <linux/iommu.h>
+ 
+ #define LBK_CHAN_BASE	0x000
+@@ -25,6 +26,29 @@
+ 
+ #define OTX2_HEAD_ROOM		OTX2_ALIGN
+ 
++#define OTX2_MAX_FRAGS_IN_SQE	9
++
++struct sg_list {
++	u16	num_segs;
++	u64	skb;
++	u64	size[OTX2_MAX_FRAGS_IN_SQE];
++	u64	dma_addr[OTX2_MAX_FRAGS_IN_SQE];
++};
++
++struct otx2_snd_queue {
++	u8			aura_id;
++	u16			head;
++	u16			sqe_size;
++	u32			sqe_cnt;
++	u16			num_sqbs;
++	u64			 io_addr;
++	u64			*aura_fc_addr;
++	u64			*lmt_addr;
++	void			*sqe_base;
++	struct qmem		*sqe;
++	struct sg_list		*sg;
++};
++
+ struct otx2_cq_poll {
+ 	void			*dev;
+ #define CINT_INVALID_CQ		255
+@@ -62,6 +86,7 @@ struct otx2_qset {
+ 	struct otx2_pool	*pool;
+ 	struct otx2_cq_poll	*napi;
+ 	struct otx2_cq_queue	*cq;
++	struct otx2_snd_queue	*sq;
+ };
+ 
+ /* Translate IOVA to physical address */
+@@ -74,4 +99,6 @@ static inline u64 otx2_iova_to_phys(void *iommu_domain, dma_addr_t dma_addr)
+ }
+ 
+ int otx2_poll(struct napi_struct *napi, int budget);
++bool otx2_sq_append_skb(struct net_device *netdev, struct otx2_snd_queue *sq,
++			struct sk_buff *skb, u16 qidx);
+ #endif /* OTX2_TXRX_H */
+-- 
+2.31.1
+

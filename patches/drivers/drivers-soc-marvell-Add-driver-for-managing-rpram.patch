@@ -1,0 +1,193 @@
+From bcea30822232602acdeb09c20e256bf5857ae126 Mon Sep 17 00:00:00 2001
+From: Jayanthi Annadurai <jannadurai@marvell.com>
+Date: Thu, 27 May 2021 10:11:34 -0700
+Subject: [PATCH 1564/1921] drivers: soc: marvell: Add driver for managing
+ rpram
+
+Interface to communicate with secure firmware and update
+rpram related data.
+
+Change-Id: Ibd148ab90ada7d66736c784253334bedb38025dc
+Signed-off-by: Jayanthi Annadurai <jannadurai@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/52877
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/soc/marvell/Kconfig          |  10 ++
+ drivers/soc/marvell/Makefile         |   1 +
+ drivers/soc/marvell/octeontx-rpram.c | 132 +++++++++++++++++++++++++++
+ 3 files changed, 143 insertions(+)
+ create mode 100644 drivers/soc/marvell/octeontx-rpram.c
+
+diff --git a/drivers/soc/marvell/Kconfig b/drivers/soc/marvell/Kconfig
+index 7e6bbf4fcd7a..bb857d7910a2 100644
+--- a/drivers/soc/marvell/Kconfig
++++ b/drivers/soc/marvell/Kconfig
+@@ -165,4 +165,14 @@ config MARVELL_CN10K_MAC_MGMT
+ 	  for the functionality.
+ 	  Driver is supported only for CN10K platforms.
+ 
++config MARVELL_CN10K_RPRAM
++	tristate "Octeontx RPRAM debugfs interface"
++	depends on HAVE_ARM_SMCCC
++	default n
++	help
++	  This option enables the user to change the persistent data updated by
++	  secure firmware. Kernel invokes secure monitor call to make the change
++	  requested by user. Enable this option if you are building for octeontx
++	  cn10k platforms and memory preservation feature is used.
++
+ endmenu
+diff --git a/drivers/soc/marvell/Makefile b/drivers/soc/marvell/Makefile
+index 7c6a9f6ddfde..7bfef4ee2252 100644
+--- a/drivers/soc/marvell/Makefile
++++ b/drivers/soc/marvell/Makefile
+@@ -11,3 +11,4 @@ obj-$(CONFIG_OCTEONTX_INFO) += octeontx_info.o
+ obj-$(CONFIG_MVMDIO_UIO) += mvmdio_uio.o
+ obj-$(CONFIG_MRVL_PHY_DIAGNOSTICS) += phy_diag.o
+ obj-$(CONFIG_MARVELL_CN10K_MAC_MGMT) += marvell_mac_mgmt.o
++obj-$(CONFIG_MARVELL_CN10K_RPRAM) += octeontx-rpram.o
+diff --git a/drivers/soc/marvell/octeontx-rpram.c b/drivers/soc/marvell/octeontx-rpram.c
+new file mode 100644
+index 000000000000..2ebb0826d931
+--- /dev/null
++++ b/drivers/soc/marvell/octeontx-rpram.c
+@@ -0,0 +1,132 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2021 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/debugfs.h>
++#include <linux/module.h>
++#include <linux/uaccess.h>
++#include <linux/arm-smccc.h>
++
++/* Default size */
++#define MIN_USERDEF_PRESERVE_MEMSZ	16 /* in MB, 16MB is minimum */
++#define MAX_USERDEF_PRESERVE_MEMSZ	1024 /* in MB, 1GB is maximum */
++
++/* SMC function id to update persistent memory */
++#define PLAT_OCTEONTX_PERSIST_DATA_COMMAND	0xc2000b0d
++/* Arg 0: UPDATE_USERDEF_PRESERVE_MEMSZ, Update user defined
++ *	preserve memory size
++ * Arg 1: Size of the preserved memory size
++ */
++#define UPDATE_USERDEF_PRESERVE_MEMSZ		1
++
++static u32 preserve_mem_size = MIN_USERDEF_PRESERVE_MEMSZ;
++static struct dentry *preserve_mem_root;
++
++static int otx_debugfs_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static ssize_t otx_debugfs_read(struct file *f, char __user *user_buf,
++		size_t count, loff_t *off)
++{
++	char *buf = (char *)&preserve_mem_size;
++	ssize_t out;
++
++	out = simple_read_from_buffer(user_buf, count, off,
++			buf, sizeof(preserve_mem_size));
++
++	return out;
++}
++
++static ssize_t otx_debugfs_write(struct file *f, const char __user *user_buf,
++		size_t count, loff_t *off)
++{
++	struct arm_smccc_res res;
++	unsigned long function_id, arg0, arg1;
++	u32 value;
++	ssize_t rc;
++	char buf[20];
++
++	if (count > sizeof(buf) - 1)
++		goto ret_err;
++
++	if (copy_from_user(buf, user_buf, count))
++		goto ret_err;
++
++	buf[count] = 0;
++
++	rc = kstrtouint(buf, 10, &value);
++	if (rc)
++		return rc;
++
++	/* size should be multiples of 16 in MB */
++	if ((value < MIN_USERDEF_PRESERVE_MEMSZ) || (value > MAX_USERDEF_PRESERVE_MEMSZ)
++		|| (value % MIN_USERDEF_PRESERVE_MEMSZ))
++		goto ret_err;
++
++	preserve_mem_size = value;
++
++	function_id = PLAT_OCTEONTX_PERSIST_DATA_COMMAND;
++	arg0 = UPDATE_USERDEF_PRESERVE_MEMSZ;
++	arg1 = preserve_mem_size;
++
++	/* Secure firmware call to update the size of user defined memory */
++	arm_smccc_smc(function_id, arg0, arg1, 0, 0, 0, 0, 0, &res);
++	return count;
++
++ret_err:
++	pr_err("Invalid size, valid values: min 16, max 1024, multiples of 16\n");
++	return -EINVAL;
++}
++
++static const struct file_operations otx_debugfs_fops = {
++	.open = otx_debugfs_open,
++	.read = otx_debugfs_read,
++	.write = otx_debugfs_write,
++};
++
++/* module init */
++static int __init otx_rpram_init(void)
++{
++	struct dentry *root, *entry;
++
++	/* root directory : rpram */
++	root = debugfs_create_dir("rpram", NULL);
++	if (!root) {
++		pr_err("rpram debugfs creation failed\n");
++		return -ENOMEM;
++	}
++
++	preserve_mem_root = root;
++
++	/* root/preserve_memsz_inMB creation */
++	entry = debugfs_create_file("preserve_memsz_inMB", 0600, root,
++			&preserve_mem_size, &otx_debugfs_fops);
++
++	if (!entry) {
++		pr_err("rpram->preserve_memsz_inMB debugfs file creation failed\n");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++/* module exit */
++static void __exit otx_rpram_exit(void)
++{
++	if (preserve_mem_root != NULL)
++		debugfs_remove_recursive(preserve_mem_root);
++}
++
++module_init(otx_rpram_init);
++module_exit(otx_rpram_exit);
++
++MODULE_DESCRIPTION("Marvell driver for managing rpram");
++MODULE_AUTHOR("Jayanthi Annadurai <jannadurai@marvell.com>");
++MODULE_LICENSE("GPL");
+-- 
+2.31.1
+

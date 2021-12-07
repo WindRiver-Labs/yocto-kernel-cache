@@ -1,0 +1,147 @@
+From 19f0aaf47065855f01867cb4cb917f347c9baa3a Mon Sep 17 00:00:00 2001
+From: Pascal van Leeuwen <pascalvanl@gmail.com>
+Date: Fri, 6 Sep 2019 16:31:52 +0200
+Subject: [PATCH 1203/1921] crypto: inside-secure - Base RD fetchcount on
+ actual RD FIFO size
+
+This patch derives the result descriptor fetch count from the actual
+FIFO size advertised by the hardware. Fetching result descriptors
+one at a time is a performance bottleneck for small blocks, especially
+on hardware with multiple pipes. Even moreso if the HW has few rings.
+
+Signed-off-by: Pascal van Leeuwen <pvanleeuwen@verimatrix.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/crypto/inside-secure/safexcel.c | 37 +++++++++++++++++--------
+ drivers/crypto/inside-secure/safexcel.h | 15 +++++++++-
+ 2 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/safexcel.c b/drivers/crypto/inside-secure/safexcel.c
+index 32366f703332..acf26dfa7e94 100644
+--- a/drivers/crypto/inside-secure/safexcel.c
++++ b/drivers/crypto/inside-secure/safexcel.c
+@@ -357,13 +357,22 @@ static int safexcel_hw_setup_cdesc_rings(struct safexcel_crypto_priv *priv)
+ static int safexcel_hw_setup_rdesc_rings(struct safexcel_crypto_priv *priv)
+ {
+ 	u32 hdw, rd_size_rnd, val;
+-	int i;
+-
+-	hdw = readl(EIP197_HIA_AIC_G(priv) + EIP197_HIA_OPTIONS);
+-	hdw &= GENMASK(27, 25);
+-	hdw >>= 25;
++	int i, rd_fetch_cnt;
+ 
+-	rd_size_rnd = (priv->config.rd_size + (BIT(hdw) - 1)) >> hdw;
++	/* determine number of RD's we can fetch into the FIFO as one block */
++	rd_size_rnd = (EIP197_RD64_FETCH_SIZE +
++		      BIT(priv->hwconfig.hwdataw) - 1) >>
++		      priv->hwconfig.hwdataw;
++	if (priv->flags & SAFEXCEL_HW_EIP197) {
++		/* EIP197: try to fetch enough in 1 go to keep all pipes busy */
++		rd_fetch_cnt = (1 << priv->hwconfig.hwrfsize) / rd_size_rnd;
++		rd_fetch_cnt = min_t(uint, rd_fetch_cnt,
++				     (priv->config.pes * EIP197_FETCH_DEPTH));
++	} else {
++		/* for the EIP97, just fetch all that fits minus 1 */
++		rd_fetch_cnt = ((1 << priv->hwconfig.hwrfsize) /
++			       rd_size_rnd) - 1;
++	}
+ 
+ 	for (i = 0; i < priv->config.rings; i++) {
+ 		/* ring base address */
+@@ -376,8 +385,8 @@ static int safexcel_hw_setup_rdesc_rings(struct safexcel_crypto_priv *priv)
+ 		       priv->config.rd_size,
+ 		       EIP197_HIA_RDR(priv, i) + EIP197_HIA_xDR_DESC_SIZE);
+ 
+-		writel(((EIP197_FETCH_COUNT * (rd_size_rnd << hdw)) << 16) |
+-		       (EIP197_FETCH_COUNT * priv->config.rd_offset),
++		writel(((rd_fetch_cnt * (rd_size_rnd << hdw)) << 16) |
++		       (rd_fetch_cnt * priv->config.rd_offset),
+ 		       EIP197_HIA_RDR(priv, i) + EIP197_HIA_xDR_CFG);
+ 
+ 		/* Configure DMA tx control */
+@@ -1244,12 +1253,17 @@ static int safexcel_probe_generic(void *pdev,
+ 		priv->hwconfig.hwcfsize = ((hiaopt >> EIP197_CFSIZE_OFFSET) &
+ 					   EIP197_CFSIZE_MASK) +
+ 					  EIP197_CFSIZE_ADJUST;
++		priv->hwconfig.hwrfsize = ((hiaopt >> EIP197_RFSIZE_OFFSET) &
++					   EIP197_RFSIZE_MASK) +
++					  EIP197_RFSIZE_ADJUST;
+ 	} else {
+ 		/* EIP97 */
+ 		priv->hwconfig.hwdataw  = (hiaopt >> EIP197_HWDATAW_OFFSET) &
+ 					  EIP97_HWDATAW_MASK;
+ 		priv->hwconfig.hwcfsize = (hiaopt >> EIP97_CFSIZE_OFFSET) &
+ 					  EIP97_CFSIZE_MASK;
++		priv->hwconfig.hwrfsize = (hiaopt >> EIP97_RFSIZE_OFFSET) &
++					  EIP97_RFSIZE_MASK;
+ 	}
+ 
+ 	/* Get supported algorithms from EIP96 transform engine */
+@@ -1257,10 +1271,11 @@ static int safexcel_probe_generic(void *pdev,
+ 				    EIP197_PE_EIP96_OPTIONS(0));
+ 
+ 	/* Print single info line describing what we just detected */
+-	dev_info(priv->dev, "EIP%d:%x(%d)-HIA:%x(%d,%d),PE:%x,alg:%08x\n", peid,
+-		 priv->hwconfig.hwver, hwctg, priv->hwconfig.hiaver,
++	dev_info(priv->dev, "EIP%d:%x(%d)-HIA:%x(%d,%d,%d),PE:%x,alg:%08x\n",
++		 peid, priv->hwconfig.hwver, hwctg, priv->hwconfig.hiaver,
+ 		 priv->hwconfig.hwdataw, priv->hwconfig.hwcfsize,
+-		 priv->hwconfig.pever, priv->hwconfig.algo_flags);
++		 priv->hwconfig.hwrfsize, priv->hwconfig.pever,
++		 priv->hwconfig.algo_flags);
+ 
+ 	safexcel_configure(priv);
+ 
+diff --git a/drivers/crypto/inside-secure/safexcel.h b/drivers/crypto/inside-secure/safexcel.h
+index 2da757d5b404..7d740b31c056 100644
+--- a/drivers/crypto/inside-secure/safexcel.h
++++ b/drivers/crypto/inside-secure/safexcel.h
+@@ -30,7 +30,6 @@
+ #define EIP197_DEFAULT_RING_SIZE		400
+ #define EIP197_MAX_TOKENS			18
+ #define EIP197_MAX_RINGS			4
+-#define EIP197_FETCH_COUNT			1
+ #define EIP197_FETCH_DEPTH			2
+ #define EIP197_MAX_BATCH_SZ			64
+ 
+@@ -234,6 +233,11 @@
+ #define EIP97_CFSIZE_OFFSET			8
+ #define EIP197_CFSIZE_MASK			GENMASK(3, 0)
+ #define EIP97_CFSIZE_MASK			GENMASK(4, 0)
++#define EIP197_RFSIZE_OFFSET			12
++#define EIP197_RFSIZE_ADJUST			4
++#define EIP97_RFSIZE_OFFSET			12
++#define EIP197_RFSIZE_MASK			GENMASK(3, 0)
++#define EIP97_RFSIZE_MASK			GENMASK(4, 0)
+ 
+ /* EIP197_HIA_AIC_R_ENABLE_CTRL */
+ #define EIP197_CDR_IRQ(n)			BIT((n) * 2)
+@@ -462,6 +466,14 @@ struct safexcel_result_desc {
+ 	struct result_data_desc result_data;
+ } __packed;
+ 
++/*
++ * The EIP(1)97 only needs to fetch the descriptor part of
++ * the result descriptor, not the result token part!
++ */
++#define EIP197_RD64_FETCH_SIZE		((sizeof(struct safexcel_result_desc) -\
++					  sizeof(struct result_data_desc)) /\
++					 sizeof(u32))
++
+ struct safexcel_token {
+ 	u32 packet_length:17;
+ 	u8 stat:2;
+@@ -691,6 +703,7 @@ struct safexcel_hwconfig {
+ 	int pever;
+ 	int hwdataw;
+ 	int hwcfsize;
++	int hwrfsize;
+ };
+ 
+ struct safexcel_crypto_priv {
+-- 
+2.31.1
+

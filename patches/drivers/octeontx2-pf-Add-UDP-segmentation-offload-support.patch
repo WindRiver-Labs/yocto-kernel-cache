@@ -1,0 +1,228 @@
+From 95c1f38d559407781f8155a2b11f4aea259a43dd Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 1 Sep 2020 22:47:32 +0530
+Subject: [PATCH 0756/1921] octeontx2-pf: Add UDP segmentation offload support
+
+Defines UDP segmentation algorithm in hardware and supports
+offloading UDP segmentation.
+
+Change-Id: I2308c577ff211d8e69bd8cba5124bac936153f80
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/35193
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 89 +++++++++++++++++++
+ .../marvell/octeontx2/nic/otx2_common.h       |  5 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  6 +-
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 25 +++++-
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |  3 +-
+ 5 files changed, 124 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index fb1821733a61..9e1c37366550 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -362,6 +362,95 @@ int otx2_rss_init(struct otx2_nic *pfvf)
+ 	return 0;
+ }
+ 
++/* Setup UDP segmentation algorithm in HW */
++static void otx2_setup_udp_segmentation(struct nix_lso_format_cfg *lso, bool v4)
++{
++	struct nix_lso_format *field;
++
++	field = (struct nix_lso_format *)&lso->fields[0];
++	lso->field_mask = GENMASK(18, 0);
++
++	/* IP's Length field */
++	field->layer = NIX_TXLAYER_OL3;
++	/* In ipv4, length field is at offset 2 bytes, for ipv6 it's 4 */
++	field->offset = v4 ? 2 : 4;
++	field->sizem1 = 1; /* i.e 2 bytes */
++	field->alg = NIX_LSOALG_ADD_PAYLEN;
++	field++;
++
++	/* No ID field in IPv6 header */
++	if (v4) {
++		/* Increment IPID */
++		field->layer = NIX_TXLAYER_OL3;
++		field->offset = 4;
++		field->sizem1 = 1; /* i.e 2 bytes */
++		field->alg = NIX_LSOALG_ADD_SEGNUM;
++		field++;
++	}
++
++	/* Update length in UDP header */
++	field->layer = NIX_TXLAYER_OL4;
++	field->offset = 4;
++	field->sizem1 = 1;
++	field->alg = NIX_LSOALG_ADD_PAYLEN;
++}
++
++/* Setup segmentation algorithms in HW and retrieve algorithm index */
++void otx2_setup_segmentation(struct otx2_nic *pfvf)
++{
++	struct nix_lso_format_cfg_rsp *rsp;
++	struct nix_lso_format_cfg *lso;
++	struct otx2_hw *hw = &pfvf->hw;
++	int err;
++
++	mutex_lock(&pfvf->mbox.lock);
++
++	/* UDPv4 segmentation */
++	lso = otx2_mbox_alloc_msg_nix_lso_format_cfg(&pfvf->mbox);
++	if (!lso)
++		goto fail;
++
++	/* Setup UDP/IP header fields that HW should update per segment */
++	otx2_setup_udp_segmentation(lso, true);
++
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	if (err)
++		goto fail;
++
++	rsp = (struct nix_lso_format_cfg_rsp *)
++			otx2_mbox_get_rsp(&pfvf->mbox.mbox, 0, &lso->hdr);
++	if (IS_ERR(rsp))
++		goto fail;
++
++	hw->lso_udpv4_idx = rsp->lso_format_idx;
++
++	/* UDPv6 segmentation */
++	lso = otx2_mbox_alloc_msg_nix_lso_format_cfg(&pfvf->mbox);
++	if (!lso)
++		goto fail;
++
++	/* Setup UDP/IP header fields that HW should update per segment */
++	otx2_setup_udp_segmentation(lso, false);
++
++	err = otx2_sync_mbox_msg(&pfvf->mbox);
++	if (err)
++		goto fail;
++
++	rsp = (struct nix_lso_format_cfg_rsp *)
++			otx2_mbox_get_rsp(&pfvf->mbox.mbox, 0, &lso->hdr);
++	if (IS_ERR(rsp))
++		goto fail;
++
++	hw->lso_udpv6_idx = rsp->lso_format_idx;
++	mutex_unlock(&pfvf->mbox.lock);
++	return;
++fail:
++	mutex_unlock(&pfvf->mbox.lock);
++	netdev_info(pfvf->netdev,
++		    "Failed to get LSO index for UDP GSO offload, disabling\n");
++	pfvf->netdev->hw_features &= ~NETIF_F_GSO_UDP_L4;
++}
++
+ void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx)
+ {
+ 	/* Configure CQE interrupt coalescing parameters
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index eb45542b9b31..c3a72c24370a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -176,9 +176,11 @@ struct otx2_hw {
+ 	u16			rq_skid;
+ 	u8			cq_time_wait;
+ 
+-	/* For TSO segmentation */
++	/* Segmentation */
+ 	u8			lso_tsov4_idx;
+ 	u8			lso_tsov6_idx;
++	u8			lso_udpv4_idx;
++	u8			lso_udpv6_idx;
+ 	u8			hw_tso;
+ 
+ 	/* MSI-X*/
+@@ -711,6 +713,7 @@ void otx2_tx_timeout(struct net_device *netdev);
+ void otx2_get_mac_from_af(struct net_device *netdev);
+ void otx2_config_irq_coalescing(struct otx2_nic *pfvf, int qidx);
+ int otx2_config_pause_frm(struct otx2_nic *pfvf);
++void otx2_setup_segmentation(struct otx2_nic *pfvf);
+ 
+ /* RVU block related APIs */
+ int otx2_attach_npa_nix(struct otx2_nic *pfvf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index e298f45b1d8f..152f1621ef84 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1598,6 +1598,9 @@ int otx2_open(struct net_device *netdev)
+ 	if (err)
+ 		goto err_disable_napi;
+ 
++	/* Setup segmentation algorithms, if failed, clear offload capability */
++	otx2_setup_segmentation(pf);
++
+ 	/* Initialize RSS */
+ 	err = otx2_rss_init(pf);
+ 	if (err)
+@@ -2550,7 +2553,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	netdev->hw_features = (NETIF_F_RXCSUM | NETIF_F_IP_CSUM |
+ 			       NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+-			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);
++			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6 |
++			       NETIF_F_GSO_UDP_L4);
+ 	netdev->features |= netdev->hw_features;
+ 	/* Support TSO on tag interface */
+ 	netdev->vlan_features |= netdev->features;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 67769fc74d37..f2d44d5104b2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -600,10 +600,33 @@ static void otx2_sqe_add_ext(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+ 			 */
+ 			ip_hdr(skb)->tot_len =
+ 				htons(ext->lso_sb - skb_network_offset(skb));
+-		} else {
++		} else if (skb_shinfo(skb)->gso_type & SKB_GSO_TCPV6) {
+ 			ext->lso_format = pfvf->hw.lso_tsov6_idx;
++
+ 			ipv6_hdr(skb)->payload_len =
+ 				htons(ext->lso_sb - skb_network_offset(skb));
++		} else if (skb_shinfo(skb)->gso_type & SKB_GSO_UDP_L4) {
++			__be16 l3_proto = vlan_get_protocol(skb);
++			struct udphdr *udph = udp_hdr(skb);
++			u16 iplen;
++
++			ext->lso_sb = skb_transport_offset(skb) +
++					sizeof(struct udphdr);
++
++			/* HW adds payload size to length fields in IP and
++			 * UDP headers while segmentation, hence adjust the
++			 * lengths to just header sizes.
++			 */
++			iplen = htons(ext->lso_sb - skb_network_offset(skb));
++			if (l3_proto == htons(ETH_P_IP)) {
++				ip_hdr(skb)->tot_len = iplen;
++				ext->lso_format = pfvf->hw.lso_udpv4_idx;
++			} else {
++				ipv6_hdr(skb)->payload_len = iplen;
++				ext->lso_format = pfvf->hw.lso_udpv6_idx;
++			}
++
++			udph->len = htons(sizeof(struct udphdr));
+ 		}
+ 	} else if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) {
+ 		ext->tstmp = 1;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 2e6c56791b8a..556b1bc0c765 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -604,7 +604,8 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	netdev->hw_features = NETIF_F_RXCSUM | NETIF_F_IP_CSUM |
+ 			      NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+-			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
++			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6 |
++			      NETIF_F_GSO_UDP_L4;
+ 	netdev->features = netdev->hw_features;
+ 	/* Support TSO on tag interface */
+ 	netdev->vlan_features |= netdev->features;
+-- 
+2.31.1
+

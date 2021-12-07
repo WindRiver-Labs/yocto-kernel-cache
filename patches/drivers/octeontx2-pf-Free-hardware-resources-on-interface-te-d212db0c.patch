@@ -1,0 +1,271 @@
+From ca55306c2aaf02120f830658dab956dc89a2c3e2 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 7 Feb 2019 14:41:34 +0530
+Subject: [PATCH 0053/1921] octeontx2-pf: Free hardware resources on interface
+ teardown
+
+This patch does all the cleanup of NPA nad NIX resources
+upon logical interface teardown
+
+Change-Id: I4c6803e432c2ad3d75cdced33cdff909a11083f1
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Nithin Dabilpuram <ndabilpuram@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.c       | 74 ++++++++++++++++++-
+ .../marvell/octeontx2/nic/otx2_common.h       | 17 +++++
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 65 ++++++++++++++++
+ .../marvell/octeontx2/nic/otx2_txrx.c         |  4 +-
+ 4 files changed, 157 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index a87de5bb3877..d640c147f625 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -157,6 +157,27 @@ int otx2_txsch_alloc(struct otx2_nic *pfvf)
+ 	return otx2_sync_mbox_msg(&pfvf->mbox);
+ }
+ 
++int otx2_txschq_stop(struct otx2_nic *pfvf)
++{
++	struct nix_txsch_free_req *free_req;
++	int lvl, schq;
++
++	/* Free the transmit schedulers */
++	free_req = otx2_mbox_alloc_msg_nix_txsch_free(&pfvf->mbox);
++	if (!free_req)
++		return -ENOMEM;
++
++	free_req->flags = TXSCHQ_FREE_ALL;
++	WARN_ON(otx2_sync_mbox_msg(&pfvf->mbox));
++
++	/* Clear the txschq list */
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
++		for (schq = 0; schq < MAX_TXSCHQ_PER_FUNC; schq++)
++			pfvf->hw.txschq_list[lvl][schq] = 0;
++	}
++	return 0;
++}
++
+ static int otx2_rq_init(struct otx2_nic *pfvf, u16 qidx, u16 lpb_aura)
+ {
+ 	struct nix_aq_enq_req *aq;
+@@ -345,7 +366,40 @@ int otx2_config_nix(struct otx2_nic *pfvf)
+ 	return otx2_sync_mbox_msg(&pfvf->mbox);
+ }
+ 
+-static void otx2_aura_pool_free(struct otx2_nic *pfvf)
++void otx2_free_aura_ptr(struct otx2_nic *pfvf, int type)
++{
++	int pool_id, pool_start = 0, pool_end = 0, size = 0;
++	u64 iova, pa;
++
++	if (type == AURA_NIX_SQ) {
++		pool_start = otx2_get_pool_idx(pfvf, type, 0);
++		pool_end =  pool_start + pfvf->hw.sqpool_cnt;
++		size = pfvf->hw.sqb_size;
++	}
++	if (type == AURA_NIX_RQ) {
++		pool_start = otx2_get_pool_idx(pfvf, type, 0);
++		pool_end = pfvf->hw.rqpool_cnt;
++		size = RCV_FRAG_LEN;
++	}
++
++	/* Free SQB and RQB pointers from the aura pool */
++	for (pool_id = pool_start; pool_id < pool_end; pool_id++) {
++		iova = otx2_aura_allocptr(pfvf, pool_id);
++		while (iova) {
++			if (type == AURA_NIX_RQ)
++				iova -= OTX2_HEAD_ROOM;
++
++			pa = otx2_iova_to_phys(pfvf->iommu_domain, iova);
++			dma_unmap_page_attrs(pfvf->dev, iova, size,
++					     DMA_FROM_DEVICE,
++					     DMA_ATTR_SKIP_CPU_SYNC);
++			put_page(virt_to_page(phys_to_virt(pa)));
++			iova = otx2_aura_allocptr(pfvf, pool_id);
++		}
++	}
++}
++
++void otx2_aura_pool_free(struct otx2_nic *pfvf)
+ {
+ 	struct otx2_pool *pool;
+ 	int pool_id;
+@@ -654,6 +708,24 @@ int otx2_attach_npa_nix(struct otx2_nic *pfvf)
+ 	return 0;
+ }
+ 
++void otx2_ctx_disable(struct mbox *mbox, int type, bool npa)
++{
++	struct hwctx_disable_req *req;
++
++	/* Request AQ to disable this context */
++	if (npa)
++		req = otx2_mbox_alloc_msg_npa_hwctx_disable(mbox);
++	else
++		req = otx2_mbox_alloc_msg_nix_hwctx_disable(mbox);
++
++	if (!req)
++		return;
++
++	req->ctype = type;
++
++	WARN_ON(otx2_sync_mbox_msg(mbox));
++}
++
+ /* Mbox message handlers */
+ void mbox_handler_nix_txsch_alloc(struct otx2_nic *pf,
+ 				  struct nix_txsch_alloc_rsp *rsp)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 472ecee35ebe..50c290b8ce04 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -179,6 +179,16 @@ static inline __uint128_t otx2_read128(const void __iomem *addr)
+ 		(((__uint128_t)le64_to_cpu(otx2_high(h, l))) << 64);
+ }
+ 
++/* Alloc pointer from pool/aura */
++static inline u64 otx2_aura_allocptr(struct otx2_nic *pfvf, int aura)
++{
++	atomic64_t *ptr = (__force atomic64_t *)(pfvf->reg_base
++				+ NPA_LF_AURA_OP_ALLOCX(0));
++	u64 incr = (u64)aura | BIT_ULL(63);
++
++	return atomic64_fetch_add_relaxed(incr, ptr);
++}
++
+ /* Free pointer to a pool/aura */
+ static inline void otx2_aura_freeptr(struct otx2_nic *pfvf,
+ 				     int aura, s64 buf)
+@@ -279,13 +289,20 @@ int otx2_detach_resources(struct mbox *mbox);
+ int otx2_config_npa(struct otx2_nic *pfvf);
+ int otx2_sq_aura_pool_init(struct otx2_nic *pfvf);
+ int otx2_rq_aura_pool_init(struct otx2_nic *pfvf);
++void otx2_aura_pool_free(struct otx2_nic *pfvf);
++void otx2_free_aura_ptr(struct otx2_nic *pfvf, int type);
+ int otx2_config_nix(struct otx2_nic *pfvf);
+ int otx2_config_nix_queues(struct otx2_nic *pfvf);
+ int otx2_txschq_config(struct otx2_nic *pfvf, int lvl);
+ int otx2_txsch_alloc(struct otx2_nic *pfvf);
++int otx2_txschq_stop(struct otx2_nic *pfvf);
+ dma_addr_t otx2_alloc_rbuf(struct otx2_nic *pfvf, struct otx2_pool *pool,
+ 			   gfp_t gfp);
+ int otx2_rxtx_enable(struct otx2_nic *pfvf, bool enable);
++void otx2_ctx_disable(struct mbox *mbox, int type, bool npa);
++
++int otx2_napi_handler(struct otx2_cq_queue *cq,
++		      struct otx2_nic *pfvf, int budget);
+ 
+ /* Mbox handlers */
+ void mbox_handler_msix_offset(struct otx2_nic *pfvf,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 8c0b2de5b1e7..61e781e01700 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -361,6 +361,69 @@ static int otx2_init_hw_resources(struct otx2_nic *pf)
+ 	return 0;
+ }
+ 
++static void otx2_free_hw_resources(struct otx2_nic *pf)
++{
++	struct otx2_qset *qset = &pf->qset;
++	struct mbox *mbox = &pf->mbox;
++	struct otx2_snd_queue *sq;
++	struct otx2_cq_queue *cq;
++	int err, qidx, cqe_count;
++	struct msg_req *req;
++
++	/* Stop transmission */
++	err = otx2_txschq_stop(pf);
++	if (err)
++		dev_err(pf->dev, "RVUPF: Failed to stop/free TX schedulers\n");
++
++	/* Disable SQs */
++	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_SQ, false);
++	for (qidx = 0; qidx < pf->hw.tx_queues; qidx++) {
++		sq = &qset->sq[qidx];
++		qmem_free(pf->dev, sq->sqe);
++		kfree(sq->sg);
++	}
++
++	/* Free SQB pointers */
++	otx2_free_aura_ptr(pf, AURA_NIX_SQ);
++
++	/* Disable RQs */
++	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_RQ, false);
++
++	/*Dequeue all CQEs */
++	for (qidx = 0; qidx < qset->cq_cnt; qidx++) {
++		cq = &qset->cq[qidx];
++		cqe_count = otx2_read64(pf, NIX_LF_CINTX_CNT(cq->cint_idx));
++		cqe_count &= 0xFFFFFFFF;
++		if (cqe_count)
++			otx2_napi_handler(cq, pf, cqe_count);
++	}
++
++	/* Free RQ buffer pointers*/
++	otx2_free_aura_ptr(pf, AURA_NIX_RQ);
++
++	/* Disable CQs*/
++	otx2_ctx_disable(mbox, NIX_AQ_CTYPE_CQ, false);
++	for (qidx = 0; qidx < qset->cq_cnt; qidx++) {
++		cq = &qset->cq[qidx];
++		qmem_free(pf->dev, cq->cqe);
++	}
++
++	/* Reset NIX LF */
++	req = otx2_mbox_alloc_msg_nix_lf_free(mbox);
++	if (req)
++		WARN_ON(otx2_sync_mbox_msg(mbox));
++
++	/* Disable NPA Pool and Aura hw context */
++	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_POOL, true);
++	otx2_ctx_disable(mbox, NPA_AQ_CTYPE_AURA, true);
++	otx2_aura_pool_free(pf);
++
++	/* Reset NPA LF */
++	req = otx2_mbox_alloc_msg_npa_lf_free(mbox);
++	if (req)
++		WARN_ON(otx2_sync_mbox_msg(mbox));
++}
++
+ static netdev_tx_t otx2_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 
+ {
+@@ -498,6 +561,7 @@ static int otx2_open(struct net_device *netdev)
+ err_free_cints:
+ 	otx2_free_cints(pf, qidx);
+ 	otx2_disable_napi(pf);
++	otx2_free_hw_resources(pf);
+ err_free_mem:
+ 	kfree(qset->sq);
+ 	kfree(qset->cq);
+@@ -537,6 +601,7 @@ static int otx2_stop(struct net_device *netdev)
+ 
+ 	netif_tx_disable(netdev);
+ 
++	otx2_free_hw_resources(pf);
+ 	otx2_free_cints(pf, pf->hw.cint_cnt);
+ 	otx2_disable_napi(pf);
+ 	kfree(qset->sq);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 1b6c73f2239a..a54e3ebaff01 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -232,8 +232,8 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 
+ #define CQE_ADDR(CQ, idx) ((CQ)->cqe_base + ((CQ)->cqe_size * (idx)))
+ 
+-static int otx2_napi_handler(struct otx2_cq_queue *cq, struct otx2_nic *pfvf,
+-			     int budget)
++int otx2_napi_handler(struct otx2_cq_queue *cq,
++		      struct otx2_nic *pfvf, int budget)
+ {
+ 	struct otx2_pool *rbpool = cq->rbpool;
+ 	int processed_cqe = 0, workdone = 0;
+-- 
+2.31.1
+

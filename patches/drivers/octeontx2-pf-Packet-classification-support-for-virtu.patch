@@ -1,0 +1,298 @@
+From 85eb79bad5f5b5c4e8762b43eaf4e5758c73a9ee Mon Sep 17 00:00:00 2001
+From: Rakesh Babu <rsaladi2@marvell.com>
+Date: Tue, 20 Jul 2021 12:02:45 +0530
+Subject: [PATCH 1666/1921] octeontx2-pf: Packet classification support for
+ virtual functions.
+
+Add packet flow classification support for both LMAC mapped virtual
+functions and loopback VFs. This patch adds supports for ntuple
+offload feature.
+
+Change-Id: Ic83a350a8e40c5d3fe1ecaf5f117dd364eddefef
+Signed-off-by: Rakesh Babu <rsaladi2@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/57363
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 13 +----
+ .../marvell/octeontx2/nic/otx2_common.h       |  1 +
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 52 ++++-------------
+ .../marvell/octeontx2/nic/otx2_flows.c        | 58 ++++++++++++++++++-
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  | 20 +++++++
+ 5 files changed, 91 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index 7058318b4fae..6cf0118688b7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -1034,13 +1034,11 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	struct rvu_npc_mcam_rule dummy = { 0 };
+ 	struct rvu_npc_mcam_rule *rule;
+-	bool new = false, msg_from_vf;
+ 	u16 owner = req->hdr.pcifunc;
+ 	struct msg_rsp write_rsp;
+ 	struct mcam_entry *entry;
+ 	int entry_index, err;
+-
+-	msg_from_vf = !!(owner & RVU_PFVF_FUNC_MASK);
++	bool new = false;
+ 
+ 	installed_features = req->features;
+ 	features = req->features;
+@@ -1066,7 +1064,7 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 	}
+ 
+ 	/* update mcam entry with default unicast rule attributes */
+-	if (def_ucast_rule && (msg_from_vf || (req->default_rule && req->append))) {
++	if (def_ucast_rule && (req->default_rule && req->append)) {
+ 		missing_features = (def_ucast_rule->features ^ features) &
+ 					def_ucast_rule->features;
+ 		if (missing_features)
+@@ -1262,13 +1260,6 @@ int rvu_mbox_handler_npc_install_flow(struct rvu *rvu,
+ 		return 0;
+ 	}
+ 
+-	/* If message is from VF then its flow should not overlap with
+-	 * reserved unicast flow.
+-	 */
+-	if (from_vf && pfvf->def_ucast_rule && is_npc_intf_rx(req->intf) &&
+-	    pfvf->def_ucast_rule->features & req->features)
+-		return NPC_FLOW_VF_OVERLAP;
+-
+ 	mutex_lock(&rswitch->switch_lock);
+ 	err = npc_install_flow(rvu, blkaddr, target, nixlf, pfvf,
+ 			       req, rsp, enable, pf_set_vfs_mac);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index c5a821eefcb4..f4a687b63ca7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -878,6 +878,7 @@ int otx2_set_npc_parse_mode(struct otx2_nic *pfvf, bool unbind);
+ 
+ /* MCAM filter related APIs */
+ int otx2_mcam_flow_init(struct otx2_nic *pf);
++int otx2vf_mcam_flow_init(struct otx2_nic *pfvf);
+ int otx2_alloc_mcam_entries(struct otx2_nic *pfvf);
+ void otx2_mcam_flow_del(struct otx2_nic *pf);
+ int otx2_destroy_ntuple_flows(struct otx2_nic *pf);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index 2d4eb25463f0..70f7100eb5cf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -688,6 +688,7 @@ static int otx2_set_rss_hash_opts(struct otx2_nic *pfvf,
+ static int otx2_get_rxnfc(struct net_device *dev,
+ 			  struct ethtool_rxnfc *nfc, u32 *rules)
+ {
++	bool ntuple = !!(dev->features & NETIF_F_NTUPLE);
+ 	struct otx2_nic *pfvf = netdev_priv(dev);
+ 	int ret = -EOPNOTSUPP;
+ 
+@@ -697,14 +698,18 @@ static int otx2_get_rxnfc(struct net_device *dev,
+ 		ret = 0;
+ 		break;
+ 	case ETHTOOL_GRXCLSRLCNT:
+-		nfc->rule_cnt = pfvf->flow_cfg->nr_flows;
+-		ret = 0;
++		if (netif_running(dev) && ntuple) {
++			nfc->rule_cnt = pfvf->flow_cfg->nr_flows;
++			ret = 0;
++		}
+ 		break;
+ 	case ETHTOOL_GRXCLSRULE:
+-		ret = otx2_get_flow(pfvf, nfc,  nfc->fs.location);
++		if (netif_running(dev) && ntuple)
++			ret = otx2_get_flow(pfvf, nfc,  nfc->fs.location);
+ 		break;
+ 	case ETHTOOL_GRXCLSRLALL:
+-		ret = otx2_get_all_flows(pfvf, nfc, rules);
++		if (netif_running(dev) && ntuple)
++			ret = otx2_get_all_flows(pfvf, nfc, rules);
+ 		break;
+ 	case ETHTOOL_GRXFH:
+ 		return otx2_get_rss_hash_opts(pfvf, nfc);
+@@ -739,41 +744,6 @@ static int otx2_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *nfc)
+ 	return ret;
+ }
+ 
+-static int otx2vf_get_rxnfc(struct net_device *dev,
+-			    struct ethtool_rxnfc *nfc, u32 *rules)
+-{
+-	struct otx2_nic *pfvf = netdev_priv(dev);
+-	int ret = -EOPNOTSUPP;
+-
+-	switch (nfc->cmd) {
+-	case ETHTOOL_GRXRINGS:
+-		nfc->data = pfvf->hw.rx_queues;
+-		ret = 0;
+-		break;
+-	case ETHTOOL_GRXFH:
+-		return otx2_get_rss_hash_opts(pfvf, nfc);
+-	default:
+-		break;
+-	}
+-	return ret;
+-}
+-
+-static int otx2vf_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *nfc)
+-{
+-	struct otx2_nic *pfvf = netdev_priv(dev);
+-	int ret = -EOPNOTSUPP;
+-
+-	switch (nfc->cmd) {
+-	case ETHTOOL_SRXFH:
+-		ret = otx2_set_rss_hash_opts(pfvf, nfc);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return ret;
+-}
+-
+ static u32 otx2_get_rxfh_key_size(struct net_device *netdev)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+@@ -1684,8 +1654,8 @@ static const struct ethtool_ops otx2vf_ethtool_ops = {
+ 	.get_sset_count		= otx2vf_get_sset_count,
+ 	.set_channels		= otx2_set_channels,
+ 	.get_channels		= otx2_get_channels,
+-	.get_rxnfc		= otx2vf_get_rxnfc,
+-	.set_rxnfc              = otx2vf_set_rxnfc,
++	.get_rxnfc		= otx2_get_rxnfc,
++	.set_rxnfc              = otx2_set_rxnfc,
+ 	.get_rxfh_key_size	= otx2_get_rxfh_key_size,
+ 	.get_rxfh_indir_size	= otx2_get_rxfh_indir_size,
+ 	.get_rxfh		= otx2_get_rxfh,
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+index cd12618ecf66..5ed3b2540982 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+@@ -98,7 +98,11 @@ static int otx2_alloc_ntuple_mcam_entries(struct otx2_nic *pfvf, u16 count)
+ 		req->contig = false;
+ 		req->count = (count - allocated) > NPC_MAX_NONCONTIG_ENTRIES ?
+ 				NPC_MAX_NONCONTIG_ENTRIES : count - allocated;
+-		req->priority = NPC_MCAM_HIGHER_PRIO;
++		/* For VFs setting the priority to be of NPC_MCAM_ANY_PRIO so
++		 * that MCAM entries gets allocated from middle zone
++		 */
++		req->priority = (pfvf->pcifunc & RVU_PFVF_FUNC_MASK) ?
++				 NPC_MCAM_ANY_PRIO : NPC_MCAM_HIGHER_PRIO;
+ 		req->ref_entry = flow_cfg->def_ent[0];
+ 
+ 		/* Send message to AF */
+@@ -208,6 +212,56 @@ int otx2_alloc_mcam_entries(struct otx2_nic *pfvf)
+ 	return 0;
+ }
+ 
++static void otx2vf_free_flow_cfg(struct otx2_nic *pfvf)
++{
++	if (pfvf->flow_cfg) {
++		if (pfvf->flow_cfg->def_ent) {
++			devm_kfree(pfvf->dev, pfvf->flow_cfg->def_ent);
++			pfvf->flow_cfg->def_ent = NULL;
++		}
++
++		devm_kfree(pfvf->dev, pfvf->flow_cfg);
++		pfvf->flow_cfg = NULL;
++	}
++}
++
++int otx2vf_mcam_flow_init(struct otx2_nic *pfvf)
++{
++	struct otx2_flow_config *flow_cfg;
++	int count;
++
++	pfvf->flow_cfg = devm_kzalloc(pfvf->dev,
++				      sizeof(struct otx2_flow_config),
++				      GFP_KERNEL);
++	if (!pfvf->flow_cfg)
++		return -ENOMEM;
++
++	flow_cfg = pfvf->flow_cfg;
++	INIT_LIST_HEAD(&flow_cfg->flow_list);
++	flow_cfg->ntuple_max_flows = 0;
++	flow_cfg->def_ent = devm_kmalloc_array(pfvf->dev,
++					       OTX2_DEFAULT_FLOWCOUNT,
++					       sizeof(u16), GFP_KERNEL);
++	if (!flow_cfg->def_ent) {
++		otx2vf_free_flow_cfg(pfvf);
++		return -ENOMEM;
++	}
++
++	count = otx2_alloc_ntuple_mcam_entries(pfvf, OTX2_DEFAULT_FLOWCOUNT);
++	if (count <= 0) {
++		netdev_info(pfvf->netdev, "Unable to allocate MCAM entries\n");
++		otx2vf_free_flow_cfg(pfvf);
++		return -ENOMEM;
++	}
++
++	flow_cfg->ntuple_max_flows = count;
++
++	pfvf->flags |= OTX2_FLAG_MCAM_ENTRIES_ALLOC;
++	pfvf->flags |= OTX2_FLAG_NTUPLE_SUPPORT;
++
++	return 0;
++}
++
+ int otx2_mcam_flow_init(struct otx2_nic *pf)
+ {
+ 	int err;
+@@ -1060,6 +1114,8 @@ int otx2_add_flow(struct otx2_nic *pfvf, struct ethtool_rxnfc *nfc)
+ 	}
+ 
+ 	if (err) {
++		if (err == 0xFFFEULL)
++			err = -EINVAL;
+ 		if (new)
+ 			kfree(flow);
+ 		return err;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index 1fdeb201ad3f..cd904eeda51f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -487,6 +487,24 @@ static void otx2vf_reset_task(struct work_struct *work)
+ 	rtnl_unlock();
+ }
+ 
++static int otx2vf_set_features(struct net_device *netdev,
++			       netdev_features_t features)
++{
++	netdev_features_t changed = features ^ netdev->features;
++	bool ntuple_enabled = !!(features & NETIF_F_NTUPLE);
++	struct otx2_nic *vf = netdev_priv(netdev);
++	int err = 0;
++
++	if (changed & NETIF_F_NTUPLE) {
++		if (ntuple_enabled)
++			err = otx2vf_mcam_flow_init(vf);
++		else
++			otx2_mcam_flow_del(vf);
++	}
++
++	return err;
++}
++
+ static const struct net_device_ops otx2vf_netdev_ops = {
+ 	.ndo_open = otx2vf_open,
+ 	.ndo_stop = otx2vf_stop,
+@@ -494,6 +512,7 @@ static const struct net_device_ops otx2vf_netdev_ops = {
+ 	.ndo_set_rx_mode = otx2vf_set_rx_mode,
+ 	.ndo_set_mac_address = otx2_set_mac_address,
+ 	.ndo_change_mtu = otx2vf_change_mtu,
++	.ndo_set_features = otx2vf_set_features,
+ 	.ndo_get_stats64 = otx2_get_stats64,
+ 	.ndo_tx_timeout = otx2_tx_timeout,
+ };
+@@ -660,6 +679,7 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 				NETIF_F_HW_VLAN_STAG_TX;
+ 	netdev->features |= netdev->hw_features;
+ 
++	netdev->hw_features |= NETIF_F_NTUPLE;
+ 	netdev->hw_features |= NETIF_F_RXALL;
+ 
+ 	netdev->gso_max_segs = OTX2_MAX_GSO_SEGS;
+-- 
+2.31.1
+

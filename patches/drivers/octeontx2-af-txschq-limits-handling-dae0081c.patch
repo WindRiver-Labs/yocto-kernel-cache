@@ -1,0 +1,352 @@
+From 4e5e20f49c89293cee1b3248cc22d18284d067ab Mon Sep 17 00:00:00 2001
+From: Krzysztof Garczynski <kgarczynski@marvell.com>
+Date: Fri, 25 Jan 2019 16:51:09 +0530
+Subject: [PATCH 0019/1921] octeontx2-af: txschq limits handling
+
+This commit adds ability to set and track limits for all TXSCHQs.
+
+Limit value, for every txschq, may be set through sysfs entry for each
+PF. Maximum value cannot exceed the amount of resources attachet to
+all pcifunc from a given PF family (PF + its VFs).
+
+Change-Id: I636705cf10cf73b4bc033b70cd417621b541a118
+Signed-off-by: Krzysztof Garczynski <kgarczynski@marvell.com>
+Signed-off-by: Stanislaw Kardach <skardach@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |   8 +
+ .../marvell/octeontx2/af/rvu_validation.c     | 195 +++++++++++++++++-
+ .../marvell/octeontx2/af/rvu_validation.h     |   6 +
+ 3 files changed, 204 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 4a7609fd6dd0..dac3b9c4c9af 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -1151,6 +1151,14 @@ int rvu_mbox_handler_nix_txsch_alloc(struct rvu *rvu,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&rvu->rsrc_lock);
++
++	/* Check if full request can be accommodated */
++	if (rvu_check_txsch_policy(rvu, req, pcifunc)) {
++		dev_err(rvu->dev, "Func 0x%x: TXSCH policy check failed\n",
++			pcifunc);
++		goto err;
++	}
++
+ 	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
+ 		txsch = &nix_hw->txsch[lvl];
+ 		req_schq = req->schq_contig[lvl] + req->schq[lvl];
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.c
+index eba92628efd5..ea95518694cd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.c
+@@ -205,14 +205,30 @@ static int rvu_blk_count_rsrc(struct rvu_block *block, u16 pcifunc, u8 rshift)
+ 	return count;
+ }
+ 
++static int rvu_txsch_count_rsrc(struct rvu *rvu, int lvl, u16 pcifunc,
++				u8 rshift)
++{
++	struct nix_txsch *txsch = &rvu->hw->nix0->txsch[lvl];
++	int count = 0, schq;
++
++	if (lvl == NIX_TXSCH_LVL_TL1)
++		return 0;
++
++	for (schq = 0; schq < txsch->schq.max; schq++) {
++		if ((txsch->pfvf_map[schq] >> rshift) == (pcifunc >> rshift))
++			count++;
++	}
++
++	return count;
++}
++
+ int rvu_mbox_handler_free_rsrc_cnt(struct rvu *rvu, struct msg_req *req,
+ 				   struct free_rsrcs_rsp *rsp)
+ {
+-	struct nix_hw *nix_hw = rvu->hw->nix0;
+ 	struct rvu_hwinfo *hw = rvu->hw;
+ 	u16 pcifunc = req->hdr.pcifunc;
+ 	struct rvu_block *block;
+-	int lvl, pf, curlfs;
++	int pf, curlfs;
+ 
+ 	mutex_lock(&rvu->rsrc_lock);
+ 	pf = rvu_get_pf(pcifunc);
+@@ -241,13 +257,73 @@ int rvu_mbox_handler_free_rsrc_cnt(struct rvu *rvu, struct msg_req *req,
+ 	curlfs = rvu_blk_count_rsrc(block, pcifunc, RVU_PFVF_PF_SHIFT);
+ 	rsp->cpt = rvu->pf_limits.cpt->a[pf].val - curlfs;
+ 
+-	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++)
+-		rsp->schq[lvl] = rvu_rsrc_free_count(&nix_hw->txsch[lvl].schq);
++	curlfs = rvu_txsch_count_rsrc(rvu, NIX_TXSCH_LVL_SMQ, pcifunc,
++				      RVU_PFVF_PF_SHIFT);
++	rsp->schq[NIX_TXSCH_LVL_SMQ] = rvu->pf_limits.smq->a[pf].val - curlfs;
++
++	curlfs = rvu_txsch_count_rsrc(rvu, NIX_TXSCH_LVL_TL4, pcifunc,
++				      RVU_PFVF_PF_SHIFT);
++	rsp->schq[NIX_TXSCH_LVL_TL4] = rvu->pf_limits.tl4->a[pf].val - curlfs;
++
++	curlfs = rvu_txsch_count_rsrc(rvu, NIX_TXSCH_LVL_TL3, pcifunc,
++				      RVU_PFVF_PF_SHIFT);
++	rsp->schq[NIX_TXSCH_LVL_TL3] = rvu->pf_limits.tl3->a[pf].val - curlfs;
++
++	curlfs = rvu_txsch_count_rsrc(rvu, NIX_TXSCH_LVL_TL2, pcifunc,
++				      RVU_PFVF_PF_SHIFT);
++	rsp->schq[NIX_TXSCH_LVL_TL2] = rvu->pf_limits.tl2->a[pf].val - curlfs;
++
++	//Two TL1s available (normal and express DMA)
++	rsp->schq[NIX_TXSCH_LVL_TL1] = 2;
++
+ 	mutex_unlock(&rvu->rsrc_lock);
+ 
+ 	return 0;
+ }
+ 
++int rvu_check_txsch_policy(struct rvu *rvu, struct nix_txsch_alloc_req *req,
++				u16 pcifunc)
++{
++	struct nix_txsch *txsch;
++	int lvl, req_schq, pf = rvu_get_pf(pcifunc);
++	int limit, familylfs, delta;
++
++	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
++		txsch = &rvu->hw->nix0->txsch[lvl];
++		req_schq = req->schq_contig[lvl] + req->schq[lvl];
++
++		switch (lvl) {
++		case NIX_TXSCH_LVL_SMQ:
++			limit = rvu->pf_limits.smq->a[pf].val;
++			break;
++		case NIX_TXSCH_LVL_TL4:
++			limit = rvu->pf_limits.tl4->a[pf].val;
++			break;
++		case NIX_TXSCH_LVL_TL3:
++			limit = rvu->pf_limits.tl3->a[pf].val;
++			break;
++		case NIX_TXSCH_LVL_TL2:
++			limit = rvu->pf_limits.tl2->a[pf].val;
++			break;
++		case NIX_TXSCH_LVL_TL1:
++			if (req_schq > 2)
++				return -ENOSPC;
++			continue;
++		}
++
++		familylfs = rvu_txsch_count_rsrc(rvu, lvl, pcifunc,
++						 RVU_PFVF_PF_SHIFT);
++		delta = req_schq - rvu_txsch_count_rsrc(rvu, lvl, pcifunc, 0);
++
++		if ((delta > 0) && /* always allow usage decrease */
++		    ((limit < familylfs + delta) ||
++		     (delta > rvu_rsrc_free_count(&txsch->schq))))
++			return -ENOSPC;
++	}
++
++	return 0;
++}
++
+ int rvu_check_rsrc_policy(struct rvu *rvu, struct rsrc_attach *req,
+ 			  u16 pcifunc)
+ {
+@@ -364,7 +440,8 @@ static struct rvu_quota_ops pf_limit_ops = {
+ 
+ static void rvu_set_default_limits(struct rvu *rvu)
+ {
+-	int i, sso_rvus = 0, totalvfs;
++	struct nix_hw *nix_hw = rvu->hw->nix0;
++	int i, sso_rvus = 0, nix_rvus = 0, totalvfs;
+ 
+ 	/* First pass, count number of SSO/TIM PFs. */
+ 	for (i = 0; i < rvu->hw->total_pfs; i++) {
+@@ -372,7 +449,11 @@ static void rvu_set_default_limits(struct rvu *rvu)
+ 			continue;
+ 		if (rvu->pf[i].pdev->device == PCI_DEVID_OCTEONTX2_SSO_RVU_PF)
+ 			sso_rvus++;
++		if (rvu->pf[i].pdev->device == PCI_DEVID_OCTEONTX2_RVU_PF ||
++		    rvu->pf[i].pdev->device == PCI_DEVID_OCTEONTX2_RVU_AF)
++			nix_rvus++;
+ 	}
++
+ 	/* Second pass, set the default limit values. */
+ 	for (i = 0; i < rvu->hw->total_pfs; i++) {
+ 		if (rvu->pf[i].pdev == NULL)
+@@ -382,10 +463,34 @@ static void rvu_set_default_limits(struct rvu *rvu)
+ 		case PCI_DEVID_OCTEONTX2_RVU_AF:
+ 			rvu->pf_limits.nix->a[i].val = totalvfs;
+ 			rvu->pf_limits.npa->a[i].val = totalvfs;
++			rvu->pf_limits.smq->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_SMQ].schq.max /
++				nix_rvus;
++			rvu->pf_limits.tl4->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_TL4].schq.max /
++				nix_rvus;
++			rvu->pf_limits.tl3->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_TL3].schq.max /
++				nix_rvus;
++			rvu->pf_limits.tl2->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_TL2].schq.max /
++				nix_rvus;
+ 			break;
+ 		case PCI_DEVID_OCTEONTX2_RVU_PF:
+ 			rvu->pf_limits.nix->a[i].val = 1 + totalvfs;
+ 			rvu->pf_limits.npa->a[i].val = 1 + totalvfs;
++			rvu->pf_limits.smq->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_SMQ].schq.max /
++				nix_rvus;
++			rvu->pf_limits.tl4->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_TL4].schq.max /
++				nix_rvus;
++			rvu->pf_limits.tl3->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_TL3].schq.max /
++				nix_rvus;
++			rvu->pf_limits.tl2->a[i].val =
++				nix_hw->txsch[NIX_TXSCH_LVL_TL2].schq.max /
++				nix_rvus;
+ 			break;
+ 		case PCI_DEVID_OCTEONTX2_SSO_RVU_PF:
+ 			rvu->pf_limits.npa->a[i].val = totalvfs;
+@@ -478,6 +583,38 @@ static int rvu_create_limits_sysfs(struct rvu *rvu)
+ 			err = -EFAULT;
+ 			break;
+ 		}
++
++		if (quota_sysfs_create("smq", pf->limits_kobj, rvu->dev,
++				       &rvu->pf_limits.smq->a[i], pf)) {
++			dev_err(rvu->dev, "Failed to allocate quota for smq on %s\n",
++				pci_name(pf->pdev));
++			err = -EFAULT;
++			break;
++		}
++
++		if (quota_sysfs_create("tl4", pf->limits_kobj, rvu->dev,
++				       &rvu->pf_limits.tl4->a[i], pf)) {
++			dev_err(rvu->dev, "Failed to allocate quota for tl4 on %s\n",
++				pci_name(pf->pdev));
++			err = -EFAULT;
++			break;
++		}
++
++		if (quota_sysfs_create("tl3", pf->limits_kobj, rvu->dev,
++				       &rvu->pf_limits.tl3->a[i], pf)) {
++			dev_err(rvu->dev, "Failed to allocate quota for tl3 on %s\n",
++				pci_name(pf->pdev));
++			err = -EFAULT;
++			break;
++		}
++
++		if (quota_sysfs_create("tl2", pf->limits_kobj, rvu->dev,
++				       &rvu->pf_limits.tl2->a[i], pf)) {
++			dev_err(rvu->dev, "Failed to allocate quota for tl2 on %s\n",
++				pci_name(pf->pdev));
++			err = -EFAULT;
++			break;
++		}
+ 	}
+ 
+ 	return err;
+@@ -494,6 +631,12 @@ void rvu_policy_destroy(struct rvu *rvu)
+ 	quotas_free(rvu->pf_limits.cpt);
+ 	quotas_free(rvu->pf_limits.tim);
+ 	quotas_free(rvu->pf_limits.nix);
++
++	quotas_free(rvu->pf_limits.smq);
++	quotas_free(rvu->pf_limits.tl4);
++	quotas_free(rvu->pf_limits.tl3);
++	quotas_free(rvu->pf_limits.tl2);
++
+ 	rvu->pf_limits.sso = NULL;
+ 	rvu->pf_limits.ssow = NULL;
+ 	rvu->pf_limits.npa = NULL;
+@@ -501,6 +644,11 @@ void rvu_policy_destroy(struct rvu *rvu)
+ 	rvu->pf_limits.tim = NULL;
+ 	rvu->pf_limits.nix = NULL;
+ 
++	rvu->pf_limits.smq = NULL;
++	rvu->pf_limits.tl4 = NULL;
++	rvu->pf_limits.tl3 = NULL;
++	rvu->pf_limits.tl2 = NULL;
++
+ 	for (i = 0; i < rvu->hw->total_pfs; i++) {
+ 		pf = &rvu->pf[i];
+ 		kobject_del(pf->limits_kobj);
+@@ -511,6 +659,7 @@ int rvu_policy_init(struct rvu *rvu)
+ {
+ 	struct pci_dev *pdev = rvu->pdev;
+ 	struct rvu_hwinfo *hw = rvu->hw;
++	struct nix_hw *nix_hw = rvu->hw->nix0;
+ 	int err, i = 0;
+ 	u32 max = 0;
+ 
+@@ -571,6 +720,42 @@ int rvu_policy_init(struct rvu *rvu)
+ 		goto error;
+ 	}
+ 
++	max = nix_hw->txsch[NIX_TXSCH_LVL_SMQ].schq.max;
++	rvu->pf_limits.smq = quotas_alloc(hw->total_pfs, max, max, 0,
++					     &rvu->rsrc_lock, &pf_limit_ops);
++	if (!rvu->pf_limits.smq) {
++		dev_err(rvu->dev, "Failed to allocate SQM txschq limits\n");
++		err = -EFAULT;
++		goto error;
++	}
++
++	max = nix_hw->txsch[NIX_TXSCH_LVL_TL4].schq.max;
++	rvu->pf_limits.tl4 = quotas_alloc(hw->total_pfs, max, max, 0,
++					     &rvu->rsrc_lock, &pf_limit_ops);
++	if (!rvu->pf_limits.tl4) {
++		dev_err(rvu->dev, "Failed to allocate TL4 txschq limits\n");
++		err = -EFAULT;
++		goto error;
++	}
++
++	max = nix_hw->txsch[NIX_TXSCH_LVL_TL3].schq.max;
++	rvu->pf_limits.tl3 = quotas_alloc(hw->total_pfs, max, max, 0,
++					     &rvu->rsrc_lock, &pf_limit_ops);
++	if (!rvu->pf_limits.tl3) {
++		dev_err(rvu->dev, "Failed to allocate TL3 txschq limits\n");
++		err = -EFAULT;
++		goto error;
++	}
++
++	max = nix_hw->txsch[NIX_TXSCH_LVL_TL2].schq.max;
++	rvu->pf_limits.tl2 = quotas_alloc(hw->total_pfs, max, max, 0,
++					     &rvu->rsrc_lock, &pf_limit_ops);
++	if (!rvu->pf_limits.tl2) {
++		dev_err(rvu->dev, "Failed to allocate TL2 txschq limits\n");
++		err = -EFAULT;
++		goto error;
++	}
++
+ 	for (i = 0; i < hw->total_pfs; i++)
+ 		rvu->pf[i].pdev =
+ 			pci_get_domain_bus_and_slot(pci_domain_nr(pdev->bus),
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.h
+index cff4fa80996f..9dc8252d9986 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_validation.h
+@@ -54,12 +54,18 @@ struct rvu_limits {
+ 	struct rvu_quotas	*cpt;
+ 	struct rvu_quotas	*npa;
+ 	struct rvu_quotas	*nix;
++	struct rvu_quotas	*smq;
++	struct rvu_quotas	*tl4;
++	struct rvu_quotas	*tl3;
++	struct rvu_quotas	*tl2;
+ };
+ 
+ int rvu_policy_init(struct rvu *rvu);
+ void rvu_policy_destroy(struct rvu *rvu);
+ int rvu_check_rsrc_policy(struct rvu *rvu,
+ 			  struct rsrc_attach *req, u16 pcifunc);
++int rvu_check_txsch_policy(struct rvu *rvu, struct nix_txsch_alloc_req *req,
++			   u16 pcifunc);
+ 
+ int rvu_mbox_handler_free_rsrc_cnt(struct rvu *rvu, struct msg_req *req,
+ 				   struct free_rsrcs_rsp *rsp);
+-- 
+2.31.1
+

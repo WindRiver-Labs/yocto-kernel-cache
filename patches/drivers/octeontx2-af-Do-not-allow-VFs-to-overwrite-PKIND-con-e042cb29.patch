@@ -1,0 +1,156 @@
+From fa99db745eeac7c1e2bbde55f983f37d15873b32 Mon Sep 17 00:00:00 2001
+From: Hariprasad Kelam <hkelam@marvell.com>
+Date: Mon, 2 Mar 2020 14:54:07 +0530
+Subject: [PATCH 0371/1921] octeontx2-af: Do not allow VFs to overwrite PKIND
+ config
+
+When switch headers like EDSA, Higig2 etc are present in ingress
+or egress packets the packet parsing done by NPC needs to take additional
+headers into account. KPU profile handles these using specific
+PKINDs (the iKPU index) to  parse these packets differently.
+
+AF writes these pkinds to HW upon receiving NPC_SET_PKIND mbox request.
+But in nix_lf_alloc mbox request from VF, AF writes default RX/TX
+pkinds to HW. Since PF and its VFs share same CGX/LMAC pair, earlier
+configuration is getting overwritten. Ideally VF should not override PF
+configuration. This patch adds proper validation to ensure the same.
+
+Change-Id: I3e5e0f8cd3256ecfa906a38f1da661a3f9456fbc
+Signed-off-by: Hariprasad Kelam <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/24358
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/cgx.c   | 12 +++++++
+ .../net/ethernet/marvell/octeontx2/af/cgx.h   |  1 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_cgx.c   | 36 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 14 +++++---
+ 5 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+index e187cd844628..f33828be3bff 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.c
+@@ -314,6 +314,18 @@ int cgx_set_pkind(void *cgxd, u8 lmac_id, int pkind)
+ }
+ EXPORT_SYMBOL(cgx_set_pkind);
+ 
++int cgx_get_pkind(void *cgxd, u8 lmac_id, int *pkind)
++{
++	struct cgx *cgx = cgxd;
++
++	if (!cgx || lmac_id >= cgx->lmac_count)
++		return -ENODEV;
++
++	*pkind = cgx_read(cgx, lmac_id, CGXX_CMRX_RX_ID_MAP);
++	*pkind = *pkind & 0x3F;
++	return 0;
++}
++
+ static inline u8 cgx_get_lmac_type(struct cgx *cgx, int lmac_id)
+ {
+ 	u64 cfg;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+index 5be53cc0dc4f..1aaa4a4f8727 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/cgx.h
+@@ -172,4 +172,5 @@ int cgx_get_phy_mod_type(void *cgxd, int lmac_id);
+ int cgx_get_phy_fec_stats(void *cgxd, int lmac_id);
+ void cgx_lmac_enadis_higig2(void *cgxd, int lmac_id, bool enable);
+ bool is_higig2_enabled(void *cgxd, int lmac_id);
++int cgx_get_pkind(void *cgxd, u8 lmac_id, int *pkind);
+ #endif /* CGX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 35fdd17b805e..a318f6075b70 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -621,6 +621,7 @@ int rvu_cgx_start_stop_io(struct rvu *rvu, u16 pcifunc, bool start);
+ int rvu_cgx_nix_cuml_stats(struct rvu *rvu, void *cgxd, int lmac_id, int index,
+ 			   int rxtxflag, u64 *stat);
+ bool is_cgx_config_permitted(struct rvu *rvu, u16 pcifunc);
++bool rvu_cgx_is_pkind_config_permitted(struct rvu *rvu, u16 pcifunc);
+ 
+ /* SSO APIs */
+ int rvu_sso_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+index 72323bb3d602..a153f8f2bcde 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cgx.c
+@@ -1037,3 +1037,39 @@ int rvu_mbox_handler_cgx_set_link_mode(struct rvu *rvu,
+ 	rsp->status =  cgx_set_link_mode(cgxd, req->args, cgx_idx, lmac);
+ 	return 0;
+ }
++
++/* Dont allow cgx mapped VFs to overwrite PKIND config
++ * incase of special PKINDs are configured like (HIGIG/EDSA)
++ */
++bool rvu_cgx_is_pkind_config_permitted(struct rvu *rvu, u16 pcifunc)
++{
++	int rc, pf, rxpkind;
++	u8 cgx_id, lmac_id;
++
++	pf = rvu_get_pf(pcifunc);
++
++	/* Ret here for PFs or non cgx interfaces */
++	if (!(pcifunc & RVU_PFVF_FUNC_MASK))
++		return true;
++
++	if (!is_pf_cgxmapped(rvu, pf))
++		return true;
++
++	rvu_get_cgx_lmac_id(rvu->pf2cgxlmac_map[pf], &cgx_id, &lmac_id);
++
++	rc = cgx_get_pkind(rvu_cgx_pdata(cgx_id, rvu), lmac_id, &rxpkind);
++	if (rc)
++		return false;
++
++	switch (rxpkind) {
++	/* Add here specific pkinds reserved for pkt parsing */
++	case NPC_RX_HIGIG_PKIND:
++	case NPC_RX_EDSA_PKIND:
++		rc = false;
++		break;
++	default:
++		rc = true;
++	}
++
++	return rc;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index 9df2b1fded0b..43b4df72f907 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -220,8 +220,12 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf)
+ 		pfvf->tx_chan_base = pfvf->rx_chan_base;
+ 		pfvf->rx_chan_cnt = 1;
+ 		pfvf->tx_chan_cnt = 1;
+-		cgx_set_pkind(rvu_cgx_pdata(cgx_id, rvu), lmac_id, pkind);
+-		rvu_npc_set_pkind(rvu, pkind, pfvf);
++
++		if (rvu_cgx_is_pkind_config_permitted(rvu, pcifunc)) {
++			cgx_set_pkind(rvu_cgx_pdata(cgx_id, rvu), lmac_id,
++				      pkind);
++			rvu_npc_set_pkind(rvu, pkind, pfvf);
++		}
+ 
+ 		/* By default we enable pause frames */
+ 		if ((pcifunc & RVU_PFVF_FUNC_MASK) == 0)
+@@ -1156,8 +1160,10 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	rvu_write64(rvu, blkaddr, NIX_AF_LFX_RX_CFG(nixlf), req->rx_cfg);
+ 
+ 	/* Configure pkind for TX parse config, 63 from npc_profile */
+-	cfg = NPC_TX_DEF_PKIND;
+-	rvu_write64(rvu, blkaddr, NIX_AF_LFX_TX_PARSE_CFG(nixlf), cfg);
++	if (rvu_cgx_is_pkind_config_permitted(rvu, pcifunc)) {
++		cfg = NPC_TX_DEF_PKIND;
++		rvu_write64(rvu, blkaddr, NIX_AF_LFX_TX_PARSE_CFG(nixlf), cfg);
++	}
+ 
+ 	intf = is_afvf(pcifunc) ? NIX_INTF_TYPE_LBK : NIX_INTF_TYPE_CGX;
+ 	if (is_sdp_pf(pcifunc))
+-- 
+2.31.1
+

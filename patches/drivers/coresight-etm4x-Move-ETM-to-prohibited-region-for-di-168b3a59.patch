@@ -1,0 +1,126 @@
+From 9b0db60ab5e34329110fb57506ffda72b6c21a0b Mon Sep 17 00:00:00 2001
+From: Suzuki K Poulose <suzuki.poulose@arm.com>
+Date: Mon, 5 Apr 2021 17:42:55 +0100
+Subject: [PATCH 1825/1921] coresight: etm4x: Move ETM to prohibited region for
+ disable
+
+If the CPU implements Arm v8.4 Trace filter controls (FEAT_TRF),
+move the ETM to trace prohibited region using TRFCR, while disabling.
+
+Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+Cc: Mike Leach <mike.leach@linaro.org>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Reviewed-by: Mike Leach <mike.leach@linaro.org>
+Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+Link: https://lore.kernel.org/r/20210405164307.1720226-9-suzuki.poulose@arm.com
+Signed-off-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../coresight/coresight-etm4x-core.c          | 21 +++++++++++++++++--
+ drivers/hwtracing/coresight/coresight-etm4x.h |  2 ++
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x-core.c b/drivers/hwtracing/coresight/coresight-etm4x-core.c
+index 15016f757828..00297906669c 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x-core.c
++++ b/drivers/hwtracing/coresight/coresight-etm4x-core.c
+@@ -31,6 +31,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/property.h>
+ 
++#include <asm/barrier.h>
+ #include <asm/sections.h>
+ #include <asm/sysreg.h>
+ #include <asm/local.h>
+@@ -654,6 +655,7 @@ static int etm4_enable(struct coresight_device *csdev,
+ static void etm4_disable_hw(void *info)
+ {
+ 	u32 control;
++	u64 trfcr;
+ 	struct etmv4_drvdata *drvdata = info;
+ 	struct etmv4_config *config = &drvdata->config;
+ 	struct coresight_device *csdev = drvdata->csdev;
+@@ -676,6 +678,16 @@ static void etm4_disable_hw(void *info)
+ 	/* EN, bit[0] Trace unit enable bit */
+ 	control &= ~0x1;
+ 
++	/*
++	 * If the CPU supports v8.4 Trace filter Control,
++	 * set the ETM to trace prohibited region.
++	 */
++	if (drvdata->trfc) {
++		trfcr = read_sysreg_s(SYS_TRFCR_EL1);
++		write_sysreg_s(trfcr & ~(TRFCR_ELx_ExTRE | TRFCR_ELx_E0TRE),
++			       SYS_TRFCR_EL1);
++		isb();
++	}
+ 	/*
+ 	 * Make sure everything completes before disabling, as recommended
+ 	 * by section 7.3.77 ("TRCVICTLR, ViewInst Main Control Register,
+@@ -683,12 +695,16 @@ static void etm4_disable_hw(void *info)
+ 	 */
+ 	dsb(sy);
+ 	isb();
++	/* Trace synchronization barrier, is a nop if not supported */
++	tsb_csync();
+ 	etm4x_relaxed_write32(csa, control, TRCPRGCTLR);
+ 
+ 	/* wait for TRCSTATR.PMSTABLE to go to '1' */
+ 	if (coresight_timeout(csa, TRCSTATR, TRCSTATR_PMSTABLE_BIT, 1))
+ 		dev_err(etm_dev,
+ 			"timeout while waiting for PM stable Trace Status\n");
++	if (drvdata->trfc)
++		write_sysreg_s(trfcr, SYS_TRFCR_EL1);
+ 
+ 	/* read the status of the single shot comparators */
+ 	for (i = 0; i < drvdata->nr_ss_cmp; i++) {
+@@ -873,7 +889,7 @@ static bool etm4_init_csdev_access(struct etmv4_drvdata *drvdata,
+ 	return false;
+ }
+ 
+-static void cpu_enable_tracing(void)
++static void cpu_enable_tracing(struct etmv4_drvdata *drvdata)
+ {
+ 	u64 dfr0 = read_sysreg(id_aa64dfr0_el1);
+ 	u64 trfcr;
+@@ -881,6 +897,7 @@ static void cpu_enable_tracing(void)
+ 	if (!cpuid_feature_extract_unsigned_field(dfr0, ID_AA64DFR0_TRACE_FILT_SHIFT))
+ 		return;
+ 
++	drvdata->trfc = true;
+ 	/*
+ 	 * If the CPU supports v8.4 SelfHosted Tracing, enable
+ 	 * tracing at the kernel EL and EL0, forcing to use the
+@@ -1082,7 +1099,7 @@ static void etm4_init_arch_data(void *info)
+ 	/* NUMCNTR, bits[30:28] number of counters available for tracing */
+ 	drvdata->nr_cntr = BMVAL(etmidr5, 28, 30);
+ 	etm4_cs_lock(drvdata, csa);
+-	cpu_enable_tracing();
++	cpu_enable_tracing(drvdata);
+ }
+ 
+ static inline u32 etm4_get_victlr_access_type(struct etmv4_config *config)
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x.h b/drivers/hwtracing/coresight/coresight-etm4x.h
+index 0af60571aa23..f6478ef642bf 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x.h
++++ b/drivers/hwtracing/coresight/coresight-etm4x.h
+@@ -862,6 +862,7 @@ struct etmv4_save_state {
+  * @nooverflow:	Indicate if overflow prevention is supported.
+  * @atbtrig:	If the implementation can support ATB triggers
+  * @lpoverride:	If the implementation can support low-power state over.
++ * @trfc:	If the implementation supports Arm v8.4 trace filter controls.
+  * @config:	structure holding configuration parameters.
+  * @save_state:	State to be preserved across power loss
+  * @state_needs_restore: True when there is context to restore after PM exit
+@@ -912,6 +913,7 @@ struct etmv4_drvdata {
+ 	bool				nooverflow;
+ 	bool				atbtrig;
+ 	bool				lpoverride;
++	bool				trfc;
+ 	struct etmv4_config		config;
+ 	struct etmv4_save_state		*save_state;
+ 	bool				state_needs_restore;
+-- 
+2.31.1
+

@@ -1,0 +1,248 @@
+From 5363ed481122364b3b5b8bc0bffc08f5466e6cc4 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Wed, 21 Oct 2020 23:50:55 +0530
+Subject: [PATCH 0893/1921] octeontx2-pf: cn10k: Map LMTST region
+
+On CN10K platform transmit/receive buffer alloc and free from/to hardware
+had changed to support burst operation. Whereas pervious silicon's only
+support single buffer free at a time.
+To Support the same firmware allocates a DRAM region for each PF/VF for
+storing LMTLINES. These LMTLINES are used for NPA batch free and for
+flushing SQE to the hardware.
+PF/VF LMTST region is accessed via BAR4. PFs LMTST region is is followed
+by its VFs mbox memory. The size of region various from 2KB to 256KB based
+on number of LMTLINES configured.
+
+This patch adds support for
+- Mapping PF/VF LMTST region.
+- Reserves 0-71 (RX + TX + XDP) LMTST lines for NPA batch
+  free operation.
+- Reserves 72-512 LMTST lines for NIX SQE flush.
+
+Change-Id: Ib17859fe82686f32992b22587329070a25d8c552
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.h       | 14 ++++-
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 52 ++++++++++++++++++-
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  | 35 ++++++++++++-
+ 3 files changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 8935f5701fff..459c210a05c2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -205,7 +205,14 @@ struct otx2_hw {
+ 
+ #define HW_TSO			BIT_ULL(0)
+ #define CN10K_MBOX		BIT_ULL(1)
++#define CN10K_LMTST		BIT_ULL(2)
+ 	unsigned long		cap_flag;
++
++#define LMT_LINE_SIZE		128
++#define NIX_LMTID_BASE		72 /* RX + TX + XDP */
++	void __iomem		*lmt_base;
++	u64			*npa_lmt_base;
++	u64			*nix_lmt_base;
+ };
+ 
+ struct otx2_ptp {
+@@ -345,6 +352,9 @@ struct otx2_nic {
+ 	u32			addl_mtu;
+ 	/* Block address of NIX either BLKADDR_NIX0 or BLKADDR_NIX1 */
+ 	int			nix_blkaddr;
++	u16			tot_lmt_lines;
++	u16			nix_lmt_lines;
++	u32			nix_lmt_size;
+ };
+ 
+ static inline bool is_otx2_lbkvf(struct pci_dev *pdev)
+@@ -415,8 +425,10 @@ static inline void otx2_setup_dev_hw_settings(struct otx2_nic *pfvf)
+ 		 */
+ 		pfvf->netdev->watchdog_timeo = 10000 * HZ;
+ 	}
+-	if (!is_dev_otx2(pfvf->pdev))
++	if (!is_dev_otx2(pfvf->pdev)) {
+ 		__set_bit(CN10K_MBOX, &hw->cap_flag);
++		__set_bit(CN10K_LMTST, &hw->cap_flag);
++	}
+ }
+ 
+ /* Register read/write APIs */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 64ecaf5e1959..d99c168c5703 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -47,6 +47,39 @@ enum {
+ 	TYPE_PFVF,
+ };
+ 
++static int cn10k_lmtst_init(struct otx2_nic *pf)
++{
++	int size, num_lines;
++	u64 base;
++
++	if (!test_bit(CN10K_LMTST, &pf->hw.cap_flag))
++		return 0;
++
++	base = pci_resource_start(pf->pdev, PCI_MBOX_BAR_NUM) +
++		       (MBOX_SIZE * (pf->total_vfs + 1));
++
++	size = pci_resource_len(pf->pdev, PCI_MBOX_BAR_NUM) -
++	       (MBOX_SIZE * (pf->total_vfs + 1));
++
++	pf->hw.lmt_base = ioremap(base, size);
++
++	if (!pf->hw.lmt_base) {
++		dev_err(pf->dev, "Unable to map PF LMTST region\n");
++		return -ENOMEM;
++	}
++
++	/* FIXME: Get the num of LMTST lines from LMT table */
++	pf->tot_lmt_lines = size / LMT_LINE_SIZE;
++	num_lines = (pf->tot_lmt_lines - NIX_LMTID_BASE) /
++			    pf->hw.tx_queues;
++	/* Number of LMT lines per SQ queues */
++	pf->nix_lmt_lines = num_lines > 32 ? 32 : num_lines;
++
++	pf->nix_lmt_size = pf->nix_lmt_lines * LMT_LINE_SIZE;
++
++	return 0;
++}
++
+ static int otx2_change_mtu(struct net_device *netdev, int new_mtu)
+ {
+ 	bool if_up = netif_running(netdev);
+@@ -1570,6 +1603,14 @@ int otx2_open(struct net_device *netdev)
+ 	if (!qset->rq)
+ 		goto err_free_mem;
+ 
++	if (test_bit(CN10K_LMTST, &pf->hw.cap_flag)) {
++		/* Reserve LMT lines for NPA AURA batch free */
++		pf->hw.npa_lmt_base = (__force u64 *)pf->hw.lmt_base;
++		/* Reserve LMT lines for NIX TX */
++		pf->hw.nix_lmt_base = (__force u64 *)((u64)pf->hw.npa_lmt_base +
++				      (NIX_LMTID_BASE * LMT_LINE_SIZE));
++	}
++
+ 	err = otx2_init_hw_resources(pf);
+ 	if (err)
+ 		goto err_free_mem;
+@@ -2519,6 +2560,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_free_netdev;
+ 	}
+ 
++	otx2_setup_dev_hw_settings(pf);
++
+ 	/* Init PF <=> AF mailbox stuff */
+ 	err = otx2_pfaf_mbox_init(pf);
+ 	if (err)
+@@ -2544,7 +2587,9 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_detach_rsrc;
+ 
+-	otx2_setup_dev_hw_settings(pf);
++	err = cn10k_lmtst_init(pf);
++	if (err)
++		goto err_detach_rsrc;
+ 
+ 	/* Don't check for error.  Proceed without ptp */
+ 	otx2_ptp_init(pf);
+@@ -2629,6 +2674,8 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ err_ptp_destroy:
+ 	otx2_ptp_destroy(pf);
+ err_detach_rsrc:
++	if (hw->lmt_base)
++		iounmap(hw->lmt_base);
+ 	otx2_detach_resources(&pf->mbox);
+ err_disable_mbox_intr:
+ 	otx2_disable_mbox_intr(pf);
+@@ -2805,6 +2852,9 @@ static void otx2_remove(struct pci_dev *pdev)
+ 
+ 	pf = netdev_priv(netdev);
+ 
++	if (pf->hw.lmt_base)
++		iounmap(pf->hw.lmt_base);
++
+ 	pf->flags |= OTX2_FLAG_PF_SHUTDOWN;
+ 
+ 	if (pf->flags & OTX2_FLAG_TX_TSTAMP_ENABLED)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index adfe703f4b92..ce561f044ad5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -36,6 +36,31 @@ enum {
+ 	RVU_VF_INT_VEC_MBOX = 0x0,
+ };
+ 
++static int cn10k_lmtst_init(struct otx2_nic *vf)
++{
++	int size, num_lines;
++
++	if (!test_bit(CN10K_LMTST, &vf->hw.cap_flag))
++		return 0;
++
++	size = pci_resource_len(vf->pdev, PCI_MBOX_BAR_NUM);
++	vf->hw.lmt_base = ioremap_wc(pci_resource_start(vf->pdev,
++							PCI_MBOX_BAR_NUM),
++				     size);
++	if (!vf->hw.lmt_base) {
++		dev_err(vf->dev, "Unable to map VF LMTST region\n");
++		return -ENOMEM;
++	}
++
++	vf->tot_lmt_lines = size / LMT_LINE_SIZE;
++	/* LMTST lines per per SQ */
++	num_lines = (vf->tot_lmt_lines - NIX_LMTID_BASE) /
++			    vf->hw.tx_queues;
++	vf->nix_lmt_lines = num_lines > 32 ? 32 : num_lines;
++	vf->nix_lmt_size = vf->nix_lmt_lines * LMT_LINE_SIZE;
++	return 0;
++}
++
+ static void otx2vf_process_vfaf_mbox_msg(struct otx2_nic *vf,
+ 					 struct mbox_msghdr *msg)
+ {
+@@ -580,6 +605,7 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_free_irq_vectors;
+ 	}
+ 
++	otx2_setup_dev_hw_settings(vf);
+ 	/* Init VF <=> PF mailbox stuff */
+ 	err = otx2vf_vfaf_mbox_init(vf);
+ 	if (err)
+@@ -603,7 +629,9 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (err)
+ 		goto err_detach_rsrc;
+ 
+-	otx2_setup_dev_hw_settings(vf);
++	err = cn10k_lmtst_init(vf);
++	if (err)
++		goto err_detach_rsrc;
+ 
+ 	err = otx2smqvf_probe(vf);
+ 	if (!err)
+@@ -662,6 +690,8 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	return 0;
+ 
+ err_detach_rsrc:
++	if (hw->lmt_base)
++		iounmap(hw->lmt_base);
+ 	otx2_detach_resources(&vf->mbox);
+ err_disable_mbox_intr:
+ 	otx2vf_disable_mbox_intr(vf);
+@@ -692,6 +722,9 @@ static void otx2vf_remove(struct pci_dev *pdev)
+ 
+ 	otx2vf_disable_mbox_intr(vf);
+ 
++	if (vf->hw.lmt_base)
++		iounmap(vf->hw.lmt_base);
++
+ 	otx2_detach_resources(&vf->mbox);
+ 	otx2vf_vfaf_mbox_destroy(vf);
+ 	pci_free_irq_vectors(vf->pdev);
+-- 
+2.31.1
+

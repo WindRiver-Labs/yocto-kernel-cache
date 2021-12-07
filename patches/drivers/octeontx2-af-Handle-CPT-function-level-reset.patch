@@ -1,0 +1,157 @@
+From 8a19c3f4d8449443e8fd5d892981efba361ab126 Mon Sep 17 00:00:00 2001
+From: Srujana Challa <schalla@marvell.com>
+Date: Mon, 16 Nov 2020 14:32:34 +0530
+Subject: [PATCH 0939/1921] octeontx2-af: Handle CPT function level reset
+
+When FLR is initiated for a VF (PCI function level reset),
+the parent PF gets a interrupt. PF then sends a message to
+admin function (AF), which then cleans up all resources
+attached to that VF. This patch adds support to handle
+CPT FLR.
+
+Change-Id: Ide2f234024d0d93f4552d63ccdbb84f19551647c
+Signed-off-by: Srujana Challa <schalla@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/40419
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |  3 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_cpt.c   | 74 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_reg.h   |  7 ++
+ 4 files changed, 85 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 134485817949..4f4ea851be2d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -2659,6 +2659,9 @@ static void rvu_blklf_teardown(struct rvu *rvu, u16 pcifunc, u8 blkaddr)
+ 			rvu_ssow_lf_teardown(rvu, pcifunc, lf, slot);
+ 		else if (block->addr == BLKADDR_TIM)
+ 			rvu_tim_lf_teardown(rvu, pcifunc, lf, slot);
++		else if ((block->addr == BLKADDR_CPT0) ||
++			 (block->addr == BLKADDR_CPT1))
++			rvu_cpt_lf_teardown(rvu, pcifunc, lf, slot);
+ 
+ 		err = rvu_lf_reset(rvu, block, lf);
+ 		if (err) {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 1778fb0c6fbd..a29853d4e0a4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -835,6 +835,7 @@ bool is_npc_interface_valid(struct rvu *rvu, u8 intf);
+ int rvu_cpt_init(struct rvu *rvu);
+ int rvu_cpt_register_interrupts(struct rvu *rvu);
+ void rvu_cpt_unregister_interrupts(struct rvu *rvu);
++int rvu_cpt_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot);
+ 
+ /* TIM APIs */
+ int rvu_tim_init(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cpt.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cpt.c
+index 17d8854ad3c3..ca7700aad0d3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cpt.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cpt.c
+@@ -517,3 +517,77 @@ int rvu_mbox_handler_cpt_rd_wr_register(struct rvu *rvu,
+ 	/* Access to register denied */
+ 	return CPT_AF_ERR_ACCESS_DENIED;
+ }
++
++static void cpt_lf_disable_iqueue(struct rvu *rvu, int blkaddr, int slot)
++{
++	u64 inprog, grp_ptr;
++	int i = 0;
++
++	/* Disable instructions enqueuing */
++	rvu_write64(rvu, blkaddr, CPT_AF_BAR2_ALIASX(slot, CPT_LF_CTL), 0x0);
++
++	/* Disable executions in the LF's queue */
++	inprog = rvu_read64(rvu, blkaddr,
++			    CPT_AF_BAR2_ALIASX(slot, CPT_LF_INPROG));
++	inprog &= ~BIT_ULL(16);
++	rvu_write64(rvu, blkaddr,
++		    CPT_AF_BAR2_ALIASX(slot, CPT_LF_INPROG), inprog);
++
++	/* Wait for CPT queue to become execution-quiescent */
++	do {
++		inprog = rvu_read64(rvu, blkaddr,
++				    CPT_AF_BAR2_ALIASX(slot, CPT_LF_INPROG));
++		/* Check for partial entries (GRB_PARTIAL) */
++		if (inprog & BIT_ULL(31))
++			i = 0;
++		else
++			i++;
++
++		grp_ptr = rvu_read64(rvu, blkaddr,
++				     CPT_AF_BAR2_ALIASX(slot,
++							CPT_LF_Q_GRP_PTR));
++	} while ((i < 10) && (((grp_ptr >> 32) & 0x7FFF) !=
++				(grp_ptr & 0x7FFF)));
++
++	i = 0;
++	do {
++		inprog = rvu_read64(rvu, blkaddr,
++				    CPT_AF_BAR2_ALIASX(slot, CPT_LF_INPROG));
++		/* GWB writes groups of 40. So below formula is used for
++		 * knowing that no more instructions will be scheduled
++		 * (INFLIGHT == 0) && (GWB < 40) && (GRB == 0 OR 40)
++		 */
++		if (((inprog && 0x1FF) == 0) &&
++		    (((inprog >> 40) & 0xFF) < 40) &&
++		    ((((inprog >> 32) & 0xFF) == 0) ||
++		    (((inprog >> 32) & 0xFF) == 40)))
++			i++;
++		else
++			i = 0;
++	} while (i < 10);
++}
++
++int rvu_cpt_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot)
++{
++	int blkaddr;
++	u64 reg;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_CPT, pcifunc);
++	if (blkaddr != BLKADDR_CPT0 && blkaddr != BLKADDR_CPT1)
++		return -EINVAL;
++
++	/* Enable BAR2 ALIAS for this pcifunc. */
++	reg = BIT_ULL(16) | pcifunc;
++	rvu_write64(rvu, blkaddr, CPT_AF_BAR2_SEL, reg);
++
++	cpt_lf_disable_iqueue(rvu, blkaddr, slot);
++
++	/* Set group drop to help clear out hardware */
++	reg = rvu_read64(rvu, blkaddr, CPT_AF_BAR2_ALIASX(slot, CPT_LF_INPROG));
++	reg |= BIT_ULL(17);
++	rvu_write64(rvu, blkaddr, CPT_AF_BAR2_ALIASX(slot, CPT_LF_INPROG), reg);
++
++	rvu_write64(rvu, blkaddr, CPT_AF_BAR2_SEL, 0);
++
++	return 0;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+index 65963a6df6c8..0020e701028d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+@@ -698,9 +698,16 @@
+ #define CPT_AF_RAS_INT_ENA_W1C          (0x47038ull)
+ #define CPT_AF_CTX_FLUSH_TIMER          (0x48000ull)
+ 
++#define CPT_AF_BAR2_SEL                 0x9000000
++#define CPT_AF_BAR2_ALIASX(a, b)        AF_BAR2_ALIASX(a, b)
++
+ #define CPT_AF_LF_CTL2_SHIFT		3
+ #define CPT_AF_LF_SSO_PF_FUNC_SHIFT	32
+ 
++#define CPT_LF_CTL                      0x10
++#define CPT_LF_INPROG                   0x40
++#define CPT_LF_Q_GRP_PTR                0x120
++
+ /* NPC */
+ #define NPC_AF_CFG			(0x00000)
+ #define NPC_AF_ACTIVE_PC		(0x00010)
+-- 
+2.31.1
+

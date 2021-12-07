@@ -1,0 +1,355 @@
+From ba6126f3ef3f8fa0e70ce5fcca1049fca92e9010 Mon Sep 17 00:00:00 2001
+From: Hariprasad Kelam <hkelam@marvell.com>
+Date: Wed, 29 Apr 2020 22:17:01 +0530
+Subject: [PATCH 0466/1921] octeontx2-pf: Add ntuple filter support for FDSA
+
+Marvell switches support FDSA (Forward DSA). FDSA has
+4 bytes length and it contains Src port and vlan field.
+KPU profile is updated to parse  FDSA packet and extract Src port. The
+extracted Src port is placed in vlan field of KEX key.
+
+This patch adds ntuple filter support to FDSA tag.
+So that user can send traffic to either PF or VF based on
+Src port or Vlan id. All rules installed for FDSA has default
+action as RSS. Upon enabling FDSA , vf vlan rules will be disabled.
+
+To enable fdsa tag
+ethtool --set-priv-flags eth0 fdsa on
+
+To send traffic with Srcport 30 to PF
+ethtool -U eth0 flow-type ether  user-def 0x1e
+
+To send traffic with vlan id 30 to PF
+ethtool -U eth0 flow-type ether  dst xx vlan 30 m 0xf000
+
+To send traffic with Srcport 20 to vf 0
+ethtool -U eth0 flow-type ether vf 0 user-def 0x14
+
+Change-Id: I547296bb497e73b5b048297b8459543cd5d3bfb5
+Signed-off-by: Hariprasad Kelam <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/27677
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_common.h       |  17 ++-
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 107 ++++++++++++++++--
+ .../marvell/octeontx2/nic/otx2_flows.c        |   6 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  13 ++-
+ 4 files changed, 130 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 8e791f89d0ff..3f4fe7ce5d7f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -207,6 +207,12 @@ struct otx2_ptp {
+ 	bool ptp_en;
+ };
+ 
++struct vfvlan {
++	u16 vlan;
++	u16 proto;
++	u8 qos;
++};
++
+ struct otx2_vf_config {
+ 	struct otx2_nic *pf;
+ 	struct delayed_work link_event_work;
+@@ -215,6 +221,7 @@ struct otx2_vf_config {
+ 	u8 mac[ETH_ALEN];
+ 	u16 vlan;
+ 	int tx_vtag_idx;
++	struct vfvlan rule;
+ };
+ 
+ struct flr_work {
+@@ -306,7 +313,9 @@ struct otx2_nic {
+ #define OTX2_PRIV_FLAG_PAM4			BIT(0)
+ #define OTX2_PRIV_FLAG_EDSA_HDR			BIT(1)
+ #define OTX2_PRIV_FLAG_HIGIG2_HDR		BIT(2)
+-#define OTX2_PRIV_FLAG_DEF_MODE			BIT(3)
++#define OTX2_PRIV_FLAG_FDSA_HDR			BIT(3)
++#define OTX2_INTF_MOD_MASK			GENMASK(3, 1)
++#define OTX2_PRIV_FLAG_DEF_MODE			BIT(4)
+ #define OTX2_IS_EDSA_ENABLED(flags)		((flags) &              \
+ 						 OTX2_PRIV_FLAG_EDSA_HDR)
+ #define OTX2_IS_HIGIG2_ENABLED(flags)		((flags) &              \
+@@ -321,6 +330,7 @@ struct otx2_nic {
+ #define OTX2_EDSA_HDR_LEN			16
+ #define OTX2_HIGIG2_HDR_LEN			16
+ #define OTX2_HW_TIMESTAMP_LEN			8
++#define OTX2_FDSA_HDR_LEN			4
+ 	u32			addl_mtu;
+ 	/* Block address of NIX either BLKADDR_NIX0 or BLKADDR_NIX1 */
+ 	int			nix_blkaddr;
+@@ -782,10 +792,13 @@ int otx2_add_flow(struct otx2_nic *pfvf,
+ 		  struct ethtool_rx_flow_spec *fsp);
+ int otx2_remove_flow(struct otx2_nic *pfvf, u32 location);
+ int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+-			      struct npc_install_flow_req *req);
++			      struct npc_install_flow_req *req,
++			      struct otx2_nic *pfvf);
+ int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable);
+ int otx2_enable_vf_vlan(struct otx2_nic *pf);
+ int otx2_install_rxvlan_offload_flow(struct otx2_nic *pfvf);
++int otx2_do_set_vf_vlan(struct otx2_nic *pf, int vf, u16 vlan, u8 qos,
++			u16 proto);
+ int otx2smqvf_probe(struct otx2_nic *vf);
+ int otx2smqvf_remove(struct otx2_nic *vf);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index 9d6f931d870a..1b1d5578e92e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -24,6 +24,8 @@
+ #define DRV_VF_VERSION	"1.0"
+ 
+ #define OTX2_DEFAULT_ACTION	0x1
++#define FDSA_MAX_SPORT		32
++#define FDSA_SPORT_MASK         0xf8
+ 
+ static struct cgx_fw_data *otx2_get_fwdata(struct otx2_nic *pfvf);
+ 
+@@ -31,6 +33,7 @@ static const char otx2_priv_flags_strings[][ETH_GSTRING_LEN] = {
+ 	"pam4",
+ 	"edsa",
+ 	"higig2",
++	"fdsa",
+ };
+ 
+ struct otx2_stat {
+@@ -704,8 +707,27 @@ static int otx2_get_rxnfc(struct net_device *dev,
+ 	return ret;
+ }
+ 
++static void otx2_prepare_fdsa_flow_request(struct npc_install_flow_req *req,
++					   bool is_vlan)
++{
++	struct flow_msg *pmask = &req->mask;
++	struct flow_msg *pkt = &req->packet;
++
++	/* In FDSA tag srcport starts from b3..b7 */
++	if (!is_vlan) {
++		pkt->vlan_tci <<= 3;
++		pmask->vlan_tci = cpu_to_be16(FDSA_SPORT_MASK);
++	}
++	/* Strip FDSA tag */
++	req->features |= BIT_ULL(NPC_FDSA_VAL);
++	req->vtag0_valid = true;
++	req->vtag0_type = NIX_AF_LFX_RX_VTAG_TYPE6;
++	req->op = NIX_RX_ACTION_DEFAULT;
++}
++
+ int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+-			      struct npc_install_flow_req *req)
++			      struct npc_install_flow_req *req,
++			      struct otx2_nic *pfvf)
+ {
+ 	struct ethtool_tcpip4_spec *l4_mask = &fsp->m_u.tcp_ip4_spec;
+ 	struct ethtool_tcpip4_spec *l4_hdr = &fsp->h_u.tcp_ip4_spec;
+@@ -776,6 +798,8 @@ int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+ 		return -ENOTSUPP;
+ 	}
+ 	if (fsp->flow_type & FLOW_EXT) {
++		int skip_user_def = false;
++
+ 		if (fsp->m_ext.vlan_etype)
+ 			return -EINVAL;
+ 		if (fsp->m_ext.vlan_tci) {
+@@ -783,17 +807,40 @@ int otx2_prepare_flow_request(struct ethtool_rx_flow_spec *fsp,
+ 				return -EINVAL;
+ 			if (be16_to_cpu(fsp->h_ext.vlan_tci) >= VLAN_N_VID)
+ 				return -EINVAL;
++
+ 			memcpy(&pkt->vlan_tci, &fsp->h_ext.vlan_tci,
+ 			       sizeof(pkt->vlan_tci));
+ 			memcpy(&pmask->vlan_tci, &fsp->m_ext.vlan_tci,
+ 			       sizeof(pmask->vlan_tci));
+-			req->features |= BIT_ULL(NPC_OUTER_VID);
++
++			if (pfvf->ethtool_flags & OTX2_PRIV_FLAG_FDSA_HDR) {
++				otx2_prepare_fdsa_flow_request(req, true);
++				skip_user_def = true;
++			} else {
++				req->features |= BIT_ULL(NPC_OUTER_VID);
++			}
++		}
++
++		if (fsp->m_ext.data[1] && !skip_user_def) {
++			if (pfvf->ethtool_flags & OTX2_PRIV_FLAG_FDSA_HDR) {
++				if (be32_to_cpu(fsp->h_ext.data[1]) >=
++						FDSA_MAX_SPORT)
++					return -EINVAL;
++
++				memcpy(&pkt->vlan_tci,
++				       (u8 *)&fsp->h_ext.data[1] + 2,
++				       sizeof(pkt->vlan_tci));
++				otx2_prepare_fdsa_flow_request(req, false);
++			} else if (fsp->h_ext.data[1] ==
++					cpu_to_be32(OTX2_DEFAULT_ACTION)) {
++				/* Not Drop/Direct to queue but use action
++				 * in default entry
++				 */
++				req->op = NIX_RX_ACTION_DEFAULT;
++			}
+ 		}
+-		/* Not Drop/Direct to queue but use action in default entry */
+-		if (fsp->m_ext.data[1] &&
+-		    fsp->h_ext.data[1] == cpu_to_be32(OTX2_DEFAULT_ACTION))
+-			req->op = NIX_RX_ACTION_DEFAULT;
+ 	}
++
+ 	if (fsp->flow_type & FLOW_MAC_EXT &&
+ 	    !is_zero_ether_addr(fsp->m_ext.h_dest)) {
+ 		ether_addr_copy(pkt->dmac, fsp->h_ext.h_dest);
+@@ -1364,6 +1411,9 @@ int otx2_set_npc_parse_mode(struct otx2_nic *pfvf, bool unbind)
+ 	} else if (OTX2_IS_EDSA_ENABLED(pfvf->ethtool_flags))   {
+ 		req->mode = OTX2_PRIV_FLAGS_EDSA;
+ 		interface_mode = OTX2_PRIV_FLAG_EDSA_HDR;
++	} else if (pfvf->ethtool_flags & OTX2_PRIV_FLAG_FDSA_HDR) {
++		req->mode = OTX2_PRIV_FLAGS_FDSA;
++		interface_mode = OTX2_PRIV_FLAG_FDSA_HDR;
+ 	} else {
+ 		req->mode = OTX2_PRIV_FLAGS_DEFAULT;
+ 		interface_mode = OTX2_PRIV_FLAG_DEF_MODE;
+@@ -1424,6 +1474,28 @@ static int otx2_enable_addl_header(struct net_device *netdev, int bitpos,
+ 	return 0;
+ }
+ 
++/* This function disables vfvlan rules upon enabling
++ * fdsa and vice versa
++ */
++static void otx2_endis_vfvlan_rules(struct otx2_nic *pfvf, bool enable)
++{
++	struct vfvlan *rule;
++	int vf;
++
++	for (vf = 0; vf < pci_num_vf(pfvf->pdev); vf++) {
++		/* pass vlan as 0 to disable rule */
++		if (enable) {
++			otx2_do_set_vf_vlan(pfvf, vf, 0, 0, 0);
++		} else {
++			rule = &pfvf->vf_configs[vf].rule;
++			otx2_do_set_vf_vlan(pfvf, vf, rule->vlan, rule->qos,
++					    rule->proto);
++		}
++	}
++}
++
++#define OTX2_IS_INTFMOD_SET(flags) hweight32((flags) & OTX2_INTF_MOD_MASK)
++
+ static int otx2_set_priv_flags(struct net_device *netdev, u32 new_flags)
+ {
+ 	struct otx2_nic *pfvf = netdev_priv(netdev);
+@@ -1452,17 +1524,36 @@ static int otx2_set_priv_flags(struct net_device *netdev, u32 new_flags)
+ 		break;
+ 	case OTX2_PRIV_FLAG_EDSA_HDR:
+ 		/* HIGIG & EDSA  are mutual exclusive */
+-		if (enable && OTX2_IS_HIGIG2_ENABLED(pfvf->ethtool_flags))
++		if (enable && OTX2_IS_INTFMOD_SET(pfvf->ethtool_flags)) {
++			netdev_info(netdev,
++				    "Disable mutually exclusive modes higig2/fdsa\n");
+ 			return -EINVAL;
++		}
+ 		return otx2_enable_addl_header(netdev, bitnr,
+ 					       OTX2_EDSA_HDR_LEN, enable);
+ 		break;
+ 	case OTX2_PRIV_FLAG_HIGIG2_HDR:
+-		if (enable && OTX2_IS_EDSA_ENABLED(pfvf->ethtool_flags))
++		if (enable && OTX2_IS_INTFMOD_SET(pfvf->ethtool_flags)) {
++			netdev_info(netdev,
++				    "Disable mutually exclusive modes edsa/fdsa\n");
+ 			return -EINVAL;
++		}
+ 		return otx2_enable_addl_header(netdev, bitnr,
+ 					       OTX2_HIGIG2_HDR_LEN, enable);
+ 		break;
++	case OTX2_PRIV_FLAG_FDSA_HDR:
++		if (enable && OTX2_IS_INTFMOD_SET(pfvf->ethtool_flags)) {
++			netdev_info(netdev,
++				    "Disable mutually exclusive modes edsa/higig2\n");
++			return -EINVAL;
++		}
++		otx2_enable_addl_header(netdev, bitnr,
++					OTX2_FDSA_HDR_LEN, enable);
++		if (enable)
++			netdev_warn(netdev,
++				    "Disabling VF VLAN rules as FDSA & VFVLAN are mutual exclusive\n");
++		otx2_endis_vfvlan_rules(pfvf, enable);
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+index d2eacdbadc8b..3c97dda57715 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_flows.c
+@@ -319,7 +319,7 @@ static int otx2_add_flow_msg(struct otx2_nic *pfvf, struct otx2_flow *flow)
+ 		return -ENOMEM;
+ 	}
+ 
+-	err = otx2_prepare_flow_request(&flow->flow_spec, req);
++	err = otx2_prepare_flow_request(&flow->flow_spec, req, pfvf);
+ 	if (err) {
+ 		/* free the allocated msg above */
+ 		otx2_mbox_reset(&pfvf->mbox.mbox, 0);
+@@ -590,6 +590,10 @@ int otx2_enable_rxvlan(struct otx2_nic *pf, bool enable)
+ 	if (!(pf->flags & OTX2_FLAG_RX_VLAN_SUPPORT))
+ 		return -ENOMEM;
+ 
++	/* FDSA & RXVLAN are mutually exclusive */
++	if (pf->ethtool_flags & OTX2_PRIV_FLAG_FDSA_HDR)
++		enable = false;
++
+ 	if (enable) {
+ 		err = otx2_install_rxvlan_offload_flow(pf);
+ 		if (err)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index c012932589bb..a44e92c8de82 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -2032,8 +2032,8 @@ static int otx2_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
+ 	return ret;
+ }
+ 
+-static int otx2_do_set_vf_vlan(struct otx2_nic *pf, int vf, u16 vlan, u8 qos,
+-			       u16 proto)
++int otx2_do_set_vf_vlan(struct otx2_nic *pf, int vf, u16 vlan, u8 qos,
++			u16 proto)
+ {
+ 	struct otx2_flow_config *flow_cfg = pf->flow_cfg;
+ 	struct nix_vtag_config_rsp *vtag_rsp;
+@@ -2092,6 +2092,8 @@ static int otx2_do_set_vf_vlan(struct otx2_nic *pf, int vf, u16 vlan, u8 qos,
+ 			flow_cfg->entry[flow_cfg->vf_vlan_offset + idx];
+ 		err = otx2_sync_mbox_msg(&pf->mbox);
+ 
++		if (!(pf->ethtool_flags & OTX2_PRIV_FLAG_FDSA_HDR))
++			memset(&config->rule, 0, sizeof(config->rule));
+ 		goto out;
+ 	}
+ 
+@@ -2165,6 +2167,10 @@ static int otx2_do_set_vf_vlan(struct otx2_nic *pf, int vf, u16 vlan, u8 qos,
+ 	req->set_cntr = 1;
+ 
+ 	err = otx2_sync_mbox_msg(&pf->mbox);
++	/* Update these values to reinstall the vfvlan rule */
++	config->rule.vlan	= vlan;
++	config->rule.proto	= proto;
++	config->rule.qos	= qos;
+ out:
+ 	config->vlan = vlan;
+ 	otx2_mbox_unlock(&pf->mbox);
+@@ -2193,6 +2199,9 @@ static int otx2_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos,
+ 	if (!(pf->flags & OTX2_FLAG_VF_VLAN_SUPPORT))
+ 		return -EOPNOTSUPP;
+ 
++	if (pf->ethtool_flags & OTX2_PRIV_FLAG_FDSA_HDR)
++		return -EOPNOTSUPP;
++
+ 	return otx2_do_set_vf_vlan(pf, vf, vlan, qos, proto);
+ }
+ 
+-- 
+2.31.1
+

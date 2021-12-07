@@ -1,0 +1,236 @@
+From 448cfee342382ef01514921c680c60677014bad1 Mon Sep 17 00:00:00 2001
+From: Codrin Ciubotariu <codrin.ciubotariu@microchip.com>
+Date: Tue, 4 Aug 2020 12:59:24 +0300
+Subject: [PATCH 1292/1921] i2c: core: add generic I2C GPIO recovery
+
+Multiple I2C bus drivers use similar bindings to obtain information needed
+for I2C recovery. For example, for platforms using device-tree, the
+properties look something like this:
+
+&i2c {
+	...
+	pinctrl-names = "default", "gpio";
+	pinctrl-0 = <&pinctrl_i2c_default>;
+	pinctrl-1 = <&pinctrl_i2c_gpio>;
+	sda-gpios = <&pio 0 GPIO_ACTIVE_HIGH>;
+	scl-gpios = <&pio 1 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+	...
+}
+
+For this reason, we can add this common initialization in the core. This
+way, other I2C bus drivers will be able to support GPIO recovery just by
+providing a pointer to platform's pinctrl and calling i2c_recover_bus()
+when SDA is stuck low.
+
+Signed-off-by: Codrin Ciubotariu <codrin.ciubotariu@microchip.com>
+[wsa: inverted one logic for better readability, minor update to kdoc]
+Signed-off-by: Wolfram Sang <wsa@kernel.org>
+Change-Id: I76906fa7b9432a0220a48c01f7052e969b73e892
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/46716
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/i2c/i2c-core-base.c | 126 ++++++++++++++++++++++++++++++++++++
+ include/linux/i2c.h         |  11 ++++
+ 2 files changed, 137 insertions(+)
+
+diff --git a/drivers/i2c/i2c-core-base.c b/drivers/i2c/i2c-core-base.c
+index d46ae60fd8d0..e00ed8a36263 100644
+--- a/drivers/i2c/i2c-core-base.c
++++ b/drivers/i2c/i2c-core-base.c
+@@ -32,6 +32,7 @@
+ #include <linux/of_device.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/pm_wakeirq.h>
+@@ -181,6 +182,8 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
+ 
+ 	if (bri->prepare_recovery)
+ 		bri->prepare_recovery(adap);
++	if (bri->pinctrl)
++		pinctrl_select_state(bri->pinctrl, bri->pins_gpio);
+ 
+ 	/*
+ 	 * If we can set SDA, we will always create a STOP to ensure additional
+@@ -236,6 +239,8 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
+ 
+ 	if (bri->unprepare_recovery)
+ 		bri->unprepare_recovery(adap);
++	if (bri->pinctrl)
++		pinctrl_select_state(bri->pinctrl, bri->pins_default);
+ 
+ 	return ret;
+ }
+@@ -251,6 +256,125 @@ int i2c_recover_bus(struct i2c_adapter *adap)
+ }
+ EXPORT_SYMBOL_GPL(i2c_recover_bus);
+ 
++static void i2c_gpio_init_pinctrl_recovery(struct i2c_adapter *adap)
++{
++	struct i2c_bus_recovery_info *bri = adap->bus_recovery_info;
++	struct device *dev = &adap->dev;
++	struct pinctrl *p = bri->pinctrl;
++
++	/*
++	 * we can't change states without pinctrl, so remove the states if
++	 * populated
++	 */
++	if (!p) {
++		bri->pins_default = NULL;
++		bri->pins_gpio = NULL;
++		return;
++	}
++
++	if (!bri->pins_default) {
++		bri->pins_default = pinctrl_lookup_state(p,
++							 PINCTRL_STATE_DEFAULT);
++		if (IS_ERR(bri->pins_default)) {
++			dev_dbg(dev, PINCTRL_STATE_DEFAULT " state not found for GPIO recovery\n");
++			bri->pins_default = NULL;
++		}
++	}
++	if (!bri->pins_gpio) {
++		bri->pins_gpio = pinctrl_lookup_state(p, "gpio");
++		if (IS_ERR(bri->pins_gpio))
++			bri->pins_gpio = pinctrl_lookup_state(p, "recovery");
++
++		if (IS_ERR(bri->pins_gpio)) {
++			dev_dbg(dev, "no gpio or recovery state found for GPIO recovery\n");
++			bri->pins_gpio = NULL;
++		}
++	}
++
++	/* for pinctrl state changes, we need all the information */
++	if (bri->pins_default && bri->pins_gpio) {
++		dev_info(dev, "using pinctrl states for GPIO recovery");
++	} else {
++		bri->pinctrl = NULL;
++		bri->pins_default = NULL;
++		bri->pins_gpio = NULL;
++	}
++}
++
++static int i2c_gpio_init_generic_recovery(struct i2c_adapter *adap)
++{
++	struct i2c_bus_recovery_info *bri = adap->bus_recovery_info;
++	struct device *dev = &adap->dev;
++	struct gpio_desc *gpiod;
++	int ret = 0;
++
++	/*
++	 * don't touch the recovery information if the driver is not using
++	 * generic SCL recovery
++	 */
++	if (bri->recover_bus && bri->recover_bus != i2c_generic_scl_recovery)
++		return 0;
++
++	/*
++	 * pins might be taken as GPIO, so we should inform pinctrl about
++	 * this and move the state to GPIO
++	 */
++	if (bri->pinctrl)
++		pinctrl_select_state(bri->pinctrl, bri->pins_gpio);
++
++	/*
++	 * if there is incomplete or no recovery information, see if generic
++	 * GPIO recovery is available
++	 */
++	if (!bri->scl_gpiod) {
++		gpiod = devm_gpiod_get(dev, "scl", GPIOD_OUT_HIGH_OPEN_DRAIN);
++		if (PTR_ERR(gpiod) == -EPROBE_DEFER) {
++			ret  = -EPROBE_DEFER;
++			goto cleanup_pinctrl_state;
++		}
++		if (!IS_ERR(gpiod)) {
++			bri->scl_gpiod = gpiod;
++			bri->recover_bus = i2c_generic_scl_recovery;
++			dev_info(dev, "using generic GPIOs for recovery\n");
++		}
++	}
++
++	/* SDA GPIOD line is optional, so we care about DEFER only */
++	if (!bri->sda_gpiod) {
++		/*
++		 * We have SCL. Pull SCL low and wait a bit so that SDA glitches
++		 * have no effect.
++		 */
++		gpiod_direction_output(bri->scl_gpiod, 0);
++		udelay(10);
++		gpiod = devm_gpiod_get(dev, "sda", GPIOD_IN);
++
++		/* Wait a bit in case of a SDA glitch, and then release SCL. */
++		udelay(10);
++		gpiod_direction_output(bri->scl_gpiod, 1);
++
++		if (PTR_ERR(gpiod) == -EPROBE_DEFER) {
++			ret = -EPROBE_DEFER;
++			goto cleanup_pinctrl_state;
++		}
++		if (!IS_ERR(gpiod))
++			bri->sda_gpiod = gpiod;
++	}
++
++cleanup_pinctrl_state:
++	/* change the state of the pins back to their default state */
++	if (bri->pinctrl)
++		pinctrl_select_state(bri->pinctrl, bri->pins_default);
++
++	return ret;
++}
++
++static int i2c_gpio_init_recovery(struct i2c_adapter *adap)
++{
++	i2c_gpio_init_pinctrl_recovery(adap);
++	return i2c_gpio_init_generic_recovery(adap);
++}
++
+ static void i2c_init_recovery(struct i2c_adapter *adap)
+ {
+ 	struct i2c_bus_recovery_info *bri = adap->bus_recovery_info;
+@@ -259,6 +383,8 @@ static void i2c_init_recovery(struct i2c_adapter *adap)
+ 	if (!bri)
+ 		return;
+ 
++	i2c_gpio_init_recovery(adap);
++
+ 	if (!bri->recover_bus) {
+ 		err_str = "no recover_bus() found";
+ 		goto err;
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index 79f0d4fd5036..ca067d4ef4e2 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -601,6 +601,14 @@ struct i2c_timings {
+  *	may configure padmux here for SDA/SCL line or something else they want.
+  * @scl_gpiod: gpiod of the SCL line. Only required for GPIO recovery.
+  * @sda_gpiod: gpiod of the SDA line. Only required for GPIO recovery.
++ * @pinctrl: pinctrl used by GPIO recovery to change the state of the I2C pins.
++ *      Optional.
++ * @pins_default: default pinctrl state of SCL/SDA lines, when they are assigned
++ *      to the I2C bus. Optional. Populated internally for GPIO recovery, if
++ *      state with the name PINCTRL_STATE_DEFAULT is found and pinctrl is valid.
++ * @pins_gpio: recovery pinctrl state of SCL/SDA lines, when they are used as
++ *      GPIOs. Optional. Populated internally for GPIO recovery, if this state
++ *      is called "gpio" or "recovery" and pinctrl is valid.
+  */
+ struct i2c_bus_recovery_info {
+ 	int (*recover_bus)(struct i2c_adapter *adap);
+@@ -617,6 +625,9 @@ struct i2c_bus_recovery_info {
+ 	/* gpio recovery */
+ 	struct gpio_desc *scl_gpiod;
+ 	struct gpio_desc *sda_gpiod;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_default;
++	struct pinctrl_state *pins_gpio;
+ };
+ 
+ int i2c_recover_bus(struct i2c_adapter *adap);
+-- 
+2.31.1
+

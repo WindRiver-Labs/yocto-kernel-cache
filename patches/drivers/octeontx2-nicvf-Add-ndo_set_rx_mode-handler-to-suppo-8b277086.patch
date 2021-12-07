@@ -1,0 +1,147 @@
+From a8b25f0715a37b22aa6a180bde4b2c4b3deb71f3 Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Mon, 26 Apr 2021 23:44:45 +0530
+Subject: [PATCH 1502/1921] octeontx2-nicvf: Add ndo_set_rx_mode handler to
+ support multicast/promisc
+
+Added ndo_set_rx_mode handler for enabling/disabling multicast and
+promisc mode from VF driver. Modified PF driver ndo_set_rx_mode
+handler to support multicast and promisc mode independently.
+
+Change-Id: I2e40d9dfc232dbf37bc7e2f1a546cc131260c14c
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/50688
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  2 +-
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  | 57 ++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index c187202fd900..fdde96bf5f94 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1927,7 +1927,7 @@ void otx2_do_set_rx_mode(struct work_struct *work)
+ 
+ 	if (promisc)
+ 		req->mode |= NIX_RX_MODE_PROMISC;
+-	else if (netdev->flags & (IFF_ALLMULTI | IFF_MULTICAST))
++	if (netdev->flags & (IFF_ALLMULTI | IFF_MULTICAST))
+ 		req->mode |= NIX_RX_MODE_ALLMULTI;
+ 
+ 	otx2_sync_mbox_msg(&pf->mbox);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index d75abdaa41ea..b78d8f62b53a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -420,6 +420,40 @@ static netdev_tx_t otx2vf_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	return NETDEV_TX_OK;
+ }
+ 
++static void otx2vf_set_rx_mode(struct net_device *netdev)
++{
++	struct otx2_nic *vf = netdev_priv(netdev);
++
++	queue_work(vf->otx2_wq, &vf->rx_mode_work);
++}
++
++static void otx2vf_do_set_rx_mode(struct work_struct *work)
++{
++	struct otx2_nic *vf = container_of(work, struct otx2_nic, rx_mode_work);
++	struct net_device *netdev = vf->netdev;
++	unsigned int flags = netdev->flags;
++	struct nix_rx_mode *req;
++
++	mutex_lock(&vf->mbox.lock);
++
++	req = otx2_mbox_alloc_msg_nix_set_rx_mode(&vf->mbox);
++	if (!req) {
++		mutex_unlock(&vf->mbox.lock);
++		return;
++	}
++
++	req->mode = NIX_RX_MODE_UCAST;
++
++	if (flags & IFF_PROMISC)
++		req->mode |= NIX_RX_MODE_PROMISC;
++	if (flags & (IFF_ALLMULTI | IFF_MULTICAST))
++		req->mode |= NIX_RX_MODE_ALLMULTI;
++
++	otx2_sync_mbox_msg(&vf->mbox);
++
++	mutex_unlock(&vf->mbox.lock);
++}
++
+ static int otx2vf_change_mtu(struct net_device *netdev, int new_mtu)
+ {
+ 	bool if_up = netif_running(netdev);
+@@ -457,12 +491,24 @@ static const struct net_device_ops otx2vf_netdev_ops = {
+ 	.ndo_open = otx2vf_open,
+ 	.ndo_stop = otx2vf_stop,
+ 	.ndo_start_xmit = otx2vf_xmit,
++	.ndo_set_rx_mode = otx2vf_set_rx_mode,
+ 	.ndo_set_mac_address = otx2_set_mac_address,
+ 	.ndo_change_mtu = otx2vf_change_mtu,
+ 	.ndo_get_stats64 = otx2_get_stats64,
+ 	.ndo_tx_timeout = otx2_tx_timeout,
+ };
+ 
++static int otx2_wq_init(struct otx2_nic *vf)
++{
++	vf->otx2_wq = create_singlethread_workqueue("otx2vf_wq");
++	if (!vf->otx2_wq)
++		return -ENOMEM;
++
++	INIT_WORK(&vf->rx_mode_work, otx2vf_do_set_rx_mode);
++	INIT_WORK(&vf->reset_task, otx2vf_reset_task);
++	return 0;
++}
++
+ static int otx2vf_realloc_msix_vectors(struct otx2_nic *vf)
+ {
+ 	struct otx2_hw *hw = &vf->hw;
+@@ -630,8 +676,6 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	netdev->min_mtu = OTX2_MIN_MTU;
+ 	netdev->max_mtu = otx2_get_max_mtu(vf);
+ 
+-	INIT_WORK(&vf->reset_task, otx2vf_reset_task);
+-
+ 	/* To distinguish, for LBK VFs set netdev name explicitly */
+ 	if (is_otx2_lbkvf(vf->pdev)) {
+ 		int n;
+@@ -648,6 +692,10 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_detach_rsrc;
+ 	}
+ 
++	err = otx2_wq_init(vf);
++	if (err)
++		goto err_unreg_netdev;
++
+ 	otx2vf_set_ethtool_ops(netdev);
+ 
+ 	otx2_cgx_features_get(vf);
+@@ -661,6 +709,8 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	return 0;
+ 
++err_unreg_netdev:
++	unregister_netdev(netdev);
+ err_detach_rsrc:
+ 	if (hw->lmt_base)
+ 		iounmap(hw->lmt_base);
+@@ -692,6 +742,9 @@ static void otx2vf_remove(struct pci_dev *pdev)
+ 	if (otx2smqvf_remove(vf))
+ 		unregister_netdev(netdev);
+ 
++	if (vf->otx2_wq)
++		destroy_workqueue(vf->otx2_wq);
++
+ 	otx2vf_disable_mbox_intr(vf);
+ 	otx2_detach_resources(&vf->mbox);
+ 	if (test_bit(CN10K_LMTST, &vf->hw.cap_flag))
+-- 
+2.31.1
+

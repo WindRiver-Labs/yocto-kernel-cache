@@ -1,0 +1,117 @@
+From 7b0af070d31f6ecf23b10f447f5f7385e8b7c54f Mon Sep 17 00:00:00 2001
+From: Linu Cherian <lcherian@marvell.com>
+Date: Sun, 9 Feb 2020 22:21:25 +0530
+Subject: [PATCH 0676/1921] coresight: tmc: Force 64b DBA access when 32b pair
+ not supported
+
+- Coresight TMC driver does register access for 64 bit DBA register in
+  32b pair.
+
+- OcteonTx2 ETR implementation doesn't support DBA access in 32b pair.
+  Support this quirk by forcing 64b access.
+
+Change-Id: Idc593eaeb9e200f50d1b11e508a8c6b7507076ae
+Signed-off-by: Linu Cherian <lcherian@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/24817
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/32251
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/hwtracing/coresight/coresight-priv.h   |  1 +
+ drivers/hwtracing/coresight/coresight-quirks.c |  4 +++-
+ drivers/hwtracing/coresight/coresight-tmc.c    | 17 ++++++++++++++++-
+ drivers/hwtracing/coresight/coresight-tmc.h    | 12 ++++++++++++
+ 4 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/hwtracing/coresight/coresight-priv.h b/drivers/hwtracing/coresight/coresight-priv.h
+index 12a111ff7b13..285c0523912d 100644
+--- a/drivers/hwtracing/coresight/coresight-priv.h
++++ b/drivers/hwtracing/coresight/coresight-priv.h
+@@ -80,6 +80,7 @@ extern const u32 barrier_pkt[4];
+ #define CSETR_QUIRK_NO_STOP_FLUSH	(0x1U << 3) /* No Stop on flush */
+ #define CSETM_QUIRK_SW_SYNC		(0x1U << 4) /* No Hardware sync */
+ #define CSETM_QUIRK_TREAT_ETMv43	(0x1U << 5) /* ETMv4.2 as ETMv4.3 */
++#define CSETR_QUIRK_FORCE_64B_DBA_RW	(0x1U << 6) /* 64b DBA read/write */
+ 
+ /* ETM sync insertion modes
+  * 1. MODE_HW
+diff --git a/drivers/hwtracing/coresight/coresight-quirks.c b/drivers/hwtracing/coresight/coresight-quirks.c
+index 32cacc1b37f8..cad1b46e2f13 100644
+--- a/drivers/hwtracing/coresight/coresight-quirks.c
++++ b/drivers/hwtracing/coresight/coresight-quirks.c
+@@ -20,8 +20,10 @@ u32 coresight_get_etr_quirks(unsigned int id)
+ 			CSETR_QUIRK_RESET_CTL_REG |
+ 			CSETR_QUIRK_NO_STOP_FLUSH;
+ 
++	/* Common across all Chip variants and revisions */
+ 	if (id == OCTEONTX_CN9XXX_ETR)
+-		options |= CSETR_QUIRK_SECURE_BUFF;
++		options |= CSETR_QUIRK_SECURE_BUFF |
++			CSETR_QUIRK_FORCE_64B_DBA_RW;
+ 
+ 	return options;
+ }
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.c b/drivers/hwtracing/coresight/coresight-tmc.c
+index 841484a72a8e..56ec99bef41f 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.c
++++ b/drivers/hwtracing/coresight/coresight-tmc.c
+@@ -282,7 +282,22 @@ coresight_tmc_reg(authstatus, TMC_AUTHSTATUS);
+ coresight_tmc_reg(devid, CORESIGHT_DEVID);
+ coresight_tmc_reg64(rrp, TMC_RRP, TMC_RRPHI);
+ coresight_tmc_reg64(rwp, TMC_RWP, TMC_RWPHI);
+-coresight_tmc_reg64(dba, TMC_DBALO, TMC_DBAHI);
++
++/* To accommodate silicons that doesn't support 32 bit split reads
++ * of dba, use tmc_read_dba so that etr options can be processed.
++ */
++static ssize_t dba_show(struct device *_dev,
++			   struct device_attribute *attr, char *buf)
++{
++	struct tmc_drvdata *drvdata = dev_get_drvdata(_dev->parent);
++	u64 val;
++
++	pm_runtime_get_sync(_dev->parent);
++	val = tmc_read_dba(drvdata);
++	pm_runtime_put_sync(_dev->parent);
++	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", val);
++}
++static DEVICE_ATTR_RO(dba);
+ 
+ static struct attribute *coresight_tmc_mgmt_attrs[] = {
+ 	&dev_attr_rsz.attr,
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.h b/drivers/hwtracing/coresight/coresight-tmc.h
+index 7542a4114893..4730ab06eb7e 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.h
++++ b/drivers/hwtracing/coresight/coresight-tmc.h
+@@ -338,15 +338,27 @@ ssize_t tmc_etr_get_sysfs_trace(struct tmc_drvdata *drvdata,
+ 				loff_t pos, size_t len, char **bufpp);
+ void *tmc_etr_drvbuf_vaddr(struct tmc_drvdata *drvdata);
+ 
++#define is_etr_dba_force_64b_rw(options, lo_off)			\
++((((options) & CSETR_QUIRK_FORCE_64B_DBA_RW) &&				\
++	(lo_off) == TMC_DBALO) ? true : false)				\
++
+ #define TMC_REG_PAIR(name, lo_off, hi_off)				\
+ static inline u64							\
+ tmc_read_##name(struct tmc_drvdata *drvdata)				\
+ {									\
++	if (is_etr_dba_force_64b_rw(drvdata->etr_options, lo_off))	\
++		return readq(drvdata->base + lo_off);			\
++									\
+ 	return coresight_read_reg_pair(drvdata->base, lo_off, hi_off);	\
+ }									\
+ static inline void							\
+ tmc_write_##name(struct tmc_drvdata *drvdata, u64 val)			\
+ {									\
++	if (is_etr_dba_force_64b_rw(drvdata->etr_options, lo_off)) {	\
++		writeq(val, drvdata->base + lo_off);			\
++		return;							\
++	}								\
++									\
+ 	coresight_write_reg_pair(drvdata->base, val, lo_off, hi_off);	\
+ }
+ 
+-- 
+2.31.1
+

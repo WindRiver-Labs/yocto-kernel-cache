@@ -1,0 +1,436 @@
+From c3190bbc8de40589b4a4dcf5f67fea93453e377c Mon Sep 17 00:00:00 2001
+From: Pascal van Leeuwen <pascalvanl@gmail.com>
+Date: Fri, 30 Aug 2019 09:40:54 +0200
+Subject: [PATCH 1191/1921] crypto: inside-secure - Only enable algorithms
+ advertised by the hardware
+
+This patch probes the supported algorithms from the hardware and only
+registers the ones that the hardware actually supports. This is necessary
+because this is a generic driver supposed to run on a wide variety of
+engines, which may or may not implement certain algorithms.
+
+Signed-off-by: Pascal van Leeuwen <pvanleeuwen@verimatrix.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/crypto/inside-secure/safexcel.c       | 36 +++++++++++++++++--
+ drivers/crypto/inside-secure/safexcel.h       | 33 +++++++++++++++++
+ .../crypto/inside-secure/safexcel_cipher.c    | 19 ++++++++++
+ drivers/crypto/inside-secure/safexcel_hash.c  | 12 +++++++
+ 4 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/safexcel.c b/drivers/crypto/inside-secure/safexcel.c
+index 9941861ae1d8..25285d664581 100644
+--- a/drivers/crypto/inside-secure/safexcel.c
++++ b/drivers/crypto/inside-secure/safexcel.c
+@@ -284,7 +284,7 @@ static int eip197_load_firmwares(struct safexcel_crypto_priv *priv)
+ 	ipuesz = eip197_write_firmware(priv, fw[FW_IPUE]);
+ 
+ 	if (eip197_start_firmware(priv, ipuesz, ifppsz, minifw)) {
+-		dev_dbg(priv->dev, "Firmware loaded successfully");
++		dev_dbg(priv->dev, "Firmware loaded successfully\n");
+ 		return 0;
+ 	}
+ 
+@@ -1014,6 +1014,12 @@ static int safexcel_register_algorithms(struct safexcel_crypto_priv *priv)
+ 	for (i = 0; i < ARRAY_SIZE(safexcel_algs); i++) {
+ 		safexcel_algs[i]->priv = priv;
+ 
++		/* Do we have all required base algorithms available? */
++		if ((safexcel_algs[i]->algo_mask & priv->hwconfig.algo_flags) !=
++		    safexcel_algs[i]->algo_mask)
++			/* No, so don't register this ciphersuite */
++			continue;
++
+ 		if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
+ 			ret = crypto_register_skcipher(&safexcel_algs[i]->alg.skcipher);
+ 		else if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
+@@ -1029,6 +1035,12 @@ static int safexcel_register_algorithms(struct safexcel_crypto_priv *priv)
+ 
+ fail:
+ 	for (j = 0; j < i; j++) {
++		/* Do we have all required base algorithms available? */
++		if ((safexcel_algs[j]->algo_mask & priv->hwconfig.algo_flags) !=
++		    safexcel_algs[j]->algo_mask)
++			/* No, so don't unregister this ciphersuite */
++			continue;
++
+ 		if (safexcel_algs[j]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
+ 			crypto_unregister_skcipher(&safexcel_algs[j]->alg.skcipher);
+ 		else if (safexcel_algs[j]->type == SAFEXCEL_ALG_TYPE_AEAD)
+@@ -1045,6 +1057,12 @@ static void safexcel_unregister_algorithms(struct safexcel_crypto_priv *priv)
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(safexcel_algs); i++) {
++		/* Do we have all required base algorithms available? */
++		if ((safexcel_algs[i]->algo_mask & priv->hwconfig.algo_flags) !=
++		    safexcel_algs[i]->algo_mask)
++			/* No, so don't unregister this ciphersuite */
++			continue;
++
+ 		if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_SKCIPHER)
+ 			crypto_unregister_skcipher(&safexcel_algs[i]->alg.skcipher);
+ 		else if (safexcel_algs[i]->type == SAFEXCEL_ALG_TYPE_AEAD)
+@@ -1123,6 +1141,7 @@ static int safexcel_probe_generic(void *pdev,
+ 				  int is_pci_dev)
+ {
+ 	struct device *dev = priv->dev;
++	u32 peid;
+ 	int i, ret;
+ 
+ 	priv->context_pool = dmam_pool_create("safexcel-context", dev,
+@@ -1133,8 +1152,21 @@ static int safexcel_probe_generic(void *pdev,
+ 
+ 	safexcel_init_register_offsets(priv);
+ 
+-	if (priv->version != EIP97IES_MRVL)
++	/* Get supported algorithms from EIP96 transform engine */
++	priv->hwconfig.algo_flags = readl(EIP197_PE(priv) +
++				    EIP197_PE_EIP96_OPTIONS(0));
++
++	if (priv->version == EIP97IES_MRVL) {
++		peid = 97;
++	} else {
+ 		priv->flags |= EIP197_TRC_CACHE;
++		peid = 197;
++	}
++
++	/* Dump some debug information important during development */
++	dev_dbg(priv->dev, "Inside Secure EIP%d packetengine\n", peid);
++	dev_dbg(priv->dev, "Supported algorithms: %08x\n",
++			   priv->hwconfig.algo_flags);
+ 
+ 	safexcel_configure(priv);
+ 
+diff --git a/drivers/crypto/inside-secure/safexcel.h b/drivers/crypto/inside-secure/safexcel.h
+index 0a30a7bf4fe0..b5ff62fa3044 100644
+--- a/drivers/crypto/inside-secure/safexcel.h
++++ b/drivers/crypto/inside-secure/safexcel.h
+@@ -145,6 +145,7 @@
+ #define EIP197_PE_EIP96_FUNCTION_EN(n)		(0x1004 + (0x2000 * (n)))
+ #define EIP197_PE_EIP96_CONTEXT_CTRL(n)		(0x1008 + (0x2000 * (n)))
+ #define EIP197_PE_EIP96_CONTEXT_STAT(n)		(0x100c + (0x2000 * (n)))
++#define EIP197_PE_EIP96_OPTIONS(n)		(0x13f8 + (0x2000 * (n)))
+ #define EIP197_PE_OUT_DBUF_THRES(n)		(0x1c00 + (0x2000 * (n)))
+ #define EIP197_PE_OUT_TBUF_THRES(n)		(0x1d00 + (0x2000 * (n)))
+ #define EIP197_MST_CTRL				0xfff4
+@@ -597,6 +598,32 @@ enum safexcel_eip_version {
+ 	EIP197_DEVBRD
+ };
+ 
++/* EIP algorithm presence flags */
++enum safexcel_eip_algorithms {
++	SAFEXCEL_ALG_BC0      = BIT(5),
++	SAFEXCEL_ALG_SM4      = BIT(6),
++	SAFEXCEL_ALG_SM3      = BIT(7),
++	SAFEXCEL_ALG_CHACHA20 = BIT(8),
++	SAFEXCEL_ALG_POLY1305 = BIT(9),
++	SAFEXCEL_SEQMASK_256   = BIT(10),
++	SAFEXCEL_SEQMASK_384   = BIT(11),
++	SAFEXCEL_ALG_AES      = BIT(12),
++	SAFEXCEL_ALG_AES_XFB  = BIT(13),
++	SAFEXCEL_ALG_DES      = BIT(15),
++	SAFEXCEL_ALG_DES_XFB  = BIT(16),
++	SAFEXCEL_ALG_ARC4     = BIT(18),
++	SAFEXCEL_ALG_AES_XTS  = BIT(20),
++	SAFEXCEL_ALG_WIRELESS = BIT(21),
++	SAFEXCEL_ALG_MD5      = BIT(22),
++	SAFEXCEL_ALG_SHA1     = BIT(23),
++	SAFEXCEL_ALG_SHA2_256 = BIT(25),
++	SAFEXCEL_ALG_SHA2_512 = BIT(26),
++	SAFEXCEL_ALG_XCBC_MAC = BIT(27),
++	SAFEXCEL_ALG_CBC_MAC_ALL = BIT(29),
++	SAFEXCEL_ALG_GHASH    = BIT(30),
++	SAFEXCEL_ALG_SHA3     = BIT(31),
++};
++
+ struct safexcel_register_offsets {
+ 	u32 hia_aic;
+ 	u32 hia_aic_g;
+@@ -614,6 +641,10 @@ enum safexcel_flags {
+ 	EIP197_TRC_CACHE = BIT(0),
+ };
+ 
++struct safexcel_hwconfig {
++	enum safexcel_eip_algorithms algo_flags;
++};
++
+ struct safexcel_crypto_priv {
+ 	void __iomem *base;
+ 	struct device *dev;
+@@ -623,6 +654,7 @@ struct safexcel_crypto_priv {
+ 
+ 	enum safexcel_eip_version version;
+ 	struct safexcel_register_offsets offsets;
++	struct safexcel_hwconfig hwconfig;
+ 	u32 flags;
+ 
+ 	/* context DMA pool */
+@@ -667,6 +699,7 @@ struct safexcel_ahash_export_state {
+ struct safexcel_alg_template {
+ 	struct safexcel_crypto_priv *priv;
+ 	enum safexcel_alg_type type;
++	enum safexcel_eip_algorithms algo_mask;
+ 	union {
+ 		struct skcipher_alg skcipher;
+ 		struct aead_alg aead;
+diff --git a/drivers/crypto/inside-secure/safexcel_cipher.c b/drivers/crypto/inside-secure/safexcel_cipher.c
+index 05e34c62945c..e60e797b5719 100644
+--- a/drivers/crypto/inside-secure/safexcel_cipher.c
++++ b/drivers/crypto/inside-secure/safexcel_cipher.c
+@@ -1034,6 +1034,7 @@ static int safexcel_skcipher_aes_ecb_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_ecb_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_AES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_skcipher_aes_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1068,6 +1069,7 @@ static int safexcel_skcipher_aes_cbc_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_cbc_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_AES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_skcipher_aes_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1141,6 +1143,7 @@ static int safexcel_skcipher_aes_ctr_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_ctr_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_AES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_skcipher_aesctr_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1198,6 +1201,7 @@ static int safexcel_skcipher_des_cbc_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_cbc_des = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_DES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_des_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1233,6 +1237,7 @@ static int safexcel_skcipher_des_ecb_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_ecb_des = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_DES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_des_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1290,6 +1295,7 @@ static int safexcel_skcipher_des3_cbc_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_cbc_des3_ede = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_DES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_des3_ede_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1325,6 +1331,7 @@ static int safexcel_skcipher_des3_ecb_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_ecb_des3_ede = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_DES,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_des3_ede_setkey,
+ 		.encrypt = safexcel_encrypt,
+@@ -1393,6 +1400,7 @@ static int safexcel_aead_sha1_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha1_cbc_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA1,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1427,6 +1435,7 @@ static int safexcel_aead_sha256_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha256_cbc_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_256,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1461,6 +1470,7 @@ static int safexcel_aead_sha224_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha224_cbc_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_256,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1495,6 +1505,7 @@ static int safexcel_aead_sha512_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha512_cbc_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_512,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1529,6 +1540,7 @@ static int safexcel_aead_sha384_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha384_cbc_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_512,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1562,6 +1574,7 @@ static int safexcel_aead_sha1_des3_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha1_cbc_des3_ede = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_DES | SAFEXCEL_ALG_SHA1,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1595,6 +1608,7 @@ static int safexcel_aead_sha1_ctr_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha1_ctr_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA1,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1628,6 +1642,7 @@ static int safexcel_aead_sha256_ctr_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha256_ctr_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_256,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1661,6 +1676,7 @@ static int safexcel_aead_sha224_ctr_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha224_ctr_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_256,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1694,6 +1710,7 @@ static int safexcel_aead_sha512_ctr_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha512_ctr_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_512,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1727,6 +1744,7 @@ static int safexcel_aead_sha384_ctr_cra_init(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_authenc_hmac_sha384_ctr_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_AEAD,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_SHA2_512,
+ 	.alg.aead = {
+ 		.setkey = safexcel_aead_setkey,
+ 		.encrypt = safexcel_aead_encrypt,
+@@ -1840,6 +1858,7 @@ static int safexcel_decrypt_xts(struct skcipher_request *req)
+ 
+ struct safexcel_alg_template safexcel_alg_xts_aes = {
+ 	.type = SAFEXCEL_ALG_TYPE_SKCIPHER,
++	.algo_mask = SAFEXCEL_ALG_AES | SAFEXCEL_ALG_AES_XTS,
+ 	.alg.skcipher = {
+ 		.setkey = safexcel_skcipher_aesxts_setkey,
+ 		.encrypt = safexcel_encrypt_xts,
+diff --git a/drivers/crypto/inside-secure/safexcel_hash.c b/drivers/crypto/inside-secure/safexcel_hash.c
+index 626dd82e583f..e60838f2fa96 100644
+--- a/drivers/crypto/inside-secure/safexcel_hash.c
++++ b/drivers/crypto/inside-secure/safexcel_hash.c
+@@ -845,6 +845,7 @@ static void safexcel_ahash_cra_exit(struct crypto_tfm *tfm)
+ 
+ struct safexcel_alg_template safexcel_alg_sha1 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA1,
+ 	.alg.ahash = {
+ 		.init = safexcel_sha1_init,
+ 		.update = safexcel_ahash_update,
+@@ -1085,6 +1086,7 @@ static int safexcel_hmac_sha1_setkey(struct crypto_ahash *tfm, const u8 *key,
+ 
+ struct safexcel_alg_template safexcel_alg_hmac_sha1 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA1,
+ 	.alg.ahash = {
+ 		.init = safexcel_hmac_sha1_init,
+ 		.update = safexcel_ahash_update,
+@@ -1140,6 +1142,7 @@ static int safexcel_sha256_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_sha256 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_256,
+ 	.alg.ahash = {
+ 		.init = safexcel_sha256_init,
+ 		.update = safexcel_ahash_update,
+@@ -1194,6 +1197,7 @@ static int safexcel_sha224_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_sha224 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_256,
+ 	.alg.ahash = {
+ 		.init = safexcel_sha224_init,
+ 		.update = safexcel_ahash_update,
+@@ -1262,6 +1266,7 @@ static int safexcel_hmac_sha224_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_hmac_sha224 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_256,
+ 	.alg.ahash = {
+ 		.init = safexcel_hmac_sha224_init,
+ 		.update = safexcel_ahash_update,
+@@ -1331,6 +1336,7 @@ static int safexcel_hmac_sha256_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_hmac_sha256 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_256,
+ 	.alg.ahash = {
+ 		.init = safexcel_hmac_sha256_init,
+ 		.update = safexcel_ahash_update,
+@@ -1386,6 +1392,7 @@ static int safexcel_sha512_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_sha512 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_512,
+ 	.alg.ahash = {
+ 		.init = safexcel_sha512_init,
+ 		.update = safexcel_ahash_update,
+@@ -1440,6 +1447,7 @@ static int safexcel_sha384_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_sha384 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_512,
+ 	.alg.ahash = {
+ 		.init = safexcel_sha384_init,
+ 		.update = safexcel_ahash_update,
+@@ -1508,6 +1516,7 @@ static int safexcel_hmac_sha512_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_hmac_sha512 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_512,
+ 	.alg.ahash = {
+ 		.init = safexcel_hmac_sha512_init,
+ 		.update = safexcel_ahash_update,
+@@ -1577,6 +1586,7 @@ static int safexcel_hmac_sha384_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_hmac_sha384 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_SHA2_512,
+ 	.alg.ahash = {
+ 		.init = safexcel_hmac_sha384_init,
+ 		.update = safexcel_ahash_update,
+@@ -1632,6 +1642,7 @@ static int safexcel_md5_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_md5 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_MD5,
+ 	.alg.ahash = {
+ 		.init = safexcel_md5_init,
+ 		.update = safexcel_ahash_update,
+@@ -1701,6 +1712,7 @@ static int safexcel_hmac_md5_digest(struct ahash_request *areq)
+ 
+ struct safexcel_alg_template safexcel_alg_hmac_md5 = {
+ 	.type = SAFEXCEL_ALG_TYPE_AHASH,
++	.algo_mask = SAFEXCEL_ALG_MD5,
+ 	.alg.ahash = {
+ 		.init = safexcel_hmac_md5_init,
+ 		.update = safexcel_ahash_update,
+-- 
+2.31.1
+

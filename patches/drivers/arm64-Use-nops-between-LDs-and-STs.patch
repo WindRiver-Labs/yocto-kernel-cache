@@ -1,0 +1,411 @@
+From 44dee7501bcbfa89f0a8b9a907205571ccaf4404 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Thu, 5 Mar 2020 13:58:41 +0530
+Subject: [PATCH 0393/1921] arm64: Use nops between LDs and STs
+
+An issue exists in T83xx chip where the CPU can
+incorrectly forward data from an older store to a
+younger load when addresses differ by bit 55.
+When this happens L1 Dcache parity error occurs in
+hardware and Synchronous parity error abort is raised
+to software. Kernel and User virtual addresses always
+differ by bit 55 and also load, store operations between
+those VAs happen at __arch_copy_to/from_user only.
+Hence as a workaround __arch_copy_to/from_user
+functions are modified to use nops between loads and
+stores for T83 CPU.
+
+Change-Id: I5ff497cf927d1bd2f41e28d813da59f35022483d
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/26580
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ arch/arm64/Kconfig                  |  12 ++
+ arch/arm64/include/asm/cpucaps.h    |   3 +-
+ arch/arm64/kernel/cpu_errata.c      |  12 ++
+ arch/arm64/lib/copy_from_user.S     |  13 ++
+ arch/arm64/lib/copy_template_nops.S | 234 ++++++++++++++++++++++++++++
+ arch/arm64/lib/copy_to_user.S       |  14 ++
+ 6 files changed, 287 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/lib/copy_template_nops.S
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index c8ce7a416cfa..b3b4bfe486b6 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -625,6 +625,18 @@ config CAVIUM_ERRATUM_36890
+ 
+ 	  If unsure, say Y.
+ 
++config MRVL_ERRATUM_38500
++	bool "Marvell erratum 38500"
++	default y
++	help
++	  Enable workaround for erratum 38500. T8x ARM CPU can incorrectly
++	  forward data from an older store to a younger load. When this happens
++	  L1 Dcache parity error occurs in hardware and Synchronous parity error
++	  abort is raised to software. To workaround this erratum, nops are
++	  introduced in between loads and stores.
++
++	  If unsure, say Y.
++
+ config QCOM_FALKOR_ERRATUM_1003
+ 	bool "Falkor E1003: Incorrect translation due to ASID change"
+ 	default y
+diff --git a/arch/arm64/include/asm/cpucaps.h b/arch/arm64/include/asm/cpucaps.h
+index 3a8961fdf22c..d77dd06d5269 100644
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@ -56,7 +56,8 @@
+ #define ARM64_WORKAROUND_CAVIUM_TX2_219_PRFM	46
+ #define ARM64_WORKAROUND_1542419		47
+ #define ARM64_WORKAROUND_CAVIUM_36890		48
++#define ARM64_WORKAROUND_MRVL_38500		49
+ 
+-#define ARM64_NCAPS				49
++#define ARM64_NCAPS				50
+ 
+ #endif /* __ASM_CPUCAPS_H */
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 034b086f4ba8..b7c416ce5b39 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -807,6 +807,11 @@ static const struct midr_range cavium_erratum_36890_cpus[] = {
+ 	MIDR_RANGE(MIDR_MRVL_OCTEONTX2_95XX, 0, 0, 0, 1),
+ };
+ 
++static const struct midr_range marvell_erratum_38500_cpus[] = {
++	/* ThunderX, T83 all passes */
++	MIDR_ALL_VERSIONS(MIDR_THUNDERX_83XX),
++};
++
+ const struct arm64_cpu_capabilities arm64_errata[] = {
+ #ifdef CONFIG_ARM64_WORKAROUND_CLEAN_CACHE
+ 	{
+@@ -979,6 +984,13 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
+ 		ERRATA_MIDR_RANGE_LIST(cavium_erratum_36890_cpus),
+ 		.cpu_enable = cpu_enable_trap_zva_access,
+ 	},
++#endif
++#ifdef CONFIG_MRVL_ERRATUM_38500
++	{
++		.desc = "Marvell erratum 38500",
++		.capability = ARM64_WORKAROUND_MRVL_38500,
++		ERRATA_MIDR_RANGE_LIST(marvell_erratum_38500_cpus),
++	},
+ #endif
+ 	{
+ 	}
+diff --git a/arch/arm64/lib/copy_from_user.S b/arch/arm64/lib/copy_from_user.S
+index 8472dc7798b3..759d4cb67f91 100644
+--- a/arch/arm64/lib/copy_from_user.S
++++ b/arch/arm64/lib/copy_from_user.S
+@@ -19,6 +19,9 @@
+  * Returns:
+  *	x0 - bytes not copied
+  */
++	.macro ins_nops
++	nops 7
++	.endm
+ 
+ 	.macro ldrb1 ptr, regB, val
+ 	uao_user_alternative 9998f, ldrb, ldtrb, \ptr, \regB, \val
+@@ -56,8 +59,18 @@ end	.req	x5
+ ENTRY(__arch_copy_from_user)
+ 	uaccess_enable_not_uao x3, x4, x5
+ 	add	end, x0, x2
++alternative_if_not ARM64_WORKAROUND_MRVL_38500
++	nop
++alternative_else
++	b .Lcopy_with_nops
++alternative_endif
++
+ #include "copy_template.S"
+ 	uaccess_disable_not_uao x3, x4
++	b .Lgetout
++.Lcopy_with_nops:
++#include "copy_template_nops.S"
++.Lgetout:
+ 	mov	x0, #0				// Nothing to copy
+ 	ret
+ ENDPROC(__arch_copy_from_user)
+diff --git a/arch/arm64/lib/copy_template_nops.S b/arch/arm64/lib/copy_template_nops.S
+new file mode 100644
+index 000000000000..00e9db9c7fbc
+--- /dev/null
++++ b/arch/arm64/lib/copy_template_nops.S
+@@ -0,0 +1,234 @@
++/* SPDX-License-Identifier: GPL-2.0
++ *
++ * Copyright (C) 2013 ARM Ltd.
++ * Copyright (C) 2013 Linaro.
++ */
++
++/*
++ * Copy a buffer from src to dest (alignment handled by the hardware)
++ *
++ * Parameters:
++ *     x0 - dest
++ *     x1 - src
++ *     x2 - n
++ * Returns:
++ *     x0 - dest
++ */
++dstin	.req	x0
++src	.req	x1
++count	.req	x2
++tmp1	.req	x3
++tmp1w	.req	w3
++tmp2	.req	x4
++tmp2w	.req	w4
++dst	.req	x6
++
++A_l	.req	x7
++A_h	.req	x8
++B_l	.req	x9
++B_h	.req	x10
++C_l	.req	x11
++C_h	.req	x12
++D_l	.req	x13
++D_h	.req	x14
++
++cvmtmp		.req	x15
++cvmctl		.req	x16
++cvmmemctl	.req	x17
++
++	mrs	cvmctl, S3_0_C11_C0_0  // AP_CVMCTL_EL1
++	mov	cvmtmp, cvmctl
++	bfi	cvmtmp, xzr, #40, #4   // clear [43:40]
++	msr	S3_0_C11_C0_0, cvmtmp
++
++	mrs	cvmmemctl, S3_0_C11_C0_4  // AP_CVMMEMCTL0_EL1
++	mov	cvmtmp, cvmmemctl
++	bfi	cvmtmp, xzr, #35, #1   // Bit 35 - prefetch disable/enable
++	msr	S3_0_C11_C0_4, cvmtmp
++	dmb	ld
++
++	mov	dst, dstin
++	cmp	count, #16
++	/*When memory length is less than 16, the accessed are not aligned.*/
++	b.lo	.Ltiny15_nops
++
++	neg	tmp2, src
++	ands	tmp2, tmp2, #15/* Bytes to reach alignment. */
++	b.eq	.LSrcAligned_nops
++	sub	count, count, tmp2
++	/*
++	* Copy the leading memory data from src to dst in an increasing
++	* address order.By this way,the risk of overwriting the source
++	* memory data is eliminated when the distance between src and
++	* dst is less than 16. The memory accesses here are alignment.
++	*/
++	tbz	tmp2, #0, 1f
++	ldrb1	tmp1w, src, #1
++	ins_nops
++	strb1	tmp1w, dst, #1
++	ins_nops
++1:
++	tbz	tmp2, #1, 2f
++	ldrh1	tmp1w, src, #2
++	ins_nops
++	strh1	tmp1w, dst, #2
++	ins_nops
++2:
++	tbz	tmp2, #2, 3f
++	ldr1	tmp1w, src, #4
++	ins_nops
++	str1	tmp1w, dst, #4
++	ins_nops
++3:
++	tbz	tmp2, #3, .LSrcAligned_nops
++	ldr1	tmp1, src, #8
++	ins_nops
++	str1	tmp1, dst, #8
++	ins_nops
++
++.LSrcAligned_nops:
++	cmp	count, #64
++	b.ge	.Lcpy_over64_nops
++	/*
++	* Deal with small copies quickly by dropping straight into the
++	* exit block.
++	*/
++.Ltail63_nops:
++	/*
++	* Copy up to 48 bytes of data. At this point we only need the
++	* bottom 6 bits of count to be accurate.
++	*/
++	ands	tmp1, count, #0x30
++	b.eq	.Ltiny15_nops
++	cmp	tmp1w, #0x20
++	b.eq	1f
++	b.lt	2f
++	ldp1	A_l, A_h, src, #16
++	ins_nops
++	stp1	A_l, A_h, dst, #16
++	ins_nops
++1:
++	ldp1	A_l, A_h, src, #16
++	ins_nops
++	stp1	A_l, A_h, dst, #16
++	ins_nops
++2:
++	ldp1	A_l, A_h, src, #16
++	ins_nops
++	stp1	A_l, A_h, dst, #16
++	ins_nops
++.Ltiny15_nops:
++	/*
++	* Prefer to break one ldp/stp into several load/store to access
++	* memory in an increasing address order,rather than to load/store 16
++	* bytes from (src-16) to (dst-16) and to backward the src to aligned
++	* address,which way is used in original cortex memcpy. If keeping
++	* the original memcpy process here, memmove need to satisfy the
++	* precondition that src address is at least 16 bytes bigger than dst
++	* address,otherwise some source data will be overwritten when memove
++	* call memcpy directly. To make memmove simpler and decouple the
++	* memcpy's dependency on memmove, withdrew the original process.
++	*/
++	tbz	count, #3, 1f
++	ldr1	tmp1, src, #8
++	ins_nops
++	str1	tmp1, dst, #8
++	ins_nops
++1:
++	tbz	count, #2, 2f
++	ldr1	tmp1w, src, #4
++	ins_nops
++	str1	tmp1w, dst, #4
++	ins_nops
++2:
++	tbz	count, #1, 3f
++	ldrh1	tmp1w, src, #2
++	ins_nops
++	strh1	tmp1w, dst, #2
++	ins_nops
++3:
++	tbz	count, #0, .Lexitfunc_nops
++	ldrb1	tmp1w, src, #1
++	ins_nops
++	strb1	tmp1w, dst, #1
++	ins_nops
++
++	b	.Lexitfunc_nops
++
++.Lcpy_over64_nops:
++	subs	count, count, #128
++	b.ge	.Lcpy_body_large_nops
++	/*
++	* Less than 128 bytes to copy, so handle 64 here and then jump
++	* to the tail.
++	*/
++	ldp1	A_l, A_h, src, #16
++	ins_nops
++	stp1	A_l, A_h, dst, #16
++	ins_nops
++	ldp1	B_l, B_h, src, #16
++	ins_nops
++	ldp1	C_l, C_h, src, #16
++	ins_nops
++	stp1	B_l, B_h, dst, #16
++	ins_nops
++	stp1	C_l, C_h, dst, #16
++	ins_nops
++	ldp1	D_l, D_h, src, #16
++	ins_nops
++	stp1	D_l, D_h, dst, #16
++	ins_nops
++
++	tst	count, #0x3f
++	b.ne	.Ltail63_nops
++	b	.Lexitfunc_nops
++
++	/*
++	* Critical loop.  Start at a new cache line boundary.  Assuming
++	* 64 bytes per line this ensures the entire loop is in one line.
++	*/
++	.p2align        L1_CACHE_SHIFT
++.Lcpy_body_large_nops:
++	/* pre-get 64 bytes data. */
++	ldp1	A_l, A_h, src, #16
++	ldp1	B_l, B_h, src, #16
++	ldp1	C_l, C_h, src, #16
++	ldp1	D_l, D_h, src, #16
++	ins_nops
++1:
++	/*
++	* interlace the load of next 64 bytes data block with store of the last
++	* loaded 64 bytes data.
++	*/
++	stp1	A_l, A_h, dst, #16
++	ins_nops
++	ldp1	A_l, A_h, src, #16
++	ins_nops
++	stp1	B_l, B_h, dst, #16
++	ins_nops
++	ldp1	B_l, B_h, src, #16
++	ins_nops
++	stp1	C_l, C_h, dst, #16
++	ins_nops
++	ldp1	C_l, C_h, src, #16
++	ins_nops
++	stp1	D_l, D_h, dst, #16
++	ins_nops
++	ldp1	D_l, D_h, src, #16
++	ins_nops
++	subs	count, count, #64
++	b.ge	1b
++	stp1	A_l, A_h, dst, #16
++	ins_nops
++	stp1	B_l, B_h, dst, #16
++	ins_nops
++	stp1	C_l, C_h, dst, #16
++	ins_nops
++	stp1	D_l, D_h, dst, #16
++	ins_nops
++
++	tst	count, #0x3f
++	b.ne	.Ltail63_nops
++.Lexitfunc_nops:
++	msr     S3_0_C11_C0_0, cvmctl
++	msr     S3_0_C11_C0_4, cvmmemctl
+diff --git a/arch/arm64/lib/copy_to_user.S b/arch/arm64/lib/copy_to_user.S
+index 6085214654dc..bf4727e252e6 100644
+--- a/arch/arm64/lib/copy_to_user.S
++++ b/arch/arm64/lib/copy_to_user.S
+@@ -19,6 +19,10 @@
+  * Returns:
+  *	x0 - bytes not copied
+  */
++	.macro ins_nops
++	nops 7
++	.endm
++
+ 	.macro ldrb1 ptr, regB, val
+ 	ldrb  \ptr, [\regB], \val
+ 	.endm
+@@ -55,8 +59,18 @@ end	.req	x5
+ ENTRY(__arch_copy_to_user)
+ 	uaccess_enable_not_uao x3, x4, x5
+ 	add	end, x0, x2
++alternative_if_not ARM64_WORKAROUND_MRVL_38500
++	nop
++alternative_else
++	b .Lcopy_with_nops
++alternative_endif
++
+ #include "copy_template.S"
+ 	uaccess_disable_not_uao x3, x4
++	b .Lgetout
++.Lcopy_with_nops:
++#include "copy_template_nops.S"
++.Lgetout:
+ 	mov	x0, #0
+ 	ret
+ ENDPROC(__arch_copy_to_user)
+-- 
+2.31.1
+

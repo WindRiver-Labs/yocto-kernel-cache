@@ -1,0 +1,148 @@
+From 5e68b65202de96be9f53056add3515f7b3b22030 Mon Sep 17 00:00:00 2001
+From: Subbaraya Sundeep <sbhatta@marvell.com>
+Date: Wed, 24 Feb 2021 12:13:55 +0530
+Subject: [PATCH 1319/1921] octeontx2-af: Change transmit side NPC rules
+
+To enable packet flow between PFs/VFs of NIX0
+to PFs/VFs of NIX1 block the NPC TX DMAC
+rules has be installed such that rules must
+be hit for any TX interface i.e., NIX0-TX or
+NIX1-TX provided DMAC match creteria is met.
+Hence this patch changes the behavior such that
+MCAM is programmed to match with any
+NIX0/1-TX interface for TX rules.
+Also a PF/VF needs to send packets over LBK
+link 0 or 1 because target PF/VF may be mapped
+to NIX or NIX1 hence enable all LBK links in
+TL3_TL2_LINKX_CFG registers.
+
+Change-Id: I64f72b0788d031dba8c628ec9f76accca869d29f
+Signed-off-by: Subbaraya Sundeep <sbhatta@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/47678
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  2 ++
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   | 19 +++++++++++--------
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 15 +++++++++++++--
+ .../marvell/octeontx2/af/rvu_npc_fs.c         |  9 ++++++++-
+ 4 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index df1a1dac4449..b5398f519d2b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -444,6 +444,8 @@ struct rvu_fwdata {
+ 
+ struct ptp;
+ 
++#define RVU_SWITCH_LBK_CHAN	63
++
+ struct rvu {
+ 	void __iomem		*afreg_base;
+ 	void __iomem		*pfreg_base;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index f8d088f52d63..504c66dd243f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -2198,25 +2198,28 @@ static void rvu_nix_tx_tl2_cfg(struct rvu *rvu, int blkaddr,
+ 			       u16 pcifunc, struct nix_txsch *txsch)
+ {
+ 	struct rvu_hwinfo *hw = rvu->hw;
++	int lbk_link_start, lbk_links;
+ 	u8 pf = rvu_get_pf(pcifunc);
+-	int lbk_link, lbkid;
+ 	int schq;
+ 
+ 	if (!is_pf_cgxmapped(rvu, pf))
+ 		return;
+ 
+-	lbkid = blkaddr == BLKADDR_NIX0 ? 0 : 1;
+-	lbk_link = hw->cgx_links + lbkid;
++	lbk_link_start = hw->cgx_links;
++	lbk_links = hw->lbk_links;
+ 
+ 	for (schq = 0; schq < txsch->schq.max; schq++) {
+ 		if (TXSCH_MAP_FUNC(txsch->pfvf_map[schq]) != pcifunc)
+ 			continue;
+-		/* Enable LBK link with channel 63 by default so that packets
+-		 * can be sent to LBK with a NPC TX MCAM rule
++		/* Enable all LBK links with channel 63 by default so that
++		 * packets can be sent to LBK with a NPC TX MCAM rule
+ 		 */
+-		rvu_write64(rvu, blkaddr,
+-			    NIX_AF_TL3_TL2X_LINKX_CFG(schq, lbk_link),
+-			    BIT_ULL(12) | 63);
++		while (lbk_links--)
++			rvu_write64(rvu, blkaddr,
++				    NIX_AF_TL3_TL2X_LINKX_CFG(schq,
++							      lbk_link_start +
++							      lbk_links),
++				    BIT_ULL(12) | RVU_SWITCH_LBK_CHAN);
+ 	}
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index f8d5fa13d360..d8541c004254 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -460,6 +460,8 @@ static void npc_config_mcam_entry(struct rvu *rvu, struct npc_mcam *mcam,
+ {
+ 	int bank = npc_get_bank(mcam, index);
+ 	int kw = 0, actbank, actindex;
++	u8 tx_intf_mask = ~intf & 0x3;
++	u8 tx_intf = intf;
+ 	u64 cam0, cam1;
+ 
+ 	actbank = bank; /* Save bank id, to set action later on */
+@@ -480,12 +482,21 @@ static void npc_config_mcam_entry(struct rvu *rvu, struct npc_mcam *mcam,
+ 	 */
+ 	for (; bank < (actbank + mcam->banks_per_entry); bank++, kw = kw + 2) {
+ 		/* Interface should be set in all banks */
++		if (is_npc_intf_tx(intf)) {
++			/* Last bit must be set and rest don't care
++			 * for TX interfaces
++			 */
++			tx_intf_mask = 0x1;
++			tx_intf = intf & tx_intf_mask;
++			tx_intf_mask = ~tx_intf & tx_intf_mask;
++		}
++
+ 		rvu_write64(rvu, blkaddr,
+ 			    NPC_AF_MCAMEX_BANKX_CAMX_INTF(index, bank, 1),
+-			    intf);
++			    tx_intf);
+ 		rvu_write64(rvu, blkaddr,
+ 			    NPC_AF_MCAMEX_BANKX_CAMX_INTF(index, bank, 0),
+-			    ~intf & 0x3);
++			    tx_intf_mask);
+ 
+ 		/* Set the match key */
+ 		npc_get_keyword(entry, kw, &cam0, &cam1);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index a1d42c826c1a..6a7276d55e79 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -960,9 +960,16 @@ static void npc_update_tx_entry(struct rvu *rvu, struct rvu_pfvf *pfvf,
+ 				struct npc_install_flow_req *req, u16 target)
+ {
+ 	struct nix_tx_action action;
++	u64 mask = ~0ULL;
++
++	/* If AF is installing then do not care about
++	 * PF_FUNC in Send Descriptor
++	 */
++	if (is_pffunc_af(req->hdr.pcifunc))
++		mask = 0;
+ 
+ 	npc_update_entry(rvu, NPC_PF_FUNC, entry, htons(target),
+-			 0, ~0ULL, 0, NIX_INTF_TX);
++			 0, mask, 0, NIX_INTF_TX);
+ 
+ 	*(u64 *)&action = 0x00;
+ 	action.op = req->op;
+-- 
+2.31.1
+

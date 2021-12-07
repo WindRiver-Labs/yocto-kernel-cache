@@ -1,0 +1,175 @@
+From 56cce5a019ca0a9a44f2c79eccd5ef77fbcc4a97 Mon Sep 17 00:00:00 2001
+From: Hariprasad Kelam <hkelam@marvell.com>
+Date: Fri, 23 Oct 2020 18:52:16 +0530
+Subject: [PATCH 0920/1921] octeontx2-pf: cn10k: Get max mtu supported from
+ admin function
+
+Octeontx3 CN10K supports max mtu of 16K on lmac links and 64k on lbk
+links and Octeontx2 silicon supports 9K mtu on both links. Get the same
+from nix_get_hw_info mbox message in netdev probe.
+
+remove updating port field value in ethtool(get_link_ksettings) as
+firmware does not support the same.
+
+Change-Id: I6cd26dc49436e1293868a8012d77150368ecbd43
+Signed-off-by: Hariprasad Kelam <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/38856
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/cn10k.c    |  2 +-
+ .../marvell/octeontx2/nic/otx2_common.c       | 50 ++++++++++++++++++-
+ .../marvell/octeontx2/nic/otx2_common.h       |  1 +
+ .../marvell/octeontx2/nic/otx2_ethtool.c      |  1 -
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  2 +-
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  1 -
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  |  2 +-
+ 7 files changed, 53 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+index 52328fd1a9a0..44cb9b7d0ff5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/cn10k.c
+@@ -107,7 +107,7 @@ int cn10k_sq_aq_init(void *dev, u16 qidx, u16 sqb_aura)
+ 	/* Only one SMQ is allocated, map all SQ's to that SMQ  */
+ 	aq->sq.smq = pfvf->hw.txschq_list[NIX_TXSCH_LVL_SMQ][0];
+ 	/* FIXME: set based on NIX_AF_DWRR_RPM_MTU*/
+-	aq->sq.smq_rr_weight = OTX2_MAX_MTU;
++	aq->sq.smq_rr_weight = pfvf->netdev->mtu;
+ 	aq->sq.default_chan = pfvf->hw.tx_chan_base;
+ 	aq->sq.sqe_stype = NIX_STYPE_STF; /* Cache SQB */
+ 	aq->sq.sqb_aura = sqb_aura;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+index c685dfd9e157..d135e3a1c292 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.c
+@@ -567,7 +567,7 @@ int otx2_txschq_config(struct otx2_nic *pfvf, int lvl)
+ 	/* Set topology e.t.c configuration */
+ 	if (lvl == NIX_TXSCH_LVL_SMQ) {
+ 		req->reg[0] = NIX_AF_SMQX_CFG(schq);
+-		req->regval[0] = ((OTX2_MAX_MTU + OTX2_ETH_HLEN) << 8) |
++		req->regval[0] = ((pfvf->netdev->max_mtu + OTX2_ETH_HLEN) << 8) |
+ 				   OTX2_MIN_MTU;
+ 
+ 		req->regval[0] |= (0x20ULL << 51) | (0x80ULL << 39) |
+@@ -1626,6 +1626,54 @@ void otx2_set_cints_affinity(struct otx2_nic *pfvf)
+ 	}
+ }
+ 
++#define OTX2_MAX_MTU_SUPPORTED	16380
++u16 otx2_get_max_mtu(struct otx2_nic *pfvf)
++{
++	struct nix_hw_info *rsp;
++	struct msg_req *req;
++	u16 max_mtu;
++	int rc;
++
++	mutex_lock(&pfvf->mbox.lock);
++
++	req = otx2_mbox_alloc_msg_nix_get_hw_info(&pfvf->mbox);
++	if (!req) {
++		rc =  -ENOMEM;
++		goto out;
++	}
++
++	rc = otx2_sync_mbox_msg(&pfvf->mbox);
++	if (!rc) {
++		rsp = (struct nix_hw_info *)
++		       otx2_mbox_get_rsp(&pfvf->mbox.mbox, 0, &req->hdr);
++
++		/* Currently driver doesn't support multi-segment ingress pkts
++		 * and the maximum buffer size we can configure in HW is 32K,
++		 * so limit the MTU for now to 16K which is same as that of
++		 * max MTU on RPM interfaces
++		 */
++		if (rsp->max_mtu > OTX2_MAX_MTU_SUPPORTED)
++			rsp->max_mtu = OTX2_MAX_MTU_SUPPORTED;
++
++		/* HW counts VLAN insertion bytes (8 for double tag)
++		 * irrespective of whether SQE is requesting to insert VLAN
++		 * in the packet or not. Hence these 8 bytes have to be
++		 * discounted from max packet size otherwise HW will throw
++		 * SMQ errors
++		 */
++		max_mtu = rsp->max_mtu - 8 - OTX2_ETH_HLEN;
++	}
++
++out:
++	mutex_unlock(&pfvf->mbox.lock);
++	if (rc) {
++		dev_warn(pfvf->dev,
++			 "Failed to get MTU from hardware setting default value(1500)\n");
++		max_mtu = 1500;
++	}
++	return max_mtu;
++}
++
+ #define M(_name, _id, _fn_name, _req_type, _rsp_type)			\
+ int __weak								\
+ otx2_mbox_up_handler_ ## _fn_name(struct otx2_nic *pfvf,		\
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+index 5c02b421e26f..2a629d96d5ce 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_common.h
+@@ -903,4 +903,5 @@ int otx2smqvf_remove(struct otx2_nic *vf);
+ 
+ bool otx2_xdp_sq_append_pkt(struct otx2_nic *pfvf, u64 iova, int len, u16 qidx);
+ int otx2_cgx_features_get(struct otx2_nic *pfvf);
++u16 otx2_get_max_mtu(struct otx2_nic *pfvf);
+ #endif /* OTX2_COMMON_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index 48799d805705..9b4fe9e16ea3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -1030,7 +1030,6 @@ static int otx2_get_link_ksettings(struct net_device *netdev,
+ 	cmd->base.duplex = pfvf->linfo.full_duplex;
+ 	cmd->base.speed = pfvf->linfo.speed;
+ 	cmd->base.autoneg = pfvf->linfo.an;
+-	cmd->base.port = pfvf->linfo.port;
+ 
+ 	rsp = otx2_get_fwdata(pfvf);
+ 	if (IS_ERR(rsp))
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index ba5aceb53117..fc36e61d5f50 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -2635,7 +2635,7 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	/* MTU range: 64 - 9190 */
+ 	netdev->min_mtu = OTX2_MIN_MTU;
+-	netdev->max_mtu = OTX2_MAX_MTU;
++	netdev->max_mtu = otx2_get_max_mtu(pf);
+ 
+ 	INIT_WORK(&pf->reset_task, otx2_reset_task);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index dcc94fdfc0c1..84f19755cae8 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -24,7 +24,6 @@
+ 
+ #define	OTX2_ETH_HLEN		(VLAN_ETH_HLEN + VLAN_HLEN)
+ #define OTX2_MIN_MTU		64
+-#define OTX2_MAX_MTU		(9204 - OTX2_ETH_HLEN)
+ 
+ #define OTX2_MAX_GSO_SEGS	255
+ #define OTX2_MAX_FRAGS_IN_SQE	9
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index dbfa1d621dd1..9242f216d5fa 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -634,7 +634,7 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	/* MTU range: 68 - 9190 */
+ 	netdev->min_mtu = OTX2_MIN_MTU;
+-	netdev->max_mtu = OTX2_MAX_MTU;
++	netdev->max_mtu = otx2_get_max_mtu(vf);
+ 
+ 	INIT_WORK(&vf->reset_task, otx2vf_reset_task);
+ 
+-- 
+2.31.1
+

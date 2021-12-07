@@ -1,0 +1,570 @@
+From 5d53b05911057d76b964680408033354acb4773f Mon Sep 17 00:00:00 2001
+From: "Nalla, Pradeep" <pnalla@marvell.com>
+Date: Mon, 25 Jan 2021 16:18:25 +0530
+Subject: [PATCH 1216/1921] octeontx2-af: Mbox to exchange SDP channel info
+
+New mbox is added to share SDP channel information that SDP PF posses by
+parsing DTS node, with the AF driver. AF driver uses this information to
+install promisc entry while processing LF alloc request from a SDP nix
+interface. LF alloc response from AF is modified by PF, according to
+prior exchanged ring information with host, before forwarding to
+corresponding VF.
+
+Also Backpressure is enabled for the channels assigned to a SDP NIX
+interface in LF alloc request.
+
+Change-Id: I5acedc7c2eba02e3c5320bd5363e83b678a5229c
+Signed-off-by: Nalla, Pradeep <pnalla@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/44344
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  16 +++
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   |   3 +-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  19 ++-
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  46 +++++--
+ .../ethernet/marvell/octeontx2/af/rvu_sdp.c   |  31 ++++-
+ drivers/soc/marvell/octeontx2-sdp/sdp.c       | 126 +++++++++++++++---
+ drivers/soc/marvell/octeontx2-sdp/sdp.h       |   6 +-
+ 7 files changed, 196 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index ac0a88f204cd..e119f536afc8 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -235,6 +235,8 @@ M(REE_RULE_DB_LEN_GET,	0xE04, ree_rule_db_len_get, ree_req_msg,	\
+ M(REE_RULE_DB_GET,	0xE05, ree_rule_db_get,				\
+ 				ree_rule_db_get_req_msg,		\
+ 				ree_rule_db_get_rsp_msg)		\
++/* SDP mbox IDs (range 0x1000 - 0x11FF) */				\
++M(SET_SDP_CHAN_INFO, 0x1000, set_sdp_chan_info, sdp_chan_info_msg, msg_rsp) \
+ /* NPC mbox IDs (range 0x6000 - 0x7FFF) */				\
+ M(NPC_MCAM_ALLOC_ENTRY,	0x6000, npc_mcam_alloc_entry, npc_mcam_alloc_entry_req,\
+ 				npc_mcam_alloc_entry_rsp)		\
+@@ -1809,4 +1811,18 @@ struct ree_rule_db_get_rsp_msg {
+ 	u8 is_last;		/* Is this the last block */
+ };
+ 
++struct sdp_node_info {
++	/* Node to which this PF belons to */
++	u8 node_id;
++	u8 max_vfs;
++	u8 num_pf_rings;
++	u8 pf_srn;
++#define SDP_MAX_VFS	128
++	u8 vf_rings[SDP_MAX_VFS];
++};
++
++struct sdp_chan_info_msg {
++	struct mbox_msghdr hdr;
++	struct sdp_node_info info;
++};
+ #endif /* MBOX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 2bb2eb8a8c86..d64edb32500d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -1099,7 +1099,6 @@ static int rvu_setup_hw_resources(struct rvu *rvu)
+ 			       sizeof(struct rvu_pfvf), GFP_KERNEL);
+ 	if (!rvu->pf)
+ 		return -ENOMEM;
+-
+ 	rvu->hwvf = devm_kcalloc(rvu->dev, hw->total_vfs,
+ 				 sizeof(struct rvu_pfvf), GFP_KERNEL);
+ 	if (!rvu->hwvf)
+@@ -1515,7 +1514,7 @@ static int rvu_get_nix_blkaddr(struct rvu *rvu, u16 pcifunc)
+ 	}
+ 
+ 	/* if SDP1 then the blkaddr is NIX1 */
+-	if (pf->is_sdp1)
++	if (is_sdp_pfvf(pcifunc) && pf->sdp_info->node_id == 1)
+ 		blkaddr = BLKADDR_NIX1;
+ 
+ 	switch (blkaddr) {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index bdf1905c0978..52db807b4298 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -290,11 +290,10 @@ struct rvu_pfvf {
+ 	int     intf_mode;
+ 	u8	nix_rx_intf; /* NIX0_RX/NIX1_RX interface to NPC */
+ 	u8	nix_tx_intf; /* NIX0_TX/NIX1_TX interface to NPC */
+-	bool	is_sdp0; /* is this PF mapped to SDP0 */
+-	bool	is_sdp1; /* is this PF mapped to SDP1 */
+ 	u64     lmt_base_addr; /* Preseving the pcifunc's lmtst base addr*/
+ 	u64     lmt_map_ent_w1; /*Preseving the word1 of lmtst map table entry*/
+ 	unsigned long flags;
++	struct  sdp_node_info *sdp_info;
+ };
+ 
+ enum rvu_pfvf_flags {
+@@ -694,13 +693,17 @@ int rvu_aq_alloc(struct rvu *rvu, struct admin_queue **ad_queue,
+ 		 int qsize, int inst_size, int res_size);
+ void rvu_aq_free(struct rvu *rvu, struct admin_queue *aq);
+ 
++/* SDP APIs */
++int rvu_sdp_init(struct rvu *rvu);
++bool is_sdp_pfvf(u16 pcifunc);
++bool is_sdp_pf(u16 pcifunc);
++bool is_sdp_vf(u16 pcifunc);
++
+ /* CGX APIs */
+ static inline bool is_pf_cgxmapped(struct rvu *rvu, u8 pf)
+ {
+-	struct rvu_pfvf *pfvf = &rvu->pf[pf];
+-
+ 	return (pf >= PF_CGXMAP_BASE && pf <= rvu->cgx_mapped_pfs) &&
+-		(!pfvf->is_sdp0 && !pfvf->is_sdp1);
++		!is_sdp_pf(pf << RVU_PFVF_PF_SHIFT);
+ }
+ 
+ static inline void rvu_get_cgx_lmac_id(u8 map, u8 *cgx_id, u8 *lmac_id)
+@@ -823,12 +826,6 @@ int rvu_cpt_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot);
+ int rvu_tim_init(struct rvu *rvu);
+ int rvu_tim_lf_teardown(struct rvu *rvu, u16 pcifunc, int lf, int slot);
+ 
+-/* SDP APIs */
+-int rvu_sdp_init(struct rvu *rvu);
+-bool is_sdp_pfvf(u16 pcifunc);
+-bool is_sdp_pf(u16 pcifunc);
+-bool is_sdp_vf(u16 pcifunc);
+-
+ /* REE APIs */
+ int rvu_ree_init(struct rvu *rvu);
+ void rvu_ree_freemem(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index e6f5acafa175..cd5c2ad2d3d7 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -221,11 +221,14 @@ static bool is_valid_txschq(struct rvu *rvu, int blkaddr,
+ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf,
+ 			      struct nix_lf_alloc_rsp *rsp)
+ {
+-	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	struct rvu_pfvf *parent_pf, *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	u16 req_chan_base, req_chan_end, req_chan_cnt;
+ 	struct rvu_hwinfo *hw = rvu->hw;
++	struct sdp_node_info *sdp_info;
++	int pkind, pf, vf, lbkid, vfid;
+ 	struct cgx_mac_ops *mac_ops;
+-	int pkind, pf, vf, lbkid;
+ 	u8 cgx_id, lmac_id;
++	bool from_vf;
+ 	int err;
+ 
+ 	pf = rvu_get_pf(pcifunc);
+@@ -293,11 +296,38 @@ static int nix_interface_init(struct rvu *rvu, u16 pcifunc, int type, int nixlf,
+ 					      pfvf->rx_chan_cnt, false);
+ 		break;
+ 	case NIX_INTF_TYPE_SDP:
+-		/* Added single interface and single channel support for now */
+-		pfvf->rx_chan_base = rvu_nix_chan_sdp(rvu, 0);
++		from_vf = !!(pcifunc & RVU_PFVF_FUNC_MASK);
++		parent_pf = &rvu->pf[rvu_get_pf(pcifunc)];
++		sdp_info = parent_pf->sdp_info;
++		if (!sdp_info) {
++			dev_err(rvu->dev, "Invalid sdp_info pointer\n");
++			return -EINVAL;
++		}
++		if (from_vf) {
++			req_chan_base = rvu_nix_chan_sdp(rvu, 0) + sdp_info->pf_srn +
++				sdp_info->num_pf_rings;
++			vf = (pcifunc & RVU_PFVF_FUNC_MASK) - 1;
++			for (vfid = 0; vfid < vf; vfid++)
++				req_chan_base += sdp_info->vf_rings[vfid];
++			req_chan_cnt = sdp_info->vf_rings[vf];
++			req_chan_end = req_chan_base + req_chan_cnt;
++			if (req_chan_base < rvu_nix_chan_sdp(rvu, 0) ||
++			    req_chan_end > rvu_nix_chan_sdp(rvu, 255)) {
++				dev_err(rvu->dev,
++					"PF_Func 0x%x: Invalid channel base and count\n",
++					pcifunc);
++				return -EINVAL;
++			}
++		} else {
++			req_chan_base = rvu_nix_chan_sdp(rvu, 0) + sdp_info->pf_srn;
++			req_chan_cnt = sdp_info->num_pf_rings;
++		}
++
++		pfvf->rx_chan_base = req_chan_base;
++		pfvf->rx_chan_cnt = req_chan_cnt;
+ 		pfvf->tx_chan_base = pfvf->rx_chan_base;
+-		pfvf->rx_chan_cnt = 1;
+-		pfvf->tx_chan_cnt = 1;
++		pfvf->tx_chan_cnt = pfvf->rx_chan_cnt;
++
+ 		rsp->tx_link = hw->cgx_links + hw->lbk_links;
+ 		rvu_npc_install_promisc_entry(rvu, pcifunc, nixlf,
+ 					      pfvf->rx_chan_base,
+@@ -1238,7 +1268,7 @@ int rvu_mbox_handler_nix_lf_alloc(struct rvu *rvu,
+ 	}
+ 
+ 	intf = is_afvf(pcifunc) ? NIX_INTF_TYPE_LBK : NIX_INTF_TYPE_CGX;
+-	if (is_sdp_pf(pcifunc))
++	if (is_sdp_pfvf(pcifunc))
+ 		intf = NIX_INTF_TYPE_SDP;
+ 
+ 	err = nix_interface_init(rvu, pcifunc, intf, nixlf, rsp);
+@@ -2557,7 +2587,7 @@ int nix_update_bcast_mce_list(struct rvu *rvu, u16 pcifunc, bool add)
+ 	int blkaddr;
+ 
+ 	/* Broadcast pkt replication is not needed for AF's VFs, hence skip */
+-	if (is_afvf(pcifunc))
++	if (is_afvf(pcifunc) || is_sdp_pfvf(pcifunc))
+ 		return 0;
+ 
+ 	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
+index ee9ec3351bb8..93201dbb3ea2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
+@@ -61,19 +61,23 @@ int rvu_sdp_init(struct rvu *rvu)
+ 		/* The RVU PF number is one less than bus number */
+ 		sdp_pf_num[i] = pdev->bus->number - 1;
+ 		pfvf = &rvu->pf[sdp_pf_num[i]];
++
++		pfvf->sdp_info = devm_kzalloc(rvu->dev,
++					      sizeof(struct sdp_node_info),
++					      GFP_KERNEL);
++		if (!pfvf->sdp_info)
++			return -ENOMEM;
++
+ 		/* To differentiate a PF between SDP0 or SDP1 we make use of the
+ 		 * revision ID field in the config space. The revision is filled
+ 		 * by the firmware.
+ 		 * 0 means SDP0
+ 		 * 1 means SDP1
+ 		 */
+-		if (pdev->revision) {
+-			pfvf->is_sdp0 = 0;
+-			pfvf->is_sdp1 = 1;
+-		} else {
+-			pfvf->is_sdp0 = 1;
+-			pfvf->is_sdp1 = 0;
+-		}
++		if (pdev->revision)
++			pfvf->sdp_info->node_id = 1;
++		else
++			pfvf->sdp_info->node_id = 0;
+ 
+ 		dev_info(rvu->dev, "SDP PF number:%d\n", sdp_pf_num[i]);
+ 
+@@ -83,3 +87,16 @@ int rvu_sdp_init(struct rvu *rvu)
+ 
+ 	return 0;
+ }
++
++int
++rvu_mbox_handler_set_sdp_chan_info(struct rvu *rvu,
++				   struct sdp_chan_info_msg *req,
++				   struct msg_rsp *rsp)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, req->hdr.pcifunc);
++
++	memcpy(pfvf->sdp_info, &req->info, sizeof(struct sdp_node_info));
++	dev_info(rvu->dev, "AF: max_vfs %d num_pf_rings %d pf_srn %d\n",
++		 req->info.max_vfs, req->info.num_pf_rings, req->info.pf_srn);
++	return 0;
++}
+diff --git a/drivers/soc/marvell/octeontx2-sdp/sdp.c b/drivers/soc/marvell/octeontx2-sdp/sdp.c
+index 9398edf7cef2..6978e36c22eb 100644
+--- a/drivers/soc/marvell/octeontx2-sdp/sdp.c
++++ b/drivers/soc/marvell/octeontx2-sdp/sdp.c
+@@ -17,6 +17,7 @@
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ 
++#include "rvu.h"
+ #include "rvu_reg.h"
+ #include "rvu_struct.h"
+ #include "sdp.h"
+@@ -34,6 +35,7 @@
+ 
+ #define FW_TO_HOST 0x2
+ #define HOST_TO_FW 0x1
++#define SDP_PPAIR_THOLD 0x400
+ 
+ union ring {
+ 	u64 u;
+@@ -70,10 +72,8 @@ struct host_hs_work {
+ };
+ struct host_hs_work hs_work;
+ static int sdp_sriov_configure(struct pci_dev *pdev, int num_vfs);
+-
+-static u32 num_pf_rings, pf_srn;
+-static u32 vf_rings[SDP_MAX_VFS];
+-static u32 neg_vf0_rings, neg_vfx_rings, max_vfs, neg_vf;
++struct sdp_node_info info;
++static u32 neg_vf0_rings, neg_vfx_rings, neg_vf;
+ 
+ static void
+ sdp_write64(struct sdp_dev *rvu, u64 b, u64 s, u64 o, u64 v)
+@@ -201,6 +201,7 @@ static void sdp_afpf_mbox_handler_up(struct work_struct *work)
+ 
+ static void sdp_afpf_mbox_handler(struct work_struct *work)
+ {
++	struct nix_lf_alloc_rsp *alloc_rsp;
+ 	struct otx2_mbox *af_mbx, *vf_mbx;
+ 	struct mbox_msghdr *msg, *fwd;
+ 	struct free_rsrcs_rsp *rsp;
+@@ -239,6 +240,19 @@ static void sdp_afpf_mbox_handler(struct work_struct *work)
+ 		}
+ 
+ 		vf_id = (msg->pcifunc & RVU_PFVF_FUNC_MASK);
++
++		if (msg->id == MBOX_MSG_NIX_LF_ALLOC) {
++			alloc_rsp = (struct nix_lf_alloc_rsp *)msg;
++			/* Adjust the rings for vf according to the values
++			 * agreed through handshake
++			 */
++			if (vf_id == 1)
++				alloc_rsp->rx_chan_cnt = neg_vf0_rings;
++			else
++				alloc_rsp->rx_chan_cnt = neg_vfx_rings;
++			alloc_rsp->tx_chan_cnt = alloc_rsp->rx_chan_cnt;
++		}
++
+ 		if (vf_id > 0) {
+ 			if (vf_id > sdp->num_vfs) {
+ 				dev_err(&sdp->pdev->dev,
+@@ -281,6 +295,9 @@ static void sdp_afpf_mbox_handler(struct work_struct *work)
+ 				rsp = (struct free_rsrcs_rsp *)msg;
+ 				memcpy(&sdp->limits, msg, sizeof(*rsp));
+ 				break;
++			case MBOX_MSG_SET_SDP_CHAN_INFO:
++				/* Nothing to do */
++				break;
+ 			default:
+ 				dev_err(&sdp->pdev->dev,
+ 					"Unsupported msg %d received.\n",
+@@ -317,7 +334,10 @@ static int
+ handle_vf_req(struct sdp_dev *sdp, struct rvu_vf *vf, struct mbox_msghdr *req,
+ 	      int size)
+ {
+-	int err = 0;
++	int err = 0, chan_idx, chan_diff, reg_off = 0, vf_id;
++	uint64_t en_bp;
++	u16 chan_base;
++	u8 chan_cnt;
+ 
+ 	/* Check if valid, if not reply with a invalid msg */
+ 	if (req->sig != OTX2_MBOX_REQ_SIG) {
+@@ -356,6 +376,26 @@ handle_vf_req(struct sdp_dev *sdp, struct rvu_vf *vf, struct mbox_msghdr *req,
+ 		}
+ 		err = forward_to_mbox(sdp, &sdp->afpf_mbox, 0, req, size, "AF");
+ 		break;
++	case MBOX_MSG_NIX_LF_ALLOC:
++		chan_base = NIX_CHAN_SDP_CHX(0) + info.num_pf_rings;
++		for (vf_id = 0; vf_id < vf->vf_id; vf_id++)
++			chan_base += info.vf_rings[vf_id];
++		chan_cnt = info.vf_rings[vf->vf_id];
++		for (chan_idx = 0; chan_idx < chan_cnt; chan_idx++) {
++			chan_diff = chan_base + chan_idx - NIX_CHAN_SDP_CHX(0);
++			reg_off = 0;
++			while (chan_diff > 63) {
++				reg_off += 1;
++				chan_diff -= 64;
++			}
++
++			en_bp = readq(sdp->sdp_base +
++				      SDPX_OUT_BP_ENX_W1S(reg_off));
++			en_bp |= (1ULL << chan_diff);
++			writeq(en_bp, sdp->sdp_base +
++			       SDPX_OUT_BP_ENX_W1S(reg_off));
++		}
++		/* Fall through */
+ 	default:
+ 		err = forward_to_mbox(sdp, &sdp->afpf_mbox, 0, req, size, "AF");
+ 		break;
+@@ -895,22 +935,23 @@ static int sdp_check_pf_usable(struct sdp_dev *sdp)
+ 	return 0;
+ }
+ 
+-static int sdp_parse_rinfo(struct sdp_dev *sdp)
++static int sdp_parse_rinfo(struct pci_dev *pdev,
++			   struct sdp_node_info *info)
+ {
++	u32 vf_ring_cnts, vf_rings;
+ 	struct device_node *dev;
+ 	struct device *sdev;
+-	u32 vf_ring_cnts;
+ 	const void *ptr;
+ 	int len, vfid;
+ 
+-	sdev = &sdp->pdev->dev;
++	sdev = &pdev->dev;
+ 	dev = of_find_node_by_name(NULL, "rvu-sdp");
+ 	if (dev == NULL) {
+ 		dev_err(sdev, "can't find FDT dev %s\n", "rvu-sdp");
+ 		return -EINVAL;
+ 	}
+ 
+-	max_vfs = pci_sriov_get_totalvfs(sdp->pdev);
++	info->max_vfs = pci_sriov_get_totalvfs(pdev);
+ 
+ 	ptr = of_get_property(dev, "num-pf-rings", &len);
+ 	if (ptr == NULL) {
+@@ -921,7 +962,7 @@ static int sdp_parse_rinfo(struct sdp_dev *sdp)
+ 		dev_err(sdev, "SDP DTS: Wrong field length: num-pf-rings\n");
+ 		return -EINVAL;
+ 	}
+-	num_pf_rings = be32_to_cpup((u32 *)ptr);
++	info->num_pf_rings = be32_to_cpup((u32 *)ptr);
+ 
+ 	ptr = of_get_property(dev, "pf-srn", &len);
+ 	if (ptr == NULL) {
+@@ -932,7 +973,7 @@ static int sdp_parse_rinfo(struct sdp_dev *sdp)
+ 		dev_err(sdev, "SDP DTS: Wrong field length: pf-srn\n");
+ 		return -EINVAL;
+ 	}
+-	pf_srn = be32_to_cpup((u32 *)ptr);
++	info->pf_srn = be32_to_cpup((u32 *)ptr);
+ 
+ 	ptr = of_get_property(dev, "num-vf-rings", &len);
+ 	if (ptr == NULL) {
+@@ -941,28 +982,29 @@ static int sdp_parse_rinfo(struct sdp_dev *sdp)
+ 	}
+ 
+ 	vf_ring_cnts = len / sizeof(u32);
+-	if (vf_ring_cnts > max_vfs) {
++	if (vf_ring_cnts > info->max_vfs) {
+ 		dev_err(sdev, "SDP DTS: Wrong field length: num-vf-rings\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	for (vfid = 0; vfid < max_vfs; vfid++) {
++	for (vfid = 0; vfid < info->max_vfs; vfid++) {
+ 		if (vfid < vf_ring_cnts) {
+ 			if (of_property_read_u32_index(dev, "num-vf-rings",
+-					vfid, &vf_rings[vfid])) {
++					vfid, &vf_rings)) {
+ 				dev_err(sdev, "SDP DTS: Failed to get vf ring count\n");
+ 				return -EINVAL;
+ 			}
++			info->vf_rings[vfid] = vf_rings;
+ 		} else {
+ 			/*
+ 			 * Rest of the VFs use the same last ring count
+ 			 * specified
+ 			 */
+-			vf_rings[vfid] = vf_rings[vf_ring_cnts - 1];
++			info->vf_rings[vfid] = info->vf_rings[vf_ring_cnts - 1];
+ 		}
+ 	}
+ 	dev_info(sdev, "pf start ring number:%d num_pf_rings:%d max_vfs:%d vf_ring_cnts:%d\n",
+-		 pf_srn, num_pf_rings, max_vfs, vf_ring_cnts);
++		 info->pf_srn, info->num_pf_rings, info->max_vfs, vf_ring_cnts);
+ 
+ 	return 0;
+ }
+@@ -1043,13 +1085,41 @@ static void sdp_host_handshake_fn(struct work_struct *wrk)
+ 	queue_delayed_work(sdp->sdp_host_handshake, &sdp->sdp_work,  HZ * 1);
+ }
+ 
++static int send_chan_info(struct sdp_dev *sdp, struct sdp_node_info *info)
++{
++	struct sdp_chan_info_msg *cinfo;
++	int res = 0;
++
++	cinfo = (struct sdp_chan_info_msg *)
++		otx2_mbox_alloc_msg(&sdp->afpf_mbox, 0, sizeof(*cinfo));
++	if (cinfo == NULL) {
++		dev_err(&sdp->pdev->dev, "RVU MBOX failed to get message.\n");
++		return -EFAULT;
++	}
++	cinfo->hdr.id = MBOX_MSG_SET_SDP_CHAN_INFO;
++	cinfo->hdr.sig = OTX2_MBOX_REQ_SIG;
++	cinfo->hdr.pcifunc = RVU_PFFUNC(sdp->pf, 0);
++
++	memcpy(&cinfo->info, info, sizeof(struct sdp_node_info));
++	otx2_mbox_msg_send(&sdp->afpf_mbox, 0);
++	res = otx2_mbox_wait_for_rsp(&sdp->afpf_mbox, 0);
++	if (res == -EIO) {
++		dev_err(&sdp->pdev->dev, "RVU AF MBOX timeout.\n");
++	} else if (res) {
++		dev_err(&sdp->pdev->dev, "RVU MBOX error: %d.\n", res);
++		res = -EFAULT;
++	}
++
++	return res;
++}
++
+ static int sdp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct device *dev = &pdev->dev;
++	uint64_t inst, sdp_gbl_ctl;
+ 	struct sdp_dev *sdp;
+ 	union ring fw_rinfo;
+ 	int err;
+-	uint64_t inst;
+ 
+ 	sdp = devm_kzalloc(dev, sizeof(struct sdp_dev), GFP_KERNEL);
+ 	if (sdp == NULL)
+@@ -1156,7 +1226,13 @@ static int sdp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto get_pcifunc_failed;
+ 	}
+ 
+-	err = sdp_parse_rinfo(sdp);
++	err = sdp_parse_rinfo(pdev, &info);
++	if (err) {
++		err = -EINVAL;
++		goto get_rinfo_failed;
++	}
++
++	err = send_chan_info(sdp, &info);
+ 	if (err) {
+ 		err = -EINVAL;
+ 		goto get_rinfo_failed;
+@@ -1164,18 +1240,24 @@ static int sdp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	fw_rinfo.u = 0;
+ 	fw_rinfo.s.dir = FW_TO_HOST;
+-	fw_rinfo.s.rppf = num_pf_rings;
+-	fw_rinfo.s.rpvf = vf_rings[0];
+-	fw_rinfo.s.numvf = max_vfs-1;
++	fw_rinfo.s.rppf = info.num_pf_rings;
++	fw_rinfo.s.rpvf = info.vf_rings[0];
++	fw_rinfo.s.numvf = info.max_vfs - 1;
+ 	/*
+ 	 * For 98xx there are 2xSDPs so start the PF ring from 128 for SDP1
+ 	 * SDP0 has PCI revid 0 and SDP1 has PCI revid 1
+ 	 */
+-	fw_rinfo.s.pf_srn = pdev->revision ? 128 : pf_srn;
++	fw_rinfo.s.pf_srn = pdev->revision ? 128 : info.pf_srn;
+ 
+ 	dev_info(&pdev->dev, "Ring info 0x%llx\n", fw_rinfo.u);
+ 	writeq(fw_rinfo.u, sdp->sdp_base + SDPX_RINGX_IN_PKT_CNT(0));
+ 
++	/* Water mark for backpressuring NIX Tx when enabled */
++	writeq(SDP_PPAIR_THOLD, sdp->sdp_base + SDPX_OUT_WMARK);
++	sdp_gbl_ctl = readq(sdp->sdp_base + SDPX_GBL_CONTROL);
++	sdp_gbl_ctl |= (1 << 2); /* BPFLR_D disable clearing BP in FLR */
++	writeq(sdp_gbl_ctl, sdp->sdp_base + SDPX_GBL_CONTROL);
++
+ 	sdp->sdp_host_handshake = alloc_workqueue("sdp_epmode_fw_hs",
+ 						     WQ_MEM_RECLAIM, 0);
+ 	INIT_DELAYED_WORK(&sdp->sdp_work, sdp_host_handshake_fn);
+diff --git a/drivers/soc/marvell/octeontx2-sdp/sdp.h b/drivers/soc/marvell/octeontx2-sdp/sdp.h
+index bcbd1a97e4f5..7d6e19874a17 100644
+--- a/drivers/soc/marvell/octeontx2-sdp/sdp.h
++++ b/drivers/soc/marvell/octeontx2-sdp/sdp.h
+@@ -31,9 +31,13 @@
+ 	(((func) & RVU_PFVF_FUNC_MASK) << RVU_PFVF_FUNC_SHIFT))
+ 
+ #define SDP_BASE(a)		(0x86E080000000ull | a << 36)
+-#define SDP_REG_SIZE		0x2000000
++#define SDP_REG_SIZE		0x42000000
+ 
+ #define SDPX_RINGX_IN_PKT_CNT(a)	(0x10080ull | a << 17)
++#define SDPX_OUT_BP_ENX_W1S(a)		(0x80280ull | a << 4)
++#define SDPX_OUT_WMARK			(0x40060000ull)
++#define SDPX_GBL_CONTROL		(0x40080200ull)
++
+ 
+ struct sdp_dev;
+ 
+-- 
+2.31.1
+

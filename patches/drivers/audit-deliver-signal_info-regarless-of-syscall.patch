@@ -1,0 +1,180 @@
+From 60699f1193ca8d59791b210776480583793c97b6 Mon Sep 17 00:00:00 2001
+From: Richard Guy Briggs <rgb@redhat.com>
+Date: Fri, 10 May 2019 12:21:49 -0400
+Subject: [PATCH 0864/1921] audit: deliver signal_info regarless of syscall
+
+When a process signals the audit daemon (shutdown, rotate, resume,
+reconfig) but syscall auditing is not enabled, we still want to know the
+identity of the process sending the signal to the audit daemon.
+
+Move audit_signal_info() out of syscall auditing to general auditing but
+create a new function audit_signal_info_syscall() to take care of the
+syscall dependent parts for when syscall auditing is enabled.
+
+Please see the github kernel audit issue
+https://github.com/linux-audit/audit-kernel/issues/111
+
+Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+Signed-off-by: Paul Moore <paul@paul-moore.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ include/linux/audit.h |  9 +++++++++
+ kernel/audit.c        | 27 +++++++++++++++++++++++++++
+ kernel/audit.h        |  8 ++++++--
+ kernel/auditsc.c      | 19 +++----------------
+ kernel/signal.c       |  2 +-
+ 5 files changed, 46 insertions(+), 19 deletions(-)
+
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index 3a4f2415bb7c..97d0925454df 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -182,6 +182,9 @@ static inline unsigned int audit_get_sessionid(struct task_struct *tsk)
+ }
+ 
+ extern u32 audit_enabled;
++
++extern int audit_signal_info(int sig, struct task_struct *t);
++
+ #else /* CONFIG_AUDIT */
+ static inline __printf(4, 5)
+ void audit_log(struct audit_context *ctx, gfp_t gfp_mask, int type,
+@@ -235,6 +238,12 @@ static inline unsigned int audit_get_sessionid(struct task_struct *tsk)
+ }
+ 
+ #define audit_enabled AUDIT_OFF
++
++static inline int audit_signal_info(int sig, struct task_struct *t)
++{
++	return 0;
++}
++
+ #endif /* CONFIG_AUDIT */
+ 
+ #ifdef CONFIG_AUDIT_COMPAT_GENERIC
+diff --git a/kernel/audit.c b/kernel/audit.c
+index a664fe710289..05ae208ad442 100644
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@ -2273,6 +2273,33 @@ int audit_set_loginuid(kuid_t loginuid)
+ 	return rc;
+ }
+ 
++/**
++ * audit_signal_info - record signal info for shutting down audit subsystem
++ * @sig: signal value
++ * @t: task being signaled
++ *
++ * If the audit subsystem is being terminated, record the task (pid)
++ * and uid that is doing that.
++ */
++int audit_signal_info(int sig, struct task_struct *t)
++{
++	kuid_t uid = current_uid(), auid;
++
++	if (auditd_test_task(t) &&
++	    (sig == SIGTERM || sig == SIGHUP ||
++	     sig == SIGUSR1 || sig == SIGUSR2)) {
++		audit_sig_pid = task_tgid_nr(current);
++		auid = audit_get_loginuid(current);
++		if (uid_valid(auid))
++			audit_sig_uid = auid;
++		else
++			audit_sig_uid = uid;
++		security_task_getsecid(current, &audit_sig_sid);
++	}
++
++	return audit_signal_info_syscall(t);
++}
++
+ /**
+  * audit_log_end - end one audit record
+  * @ab: the audit_buffer
+diff --git a/kernel/audit.h b/kernel/audit.h
+index c018dcab4b11..ddc22878433d 100644
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@ -286,7 +286,7 @@ extern const char *audit_tree_path(struct audit_tree *tree);
+ extern void audit_put_tree(struct audit_tree *tree);
+ extern void audit_kill_trees(struct audit_context *context);
+ 
+-extern int audit_signal_info(int sig, struct task_struct *t);
++extern int audit_signal_info_syscall(struct task_struct *t);
+ extern void audit_filter_inodes(struct task_struct *tsk,
+ 				struct audit_context *ctx);
+ extern struct list_head *audit_killed_trees(void);
+@@ -317,7 +317,11 @@ extern struct list_head *audit_killed_trees(void);
+ #define audit_tree_path(rule) ""	/* never called */
+ #define audit_kill_trees(context) BUG()
+ 
+-#define audit_signal_info(s, t) AUDIT_DISABLED
++static inline int audit_signal_info_syscall(struct task_struct *t)
++{
++	return 0;
++}
++
+ #define audit_filter_inodes(t, c) AUDIT_DISABLED
+ #endif /* CONFIG_AUDITSYSCALL */
+ 
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index 95ae27edd417..30aa07b0115f 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -2360,30 +2360,17 @@ void __audit_ptrace(struct task_struct *t)
+ }
+ 
+ /**
+- * audit_signal_info - record signal info for shutting down audit subsystem
+- * @sig: signal value
++ * audit_signal_info_syscall - record signal info for syscalls
+  * @t: task being signaled
+  *
+  * If the audit subsystem is being terminated, record the task (pid)
+  * and uid that is doing that.
+  */
+-int audit_signal_info(int sig, struct task_struct *t)
++int audit_signal_info_syscall(struct task_struct *t)
+ {
+ 	struct audit_aux_data_pids *axp;
+ 	struct audit_context *ctx = audit_context();
+-	kuid_t uid = current_uid(), auid, t_uid = task_uid(t);
+-
+-	if (auditd_test_task(t) &&
+-	    (sig == SIGTERM || sig == SIGHUP ||
+-	     sig == SIGUSR1 || sig == SIGUSR2)) {
+-		audit_sig_pid = task_tgid_nr(current);
+-		auid = audit_get_loginuid(current);
+-		if (uid_valid(auid))
+-			audit_sig_uid = auid;
+-		else
+-			audit_sig_uid = uid;
+-		security_task_getsecid(current, &audit_sig_sid);
+-	}
++	kuid_t t_uid = task_uid(t);
+ 
+ 	if (!audit_signals || audit_dummy_context())
+ 		return 0;
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 00448edd0282..72347cb4bb2b 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -45,6 +45,7 @@
+ #include <linux/posix-timers.h>
+ #include <linux/livepatch.h>
+ #include <linux/cgroup.h>
++#include <linux/audit.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/signal.h>
+@@ -54,7 +55,6 @@
+ #include <asm/unistd.h>
+ #include <asm/siginfo.h>
+ #include <asm/cacheflush.h>
+-#include "audit.h"	/* audit_signal_info() */
+ 
+ /*
+  * SLAB caches for signal bits.
+-- 
+2.31.1
+

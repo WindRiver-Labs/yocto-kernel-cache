@@ -1,0 +1,1865 @@
+From f8d5dad1249aba4e232e315241c3d8ab1a47f838 Mon Sep 17 00:00:00 2001
+From: Tanmay Jagdale <tanmay@marvell.com>
+Date: Mon, 5 Jul 2021 15:07:28 +0530
+Subject: [PATCH 1673/1921] coresight: Revert all OcteonTX2 changes
+
+Revert all the Coresight changes done for Marvell OcteonTX2 platform.
+This is done in preparation to bring the current Coresight driver upto
+Linux 5.13 driver version.
+
+The OcteonTX2 Coresight support will then be added on top of the
+updated driver.
+
+Change-Id: If0f797b9a5cf689f711f55fecd7d21b01c6e55eb
+Signed-off-by: Tanmay Jagdale <tanmay@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/hwtracing/coresight/Makefile          |   3 +-
+ .../hwtracing/coresight/coresight-etm-perf.c  |   2 +
+ .../coresight/coresight-etm4x-sysfs.c         |  20 +-
+ drivers/hwtracing/coresight/coresight-etm4x.c | 141 +-----
+ drivers/hwtracing/coresight/coresight-etm4x.h |   9 -
+ drivers/hwtracing/coresight/coresight-priv.h  |  62 +--
+ .../hwtracing/coresight/coresight-quirks.c    | 113 -----
+ .../hwtracing/coresight/coresight-tmc-etr.c   | 409 +-----------------
+ drivers/hwtracing/coresight/coresight-tmc.c   | 105 +----
+ drivers/hwtracing/coresight/coresight-tmc.h   | 158 -------
+ drivers/hwtracing/coresight/coresight.c       |  81 ++--
+ include/linux/coresight.h                     |  12 -
+ 12 files changed, 61 insertions(+), 1054 deletions(-)
+ delete mode 100644 drivers/hwtracing/coresight/coresight-quirks.c
+
+diff --git a/drivers/hwtracing/coresight/Makefile b/drivers/hwtracing/coresight/Makefile
+index 74e38967f2f6..3c0ac421e211 100644
+--- a/drivers/hwtracing/coresight/Makefile
++++ b/drivers/hwtracing/coresight/Makefile
+@@ -2,8 +2,7 @@
+ #
+ # Makefile for CoreSight drivers.
+ #
+-obj-$(CONFIG_CORESIGHT) += coresight.o coresight-etm-perf.o \
+-			   coresight-platform.o coresight-quirks.o
++obj-$(CONFIG_CORESIGHT) += coresight.o coresight-etm-perf.o coresight-platform.o
+ obj-$(CONFIG_CORESIGHT_LINK_AND_SINK_TMC) += coresight-tmc.o \
+ 					     coresight-tmc-etf.o \
+ 					     coresight-tmc-etr.o
+diff --git a/drivers/hwtracing/coresight/coresight-etm-perf.c b/drivers/hwtracing/coresight/coresight-etm-perf.c
+index 28e1a74281c2..9b0c5d719232 100644
+--- a/drivers/hwtracing/coresight/coresight-etm-perf.c
++++ b/drivers/hwtracing/coresight/coresight-etm-perf.c
+@@ -222,6 +222,8 @@ static void *etm_setup_aux(struct perf_event *event, void **pages,
+ 	if (event->attr.config2) {
+ 		id = (u32)event->attr.config2;
+ 		sink = coresight_get_sink_by_id(id);
++	} else {
++		sink = coresight_get_enabled_sink(true);
+ 	}
+ 
+ 	if (!sink)
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c b/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c
+index f54bfb236c77..ee44640edeb5 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c
++++ b/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c
+@@ -2079,26 +2079,8 @@ static u32 etmv4_cross_read(const struct device *dev, u32 offset)
+ 	/*
+ 	 * smp cross call ensures the CPU will be powered up before
+ 	 * accessing the ETMv4 trace core registers
+-	 *
+-	 * Note: When task isolation is enabled, the target cpu used
+-	 * is always primary core and hence the above assumption of
+-	 * cpu associated with the ETM being in powered up state during
+-	 * register writes is not valid.
+-	 * But on the other hand, using smp call ensures that atomicity is
+-	 * not broken as well.
+ 	 */
+-	smp_call_function_single(drvdata->rc_cpu, do_smp_cross_read, &reg, 1);
+-
+-	/*
+-	 * OcteonTx2 h/w reports ETMv4.2 but it supports Ignore Packet
+-	 * feature of ETMv4.3, Treat this h/w as ETMv4.3 compatible.
+-	 */
+-	if ((offset == TRCIDR1) &&
+-	    (drvdata->etm_options & CSETM_QUIRK_TREAT_ETMv43)) {
+-		reg.data &= ~0xF0;
+-		reg.data |= 0x30;
+-	}
+-
++	smp_call_function_single(drvdata->cpu, do_smp_cross_read, &reg, 1);
+ 	return reg.data;
+ }
+ 
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x.c b/drivers/hwtracing/coresight/coresight-etm4x.c
+index 55a8bc05e704..83dccdeef906 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x.c
++++ b/drivers/hwtracing/coresight/coresight-etm4x.c
+@@ -26,9 +26,6 @@
+ #include <linux/uaccess.h>
+ #include <linux/perf_event.h>
+ #include <linux/pm_runtime.h>
+-#include <linux/property.h>
+-
+-#include <asm/barrier.h>
+ #include <asm/sections.h>
+ #include <asm/local.h>
+ #include <asm/virt.h>
+@@ -83,42 +80,6 @@ static int etm4_trace_id(struct coresight_device *csdev)
+ 	return drvdata->trcid;
+ }
+ 
+-/* Raw enable/disable APIs for ETM sync insertion */
+-static void etm4_enable_raw(struct coresight_device *csdev)
+-{
+-	struct etmv4_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+-
+-	CS_UNLOCK(drvdata->base);
+-
+-	etm4_os_unlock(drvdata);
+-
+-	/* Enable the trace unit */
+-	writel(1, drvdata->base + TRCPRGCTLR);
+-
+-	dsb(sy);
+-	isb();
+-
+-	CS_LOCK(drvdata->base);
+-}
+-
+-static void etm4_disable_raw(struct coresight_device *csdev)
+-{
+-	struct etmv4_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+-
+-	CS_UNLOCK(drvdata->base);
+-	/*
+-	 * Make sure everything completes before disabling, as recommended
+-	 * by section 7.3.77 ("TRCVICTLR, ViewInst Main Control Register,
+-	 * SSTATUS") of ARM IHI 0064D
+-	 */
+-	dsb(sy);
+-	isb();
+-
+-	writel_relaxed(0x0, drvdata->base + TRCPRGCTLR);
+-
+-	CS_LOCK(drvdata->base);
+-}
+-
+ struct etm4_enable_arg {
+ 	struct etmv4_drvdata *drvdata;
+ 	int rc;
+@@ -238,20 +199,6 @@ static int etm4_enable_hw(struct etmv4_drvdata *drvdata)
+ done:
+ 	CS_LOCK(drvdata->base);
+ 
+-	/* For supporting SW sync insertion */
+-	if (!is_etm_sync_mode_hw()) {
+-		/* ETM sync insertions are gated in the
+-		 * ETR timer handler based on hw state.
+-		 */
+-		drvdata->csdev->hw_state = USR_START;
+-
+-		/* Global timer handler not being associated with
+-		 * a specific ETM core, need to know the current
+-		 * list of active ETMs.
+-		 */
+-		coresight_etm_active_enable(drvdata->cpu);
+-	}
+-
+ 	dev_dbg(etm_dev, "cpu: %d enable smp call done: %d\n",
+ 		drvdata->cpu, rc);
+ 	return rc;
+@@ -451,22 +398,14 @@ static int etm4_enable_sysfs(struct coresight_device *csdev)
+ 	/*
+ 	 * Executing etm4_enable_hw on the cpu whose ETM is being enabled
+ 	 * ensures that register writes occur when cpu is powered.
+-	 *
+-	 * Note: When task isolation is enabled, the target cpu used
+-	 * is always primary core and hence the above assumption of
+-	 * cpu associated with the ETM being in powered up state during
+-	 * register writes is not valid.
+-	 * But on the other hand, using smp call ensures that atomicity is
+-	 * not broken as well.
+ 	 */
+ 	arg.drvdata = drvdata;
+-	ret = smp_call_function_single(drvdata->rc_cpu,
++	ret = smp_call_function_single(drvdata->cpu,
+ 				       etm4_enable_hw_smp_call, &arg, 1);
+ 	if (!ret)
+ 		ret = arg.rc;
+ 	if (!ret)
+ 		drvdata->sticky_enable = true;
+-
+ 	spin_unlock(&drvdata->spinlock);
+ 
+ 	if (!ret)
+@@ -508,7 +447,6 @@ static int etm4_enable(struct coresight_device *csdev,
+ static void etm4_disable_hw(void *info)
+ {
+ 	u32 control;
+-	u64 trfcr;
+ 	struct etmv4_drvdata *drvdata = info;
+ 
+ 	CS_UNLOCK(drvdata->base);
+@@ -523,16 +461,6 @@ static void etm4_disable_hw(void *info)
+ 	/* EN, bit[0] Trace unit enable bit */
+ 	control &= ~0x1;
+ 
+-	/*
+-	 * If the CPU supports v8.4 Trace filter Control,
+-	 * set the ETM to trace prohibited region.
+-	 */
+-	if (drvdata->trfc) {
+-		trfcr = read_sysreg_s(SYS_TRFCR_EL1);
+-		write_sysreg_s(trfcr & ~(TRFCR_ELx_ExTRE | TRFCR_ELx_E0TRE),
+-			       SYS_TRFCR_EL1);
+-		isb();
+-	}
+ 	/*
+ 	 * Make sure everything completes before disabling, as recommended
+ 	 * by section 7.3.77 ("TRCVICTLR, ViewInst Main Control Register,
+@@ -540,22 +468,12 @@ static void etm4_disable_hw(void *info)
+ 	 */
+ 	dsb(sy);
+ 	isb();
+-	/* Trace synchronization barrier, is a nop if not supported */
+-	tsb_csync();
+ 	writel_relaxed(control, drvdata->base + TRCPRGCTLR);
+ 
+-	if (drvdata->trfc)
+-		write_sysreg_s(trfcr, SYS_TRFCR_EL1);
+ 	coresight_disclaim_device_unlocked(drvdata->base);
+ 
+ 	CS_LOCK(drvdata->base);
+ 
+-	/* For supporting SW sync insertion */
+-	if (!is_etm_sync_mode_hw()) {
+-		drvdata->csdev->hw_state = USR_STOP;
+-		coresight_etm_active_disable(drvdata->cpu);
+-	}
+-
+ 	dev_dbg(&drvdata->csdev->dev,
+ 		"cpu: %d disable smp call done\n", drvdata->cpu);
+ }
+@@ -601,15 +519,8 @@ static void etm4_disable_sysfs(struct coresight_device *csdev)
+ 	/*
+ 	 * Executing etm4_disable_hw on the cpu whose ETM is being disabled
+ 	 * ensures that register writes occur when cpu is powered.
+-	 *
+-	 * Note: When task isolation is enabled, the target cpu used
+-	 * is always primary core and hence the above assumption of
+-	 * cpu associated with the ETM being in powered up state during
+-	 * register writes is not valid.
+-	 * But on the other hand, using smp call ensures that atomicity is
+-	 * not broken as well.
+ 	 */
+-	smp_call_function_single(drvdata->rc_cpu, etm4_disable_hw, drvdata, 1);
++	smp_call_function_single(drvdata->cpu, etm4_disable_hw, drvdata, 1);
+ 
+ 	spin_unlock(&drvdata->spinlock);
+ 	cpus_read_unlock();
+@@ -650,39 +561,12 @@ static const struct coresight_ops_source etm4_source_ops = {
+ 	.trace_id	= etm4_trace_id,
+ 	.enable		= etm4_enable,
+ 	.disable	= etm4_disable,
+-	.enable_raw	= etm4_enable_raw,
+-	.disable_raw	= etm4_disable_raw,
+ };
+ 
+ static const struct coresight_ops etm4_cs_ops = {
+ 	.source_ops	= &etm4_source_ops,
+ };
+ 
+-static void cpu_enable_tracing(struct etmv4_drvdata *drvdata)
+-{
+-	u64 dfr0 = read_sysreg(id_aa64dfr0_el1);
+-	u64 trfcr;
+-
+-	if (!cpuid_feature_extract_unsigned_field(dfr0, ID_AA64DFR0_TRACE_FILT_SHIFT))
+-		return;
+-
+-	drvdata->trfc = true;
+-	/*
+-	 * If the CPU supports v8.4 SelfHosted Tracing, enable
+-	 * tracing at the kernel EL and EL0, forcing to use the
+-	 * virtual time as the timestamp.
+-	 */
+-	trfcr = (TRFCR_ELx_TS_VIRTUAL |
+-		 TRFCR_ELx_ExTRE |
+-		 TRFCR_ELx_E0TRE);
+-
+-	/* If we are running at EL2, allow tracing the CONTEXTIDR_EL2. */
+-	if (is_kernel_in_hyp_mode())
+-		trfcr |= TRFCR_EL2_CX;
+-
+-	write_sysreg_s(trfcr, SYS_TRFCR_EL1);
+-}
+-
+ static void etm4_init_arch_data(void *info)
+ {
+ 	u32 etmidr0;
+@@ -740,16 +624,6 @@ static void etm4_init_arch_data(void *info)
+ 
+ 	/* base architecture of trace unit */
+ 	etmidr1 = readl_relaxed(drvdata->base + TRCIDR1);
+-
+-	/*
+-	 * OcteonTx2 h/w reports ETMv4.2 but it supports Ignore Packet
+-	 * feature of ETMv4.3, Treat this h/w as ETMv4.3 compatible.
+-	 */
+-	if (drvdata->etm_options & CSETM_QUIRK_TREAT_ETMv43) {
+-		etmidr1 &= ~0xF0;
+-		etmidr1 |= 0x30;
+-	}
+-
+ 	/*
+ 	 * TRCARCHMIN, bits[7:4] architecture the minor version number
+ 	 * TRCARCHMAJ, bits[11:8] architecture major versin number
+@@ -855,7 +729,6 @@ static void etm4_init_arch_data(void *info)
+ 	/* NUMCNTR, bits[30:28] number of counters available for tracing */
+ 	drvdata->nr_cntr = BMVAL(etmidr5, 28, 30);
+ 	CS_LOCK(drvdata->base);
+-	cpu_enable_tracing(drvdata);
+ }
+ 
+ static void etm4_set_default_config(struct etmv4_config *config)
+@@ -1245,14 +1118,10 @@ static int etm4_probe(struct amba_device *adev, const struct amba_id *id)
+ 	if (!desc.name)
+ 		return -ENOMEM;
+ 
+-	/* Update the smp target cpu */
+-	drvdata->rc_cpu = is_etm_sync_mode_sw_global() ? SYNC_GLOBAL_CORE :
+-		drvdata->cpu;
+-
+ 	cpus_read_lock();
+ 	etmdrvdata[drvdata->cpu] = drvdata;
+ 
+-	if (smp_call_function_single(drvdata->rc_cpu,
++	if (smp_call_function_single(drvdata->cpu,
+ 				etm4_init_arch_data,  drvdata, 1))
+ 		dev_err(dev, "ETM arch init failed\n");
+ 
+@@ -1278,9 +1147,6 @@ static int etm4_probe(struct amba_device *adev, const struct amba_id *id)
+ 	etm4_init_trace_id(drvdata);
+ 	etm4_set_default(&drvdata->config);
+ 
+-	/* Enable fixes for Silicon issues */
+-	drvdata->etm_options = coresight_get_etm_quirks(OCTEONTX_CN9XXX_ETM);
+-
+ 	pdata = coresight_get_platform_data(dev);
+ 	if (IS_ERR(pdata)) {
+ 		ret = PTR_ERR(pdata);
+@@ -1341,7 +1207,6 @@ static const struct amba_id etm4_ids[] = {
+ 	CS_AMBA_ID(0x000bb95e),			/* Cortex-A57 */
+ 	CS_AMBA_ID(0x000bb95a),			/* Cortex-A72 */
+ 	CS_AMBA_ID(0x000bb959),			/* Cortex-A73 */
+-	CS_AMBA_ID(0x000cc210),			/* Marvell-OcteonTx-CN9xxx */
+ 	CS_AMBA_UCI_ID(0x000bb9da, uci_id_etm4),/* Cortex-A35 */
+ 	CS_AMBA_UCI_ID(0x000f0205, uci_id_etm4),/* Qualcomm Kryo */
+ 	CS_AMBA_UCI_ID(0x000f0211, uci_id_etm4),/* Qualcomm Kryo */
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x.h b/drivers/hwtracing/coresight/coresight-etm4x.h
+index a855fc3b9aab..4523f10ddd0f 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x.h
++++ b/drivers/hwtracing/coresight/coresight-etm4x.h
+@@ -191,7 +191,6 @@
+ #define ETM_EXLEVEL_NS_HYP		BIT(14)
+ #define ETM_EXLEVEL_NS_NA		BIT(15)
+ 
+-
+ /**
+  * struct etmv4_config - configuration information related to an ETMv4
+  * @mode:	Controls various modes supported by this ETM.
+@@ -288,11 +287,7 @@ struct etmv4_config {
+  * @csdev:      Component vitals needed by the framework.
+  * @spinlock:   Only one at a time pls.
+  * @mode:	This tracer's mode, i.e sysFS, Perf or disabled.
+- * @etm_options: Bitmask of options to manage ETMv4 Silicon issues
+  * @cpu:        The cpu this component is affined to.
+- * @rc_cpu:	The cpu on which remote function calls can be run
+- *		In certain kernel configurations, some cores are not expected
+- *		to be interrupted and we need a fallback target cpu.
+  * @arch:       ETM version number.
+  * @nr_pe:	The number of processing entity available for tracing.
+  * @nr_pe_cmp:	The number of processing entity comparator inputs that are
+@@ -340,7 +335,6 @@ struct etmv4_config {
+  * @nooverflow:	Indicate if overflow prevention is supported.
+  * @atbtrig:	If the implementation can support ATB triggers
+  * @lpoverride:	If the implementation can support low-power state over.
+- * @trfc:	If the implementation supports Arm v8.4 trace filter controls.
+  * @config:	structure holding configuration parameters.
+  */
+ struct etmv4_drvdata {
+@@ -348,9 +342,7 @@ struct etmv4_drvdata {
+ 	struct coresight_device		*csdev;
+ 	spinlock_t			spinlock;
+ 	local_t				mode;
+-	u32				etm_options;
+ 	int				cpu;
+-	int				rc_cpu;
+ 	u8				arch;
+ 	u8				nr_pe;
+ 	u8				nr_pe_cmp;
+@@ -388,7 +380,6 @@ struct etmv4_drvdata {
+ 	bool				nooverflow;
+ 	bool				atbtrig;
+ 	bool				lpoverride;
+-	bool				trfc;
+ 	struct etmv4_config		config;
+ };
+ 
+diff --git a/drivers/hwtracing/coresight/coresight-priv.h b/drivers/hwtracing/coresight/coresight-priv.h
+index eaecbdce9d94..56379d4a7ede 100644
+--- a/drivers/hwtracing/coresight/coresight-priv.h
++++ b/drivers/hwtracing/coresight/coresight-priv.h
+@@ -26,16 +26,14 @@
+ #define CORESIGHT_DEVID		0xfc8
+ #define CORESIGHT_DEVTYPE	0xfcc
+ 
++
+ /*
+  * Coresight device CLAIM protocol.
+  * See PSCI - ARM DEN 0022D, Section: 6.8.1 Debug and Trace save and restore.
+  */
+ #define CORESIGHT_CLAIM_SELF_HOSTED	BIT(1)
+ 
+-/* Timeout is in ms to accommodate larger ETR flush time
+- * taken by OcteonTx2 implementation
+- */
+-#define TIMEOUT_US		5000
++#define TIMEOUT_US		100
+ #define BMVAL(val, lsb, msb)	((val & GENMASK(msb, lsb)) >> lsb)
+ 
+ #define ETM_MODE_EXCL_KERN	BIT(30)
+@@ -70,48 +68,6 @@ static DEVICE_ATTR_RO(name)
+ extern const u32 barrier_pkt[4];
+ #define CORESIGHT_BARRIER_PKT_SIZE (sizeof(barrier_pkt))
+ 
+-/* Marvell OcteonTx CN9xxx device */
+-#define OCTEONTX_CN9XXX_ETR		0x000cc213
+-/* Marvell OcteonTx CN9xxx ETM device */
+-#define OCTEONTX_CN9XXX_ETM		0x000cc210
+-
+-/* Coresight Hardware quirks */
+-#define CSETR_QUIRK_BUFFSIZE_8BX	(0x1U << 0) /* 8 byte size multiplier */
+-#define CSETR_QUIRK_SECURE_BUFF		(0x1U << 1) /* Trace buffer is Secure */
+-#define CSETR_QUIRK_RESET_CTL_REG	(0x1U << 2) /* Reset CTL on reset */
+-#define CSETR_QUIRK_NO_STOP_FLUSH	(0x1U << 3) /* No Stop on flush */
+-#define CSETM_QUIRK_SW_SYNC		(0x1U << 4) /* No Hardware sync */
+-#define CSETM_QUIRK_TREAT_ETMv43	(0x1U << 5) /* ETMv4.2 as ETMv4.3 */
+-#define CSETR_QUIRK_FORCE_64B_DBA_RW	(0x1U << 6) /* 64b DBA read/write */
+-
+-/* ETM sync insertion modes
+- * 1. MODE_HW
+- *    Sync insertion is done by hardware without any software intervention
+- *
+- * 2. MODE_SW_GLOBAL
+- *    sync insertion runs from common timer handler on primary core
+- *
+- * 3. MODE_SW_PER_CORE
+- *    sync insertion runs from per core timer handler
+- *
+- * When hardware doesn't support sync insertion, we fall back to software based
+- * ones. Typically, GLOBAL mode would be preferred when the traced cores are
+- * running performance critical applications and cannot be interrupted,
+- * but at the same time there would be a small loss of trace data during the
+- * insertion sequence as well.
+- *
+- * For the sake of simplicity, in GLOBAL mode, common timer handler is
+- * always expected to run on primary core(core 0).
+- */
+-#define SYNC_GLOBAL_CORE	0 /* Core 0 */
+-
+-enum etm_sync_mode {
+-	SYNC_MODE_INVALID,
+-	SYNC_MODE_HW,
+-	SYNC_MODE_SW_GLOBAL,
+-	SYNC_MODE_SW_PER_CORE,
+-};
+-
+ enum etm_addr_type {
+ 	ETM_ADDR_TYPE_NONE,
+ 	ETM_ADDR_TYPE_SINGLE,
+@@ -124,7 +80,6 @@ enum cs_mode {
+ 	CS_MODE_DISABLED,
+ 	CS_MODE_SYSFS,
+ 	CS_MODE_PERF,
+-	CS_MODE_READ_PREVBOOT,
+ };
+ 
+ /**
+@@ -194,8 +149,7 @@ static inline void coresight_write_reg_pair(void __iomem *addr, u64 val,
+ void coresight_disable_path(struct list_head *path);
+ int coresight_enable_path(struct list_head *path, u32 mode, void *sink_data);
+ struct coresight_device *coresight_get_sink(struct list_head *path);
+-struct coresight_device *
+-coresight_get_enabled_sink(struct coresight_device *source);
++struct coresight_device *coresight_get_enabled_sink(bool reset);
+ struct coresight_device *coresight_get_sink_by_id(u32 id);
+ struct list_head *coresight_build_path(struct coresight_device *csdev,
+ 				       struct coresight_device *sink);
+@@ -249,15 +203,5 @@ static inline void *coresight_get_uci_data(const struct amba_id *id)
+ }
+ 
+ void coresight_release_platform_data(struct coresight_platform_data *pdata);
+-/* Coresight ETM/ETR hardware quirks */
+-u32 coresight_get_etr_quirks(unsigned int id);
+-u32 coresight_get_etm_quirks(unsigned int id);
+-
+-/* ETM software sync insertion */
+-bool is_etm_sync_mode_hw(void);
+-bool is_etm_sync_mode_sw_global(void);
+ 
+-void coresight_etm_active_enable(int cpu);
+-void coresight_etm_active_disable(int cpu);
+-cpumask_t coresight_etm_active_list(void);
+ #endif
+diff --git a/drivers/hwtracing/coresight/coresight-quirks.c b/drivers/hwtracing/coresight/coresight-quirks.c
+deleted file mode 100644
+index 2fa5bccfabfb..000000000000
+--- a/drivers/hwtracing/coresight/coresight-quirks.c
++++ /dev/null
+@@ -1,113 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-//
+-#include <asm/cputype.h>
+-#include <linux/coresight.h>
+-#include "coresight-priv.h"
+-
+-u32 coresight_get_etr_quirks(unsigned int id)
+-{
+-	u32 options = 0; /* reset */
+-
+-	if (midr_is_cpu_model_range(read_cpuid_id(),
+-				     MIDR_MRVL_OCTEONTX2_96XX,
+-				     MIDR_CPU_VAR_REV(0, 0),
+-				     MIDR_CPU_VAR_REV(3, 1)) ||
+-	    midr_is_cpu_model_range(read_cpuid_id(),
+-				     MIDR_MRVL_OCTEONTX2_95XX,
+-				     MIDR_CPU_VAR_REV(0, 0),
+-				     MIDR_CPU_VAR_REV(2, 0)))
+-		options |= CSETR_QUIRK_RESET_CTL_REG |
+-			CSETR_QUIRK_BUFFSIZE_8BX |
+-			CSETR_QUIRK_NO_STOP_FLUSH;
+-
+-	/* Common across all Chip variants and revisions */
+-	if (id == OCTEONTX_CN9XXX_ETR)
+-		options |= CSETR_QUIRK_SECURE_BUFF |
+-			CSETR_QUIRK_FORCE_64B_DBA_RW;
+-
+-	return options;
+-}
+-
+-bool is_etm_has_hw_sync(void)
+-{
+-	/* Check if hardware supports sync insertion */
+-	if (midr_is_cpu_model_range(read_cpuid_id(),
+-				     MIDR_MRVL_OCTEONTX2_96XX,
+-				     MIDR_CPU_VAR_REV(0, 0),
+-				     MIDR_CPU_VAR_REV(3, 1)) ||
+-	    midr_is_cpu_model_range(read_cpuid_id(),
+-				     MIDR_MRVL_OCTEONTX2_95XX,
+-				     MIDR_CPU_VAR_REV(0, 0),
+-				     MIDR_CPU_VAR_REV(2, 0)))
+-		return false;
+-	else
+-		return true;
+-}
+-
+-u32 coresight_get_etm_quirks(unsigned int id)
+-{
+-	u32 options = 0; /* reset */
+-
+-	if (id == OCTEONTX_CN9XXX_ETM)
+-		options |= CSETM_QUIRK_TREAT_ETMv43;
+-
+-	if (!is_etm_has_hw_sync())
+-		options |= CSETM_QUIRK_SW_SYNC;
+-
+-	return options;
+-}
+-
+-/* APIs for choosing the sync insertion mode */
+-static int coresight_get_etm_sync_mode(void)
+-{
+-	/* Check if hardware supports sync insertion */
+-	if (is_etm_has_hw_sync())
+-		return SYNC_MODE_HW;
+-
+-	/* Find the software based sync insertion mode */
+-#ifdef CONFIG_TASK_ISOLATION
+-	return SYNC_MODE_SW_GLOBAL;
+-#else
+-	return SYNC_MODE_SW_PER_CORE;
+-#endif
+-}
+-
+-/* APIs for enabling fixes for CSETR_QUIRK_SW_SYNC
+- *
+- * Note: Driver options are not used as done in other quirks,
+- * since the fix is spread across multiple(ETM/ETR) driver files.
+- */
+-
+-bool is_etm_sync_mode_hw(void)
+-{
+-	return coresight_get_etm_sync_mode() == SYNC_MODE_HW;
+-}
+-
+-bool is_etm_sync_mode_sw_global(void)
+-{
+-	return coresight_get_etm_sync_mode() == SYNC_MODE_SW_GLOBAL;
+-}
+-
+-/* Support functions for managing active ETM list used by
+- * global mode sync insertion.
+- *
+- * Note: It is assumed that all accessor functions
+- * on etm_active_list should be called in a atomic context
+- */
+-
+-static cpumask_t etm_active_list; /* Bitmap of active ETMs cpu wise */
+-
+-void coresight_etm_active_enable(int cpu)
+-{
+-	cpumask_set_cpu(cpu, &etm_active_list);
+-}
+-
+-void coresight_etm_active_disable(int cpu)
+-{
+-	cpumask_clear_cpu(cpu, &etm_active_list);
+-}
+-
+-cpumask_t coresight_etm_active_list(void)
+-{
+-	return etm_active_list;
+-}
+diff --git a/drivers/hwtracing/coresight/coresight-tmc-etr.c b/drivers/hwtracing/coresight/coresight-tmc-etr.c
+index c455da9c0ae7..ed77c7f7b344 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc-etr.c
++++ b/drivers/hwtracing/coresight/coresight-tmc-etr.c
+@@ -14,9 +14,7 @@
+ #include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/vmalloc.h>
+-#include <linux/arm-smccc.h>
+ #include "coresight-catu.h"
+-#include "coresight-etm4x.h"
+ #include "coresight-etm-perf.h"
+ #include "coresight-priv.h"
+ #include "coresight-tmc.h"
+@@ -110,242 +108,6 @@ struct etr_sg_table {
+ 	dma_addr_t		hwaddr;
+ };
+ 
+-void *tmc_etr_drvbuf_vaddr(struct tmc_drvdata *drvdata)
+-{
+-	struct etr_buf *etr_buf;
+-	struct etr_flat_buf *flat_buf;
+-
+-	etr_buf = drvdata->etr_buf;
+-	flat_buf = etr_buf->private;
+-
+-	return flat_buf->vaddr;
+-}
+-
+-/* SW mode sync insertion interval
+- *
+- * Sync insertion interval for 1M is based on assumption of
+- * trace data generated at  4bits/cycle ,cycle period of 0.4 ns
+- * and atleast 4 syncs per buffer wrap.
+- *
+- * One limitation of fixing only 4 syncs per buffer wrap is that
+- * we might loose 1/4 of the initial buffer data due to lack of sync.
+- * But on the other hand, we could reduce the sync insertion frequency
+- * by increasing the buffer size which seems to be a good compromise.
+- */
+-#define SYNC_TICK_NS_PER_MB 200000 /* 200us */
+-#define SYNCS_PER_FILL 4
+-
+-/* Global mode timer management */
+-
+-/**
+- * struct tmc_etr_tsync_global - Global mode timer
+- * @drvdata_cpumap:	cpu to tmc drvdata map
+- * @timer:		global timer shared by all cores
+- * @tick:		gloabl timer tick period
+- * @active_count:	timer reference count
+- */
+-static struct tmc_etr_tsync_global {
+-	struct tmc_drvdata *drvdata_cpumap[NR_CPUS];
+-	struct hrtimer	timer;
+-	int active_count;
+-	u64 tick;
+-} tmc_etr_tsync_global;
+-
+-/* Accessor functions for tsync global */
+-void tmc_etr_add_cpumap(struct tmc_drvdata *drvdata)
+-{
+-	tmc_etr_tsync_global.drvdata_cpumap[drvdata->cpu] = drvdata;
+-}
+-
+-static inline struct tmc_drvdata *cpu_to_tmcdrvdata(int cpu)
+-{
+-	return tmc_etr_tsync_global.drvdata_cpumap[cpu];
+-}
+-
+-static inline struct hrtimer *tmc_etr_tsync_global_timer(void)
+-{
+-	return &tmc_etr_tsync_global.timer;
+-}
+-
+-static inline void tmc_etr_tsync_global_tick(u64 tick)
+-{
+-	tmc_etr_tsync_global.tick = tick;
+-}
+-
+-/* Refernence counting is assumed to be always called from
+- * an atomic context.
+- */
+-static inline int tmc_etr_tsync_global_addref(void)
+-{
+-	return ++tmc_etr_tsync_global.active_count;
+-}
+-
+-static inline int tmc_etr_tsync_global_delref(void)
+-{
+-	return --tmc_etr_tsync_global.active_count;
+-}
+-
+-/* Sync insertion API */
+-static void tmc_etr_insert_sync(struct tmc_drvdata *drvdata)
+-{
+-	struct coresight_device *sdev = drvdata->etm_source;
+-	struct etr_tsync_data *syncd = &drvdata->tsync_data;
+-	int err = 0, len;
+-	u64 rwp;
+-
+-	/* We have three contenders for ETM control.
+-	 * 1. User initiated ETM control
+-	 * 2. Timer sync initiated ETM control
+-	 * 3. No stop on flush initated ETM control
+-	 * They all run in an atomic context and that too in
+-	 * the same core. Either on a core in which ETM is associated
+-	 * or in the primary core thereby mutually exclusive.
+-	 *
+-	 * To avoid any sync insertion while ETM is disabled by
+-	 * user, we rely on the device hw_state.
+-	 * Like for example, hrtimer being in active state even
+-	 * after ETM is disabled by user.
+-	 */
+-	if (sdev->hw_state != USR_START)
+-		return;
+-
+-	rwp = tmc_read_rwp(drvdata);
+-	if (!syncd->prev_rwp)
+-		goto sync_insert;
+-
+-	if (syncd->prev_rwp <= rwp) {
+-		len = rwp - syncd->prev_rwp;
+-	} else { /* Buffer wrapped */
+-		goto sync_insert;
+-	}
+-
+-	/* Check if we reached buffer threshold */
+-	if (len < syncd->len_thold)
+-		goto skip_insert;
+-
+-	/* Software based sync insertion procedure */
+-sync_insert:
+-	/* Disable source */
+-	if (likely(sdev && source_ops(sdev)->disable_raw))
+-		source_ops(sdev)->disable_raw(sdev);
+-	else
+-		err = -EINVAL;
+-
+-	/* Enable source */
+-	if (likely(sdev && source_ops(sdev)->enable_raw))
+-		source_ops(sdev)->enable_raw(sdev);
+-	else
+-		err = -EINVAL;
+-
+-	if (!err) {
+-		/* Mark the write pointer of sync insertion */
+-		syncd->prev_rwp = tmc_read_rwp(drvdata);
+-	}
+-
+-skip_insert:
+-	return;
+-}
+-
+-/* Timer handler APIs */
+-
+-static enum hrtimer_restart tmc_etr_timer_handler_percore(struct hrtimer *t)
+-{
+-	struct tmc_drvdata *drvdata;
+-
+-	drvdata = container_of(t, struct tmc_drvdata, timer);
+-	hrtimer_forward_now(t, ns_to_ktime(drvdata->tsync_data.tick));
+-	tmc_etr_insert_sync(drvdata);
+-	return HRTIMER_RESTART;
+-}
+-
+-static enum hrtimer_restart tmc_etr_timer_handler_global(struct hrtimer *t)
+-{
+-	cpumask_t active_mask;
+-	int cpu;
+-
+-	hrtimer_forward_now(t, ns_to_ktime(tmc_etr_tsync_global.tick));
+-
+-	active_mask = coresight_etm_active_list();
+-	/* Run sync insertions for all active ETMs */
+-	for_each_cpu(cpu, &active_mask)
+-		tmc_etr_insert_sync(cpu_to_tmcdrvdata(cpu));
+-
+-	return HRTIMER_RESTART;
+-}
+-
+-/* Timer init API common for both global and per core mode */
+-void tmc_etr_timer_init(struct tmc_drvdata *drvdata)
+-{
+-	struct hrtimer *timer;
+-
+-	timer = is_etm_sync_mode_sw_global() ?
+-		tmc_etr_tsync_global_timer() : &drvdata->timer;
+-	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+-}
+-
+-/* Timer setup API common for both global and per core mode
+- *
+- * Global mode: Timer gets started only if its not active already.
+- *		Number of users managed by reference counting.
+- * Percore mode: Timer gets started always
+- *
+- * Always executed in an atomic context either in IPI handler
+- * on a remote core or with irqs disabled in the local core
+- */
+-static void tmc_etr_timer_setup(void *data)
+-{
+-	struct tmc_drvdata *drvdata = data;
+-	struct hrtimer *timer;
+-	bool mode_global;
+-	u64 tick;
+-
+-	tick = drvdata->tsync_data.tick;
+-	mode_global = is_etm_sync_mode_sw_global();
+-	if (mode_global) {
+-		if (tmc_etr_tsync_global_addref() == 1) {
+-			/* Start only if we are the first user */
+-			tmc_etr_tsync_global_tick(tick); /* Configure tick */
+-		} else {
+-			dev_dbg(&drvdata->csdev->dev, "global timer active already\n");
+-			return;
+-		}
+-	}
+-
+-	timer = mode_global ?
+-		tmc_etr_tsync_global_timer() : &drvdata->timer;
+-	timer->function = mode_global ?
+-		tmc_etr_timer_handler_global : tmc_etr_timer_handler_percore;
+-	dev_dbg(&drvdata->csdev->dev, "Starting sync timer, mode:%s period:%lld ns\n",
+-		mode_global ? "global" : "percore", tick);
+-	hrtimer_start(timer, ns_to_ktime(tick), HRTIMER_MODE_REL_PINNED);
+-}
+-
+-/* Timer cancel API common for both global and per core mode
+- *
+- * Global mode: Timer gets cancelled only if there are no other users
+- * Percore mode: Timer gets cancelled always
+- *
+- * Always executed in an atomic context either in IPI handler
+- * on a remote core or with irqs disabled in the local core
+- */
+-static void tmc_etr_timer_cancel(void *data)
+-{
+-	struct tmc_drvdata *drvdata = data;
+-	struct hrtimer *timer;
+-	bool mode_global;
+-
+-	mode_global = is_etm_sync_mode_sw_global();
+-	if (mode_global) {
+-		if (tmc_etr_tsync_global_delref() != 0) {
+-			/* Nothing to do if we are not the last user */
+-			return;
+-		}
+-	}
+-
+-	timer = mode_global ?
+-		tmc_etr_tsync_global_timer() : &drvdata->timer;
+-	hrtimer_cancel(timer);
+-}
+ /*
+  * tmc_etr_sg_table_entries: Total number of table entries required to map
+  * @nr_pages system pages.
+@@ -833,8 +595,6 @@ static int tmc_etr_alloc_flat_buf(struct tmc_drvdata *drvdata,
+ {
+ 	struct etr_flat_buf *flat_buf;
+ 	struct device *real_dev = drvdata->csdev->dev.parent;
+-	u64 s_hwaddr = 0;
+-	int err;
+ 
+ 	/* We cannot reuse existing pages for flat buf */
+ 	if (pages)
+@@ -851,40 +611,12 @@ static int tmc_etr_alloc_flat_buf(struct tmc_drvdata *drvdata,
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (!(drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF))
+-		goto skip_secure_buffer;
+-
+-	/* Register driver allocated dma buffer for necessary
+-	 * mapping in the secure world
+-	 */
+-	if (tmc_register_drvbuf(drvdata, flat_buf->daddr, etr_buf->size)) {
+-		err = -ENOMEM;
+-		goto reg_err;
+-	}
+-
+-	/* Allocate secure trace buffer */
+-	if (tmc_alloc_secbuf(drvdata, etr_buf->size, &s_hwaddr)) {
+-		err = -ENOMEM;
+-		goto salloc_err;
+-	}
+-
+-skip_secure_buffer:
+ 	flat_buf->size = etr_buf->size;
+ 	flat_buf->dev = &drvdata->csdev->dev;
+ 	etr_buf->hwaddr = flat_buf->daddr;
+-	etr_buf->s_hwaddr = s_hwaddr;
+ 	etr_buf->mode = ETR_MODE_FLAT;
+ 	etr_buf->private = flat_buf;
+ 	return 0;
+-
+-salloc_err:
+-	tmc_unregister_drvbuf(drvdata, etr_buf->hwaddr,
+-					      etr_buf->size);
+-reg_err:
+-	dma_free_coherent(real_dev, etr_buf->size, flat_buf->vaddr,
+-			  flat_buf->daddr);
+-	return err;
+-
+ }
+ 
+ static void tmc_etr_free_flat_buf(struct etr_buf *etr_buf)
+@@ -902,24 +634,15 @@ static void tmc_etr_free_flat_buf(struct etr_buf *etr_buf)
+ 
+ static void tmc_etr_sync_flat_buf(struct etr_buf *etr_buf, u64 rrp, u64 rwp)
+ {
+-	u64 w_offset;
+-
+ 	/*
+ 	 * Adjust the buffer to point to the beginning of the trace data
+ 	 * and update the available trace data.
+ 	 */
+-	if (etr_buf->secure)
+-		w_offset = rwp - etr_buf->s_hwaddr;
+-	else /* TODO: Need to verify if rrp can be replaced as below */
+-		w_offset = rwp - etr_buf->hwaddr;
+-
+-	if (etr_buf->full) {
+-		etr_buf->offset = w_offset;
++	etr_buf->offset = rrp - etr_buf->hwaddr;
++	if (etr_buf->full)
+ 		etr_buf->len = etr_buf->size;
+-	} else {
+-		etr_buf->offset = 0;
+-		etr_buf->len = w_offset;
+-	}
++	else
++		etr_buf->len = rwp - rrp;
+ }
+ 
+ static ssize_t tmc_etr_get_data_flat_buf(struct etr_buf *etr_buf,
+@@ -1122,11 +845,6 @@ static struct etr_buf *tmc_alloc_etr_buf(struct tmc_drvdata *drvdata,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	etr_buf->size = size;
+-	/* TODO: Consider using etr_buf->secure everywhere instead of
+-	 * etr_options for consistency
+-	 */
+-	if (drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF)
+-		etr_buf->secure = true;
+ 
+ 	/*
+ 	 * If we have to use an existing list of pages, we cannot reliably
+@@ -1239,16 +957,10 @@ static void __tmc_etr_enable_hw(struct tmc_drvdata *drvdata)
+ 
+ 	CS_UNLOCK(drvdata->base);
+ 
+-	if (drvdata->etr_options & CSETR_QUIRK_RESET_CTL_REG)
+-		tmc_disable_hw(drvdata);
+-
+ 	/* Wait for TMCSReady bit to be set */
+ 	tmc_wait_for_tmcready(drvdata);
+ 
+-	if (drvdata->etr_options && CSETR_QUIRK_BUFFSIZE_8BX)
+-		writel_relaxed(etr_buf->size / 8, drvdata->base + TMC_RSZ);
+-	else
+-		writel_relaxed(etr_buf->size / 4, drvdata->base + TMC_RSZ);
++	writel_relaxed(etr_buf->size / 4, drvdata->base + TMC_RSZ);
+ 	writel_relaxed(TMC_MODE_CIRCULAR_BUFFER, drvdata->base + TMC_MODE);
+ 
+ 	axictl = readl_relaxed(drvdata->base + TMC_AXICTL);
+@@ -1265,11 +977,7 @@ static void __tmc_etr_enable_hw(struct tmc_drvdata *drvdata)
+ 		axictl |= TMC_AXICTL_SCT_GAT_MODE;
+ 
+ 	writel_relaxed(axictl, drvdata->base + TMC_AXICTL);
+-	if (drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF)
+-		tmc_write_dba(drvdata, etr_buf->s_hwaddr);
+-	else
+-		tmc_write_dba(drvdata, etr_buf->hwaddr);
+-
++	tmc_write_dba(drvdata, etr_buf->hwaddr);
+ 	/*
+ 	 * If the TMC pointers must be programmed before the session,
+ 	 * we have to set it properly (i.e, RRP/RWP to base address and
+@@ -1277,10 +985,7 @@ static void __tmc_etr_enable_hw(struct tmc_drvdata *drvdata)
+ 	 */
+ 	if (tmc_etr_has_cap(drvdata, TMC_ETR_SAVE_RESTORE)) {
+ 		tmc_write_rrp(drvdata, etr_buf->hwaddr);
+-		if (drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF)
+-			tmc_write_rwp(drvdata, etr_buf->s_hwaddr);
+-		else
+-			tmc_write_rwp(drvdata, etr_buf->hwaddr);
++		tmc_write_rwp(drvdata, etr_buf->hwaddr);
+ 		sts = readl_relaxed(drvdata->base + TMC_STS) & ~TMC_STS_FULL;
+ 		writel_relaxed(sts, drvdata->base + TMC_STS);
+ 	}
+@@ -1383,7 +1088,7 @@ static void tmc_etr_sync_sysfs_buf(struct tmc_drvdata *drvdata)
+ 		 * Insert barrier packets at the beginning, if there was
+ 		 * an overflow.
+ 		 */
+-		if (etr_buf->full && !drvdata->formatter_en)
++		if (etr_buf->full)
+ 			tmc_etr_buf_insert_barrier_packet(etr_buf,
+ 							  etr_buf->offset);
+ 	}
+@@ -1424,20 +1129,6 @@ static int tmc_enable_etr_sink_sysfs(struct coresight_device *csdev)
+ 	struct tmc_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+ 	struct etr_buf *sysfs_buf = NULL, *new_buf = NULL, *free_buf = NULL;
+ 
+-	if (!is_etm_sync_mode_hw()) {
+-		/* Calculate parameters for sync insertion */
+-		drvdata->tsync_data.len_thold =
+-			drvdata->size / (SYNCS_PER_FILL);
+-		drvdata->tsync_data.tick =
+-			(drvdata->size / SZ_1M) * SYNC_TICK_NS_PER_MB;
+-		drvdata->tsync_data.prev_rwp = 0;
+-		if (!drvdata->tsync_data.tick) {
+-			drvdata->tsync_data.tick = SYNC_TICK_NS_PER_MB;
+-			dev_warn(&drvdata->csdev->dev,
+-				 "Trace bufer size not sufficient, sync insertion can fail\n");
+-		}
+-	}
+-
+ 	/*
+ 	 * If we are enabling the ETR from disabled state, we need to make
+ 	 * sure we have a buffer with the right size. The etr_buf is not reset
+@@ -1465,9 +1156,6 @@ static int tmc_enable_etr_sink_sysfs(struct coresight_device *csdev)
+ 		goto out;
+ 	}
+ 
+-	if (drvdata->mode == CS_MODE_READ_PREVBOOT)
+-		goto out;
+-
+ 	/*
+ 	 * In sysFS mode we can have multiple writers per sink.  Since this
+ 	 * sink is already enabled no memory is needed and the HW need not be
+@@ -1496,11 +1184,6 @@ static int tmc_enable_etr_sink_sysfs(struct coresight_device *csdev)
+ out:
+ 	spin_unlock_irqrestore(&drvdata->spinlock, flags);
+ 
+-	if (!ret && !is_etm_sync_mode_hw() &&
+-		(drvdata->mode != CS_MODE_READ_PREVBOOT))
+-		smp_call_function_single(drvdata->rc_cpu, tmc_etr_timer_setup,
+-					 drvdata, true);
+-
+ 	/* Free memory outside the spinlock if need be */
+ 	if (free_buf)
+ 		tmc_etr_free_sysfs_buf(free_buf);
+@@ -1726,12 +1409,6 @@ static void tmc_free_etr_buffer(void *config)
+ 	if (buf && WARN_ON(buf != etr_buf))
+ 		goto free_etr_perf_buffer;
+ 
+-	tmc_unregister_drvbuf(drvdata, etr_buf->hwaddr,
+-					      etr_buf->size);
+-
+-	if (etr_buf->s_hwaddr)
+-		tmc_free_secbuf(drvdata, etr_buf->s_hwaddr, etr_buf->size);
+-
+ 	tmc_free_etr_buf(etr_perf->etr_buf);
+ 
+ free_etr_perf_buffer:
+@@ -1978,67 +1655,22 @@ static int tmc_disable_etr_sink(struct coresight_device *csdev)
+ 
+ 	spin_unlock_irqrestore(&drvdata->spinlock, flags);
+ 
+-	if (!is_etm_sync_mode_hw())
+-		smp_call_function_single(drvdata->rc_cpu, tmc_etr_timer_cancel,
+-					 drvdata, true);
+-
+ 	dev_dbg(&csdev->dev, "TMC-ETR disabled\n");
+ 	return 0;
+ }
+ 
+-void tmc_register_source(struct coresight_device *csdev, void *source)
+-{
+-	struct tmc_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+-
+-	drvdata->etm_source = source;
+-}
+-
+-void tmc_unregister_source(struct coresight_device *csdev)
+-{
+-	struct tmc_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
+-
+-	drvdata->etm_source = NULL;
+-}
+-
+ static const struct coresight_ops_sink tmc_etr_sink_ops = {
+ 	.enable		= tmc_enable_etr_sink,
+ 	.disable	= tmc_disable_etr_sink,
+ 	.alloc_buffer	= tmc_alloc_etr_buffer,
+ 	.update_buffer	= tmc_update_etr_buffer,
+ 	.free_buffer	= tmc_free_etr_buffer,
+-	.register_source = tmc_register_source,
+-	.unregister_source = tmc_unregister_source,
+ };
+ 
+ const struct coresight_ops tmc_etr_cs_ops = {
+ 	.sink_ops	= &tmc_etr_sink_ops,
+ };
+ 
+-
+-/* APIs to manage ETM start/stop when ETR stop on flush is broken */
+-
+-void tmc_flushstop_etm_off(void *data)
+-{
+-	struct tmc_drvdata *drvdata = data;
+-	struct coresight_device *sdev = drvdata->etm_source;
+-
+-	if (sdev->hw_state == USR_START) {
+-		source_ops(sdev)->disable_raw(sdev);
+-		sdev->hw_state = SW_STOP;
+-	}
+-}
+-
+-void tmc_flushstop_etm_on(void *data)
+-{
+-	struct tmc_drvdata *drvdata = data;
+-	struct coresight_device *sdev = drvdata->etm_source;
+-
+-	if (sdev->hw_state == SW_STOP) { /* Restore the user configured state */
+-		source_ops(sdev)->enable_raw(sdev);
+-		sdev->hw_state = USR_START;
+-	}
+-}
+-
+ int tmc_read_prepare_etr(struct tmc_drvdata *drvdata)
+ {
+ 	int ret = 0;
+@@ -2048,20 +1680,6 @@ int tmc_read_prepare_etr(struct tmc_drvdata *drvdata)
+ 	if (WARN_ON_ONCE(drvdata->config_type != TMC_CONFIG_TYPE_ETR))
+ 		return -EINVAL;
+ 
+-	if (drvdata->mode == CS_MODE_READ_PREVBOOT) {
+-		/* Initialize drvdata for reading trace data from last boot */
+-		ret = tmc_enable_etr_sink_sysfs(drvdata->csdev);
+-		if (ret)
+-			return ret;
+-		/* Update the buffer offset, len */
+-		tmc_etr_sync_sysfs_buf(drvdata);
+-		return 0;
+-	}
+-
+-	if (drvdata->etr_options & CSETR_QUIRK_NO_STOP_FLUSH)
+-		smp_call_function_single(drvdata->rc_cpu, tmc_flushstop_etm_off,
+-					 drvdata, true);
+-
+ 	spin_lock_irqsave(&drvdata->spinlock, flags);
+ 	if (drvdata->reading) {
+ 		ret = -EBUSY;
+@@ -2086,13 +1704,6 @@ int tmc_read_prepare_etr(struct tmc_drvdata *drvdata)
+ out:
+ 	spin_unlock_irqrestore(&drvdata->spinlock, flags);
+ 
+-	if (ret && drvdata->etr_options & CSETR_QUIRK_NO_STOP_FLUSH) {
+-		dev_warn(&drvdata->csdev->dev, "ETM wrongly stopped\n");
+-		/* Restore back on error */
+-		smp_call_function_single(drvdata->rc_cpu, tmc_flushstop_etm_on,
+-					 drvdata, true);
+-	}
+-
+ 	return ret;
+ }
+ 
+@@ -2131,9 +1742,5 @@ int tmc_read_unprepare_etr(struct tmc_drvdata *drvdata)
+ 	if (sysfs_buf)
+ 		tmc_etr_free_sysfs_buf(sysfs_buf);
+ 
+-	if ((drvdata->etr_options & CSETR_QUIRK_NO_STOP_FLUSH) &&
+-	    (drvdata->mode == CS_MODE_SYSFS))
+-		smp_call_function_single(drvdata->rc_cpu, tmc_flushstop_etm_on,
+-					drvdata, true);
+ 	return 0;
+ }
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.c b/drivers/hwtracing/coresight/coresight-tmc.c
+index 6b25bd5a2ac6..1cf82fa58289 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.c
++++ b/drivers/hwtracing/coresight/coresight-tmc.c
+@@ -46,12 +46,8 @@ void tmc_flush_and_stop(struct tmc_drvdata *drvdata)
+ 	u32 ffcr;
+ 
+ 	ffcr = readl_relaxed(drvdata->base + TMC_FFCR);
+-
+-	if (!(drvdata->etr_options & CSETR_QUIRK_NO_STOP_FLUSH)) {
+-		/* Its assumed that ETM is stopped as an alternative */
+-		ffcr |= TMC_FFCR_STOP_ON_FLUSH;
+-		writel_relaxed(ffcr, drvdata->base + TMC_FFCR);
+-	}
++	ffcr |= TMC_FFCR_STOP_ON_FLUSH;
++	writel_relaxed(ffcr, drvdata->base + TMC_FFCR);
+ 	ffcr |= BIT(TMC_FFCR_FLUSHMAN_BIT);
+ 	writel_relaxed(ffcr, drvdata->base + TMC_FFCR);
+ 	/* Ensure flush completes */
+@@ -61,8 +57,7 @@ void tmc_flush_and_stop(struct tmc_drvdata *drvdata)
+ 		"timeout while waiting for completion of Manual Flush\n");
+ 	}
+ 
+-	if (!(drvdata->etr_options & CSETR_QUIRK_NO_STOP_FLUSH))
+-		tmc_wait_for_tmcready(drvdata);
++	tmc_wait_for_tmcready(drvdata);
+ }
+ 
+ void tmc_enable_hw(struct tmc_drvdata *drvdata)
+@@ -153,11 +148,6 @@ static int tmc_open(struct inode *inode, struct file *file)
+ 	struct tmc_drvdata *drvdata = container_of(file->private_data,
+ 						   struct tmc_drvdata, miscdev);
+ 
+-	if (drvdata->buf == NULL) {
+-		drvdata->mode = CS_MODE_READ_PREVBOOT;
+-		dev_info(&drvdata->csdev->dev, "TMC read mode for previous boot\n");
+-	}
+-
+ 	ret = tmc_read_prepare(drvdata);
+ 	if (ret)
+ 		return ret;
+@@ -193,10 +183,6 @@ static ssize_t tmc_read(struct file *file, char __user *data, size_t len,
+ 	if (actual <= 0)
+ 		return 0;
+ 
+-	if ((drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF) &&
+-		tmc_copy_secure_buffer(drvdata, bufp, actual))
+-		return -EFAULT;
+-
+ 	if (copy_to_user(data, bufp, actual)) {
+ 		dev_dbg(&drvdata->csdev->dev,
+ 			"%s: copy_to_user failed\n", __func__);
+@@ -282,22 +268,7 @@ coresight_tmc_reg(authstatus, TMC_AUTHSTATUS);
+ coresight_tmc_reg(devid, CORESIGHT_DEVID);
+ coresight_tmc_reg64(rrp, TMC_RRP, TMC_RRPHI);
+ coresight_tmc_reg64(rwp, TMC_RWP, TMC_RWPHI);
+-
+-/* To accommodate silicons that doesn't support 32 bit split reads
+- * of dba, use tmc_read_dba so that etr options can be processed.
+- */
+-static ssize_t dba_show(struct device *_dev,
+-			   struct device_attribute *attr, char *buf)
+-{
+-	struct tmc_drvdata *drvdata = dev_get_drvdata(_dev->parent);
+-	u64 val;
+-
+-	pm_runtime_get_sync(_dev->parent);
+-	val = tmc_read_dba(drvdata);
+-	pm_runtime_put_sync(_dev->parent);
+-	return scnprintf(buf, PAGE_SIZE, "0x%llx\n", val);
+-}
+-static DEVICE_ATTR_RO(dba);
++coresight_tmc_reg64(dba, TMC_DBALO, TMC_DBAHI);
+ 
+ static struct attribute *coresight_tmc_mgmt_attrs[] = {
+ 	&dev_attr_rsz.attr,
+@@ -375,27 +346,9 @@ static ssize_t buffer_size_store(struct device *dev,
+ 
+ static DEVICE_ATTR_RW(buffer_size);
+ 
+-static ssize_t tracebuffer_size_store(struct device *dev,
+-			     struct device_attribute *attr,
+-			     const char *buf, size_t size)
+-{
+-	return -EINVAL;
+-}
+-
+-static ssize_t tracebuffer_size_show(struct device *dev,
+-				 struct device_attribute *attr, char *buf)
+-{
+-	struct tmc_drvdata *drvdata = dev_get_drvdata(dev->parent);
+-	unsigned long val = drvdata->size;
+-
+-	return sprintf(buf, "%#lx\n", val);
+-}
+-static DEVICE_ATTR_RW(tracebuffer_size);
+-
+ static struct attribute *coresight_tmc_attrs[] = {
+ 	&dev_attr_trigger_cntr.attr,
+ 	&dev_attr_buffer_size.attr,
+-	&dev_attr_tracebuffer_size.attr,
+ 	NULL,
+ };
+ 
+@@ -426,13 +379,6 @@ static inline bool tmc_etr_has_non_secure_access(struct tmc_drvdata *drvdata)
+ 	return (auth & TMC_AUTH_NSID_MASK) == 0x3;
+ }
+ 
+-static inline bool tmc_etr_has_secure_access(struct tmc_drvdata *drvdata)
+-{
+-	u32 auth = readl_relaxed(drvdata->base + TMC_AUTHSTATUS);
+-
+-	return (auth & TMC_AUTH_SID_MASK) == 0x30;
+-}
+-
+ /* Detect and initialise the capabilities of a TMC ETR */
+ static int tmc_etr_setup_caps(struct device *parent, u32 devid, void *dev_caps)
+ {
+@@ -440,8 +386,7 @@ static int tmc_etr_setup_caps(struct device *parent, u32 devid, void *dev_caps)
+ 	u32 dma_mask = 0;
+ 	struct tmc_drvdata *drvdata = dev_get_drvdata(parent);
+ 
+-	if (!tmc_etr_has_non_secure_access(drvdata) &&
+-	    !tmc_etr_has_secure_access(drvdata))
++	if (!tmc_etr_has_non_secure_access(drvdata))
+ 		return -EACCES;
+ 
+ 	/* Set the unadvertised capabilities */
+@@ -516,46 +461,15 @@ static int tmc_probe(struct amba_device *adev, const struct amba_id *id)
+ 
+ 	spin_lock_init(&drvdata->spinlock);
+ 
+-	drvdata->cpu = coresight_get_cpu(dev);
+-
+-	/* Enable fixes for Silicon issues */
+-	drvdata->etr_options = coresight_get_etr_quirks(OCTEONTX_CN9XXX_ETR);
+-
+-	/* Update the smp target cpu */
+-	drvdata->rc_cpu = is_etm_sync_mode_sw_global() ? SYNC_GLOBAL_CORE :
+-		drvdata->cpu;
+-	if (!is_etm_sync_mode_hw()) {
+-		tmc_etr_add_cpumap(drvdata); /* Used for global sync mode */
+-		tmc_etr_timer_init(drvdata);
+-	}
+-
+ 	devid = readl_relaxed(drvdata->base + CORESIGHT_DEVID);
+ 	drvdata->config_type = BMVAL(devid, 6, 7);
+ 	drvdata->memwidth = tmc_get_memwidth(devid);
+-	drvdata->formatter_en = !(readl_relaxed(drvdata->base + TMC_FFSR) &
+-				  TMC_FFSR_FT_NOT_PRESENT);
+ 	/* This device is not associated with a session */
+ 	drvdata->pid = -1;
+ 
+-	if (drvdata->config_type == TMC_CONFIG_TYPE_ETR) {
+-		if (drvdata->etr_options & CSETR_QUIRK_SECURE_BUFF) {
+-			if (tmc_get_cpu_tracebufsize(drvdata, &drvdata->size) ||
+-			    !drvdata->size) {
+-				pr_err("Secure tracebuffer not available\n");
+-				ret = -ENOMEM;
+-				goto out;
+-			}
+-		} else  {
+-			drvdata->size = tmc_etr_get_default_buffer_size(dev);
+-		}
+-
+-		if (dev->fwnode)
+-			drvdata->cache_lock_en =
+-				fwnode_property_read_bool(dev->fwnode,
+-							       "cache-lock");
+-		/* Keep cache lock disabled by default */
+-		drvdata->cache_lock_en = false;
+-	} else
++	if (drvdata->config_type == TMC_CONFIG_TYPE_ETR)
++		drvdata->size = tmc_etr_get_default_buffer_size(dev);
++	else
+ 		drvdata->size = readl_relaxed(drvdata->base + TMC_RSZ) * 4;
+ 
+ 	desc.dev = dev;
+@@ -632,9 +546,6 @@ static const struct amba_id tmc_ids[] = {
+ 	CS_AMBA_ID(0x000bb9e9),
+ 	/* Coresight SoC 600 TMC-ETF */
+ 	CS_AMBA_ID(0x000bb9ea),
+-	/* Marvell OcteonTx CN9xxx */
+-	CS_AMBA_ID_DATA(OCTEONTX_CN9XXX_ETR,
+-			(unsigned long)OCTEONTX_CN9XXX_ETR_CAPS),
+ 	{ 0, 0},
+ };
+ 
+diff --git a/drivers/hwtracing/coresight/coresight-tmc.h b/drivers/hwtracing/coresight/coresight-tmc.h
+index 31ac1ccaca61..71de978575f3 100644
+--- a/drivers/hwtracing/coresight/coresight-tmc.h
++++ b/drivers/hwtracing/coresight/coresight-tmc.h
+@@ -10,7 +10,6 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/idr.h>
+ #include <linux/miscdevice.h>
+-#include <linux/arm-smccc.h>
+ #include <linux/mutex.h>
+ #include <linux/refcount.h>
+ 
+@@ -76,9 +75,6 @@
+ #define TMC_AXICTL_AXCACHE_OS	(0xf << 2)
+ #define TMC_AXICTL_ARCACHE_OS	(0xf << 16)
+ 
+-/* TMC_FFSR - 0x300 */
+-#define TMC_FFSR_FT_NOT_PRESENT	BIT(4)
+-
+ /* TMC_FFCR - 0x304 */
+ #define TMC_FFCR_FLUSHMAN_BIT	6
+ #define TMC_FFCR_EN_FMT		BIT(0)
+@@ -96,7 +92,6 @@
+ #define TMC_DEVID_AXIAW_MASK	0x7f
+ 
+ #define TMC_AUTH_NSID_MASK	GENMASK(1, 0)
+-#define TMC_AUTH_SID_MASK	GENMASK(5, 4)
+ 
+ enum tmc_config_type {
+ 	TMC_CONFIG_TYPE_ETB,
+@@ -135,29 +130,6 @@ enum tmc_mem_intf_width {
+ #define CORESIGHT_SOC_600_ETR_CAPS	\
+ 	(TMC_ETR_SAVE_RESTORE | TMC_ETR_AXI_ARCACHE)
+ 
+-/* Marvell OcteonTx CN9xxx TMC-ETR unadvertised capabilities */
+-#define OCTEONTX_CN9XXX_ETR_CAPS	\
+-	(TMC_ETR_SAVE_RESTORE)
+-
+-/* SMC call ids for managing the secure trace buffer */
+-
+-/* Args: x1 - size, x2 - cpu, x3 - llc lock flag
+- * Returns: x0 - status, x1 - secure buffer address
+- */
+-#define OCTEONTX_TRC_ALLOC_SBUF		0xc2000c05
+-/* Args: x1 - non secure buffer address, x2 - size */
+-#define OCTEONTX_TRC_REGISTER_DRVBUF	0xc2000c06
+-/* Args: x1 - dst(non secure), x2 - src(secure), x3 - size */
+-#define OCTEONTX_TRC_COPY_TO_DRVBUF	0xc2000c07
+-/* Args: x1 - secure buffer address, x2 - size */
+-#define OCTEONTX_TRC_FREE_SBUF		0xc2000c08
+-/* Args: x1 - non secure buffer address, x2 - size */
+-#define OCTEONTX_TRC_UNREGISTER_DRVBUF	0xc2000c09
+-/* Args: Nil
+- * Returns: cpu trace buffer size
+- */
+-#define OCTEONTX_TRC_GET_CPU_BUFSIZE    0xc2000c0a
+-
+ enum etr_mode {
+ 	ETR_MODE_FLAT,		/* Uses contiguous flat buffer */
+ 	ETR_MODE_ETR_SG,	/* Uses in-built TMC ETR SG mechanism */
+@@ -171,10 +143,8 @@ struct etr_buf_operations;
+  * refcount	; Number of sources currently using this etr_buf.
+  * @mode	: Mode of the ETR buffer, contiguous, Scatter Gather etc.
+  * @full	: Trace data overflow
+- * @secure	: Secure status of ETR buffer
+  * @size	: Size of the buffer.
+  * @hwaddr	: Address to be programmed in the TMC:DBA{LO,HI}
+- * @s_hwaddr:	: Secure trace buffer address
+  * @offset	: Offset of the trace data in the buffer for consumption.
+  * @len		: Available trace data @buf (may round up to the beginning).
+  * @ops		: ETR buffer operations for the mode.
+@@ -184,38 +154,20 @@ struct etr_buf {
+ 	refcount_t			refcount;
+ 	enum etr_mode			mode;
+ 	bool				full;
+-	bool				secure;
+ 	ssize_t				size;
+ 	dma_addr_t			hwaddr;
+-	dma_addr_t			s_hwaddr;
+ 	unsigned long			offset;
+ 	s64				len;
+ 	const struct etr_buf_operations	*ops;
+ 	void				*private;
+ };
+ 
+-/**
+- * struct etr_tsync_data - Timer based sync insertion data management
+- * @syncs_per_fill:	syncs inserted per buffer wrap
+- * @prev_rwp:		writepointer for the last sync insertion
+- * @len_thold:		Buffer length threshold for inserting syncs
+- * @tick:		Tick interval in ns
+- */
+-struct etr_tsync_data {
+-	int syncs_per_fill;
+-	u64 prev_rwp;
+-	u64 len_thold;
+-	u64 tick;
+-};
+-
+ /**
+  * struct tmc_drvdata - specifics associated to an TMC component
+  * @base:	memory mapped base address for this component.
+  * @csdev:	component vitals needed by the framework.
+  * @miscdev:	specifics to handle "/dev/xyz.tmc" entry.
+  * @spinlock:	only one at a time pls.
+- * @formatter_en: Formatter enable/disable status
+- * @cache_lock_en: Cache lock status
+  * @pid:	Process ID of the process being monitored by the session
+  *		that is using this component.
+  * @buf:	Snapshot of the trace data for ETF/ETB.
+@@ -227,19 +179,11 @@ struct etr_tsync_data {
+  * @memwidth:	width of the memory interface databus, in bytes.
+  * @trigger_cntr: amount of words to store after a trigger.
+  * @etr_caps:	Bitmask of capabilities of the TMC ETR, inferred from the
+- * @etr_options: Bitmask of options to manage Silicon issues
+- * @cpu:	CPU id this component is associated with
+  *		device configuration register (DEVID)
+  * @idr:	Holds etr_bufs allocated for this ETR.
+  * @idr_mutex:	Access serialisation for idr.
+  * @sysfs_buf:	SYSFS buffer for ETR.
+  * @perf_buf:	PERF buffer for ETR.
+- * @rc_cpu:	The cpu on which remote function calls can be run
+- *		In certain kernel configurations, some cores are not expected
+- *		to be interrupted and we need a fallback target cpu.
+- * @etm_source:	ETM source associated with this ETR
+- * @etr_tsync_data: Timer based sync insertion data
+- * @timer:	Timer for initiating sync insertion
+  */
+ struct tmc_drvdata {
+ 	void __iomem		*base;
+@@ -247,8 +191,6 @@ struct tmc_drvdata {
+ 	struct miscdevice	miscdev;
+ 	spinlock_t		spinlock;
+ 	pid_t			pid;
+-	bool			formatter_en;
+-	bool			cache_lock_en;
+ 	bool			reading;
+ 	union {
+ 		char		*buf;		/* TMC ETB */
+@@ -261,16 +203,10 @@ struct tmc_drvdata {
+ 	enum tmc_mem_intf_width	memwidth;
+ 	u32			trigger_cntr;
+ 	u32			etr_caps;
+-	u32			etr_options;
+-	int			cpu;
+ 	struct idr		idr;
+ 	struct mutex		idr_mutex;
+ 	struct etr_buf		*sysfs_buf;
+ 	struct etr_buf		*perf_buf;
+-	int			rc_cpu;
+-	void			*etm_source;
+-	struct etr_tsync_data	tsync_data;
+-	struct hrtimer		timer;
+ };
+ 
+ struct etr_buf_operations {
+@@ -332,34 +268,20 @@ ssize_t tmc_etb_get_sysfs_trace(struct tmc_drvdata *drvdata,
+ /* ETR functions */
+ int tmc_read_prepare_etr(struct tmc_drvdata *drvdata);
+ int tmc_read_unprepare_etr(struct tmc_drvdata *drvdata);
+-void tmc_etr_timer_init(struct tmc_drvdata *drvdata);
+-void tmc_etr_add_cpumap(struct tmc_drvdata *drvdata);
+ extern const struct coresight_ops tmc_etr_cs_ops;
+ ssize_t tmc_etr_get_sysfs_trace(struct tmc_drvdata *drvdata,
+ 				loff_t pos, size_t len, char **bufpp);
+-void *tmc_etr_drvbuf_vaddr(struct tmc_drvdata *drvdata);
+ 
+-#define is_etr_dba_force_64b_rw(options, lo_off)			\
+-((((options) & CSETR_QUIRK_FORCE_64B_DBA_RW) &&				\
+-	(lo_off) == TMC_DBALO) ? true : false)				\
+ 
+ #define TMC_REG_PAIR(name, lo_off, hi_off)				\
+ static inline u64							\
+ tmc_read_##name(struct tmc_drvdata *drvdata)				\
+ {									\
+-	if (is_etr_dba_force_64b_rw(drvdata->etr_options, lo_off))	\
+-		return readq(drvdata->base + lo_off);			\
+-									\
+ 	return coresight_read_reg_pair(drvdata->base, lo_off, hi_off);	\
+ }									\
+ static inline void							\
+ tmc_write_##name(struct tmc_drvdata *drvdata, u64 val)			\
+ {									\
+-	if (is_etr_dba_force_64b_rw(drvdata->etr_options, lo_off)) {	\
+-		writeq(val, drvdata->base + lo_off);			\
+-		return;							\
+-	}								\
+-									\
+ 	coresight_write_reg_pair(drvdata->base, val, lo_off, hi_off);	\
+ }
+ 
+@@ -384,20 +306,6 @@ static inline bool tmc_etr_has_cap(struct tmc_drvdata *drvdata, u32 cap)
+ 	return !!(drvdata->etr_caps & cap);
+ }
+ 
+-static inline int tmc_get_cpu_tracebufsize(struct tmc_drvdata *drvdata,
+-					  u32 *len)
+-{
+-	struct arm_smccc_res res;
+-
+-	arm_smccc_smc(OCTEONTX_TRC_GET_CPU_BUFSIZE, 0, 0, 0,
+-		      0, 0, 0, 0, &res);
+-	if (res.a0 != SMCCC_RET_SUCCESS)
+-		return -EFAULT;
+-
+-	*len = (u32)res.a1;
+-	return 0;
+-}
+-
+ struct tmc_sg_table *tmc_alloc_sg_table(struct device *dev,
+ 					int node,
+ 					int nr_tpages,
+@@ -417,70 +325,4 @@ tmc_sg_table_buf_size(struct tmc_sg_table *sg_table)
+ 
+ struct coresight_device *tmc_etr_get_catu_device(struct tmc_drvdata *drvdata);
+ 
+-static inline int tmc_alloc_secbuf(struct tmc_drvdata *drvdata,
+-				   size_t len, dma_addr_t *s_paddr)
+-{
+-	struct arm_smccc_res res;
+-
+-	arm_smccc_smc(OCTEONTX_TRC_ALLOC_SBUF, len, drvdata->cpu,
+-		      drvdata->cache_lock_en, 0, 0, 0, 0, &res);
+-	if (res.a0 != SMCCC_RET_SUCCESS)
+-		return -EFAULT;
+-
+-	*s_paddr = res.a1;
+-	return 0;
+-}
+-
+-static inline int tmc_free_secbuf(struct tmc_drvdata *drvdata,
+-				  dma_addr_t s_paddr, size_t len)
+-{
+-	struct arm_smccc_res res;
+-
+-	arm_smccc_smc(OCTEONTX_TRC_FREE_SBUF, s_paddr, len,
+-		      0, 0, 0, 0, 0, &res);
+-	return 0;
+-}
+-
+-static inline int tmc_register_drvbuf(struct tmc_drvdata *drvdata,
+-				      dma_addr_t paddr, size_t len)
+-{
+-	struct arm_smccc_res res;
+-
+-	arm_smccc_smc(OCTEONTX_TRC_REGISTER_DRVBUF, paddr, len,
+-		      0, 0, 0, 0, 0, &res);
+-	if (res.a0 != SMCCC_RET_SUCCESS)
+-		return -EFAULT;
+-
+-	return 0;
+-}
+-
+-static inline int tmc_unregister_drvbuf(struct tmc_drvdata *drvdata,
+-					dma_addr_t paddr, size_t len)
+-{
+-	struct arm_smccc_res res;
+-
+-	arm_smccc_smc(OCTEONTX_TRC_UNREGISTER_DRVBUF, paddr, len,
+-		      0, 0, 0, 0, 0, &res);
+-	return 0;
+-
+-}
+-
+-static inline int tmc_copy_secure_buffer(struct tmc_drvdata *drvdata,
+-					 char *bufp, size_t len)
+-{
+-	struct arm_smccc_res res;
+-	struct etr_buf *etr_buf;
+-	uint64_t offset;
+-
+-	etr_buf = drvdata->etr_buf;
+-	offset = bufp - (char *)tmc_etr_drvbuf_vaddr(drvdata);
+-
+-	arm_smccc_smc(OCTEONTX_TRC_COPY_TO_DRVBUF, etr_buf->hwaddr + offset,
+-		      etr_buf->s_hwaddr + offset, len, 0, 0, 0, 0, &res);
+-	if (res.a0 != SMCCC_RET_SUCCESS)
+-		return -EFAULT;
+-
+-	return 0;
+-}
+-
+ #endif
+diff --git a/drivers/hwtracing/coresight/coresight.c b/drivers/hwtracing/coresight/coresight.c
+index 79a633810c68..0bbce0d29158 100644
+--- a/drivers/hwtracing/coresight/coresight.c
++++ b/drivers/hwtracing/coresight/coresight.c
+@@ -3,7 +3,6 @@
+  * Copyright (c) 2012, The Linux Foundation. All rights reserved.
+  */
+ 
+-#include <asm/cputype.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+ #include <linux/types.h>
+@@ -482,46 +481,50 @@ struct coresight_device *coresight_get_sink(struct list_head *path)
+ 	return csdev;
+ }
+ 
+-static struct coresight_device *
+-coresight_find_enabled_sink(struct coresight_device *csdev)
++static int coresight_enabled_sink(struct device *dev, const void *data)
+ {
+-	int i;
+-	struct coresight_device *sink;
++	const bool *reset = data;
++	struct coresight_device *csdev = to_coresight_device(dev);
+ 
+ 	if ((csdev->type == CORESIGHT_DEV_TYPE_SINK ||
+ 	     csdev->type == CORESIGHT_DEV_TYPE_LINKSINK) &&
+-	     csdev->activated)
+-		return csdev;
+-
+-	/*
+-	 * Recursively explore each port found on this element.
+-	 */
+-	for (i = 0; i < csdev->pdata->nr_outport; i++) {
+-		struct coresight_device *child_dev;
++	     csdev->activated) {
++		/*
++		 * Now that we have a handle on the sink for this session,
++		 * disable the sysFS "enable_sink" flag so that possible
++		 * concurrent perf session that wish to use another sink don't
++		 * trip on it.  Doing so has no ramification for the current
++		 * session.
++		 */
++		if (*reset)
++			csdev->activated = false;
+ 
+-		child_dev = csdev->pdata->conns[i].child_dev;
+-		if (child_dev)
+-			sink = coresight_find_enabled_sink(child_dev);
+-		if (sink)
+-			return sink;
++		return 1;
+ 	}
+ 
+-	return NULL;
++	return 0;
+ }
+ 
+ /**
+- * coresight_get_enabled_sink - returns the first enabled sink using
+- * connection based search starting from the source reference
++ * coresight_get_enabled_sink - returns the first enabled sink found on the bus
++ * @deactivate:	Whether the 'enable_sink' flag should be reset
++ *
++ * When operated from perf the deactivate parameter should be set to 'true'.
++ * That way the "enabled_sink" flag of the sink that was selected can be reset,
++ * allowing for other concurrent perf sessions to choose a different sink.
+  *
+- * @source: Coresight source device reference
++ * When operated from sysFS users have full control and as such the deactivate
++ * parameter should be set to 'false', hence mandating users to explicitly
++ * clear the flag.
+  */
+-struct coresight_device *
+-coresight_get_enabled_sink(struct coresight_device *source)
++struct coresight_device *coresight_get_enabled_sink(bool deactivate)
+ {
+-	if (!source)
+-		return NULL;
++	struct device *dev = NULL;
+ 
+-	return coresight_find_enabled_sink(source);
++	dev = bus_find_device(&coresight_bustype, NULL, &deactivate,
++			      coresight_enabled_sink);
++
++	return dev ? to_coresight_device(dev) : NULL;
+ }
+ 
+ static int coresight_sink_by_id(struct device *dev, const void *data)
+@@ -761,19 +764,16 @@ int coresight_enable(struct coresight_device *csdev)
+ 		goto out;
+ 	}
+ 
+-	sink = coresight_get_enabled_sink(csdev);
++	/*
++	 * Search for a valid sink for this session but don't reset the
++	 * "enable_sink" flag in sysFS.  Users get to do that explicitly.
++	 */
++	sink = coresight_get_enabled_sink(false);
+ 	if (!sink) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
+-	if (!is_etm_sync_mode_hw()) {
+-		/* Add reference to source
+-		 * Used by sync insertion logic in ETR driver
+-		 */
+-		sink_ops(sink)->register_source(sink, csdev);
+-	}
+-
+ 	path = coresight_build_path(csdev, sink);
+ 	if (IS_ERR(path)) {
+ 		pr_err("building path(s) failed\n");
+@@ -825,7 +825,6 @@ EXPORT_SYMBOL_GPL(coresight_enable);
+ void coresight_disable(struct coresight_device *csdev)
+ {
+ 	int cpu, ret;
+-	struct coresight_device *sink;
+ 	struct list_head *path = NULL;
+ 
+ 	mutex_lock(&coresight_mutex);
+@@ -852,16 +851,6 @@ void coresight_disable(struct coresight_device *csdev)
+ 		break;
+ 	}
+ 
+-	if (!is_etm_sync_mode_hw()) {
+-		sink = coresight_get_enabled_sink(csdev);
+-		if (!sink)
+-			goto out;
+-		/* Remove source reference
+-		 * Used by sync insertion logic in ETR driver
+-		 */
+-		sink_ops(sink)->unregister_source(csdev);
+-	}
+-
+ 	coresight_disable_path(path);
+ 	coresight_release_path(path);
+ 
+diff --git a/include/linux/coresight.h b/include/linux/coresight.h
+index 2401e5c43a2e..a2b68823717b 100644
+--- a/include/linux/coresight.h
++++ b/include/linux/coresight.h
+@@ -138,12 +138,6 @@ struct coresight_connection {
+ 	struct coresight_device *child_dev;
+ };
+ 
+-enum hw_state {
+-	USR_STOP,
+-	SW_STOP,
+-	USR_START,
+-};
+-
+ /**
+  * struct coresight_device - representation of a device as used by the framework
+  * @pdata:	Platform data with device connections associated to this device.
+@@ -155,7 +149,6 @@ enum hw_state {
+  * @refcnt:	keep track of what is in use.
+  * @orphan:	true if the component has connections that haven't been linked.
+  * @enable:	'true' if component is currently part of an active path.
+- * @hw_state:   state of hw
+  * @activated:	'true' only if a _sink_ has been activated.  A sink can be
+  *		activated but not yet enabled.  Enabling for a _sink_
+  *		appens when a source has been selected for that it.
+@@ -170,7 +163,6 @@ struct coresight_device {
+ 	atomic_t *refcnt;
+ 	bool orphan;
+ 	bool enable;	/* true only if configured as part of a path */
+-	int hw_state;
+ 	/* sink specific fields */
+ 	bool activated;	/* true only if a sink is part of a path */
+ 	struct dev_ext_attribute *ea;
+@@ -224,8 +216,6 @@ struct coresight_ops_sink {
+ 	unsigned long (*update_buffer)(struct coresight_device *csdev,
+ 			      struct perf_output_handle *handle,
+ 			      void *sink_config);
+-	void (*register_source)(struct coresight_device *csdev, void *source);
+-	void (*unregister_source)(struct coresight_device *csdev);
+ };
+ 
+ /**
+@@ -256,8 +246,6 @@ struct coresight_ops_source {
+ 		      struct perf_event *event,  u32 mode);
+ 	void (*disable)(struct coresight_device *csdev,
+ 			struct perf_event *event);
+-	void (*enable_raw)(struct coresight_device *csdev);
+-	void (*disable_raw)(struct coresight_device *csdev);
+ };
+ 
+ /**
+-- 
+2.31.1
+

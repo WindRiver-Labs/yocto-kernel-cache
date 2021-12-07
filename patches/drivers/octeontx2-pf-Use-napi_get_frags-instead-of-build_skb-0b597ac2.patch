@@ -1,0 +1,220 @@
+From e45fbcc08c23f75f4432c838dfb7469f2548d087 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Mon, 28 Oct 2019 14:42:49 +0530
+Subject: [PATCH 0313/1921] octeontx2-pf: Use napi_get_frags instead of
+ build_skb
+
+For GRO'ble packets napi_get_frags helps in recycling
+SKBs instead of allocating new SKB for every packet.
+
+This improves performance of GRO'ble frames but effects
+IP forwarding performance.
+
+Change-Id: I191194cb5feefb1e617a4c7fa152f0e325d9aa1a
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/17956
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 133 ++++++++----------
+ 1 file changed, 58 insertions(+), 75 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 6cd96052e7c0..adce012f1e51 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -137,6 +137,24 @@ static void otx2_snd_pkt_handler(struct otx2_nic *pfvf,
+ 	sg->skb = (u64)NULL;
+ }
+ 
++static inline void otx2_set_taginfo(struct nix_rx_parse_s *parse,
++				    struct sk_buff *skb)
++{
++	/* Check if VLAN is present, captured and stripped from packet */
++	if (parse->vtag0_valid && parse->vtag0_gone) {
++		skb_frag_t *frag0 = &skb_shinfo(skb)->frags[0];
++
++		/* Is the tag captured STAG or CTAG ? */
++		if (((struct ethhdr *)skb_frag_address(frag0))->h_proto ==
++		    htons(ETH_P_8021Q))
++			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021AD),
++					       parse->vtag0_tci);
++		else
++			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
++					       parse->vtag0_tci);
++	}
++}
++
+ static inline void otx2_set_rxhash(struct otx2_nic *pfvf,
+ 				   struct nix_cqe_hdr_s *cqe_hdr,
+ 				   struct sk_buff *skb)
+@@ -160,61 +178,51 @@ static inline void otx2_set_rxhash(struct otx2_nic *pfvf,
+ 	skb_set_hash(skb, hash, hash_type);
+ }
+ 
+-static void otx2_skb_add_frag(struct otx2_nic *pfvf,
+-			      struct sk_buff *skb, u64 iova, int len)
++static inline void otx2_set_rxtstamp(struct otx2_nic *pfvf,
++				     struct sk_buff *skb, void *data)
+ {
+-	struct page *page;
+-	void *va;
++	u64 tsns;
++	int err;
+ 
+-	va = phys_to_virt(otx2_iova_to_phys(pfvf->iommu_domain, iova));
+-	page = virt_to_page(va);
+-	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+-			va - page_address(page), len, RCV_FRAG_LEN);
++	if (!pfvf->hw_rx_tstamp)
++		return;
+ 
+-	dma_unmap_page_attrs(pfvf->dev, iova - OTX2_HEAD_ROOM, RCV_FRAG_LEN,
+-			     DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++	/* The first 8 bytes is the timestamp */
++	err = otx2_ptp_tstamp2time(pfvf, be64_to_cpu(*(u64 *)data), &tsns);
++	if (err)
++		return;
++
++	skb_hwtstamps(skb)->hwtstamp = ns_to_ktime(tsns);
+ }
+ 
+-static inline struct sk_buff *
+-otx2_get_rcv_skb(struct otx2_nic *pfvf, u64 iova, int len)
++static void otx2_skb_add_frag(struct otx2_nic *pfvf, struct sk_buff *skb,
++			      u64 iova, int len, struct nix_rx_parse_s *parse)
+ {
+-	struct sk_buff *skb;
++	struct page *page;
++	int off = 0;
+ 	void *va;
+ 
+-	iova -= OTX2_HEAD_ROOM;
+ 	va = phys_to_virt(otx2_iova_to_phys(pfvf->iommu_domain, iova));
+-	skb = build_skb(va, RCV_FRAG_LEN);
+-	if (!skb) {
+-		put_page(virt_to_page(va));
+-		return NULL;
++
++	if (!skb_shinfo(skb)->nr_frags) {
++		/* Check if data starts at some nonzero offset
++		 * from the start of the buffer.  For now the
++		 * only possible offset is 8 bytes in the case
++		 * where packet is prepended by a timestamp.
++		 */
++		if (parse->laptr) {
++			otx2_set_rxtstamp(pfvf, skb, va);
++			off = 8;
++		}
++		off += pfvf->xtra_hdr;
+ 	}
+ 
+-	skb_reserve(skb, OTX2_HEAD_ROOM);
+-	skb_put(skb, len);
++	page = virt_to_page(va);
++	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
++			va - page_address(page) + off, len - off, RCV_FRAG_LEN);
+ 
+-	dma_unmap_page_attrs(pfvf->dev, iova, RCV_FRAG_LEN,
++	dma_unmap_page_attrs(pfvf->dev, iova - OTX2_HEAD_ROOM, RCV_FRAG_LEN,
+ 			     DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+-	prefetch(skb->data);
+-	return skb;
+-}
+-
+-static inline void otx2_set_rxtstamp(struct otx2_nic *pfvf, struct sk_buff *skb)
+-{
+-	u64 tsns;
+-	int err;
+-
+-	if (!pfvf->hw_rx_tstamp)
+-		return;
+-
+-	/* The first 8 bytes is the timestamp */
+-	err = otx2_ptp_tstamp2time(pfvf, be64_to_cpu(*(u64 *)skb->data), &tsns);
+-	if (err)
+-		goto done;
+-
+-	skb_hwtstamps(skb)->hwtstamp = ns_to_ktime(tsns);
+-
+-done:
+-	__skb_pull(skb, 8);
+ }
+ 
+ static inline bool otx2_check_rcv_errors(struct otx2_nic *pfvf,
+@@ -319,6 +327,10 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 	start = (void *)parse + sizeof(*parse);
+ 	end = start + ((parse->desc_sizem1 + 1) * 16);
+ 
++	skb = napi_get_frags(napi);
++	if (!skb)
++		return;
++
+ 	/* Run through the each NIX_RX_SG_S subdc and frame the skb */
+ 	while ((start + sizeof(*sg)) < end) {
+ 		sg = (struct nix_rx_sg_s *)start;
+@@ -327,25 +339,10 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 
+ 		for (seg = 0; seg < sg->segs; seg++) {
+ 			len = sg_lens[frag_num(seg)];
+-			/* Starting IOVA's 2:0 bits give alignment
+-			 * bytes after which packet data starts.
+-			 */
+-			if (!skb) {
+-				skb = otx2_get_rcv_skb(pfvf, *iova, len);
+-				/* check if data starts at some nonzero offset
+-				 * from the start of the buffer.  For now the
+-				 * only possible offset is 8 bytes in the case
+-				 * the packet data are prepended by a timestamp.
+-				 */
+-				if (parse->laptr)
+-					otx2_set_rxtstamp(pfvf, skb);
+-				skb_pull(skb, pfvf->xtra_hdr);
+-			} else {
+-				otx2_skb_add_frag(pfvf, skb, *iova, len);
+-			}
++			otx2_skb_add_frag(pfvf, skb, *iova, len, parse);
+ 			iova++;
+-			cq->pool_ptrs++;
+ 		}
++		cq->pool_ptrs += sg->segs;
+ 
+ 		/* When SEGS = 1, only one IOVA is followed by NIX_RX_SG_S.
+ 		 * When SEGS >= 2, three IOVAs will follow NIX_RX_SG_S,
+@@ -357,29 +354,15 @@ static void otx2_rcv_pkt_handler(struct otx2_nic *pfvf,
+ 			start += sizeof(*sg) + (3 * sizeof(u64));
+ 	}
+ 
+-	if (!skb)
+-		return;
+-
+ 	otx2_set_rxhash(pfvf, cqe_hdr, skb);
+ 
+ 	skb_record_rx_queue(skb, cq->cq_idx);
+-	skb->protocol = eth_type_trans(skb, pfvf->netdev);
+ 	if (pfvf->netdev->features & NETIF_F_RXCSUM)
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+-	/* This holds true on condition RX VLAN offloads are enabled and
+-	 * 802.1AD or 802.1Q VLANs were found in frame.
+-	 */
+-	if (parse->vtag0_gone) {
+-		if (skb->protocol == htons(ETH_P_8021Q))
+-			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021AD),
+-					       parse->vtag0_tci);
+-		else
+-			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+-					       parse->vtag0_tci);
+-	}
++	otx2_set_taginfo(parse, skb);
+ 
+-	napi_gro_receive(napi, skb);
++	napi_gro_frags(napi);
+ }
+ 
+ static inline int otx2_rx_napi_handler(struct otx2_nic *pfvf,
+-- 
+2.31.1
+

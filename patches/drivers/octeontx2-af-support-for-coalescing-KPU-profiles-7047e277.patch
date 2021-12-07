@@ -1,0 +1,171 @@
+From 82d67e3e98f3afcf623233f12055939e01f7b940 Mon Sep 17 00:00:00 2001
+From: Harman Kalra <hkalra@marvell.com>
+Date: Sat, 6 Feb 2021 01:51:07 +0530
+Subject: [PATCH 1250/1921] octeontx2-af: support for coalescing KPU profiles
+
+Adding support to load a new type of KPU image, known as coalesced/
+consolidated KPU image via firmware database. This image is a
+consolidation of multiple KPU profiles into a single image.
+Advantage of this enhancement is to ease the process of maintaining
+different KPU profiles for different platforms but for same customer.
+All these different KPU profiles are combined into a single image
+with a defined header. During kernel bootup this coalesced image will
+be read via firmware database and only the KPU profile name mentioned
+in "rvu_af.kpu_profile=<profile_name>" boot argument will be chosen
+and loaded.
+Existing functionality of loading single KPU/MKEX profile is intact as
+the images are differentiated based on the image signature.
+
+Change-Id: I6cd6deb20b09ab679b9e23869d9f6d8b9b25f394
+Signed-off-by: Harman Kalra <hkalra@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/45698
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/npc.h   | 11 +++
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 83 +++++++++++++++----
+ 2 files changed, 79 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index c6b39e900392..2a766b4b7b23 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -449,6 +449,17 @@ struct nix_tx_action {
+ #define NIXLF_BCAST_ENTRY	1
+ #define NIXLF_PROMISC_ENTRY	2
+ 
++struct npc_coalesced_kpu_prfl {
++#define NPC_SIGN	0x00666f727063706e
++#define NPC_PRFL_NAME   "npc_prfls_array"
++#define NPC_NAME_LEN	32
++	u64 signature; /* "npcprof\0" (8 bytes/ASCII characters) */
++	u8 name[NPC_NAME_LEN]; /* KPU Profile name */
++	u64 version; /* KPU firmware/profile version */
++	u8 num_prfl; /* No of NPC profiles. */
++	u16 prfl_sz[0];
++};
++
+ struct npc_mcam_kex {
+ 	/* MKEX Profle Header */
+ 	u64 mkex_sign; /* "mcam-kex-profile" (8 bytes/ASCII characters) */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 60867ac89e89..4541ee94602d 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -29,6 +29,8 @@
+ 
+ #define NPC_HW_TSTAMP_OFFSET	8ULL
+ 
++#define ALIGN_8B_CEIL(__a)	(((__a) + 7) & (-8))
++
+ static const char def_pfl_name[] = "default";
+ 
+ static void npc_mcam_free_all_entries(struct rvu *rvu, struct npc_mcam *mcam,
+@@ -1443,28 +1445,78 @@ static int npc_apply_custom_kpu(struct rvu *rvu,
+ 	return 0;
+ }
+ 
++static int npc_load_kpu_prfl_img(struct rvu *rvu, void __iomem *prfl_addr,
++				 u64 prfl_sz, const char *kpu_profile)
++{
++	struct npc_kpu_profile_fwdata *kpu_data = NULL;
++	int rc = -EINVAL;
++
++	kpu_data = (struct npc_kpu_profile_fwdata __force *)prfl_addr;
++	if (le64_to_cpu(kpu_data->signature) == KPU_SIGN &&
++	    !strncmp(kpu_data->name, kpu_profile, KPU_NAME_LEN)) {
++		dev_info(rvu->dev, "Loading KPU profile from firmware db: %s\n",
++			 kpu_profile);
++		rvu->kpu_fwdata = kpu_data;
++		rvu->kpu_fwdata_sz = prfl_sz;
++		rvu->kpu_prfl_addr = prfl_addr;
++		rc = 0;
++	}
++
++	return rc;
++}
++
++static int npc_fwdb_detect_load_prfl_img(struct rvu *rvu, uint64_t prfl_sz,
++					 const char *kpu_profile)
++{
++	struct npc_coalesced_kpu_prfl *img_data = NULL;
++	int i = 0, rc = -EINVAL;
++	void *kpu_prfl_addr;
++	u16 offset;
++
++	img_data = (struct npc_coalesced_kpu_prfl __force *)rvu->kpu_prfl_addr;
++	if (le64_to_cpu(img_data->signature) == KPU_SIGN &&
++	    !strncmp(img_data->name, kpu_profile, KPU_NAME_LEN)) {
++		/* Loaded profile is a single KPU profile. */
++		rc = npc_load_kpu_prfl_img(rvu, rvu->kpu_prfl_addr,
++					   prfl_sz, kpu_profile);
++		goto done;
++	}
++
++	/* Loaded profile is coalesced image, offset of first KPU profile.*/
++	offset = offsetof(struct npc_coalesced_kpu_prfl, prfl_sz) +
++		(img_data->num_prfl * sizeof(uint16_t));
++	/* Check if mapped image is coalesced image. */
++	while (i < img_data->num_prfl) {
++		/* Profile image offsets are rounded up to next 8 multiple.*/
++		offset = ALIGN_8B_CEIL(offset);
++		kpu_prfl_addr = (void *)((uintptr_t)rvu->kpu_prfl_addr +
++					 offset);
++		rc = npc_load_kpu_prfl_img(rvu, kpu_prfl_addr,
++					   img_data->prfl_sz[i], kpu_profile);
++		if (!rc)
++			break;
++		/* Calculating offset of profile image based on profile size.*/
++		offset += img_data->prfl_sz[i];
++		i++;
++	}
++done:
++	return rc;
++}
++
+ static int npc_load_kpu_profile_fwdb(struct rvu *rvu, const char *kpu_profile)
+ {
+-	struct npc_kpu_profile_fwdata *kpu_fw = NULL;
++	int ret = -EINVAL;
+ 	u64 prfl_sz;
+-	int ret;
+ 
+ 	/* Setting up the mapping for NPC profile image */
+ 	ret = npc_fwdb_prfl_img_map(rvu, &rvu->kpu_prfl_addr, &prfl_sz);
+ 	if (ret < 0)
+-		return ret;
++		goto done;
+ 
+-	rvu->kpu_fwdata =
+-		(struct npc_kpu_profile_fwdata __force *)rvu->kpu_prfl_addr;
+-	rvu->kpu_fwdata_sz = prfl_sz;
+-
+-	kpu_fw = rvu->kpu_fwdata;
+-	if (le64_to_cpu(kpu_fw->signature) == KPU_SIGN &&
+-	    !strncmp(kpu_fw->name, kpu_profile, KPU_NAME_LEN)) {
+-		dev_info(rvu->dev, "Loading KPU profile from firmware db: %s\n",
+-			 kpu_profile);
+-		return 0;
+-	}
++	/* Detect if profile is coalesced or single KPU profile and load */
++	ret = npc_fwdb_detect_load_prfl_img(rvu, prfl_sz, kpu_profile);
++	if (ret == 0)
++		goto done;
+ 
+ 	/* Cleaning up if KPU profile image from fwdata is not valid. */
+ 	if (rvu->kpu_prfl_addr) {
+@@ -1474,7 +1526,8 @@ static int npc_load_kpu_profile_fwdb(struct rvu *rvu, const char *kpu_profile)
+ 		rvu->kpu_fwdata = NULL;
+ 	}
+ 
+-	return -EINVAL;
++done:
++	return ret;
+ }
+ 
+ static void npc_load_kpu_profile(struct rvu *rvu)
+-- 
+2.31.1
+

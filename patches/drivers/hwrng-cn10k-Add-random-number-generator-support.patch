@@ -1,0 +1,171 @@
+From b5e21f9615343b662ca4c891f0b3f091b2ae53b5 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Tue, 25 Aug 2020 17:40:39 +0530
+Subject: [PATCH 0859/1921] hwrng: cn10k: Add random number generator support
+
+CN10K series of silicons support true random number
+generators. This patch adds suuport for the same.
+Checking health status of the entropy is not added
+as that is not supported on current simulator.
+
+Change-Id: I466c7dd14ee1a60140f63e77658d8918c149984c
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/34524
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/char/hw_random/Kconfig     |  13 ++++
+ drivers/char/hw_random/Makefile    |   1 +
+ drivers/char/hw_random/cn10k-rng.c | 105 +++++++++++++++++++++++++++++
+ 3 files changed, 119 insertions(+)
+ create mode 100644 drivers/char/hw_random/cn10k-rng.c
+
+diff --git a/drivers/char/hw_random/Kconfig b/drivers/char/hw_random/Kconfig
+index 14ec97380008..0dcea3e1ac6d 100644
+--- a/drivers/char/hw_random/Kconfig
++++ b/drivers/char/hw_random/Kconfig
+@@ -440,6 +440,19 @@ config HW_RANDOM_OPTEE
+ 
+ 	  If unsure, say Y.
+ 
++config HW_RANDOM_CN10K
++       tristate "Marvell CN10K Random Number Generator support"
++       depends on HW_RANDOM && PCI && (ARM64 || (COMPILE_TEST && 64BIT))
++       default HW_RANDOM
++       help
++	 This driver provides support for the True Random Number
++	 Generator available in Marvell CN10K SoCs.
++
++         To compile this driver as a module, choose M here.
++	 The module will be called cn10k_rng.
++
++	 If unsure, say Y.
++
+ endif # HW_RANDOM
+ 
+ config UML_RANDOM
+diff --git a/drivers/char/hw_random/Makefile b/drivers/char/hw_random/Makefile
+index 7c9ef4a7667f..4cff19adffd2 100644
+--- a/drivers/char/hw_random/Makefile
++++ b/drivers/char/hw_random/Makefile
+@@ -39,3 +39,4 @@ obj-$(CONFIG_HW_RANDOM_MTK)	+= mtk-rng.o
+ obj-$(CONFIG_HW_RANDOM_S390) += s390-trng.o
+ obj-$(CONFIG_HW_RANDOM_KEYSTONE) += ks-sa-rng.o
+ obj-$(CONFIG_HW_RANDOM_OPTEE) += optee-rng.o
++obj-$(CONFIG_HW_RANDOM_CN10K) += cn10k-rng.o
+diff --git a/drivers/char/hw_random/cn10k-rng.c b/drivers/char/hw_random/cn10k-rng.c
+new file mode 100644
+index 000000000000..f886bae36cbf
+--- /dev/null
++++ b/drivers/char/hw_random/cn10k-rng.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Marvell CN10K RVU Hardware Random Number Generator.
++ *
++ * Copyright (C) 2020 Marvell International Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/hw_random.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/pci_ids.h>
++
++/* CSRs */
++#define RNM_CTL_STATUS		0x000
++#define RNM_CONST		0x030
++#define RNM_EBG_ENT		0x048
++#define RNM_PF_EBG_HEALTH	0x050
++#define RNM_PF_RANDOM		0x400
++
++struct cn10k_rng {
++	void __iomem *reg_base;
++	struct hwrng ops;
++};
++
++static int cn10k_rng_read(struct hwrng *hwrng, void *data,
++			  size_t max, bool wait)
++{
++	struct cn10k_rng *rng = (struct cn10k_rng *)hwrng->priv;
++	unsigned int size = max;
++
++	while (size >= 8) {
++		*((u64 *)data) = readq(rng->reg_base + RNM_PF_RANDOM);
++		size -= 8;
++		data += 8;
++	}
++	while (size > 0) {
++		*((u8 *)data) = readb(rng->reg_base + RNM_PF_RANDOM);
++		size--;
++		data++;
++	}
++	return max;
++}
++
++static int cn10k_rng_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++	struct	cn10k_rng *rng;
++	int	err;
++
++	rng = devm_kzalloc(&pdev->dev, sizeof(*rng), GFP_KERNEL);
++	if (!rng)
++		return -ENOMEM;
++
++	pci_set_drvdata(pdev, rng);
++
++	rng->reg_base = pcim_iomap(pdev, 0, 0);
++	if (!rng->reg_base) {
++		dev_err(&pdev->dev, "Error while mapping CSRs, exiting\n");
++		return -ENOMEM;
++	}
++
++	rng->ops.name = devm_kasprintf(&pdev->dev, GFP_KERNEL,
++				       "cn10k-rng-%s", dev_name(&pdev->dev));
++	if (!rng->ops.name)
++		return -ENOMEM;
++
++	rng->ops.read    = cn10k_rng_read;
++	rng->ops.quality = 1000;
++	rng->ops.priv = (unsigned long) rng;
++
++	err = devm_hwrng_register(&pdev->dev, &rng->ops);
++	if (err) {
++		dev_err(&pdev->dev, "Could not register hwrng device.\n");
++		return err;
++	}
++
++	return 0;
++}
++
++static void cn10k_rng_remove(struct pci_dev *pdev)
++{
++	/* Nothing to do */
++}
++
++static const struct pci_device_id cn10k_rng_id_table[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_CAVIUM, 0xA098) }, /* RNG PF */
++	{0,},
++};
++
++MODULE_DEVICE_TABLE(pci, cn10k_rng_id_table);
++
++static struct pci_driver cn10k_rng_driver = {
++	.name		= "cn10k_rng",
++	.id_table	= cn10k_rng_id_table,
++	.probe		= cn10k_rng_probe,
++	.remove		= cn10k_rng_remove,
++};
++
++module_pci_driver(cn10k_rng_driver);
++MODULE_AUTHOR("Sunil Goutham <sgoutham@marvell.com>");
++MODULE_DESCRIPTION("Marvell CN10K HW RNG Driver");
++MODULE_LICENSE("GPL v2");
+-- 
+2.31.1
+

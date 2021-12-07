@@ -1,0 +1,248 @@
+From 5a66cfefc078e14d6ea799959c6fdcd195bfd36d Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Tue, 15 Dec 2020 19:33:01 +0530
+Subject: [PATCH 0972/1921] octeontx2-af: refactor function npc_install_flow
+ for default entry
+
+This patch refactors npc_install_flow to install default entry
+similar to other MCAM entries. That way the code is more readable.
+Modified npc_verify_entry and npc_verify_channel to correctly check
+MCAM rules installed by AF.
+
+Change-Id: I9b7f7ec2a8e9888f30d0d8d3ab9933f17c36a2e8
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/42337
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/npc.h   |  5 +++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   | 14 ++++--
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 43 +++++--------------
+ .../marvell/octeontx2/af/rvu_npc_fs.c         | 36 +++++-----------
+ 4 files changed, 38 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/npc.h b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+index 5c9bc924fd50..81294f556c9b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/npc.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/npc.h
+@@ -360,6 +360,11 @@ struct nix_tx_action {
+ #define TX_VTAG1_LID_MASK		GENMASK_ULL(42, 40)
+ #define TX_VTAG1_RELPTR_MASK		GENMASK_ULL(39, 32)
+ 
++/* NPC MCAM reserved entry index per nixlf */
++#define NIXLF_UCAST_ENTRY	0
++#define NIXLF_BCAST_ENTRY	1
++#define NIXLF_PROMISC_ENTRY	2
++
+ struct npc_mcam_kex {
+ 	/* MKEX Profle Header */
+ 	u64 mkex_sign; /* "mcam-kex-profile" (8 bytes/ASCII characters) */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index a29853d4e0a4..c482e4957a8f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -675,6 +675,12 @@ static inline int is_afvf(u16 pcifunc)
+ 	return !(pcifunc & ~RVU_PFVF_FUNC_MASK);
+ }
+ 
++/* check if PF_FUNC is AF */
++static inline bool is_pffunc_af(u16 pcifunc)
++{
++	return !pcifunc;
++}
++
+ static inline bool is_rvu_fwdata_valid(struct rvu *rvu)
+ {
+ 	return (rvu->fwdata->header_magic == RVU_FWDATA_HEADER_MAGIC) &&
+@@ -815,9 +821,6 @@ void rvu_npc_get_mcam_counter_alloc_info(struct rvu *rvu, u16 pcifunc,
+ 					 int *enable_cnt);
+ int npc_flow_steering_init(struct rvu *rvu, int blkaddr);
+ const char *npc_get_field_name(u8 hdr);
+-bool rvu_npc_write_default_rule(struct rvu *rvu, int blkaddr, int nixlf,
+-				u16 pcifunc, u8 intf, struct mcam_entry *entry,
+-				int *entry_index);
+ int npc_mcam_verify_channel(struct rvu *rvu, u16 pcifunc, u8 intf, u16 channel);
+ int npc_get_bank(struct npc_mcam *mcam, int index);
+ void npc_mcam_enable_flows(struct rvu *rvu, u16 target);
+@@ -831,6 +834,11 @@ bool is_npc_intf_tx(u8 intf);
+ bool is_npc_intf_rx(u8 intf);
+ bool is_npc_interface_valid(struct rvu *rvu, u8 intf);
+ 
++int npc_get_nixlf_mcam_index(struct npc_mcam *mcam, u16 pcifunc, int nixlf,
++			     int type);
++bool is_mcam_entry_enabled(struct rvu *rvu, struct npc_mcam *mcam, int blkaddr,
++			   int index);
++
+ /* CPT APIs */
+ int rvu_cpt_init(struct rvu *rvu);
+ int rvu_cpt_register_interrupts(struct rvu *rvu);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index b5a37c55f68c..10af743855cf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -24,10 +24,6 @@
+ #define RSVD_MCAM_ENTRIES_PER_PF	2 /* Bcast & Promisc */
+ #define RSVD_MCAM_ENTRIES_PER_NIXLF	1 /* Ucast for LFs */
+ 
+-#define NIXLF_UCAST_ENTRY	0
+-#define NIXLF_BCAST_ENTRY	1
+-#define NIXLF_PROMISC_ENTRY	2
+-
+ #define NPC_KEX_CHAN_MASK	0xFFFULL
+ #define NPC_KEX_PF_FUNC_MASK    0xFFFFULL
+ 
+@@ -89,6 +85,10 @@ int npc_mcam_verify_channel(struct rvu *rvu, u16 pcifunc, u8 intf, u16 channel)
+ 	if (is_npc_intf_tx(intf))
+ 		return 0;
+ 
++	/* return in case of AF installed rules */
++	if (is_pffunc_af(pcifunc))
++		return 0;
++
+ 	if (is_afvf(pcifunc)) {
+ 		end = rvu_get_num_lbk_chans();
+ 		if (end < 0)
+@@ -186,8 +186,8 @@ static int npc_get_ucast_mcam_index(struct npc_mcam *mcam, u16 pcifunc,
+ 	return mcam->nixlf_offset + (max + nixlf) * RSVD_MCAM_ENTRIES_PER_NIXLF;
+ }
+ 
+-static int npc_get_nixlf_mcam_index(struct npc_mcam *mcam,
+-				    u16 pcifunc, int nixlf, int type)
++int npc_get_nixlf_mcam_index(struct npc_mcam *mcam,
++			     u16 pcifunc, int nixlf, int type)
+ {
+ 	int pf = rvu_get_pf(pcifunc);
+ 	int index;
+@@ -220,8 +220,8 @@ int npc_get_bank(struct npc_mcam *mcam, int index)
+ 	return bank;
+ }
+ 
+-static bool is_mcam_entry_enabled(struct rvu *rvu, struct npc_mcam *mcam,
+-				  int blkaddr, int index)
++bool is_mcam_entry_enabled(struct rvu *rvu, struct npc_mcam *mcam,
++			   int blkaddr, int index)
+ {
+ 	int bank = npc_get_bank(mcam, index);
+ 	u64 cfg;
+@@ -1896,6 +1896,9 @@ void rvu_npc_get_mcam_counter_alloc_info(struct rvu *rvu, u16 pcifunc,
+ static int npc_mcam_verify_entry(struct npc_mcam *mcam,
+ 				 u16 pcifunc, int entry)
+ {
++	/* verify AF installed entries */
++	if (is_pffunc_af(pcifunc))
++		return 0;
+ 	/* Verify if entry is valid and if it is indeed
+ 	 * allocated to the requesting PFFUNC.
+ 	 */
+@@ -2964,30 +2967,6 @@ int rvu_mbox_handler_npc_get_kex_cfg(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
+-bool rvu_npc_write_default_rule(struct rvu *rvu, int blkaddr, int nixlf,
+-				u16 pcifunc, u8 intf, struct mcam_entry *entry,
+-				int *index)
+-{
+-	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
+-	struct npc_mcam *mcam = &rvu->hw->mcam;
+-	bool enable;
+-	u8 nix_intf;
+-
+-	if (is_npc_intf_tx(intf))
+-		nix_intf = pfvf->nix_tx_intf;
+-	else
+-		nix_intf = pfvf->nix_rx_intf;
+-
+-	*index = npc_get_nixlf_mcam_index(mcam, pcifunc,
+-					  nixlf, NIXLF_UCAST_ENTRY);
+-	/* dont force enable unicast entry  */
+-	enable = is_mcam_entry_enabled(rvu, mcam, blkaddr, *index);
+-	npc_config_mcam_entry(rvu, mcam, blkaddr, *index, nix_intf,
+-			      entry, enable);
+-
+-	return enable;
+-}
+-
+ int rvu_npc_set_parse_mode(struct rvu *rvu, u16 pcifunc, u64 mode, u8 dir,
+ 			   u64 pkind)
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+index cf2cc7f52f85..54ebf2a851a6 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc_fs.c
+@@ -982,31 +982,20 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 	if (is_npc_intf_tx(req->intf))
+ 		goto find_rule;
+ 
+-	if (def_rule)
++	if (req->default_rule) {
++		entry_index = npc_get_nixlf_mcam_index(mcam, target, nixlf,
++						       NIXLF_UCAST_ENTRY);
++		enable = is_mcam_entry_enabled(rvu, mcam, blkaddr, entry_index);
++	}
++
++	/* update mcam entry with default unicast rule attributes */
++	if (def_rule && (msg_from_vf || (req->default_rule && req->append))) {
+ 		missing_features = (def_rule->features ^ features) &
+ 					def_rule->features;
+-
+-	if (req->default_rule && req->append) {
+-		/* add to default rule */
+ 		if (missing_features)
+ 			npc_update_flow(rvu, entry, missing_features,
+ 					&def_rule->packet, &def_rule->mask,
+ 					&dummy, req->intf);
+-		enable = rvu_npc_write_default_rule(rvu, blkaddr,
+-						    nixlf, target,
+-						    pfvf->nix_rx_intf, entry,
+-						    &entry_index);
+-		installed_features = req->features | missing_features;
+-	} else if (req->default_rule && !req->append) {
+-		/* overwrite default rule */
+-		enable = rvu_npc_write_default_rule(rvu, blkaddr,
+-						    nixlf, target,
+-						    pfvf->nix_rx_intf, entry,
+-						    &entry_index);
+-	} else if (msg_from_vf) {
+-		/* normal rule - include default rule also to it for VF */
+-		npc_update_flow(rvu, entry, missing_features, &def_rule->packet,
+-				&def_rule->mask, &dummy, req->intf);
+ 		installed_features = req->features | missing_features;
+ 	}
+ find_rule:
+@@ -1017,12 +1006,9 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 			return -ENOMEM;
+ 		new = true;
+ 	}
+-	/* no counter for default rule */
+-	if (req->default_rule)
+-		goto update_rule;
+ 
+ 	/* allocate new counter if rule has no counter */
+-	if (req->set_cntr && !rule->has_cntr)
++	if (!req->default_rule && req->set_cntr && !rule->has_cntr)
+ 		rvu_mcam_add_counter_to_rule(rvu, owner, rule, rsp);
+ 
+ 	/* if user wants to delete an existing counter for a rule then
+@@ -1032,7 +1018,7 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 		rvu_mcam_remove_counter_from_rule(rvu, owner, rule);
+ 
+ 	write_req.hdr.pcifunc = owner;
+-	write_req.entry = req->entry;
++	write_req.entry = entry_index;
+ 	write_req.intf = req->intf;
+ 	write_req.enable_entry = (u8)enable;
+ 	/* if counter is available then clear and use it */
+@@ -1050,7 +1036,7 @@ static int npc_install_flow(struct rvu *rvu, int blkaddr, u16 target,
+ 			kfree(rule);
+ 		return err;
+ 	}
+-update_rule:
++	/* update rule */
+ 	memcpy(&rule->packet, &dummy.packet, sizeof(rule->packet));
+ 	memcpy(&rule->mask, &dummy.mask, sizeof(rule->mask));
+ 	rule->entry = entry_index;
+-- 
+2.31.1
+

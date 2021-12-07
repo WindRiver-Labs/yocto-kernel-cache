@@ -1,0 +1,185 @@
+From 06975b0dd7798656c6fbd4c6bbe66600ddcf4685 Mon Sep 17 00:00:00 2001
+From: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Date: Mon, 15 Apr 2019 15:07:26 +0530
+Subject: [PATCH 0168/1921] octeontx2-af: NDC sync op af mbox support
+
+Adds ndc_sync_op mbox to trigger nix/npa sync for
+when requested. This is needed for application to
+trigger an NDC sync when it is freeing memory that
+was earlier used by NIX/NPA and cached in NDC.
+
+Change-Id: Ic6111e1e56817ef1c142a84b5f4f5f123eec79d8
+Signed-off-by: Nithin Dabilpuram <ndabilpuram@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/8047
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  8 +++
+ .../net/ethernet/marvell/octeontx2/af/rvu.c   | 66 +++++++++++++++++++
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_nix.c   |  4 +-
+ .../ethernet/marvell/octeontx2/af/rvu_reg.h   |  2 +
+ 5 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 5d13a5625731..a678b425ab6a 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -130,6 +130,7 @@ M(MSIX_OFFSET,		0x005, msix_offset, msg_req, msix_offset_rsp)	\
+ M(VF_FLR,		0x006, vf_flr, msg_req, msg_rsp)		\
+ M(PTP_OP,		0x007, ptp_op, ptp_req, ptp_rsp)		\
+ M(GET_HW_CAP,		0x008, get_hw_cap, msg_req, get_hw_cap_rsp)	\
++M(NDC_SYNC_OP,		0x009, ndc_sync_op, ndc_sync_op, msg_rsp)	\
+ /* CGX mbox IDs (range 0x200 - 0x3FF) */				\
+ M(CGX_START_RXTX,	0x200, cgx_start_rxtx, msg_req, msg_rsp)	\
+ M(CGX_STOP_RXTX,	0x201, cgx_stop_rxtx, msg_req, msg_rsp)		\
+@@ -1247,6 +1248,13 @@ struct get_hw_cap_rsp {
+ 	u8 nix_shaping;		     /* Is shaping and coloring supported */
+ };
+ 
++struct ndc_sync_op {
++	struct mbox_msghdr hdr;
++	u8 nix_lf_tx_sync;
++	u8 nix_lf_rx_sync;
++	u8 npa_lf_sync;
++};
++
+ /* CPT mailbox error codes
+  * Range 901 - 1000.
+  */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index c5541495d75e..a60961e83d1f 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -1495,6 +1495,13 @@ int rvu_mbox_handler_vf_flr(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
++int rvu_ndc_sync(struct rvu *rvu, int lfblkaddr, int lfidx, u64 lfoffset)
++{
++	/* Sync cached info for this LF in NDC to LLC/DRAM */
++	rvu_write64(rvu, lfblkaddr, lfoffset, BIT_ULL(12) | lfidx);
++	return rvu_poll_reg(rvu, lfblkaddr, lfoffset, BIT_ULL(12), true);
++}
++
+ int rvu_mbox_handler_get_hw_cap(struct rvu *rvu, struct msg_req *req,
+ 				struct get_hw_cap_rsp *rsp)
+ {
+@@ -1507,6 +1514,65 @@ int rvu_mbox_handler_get_hw_cap(struct rvu *rvu, struct msg_req *req,
+ 	return 0;
+ }
+ 
++int rvu_mbox_handler_ndc_sync_op(struct rvu *rvu,
++				 struct ndc_sync_op *req,
++				 struct msg_rsp *rsp)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	u16 pcifunc = req->hdr.pcifunc;
++	int err, lfidx, lfblkaddr;
++
++	if (req->npa_lf_sync) {
++		/* Get NPA LF data */
++		lfblkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPA, pcifunc);
++		if (lfblkaddr < 0)
++			return NPA_AF_ERR_AF_LF_INVALID;
++
++		lfidx = rvu_get_lf(rvu, &hw->block[lfblkaddr], pcifunc, 0);
++		if (lfidx < 0)
++			return NPA_AF_ERR_AF_LF_INVALID;
++
++		/* Sync NPA NDC */
++		err = rvu_ndc_sync(rvu, lfblkaddr,
++				   lfidx, NPA_AF_NDC_SYNC);
++		if (err)
++			dev_err(rvu->dev,
++				"NDC-NPA sync failed for LF %u\n", lfidx);
++	}
++
++	if (!req->nix_lf_tx_sync && !req->nix_lf_rx_sync)
++		return 0;
++
++	/* Get NIX LF data */
++	lfblkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, pcifunc);
++	if (lfblkaddr < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	lfidx = rvu_get_lf(rvu, &hw->block[lfblkaddr], pcifunc, 0);
++	if (lfidx < 0)
++		return NIX_AF_ERR_AF_LF_INVALID;
++
++	if (req->nix_lf_tx_sync) {
++		/* Sync NIX TX NDC */
++		err = rvu_ndc_sync(rvu, lfblkaddr,
++				   lfidx, NIX_AF_NDC_TX_SYNC);
++		if (err)
++			dev_err(rvu->dev,
++				"NDC-NIX-TX sync fail for LF %u\n", lfidx);
++	}
++
++	if (req->nix_lf_rx_sync) {
++		/* Sync NIX RX NDC */
++		err = rvu_ndc_sync(rvu, lfblkaddr,
++				   lfidx, NIX_AF_NDC_RX_SYNC);
++		if (err)
++			dev_err(rvu->dev,
++				"NDC-NIX-RX sync failed for LF %u\n", lfidx);
++	}
++
++	return 0;
++}
++
+ static int rvu_process_mbox_msg(struct otx2_mbox *mbox, int devid,
+ 				struct mbox_msghdr *req)
+ {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 0b52d400fa4c..099edac0369b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -492,6 +492,7 @@ int rvu_get_blkaddr(struct rvu *rvu, int blktype, u16 pcifunc);
+ int rvu_poll_reg(struct rvu *rvu, u64 block, u64 offset, u64 mask, bool zero);
+ u16 rvu_get_rsrc_mapcount(struct rvu_pfvf *pfvf, int blkid);
+ int rvu_get_num_lbk_chans(void);
++int rvu_ndc_sync(struct rvu *rvu, int lfblkid, int lfidx, u64 lfoffset);
+ 
+ /* RVU HW reg validation */
+ enum regmap_block {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+index ceb6f0067ce8..544ab497ed42 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_nix.c
+@@ -1599,9 +1599,7 @@ static int nix_txschq_free(struct rvu *rvu, u16 pcifunc)
+ 	}
+ 	mutex_unlock(&rvu->rsrc_lock);
+ 
+-	/* Sync cached info for this LF in NDC-TX to LLC/DRAM */
+-	rvu_write64(rvu, blkaddr, NIX_AF_NDC_TX_SYNC, BIT_ULL(12) | nixlf);
+-	err = rvu_poll_reg(rvu, blkaddr, NIX_AF_NDC_TX_SYNC, BIT_ULL(12), true);
++	err = rvu_ndc_sync(rvu, blkaddr, nixlf, NIX_AF_NDC_TX_SYNC);
+ 	if (err)
+ 		dev_err(rvu->dev, "NDC-TX sync failed for NIXLF %d\n", nixlf);
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+index 441cbf69d538..e30bae59aa2c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+@@ -112,6 +112,7 @@
+ #define NPA_AF_LF_RST                   (0x0020)
+ #define NPA_AF_GEN_CFG                  (0x0030)
+ #define NPA_AF_NDC_CFG                  (0x0040)
++#define NPA_AF_NDC_SYNC                 (0x0050)
+ #define NPA_AF_INP_CTL                  (0x00D0)
+ #define NPA_AF_ACTIVE_CYCLES_PC         (0x00F0)
+ #define NPA_AF_AVG_DELAY                (0x0100)
+@@ -216,6 +217,7 @@
+ #define NIX_AF_RX_DEF_IPSECX		(0x02B0)
+ #define NIX_AF_RX_IPSEC_GEN_CFG		(0x0300)
+ #define NIX_AF_RX_CPTX_INST_ADDR	(0x0310)
++#define NIX_AF_NDC_RX_SYNC		(0x03E0)
+ #define NIX_AF_NDC_TX_SYNC		(0x03F0)
+ #define NIX_AF_AQ_CFG			(0x0400)
+ #define NIX_AF_AQ_BASE			(0x0410)
+-- 
+2.31.1
+

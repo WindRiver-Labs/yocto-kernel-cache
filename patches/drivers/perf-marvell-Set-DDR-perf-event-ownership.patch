@@ -1,0 +1,137 @@
+From b5eb91ed5f2f3adeff7a75b150e1871a3950a520 Mon Sep 17 00:00:00 2001
+From: Bharat Bhushan <bbhushan2@marvell.com>
+Date: Tue, 27 Apr 2021 14:32:18 +0530
+Subject: [PATCH 1507/1921] perf/marvell: Set DDR perf event ownership
+
+DDR perf events cannot be made accessible to all cores
+at same time. These events needed to be owned by one
+core at a time, so when core going offline select new online.
+perf/marvell: cn10k DDR perf event core ownership
+
+Change-Id: I088805d81c58fc7e15fecaa2ca7c0ee82d486ede
+Signed-off-by: Bharat Bhushan <bbhushan2@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/50766
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/perf/marvell_cn10k_ddr_pmu.c | 50 ++++++++++++++++++++++++++--
+ include/linux/cpuhotplug.h           |  1 +
+ 2 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/perf/marvell_cn10k_ddr_pmu.c b/drivers/perf/marvell_cn10k_ddr_pmu.c
+index 6bee609a7852..3890bfe10c6f 100644
+--- a/drivers/perf/marvell_cn10k_ddr_pmu.c
++++ b/drivers/perf/marvell_cn10k_ddr_pmu.c
+@@ -130,6 +130,7 @@ struct cn10k_ddr_pmu {
+ 	int active_events;
+ 	struct perf_event *events[DDRC_PERF_NUM_COUNTERS];
+ 	struct hrtimer hrtimer;
++	struct hlist_node node;
+ };
+ 
+ #define to_cn10k_ddr_pmu(p)	container_of(p, struct cn10k_ddr_pmu, pmu)
+@@ -616,6 +617,24 @@ static enum hrtimer_restart cn10k_ddr_pmu_timer_handler(struct hrtimer *hrtimer)
+ 	return HRTIMER_RESTART;
+ }
+ 
++static int cn10k_ddr_pmu_offline_cpu(unsigned int cpu, struct hlist_node *node)
++{
++	struct cn10k_ddr_pmu *pmu = hlist_entry_safe(node, struct cn10k_ddr_pmu,
++						     node);
++	unsigned int target;
++
++	if (cpu != pmu->cpu)
++		return 0;
++
++	target = cpumask_any_but(cpu_online_mask, cpu);
++	if (target >= nr_cpu_ids)
++		return 0;
++
++	perf_pmu_migrate_context(&pmu->pmu, cpu, target);
++	pmu->cpu = target;
++	return 0;
++}
++
+ static int cn10k_ddr_perf_probe(struct platform_device *pdev)
+ {
+ 	struct cn10k_ddr_pmu *ddr_pmu;
+@@ -669,20 +688,33 @@ static int cn10k_ddr_perf_probe(struct platform_device *pdev)
+ 	hrtimer_init(&ddr_pmu->hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	ddr_pmu->hrtimer.function = cn10k_ddr_pmu_timer_handler;
+ 
++	cpuhp_state_add_instance_nocalls(
++				CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE,
++				&ddr_pmu->node);
++
+ 	ret = perf_pmu_register(&ddr_pmu->pmu, name, -1);
+ 	if (ret)
+-		return ret;
++		goto error;
+ 
+ 	ddr_pmu->id = index++;
+ 	pr_info("CN10K DDR PMU Driver for ddrc@%llx - id-%d\n",
+ 		res->start, ddr_pmu->id);
+ 	return 0;
++error:
++	cpuhp_state_remove_instance_nocalls(
++				CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE,
++				&ddr_pmu->node);
++	return ret;
+ }
+ 
+ static int cn10k_ddr_perf_remove(struct platform_device *pdev)
+ {
+ 	struct cn10k_ddr_pmu *ddr_pmu = platform_get_drvdata(pdev);
+ 
++	cpuhp_state_remove_instance_nocalls(
++				CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE,
++				&ddr_pmu->node);
++
+ 	perf_pmu_unregister(&ddr_pmu->pmu);
+ 	return 0;
+ }
+@@ -705,12 +737,26 @@ static struct platform_driver cn10k_ddr_pmu_driver = {
+ 
+ static int __init cn10k_ddr_pmu_init(void)
+ {
+-	return platform_driver_register(&cn10k_ddr_pmu_driver);
++	int ret;
++
++	ret = cpuhp_setup_state_multi(
++				CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE,
++				"perf/marvell/cn10k/ddr:online", NULL,
++				cn10k_ddr_pmu_offline_cpu);
++	if (ret)
++		return ret;
++
++	ret = platform_driver_register(&cn10k_ddr_pmu_driver);
++	if (ret)
++		cpuhp_remove_multi_state(
++				CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE);
++	return ret;
+ }
+ 
+ static void __exit cn10k_ddr_pmu_exit(void)
+ {
+ 	platform_driver_unregister(&cn10k_ddr_pmu_driver);
++	cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE);
+ }
+ 
+ module_init(cn10k_ddr_pmu_init);
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 068793a619ca..33dcef949781 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -169,6 +169,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_PERF_ARM_QCOM_L3_ONLINE,
+ 	CPUHP_AP_PERF_ARM_APM_XGENE_ONLINE,
+ 	CPUHP_AP_PERF_ARM_CAVIUM_TX2_UNCORE_ONLINE,
++	CPUHP_AP_PERF_ARM_MARVELL_CN10K_DDR_ONLINE,
+ 	CPUHP_AP_PERF_POWERPC_NEST_IMC_ONLINE,
+ 	CPUHP_AP_PERF_POWERPC_CORE_IMC_ONLINE,
+ 	CPUHP_AP_PERF_POWERPC_THREAD_IMC_ONLINE,
+-- 
+2.31.1
+

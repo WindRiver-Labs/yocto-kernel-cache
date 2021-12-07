@@ -1,0 +1,206 @@
+From fbb22f63a69a3bc3be80a242da9855ba953d82a2 Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Fri, 26 Feb 2021 16:00:03 +0530
+Subject: [PATCH 1311/1921] octeontx2-pf: add tc flower stats handler for hw
+ offloads
+
+Add support to get the stats for tc flower flows that are
+offloaded to hardware. To support this feature, added a
+new AF mbox handler which returns the MCAM entry stats
+for a flow that has hardware stat counter enabled.
+
+Change-Id: If92b4d6f62712de360c27c62256ce9c8d4f9d43e
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/47514
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  | 14 ++++
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   | 39 +++++++++++
+ .../ethernet/marvell/octeontx2/nic/otx2_tc.c  | 69 ++++++++++++++++++-
+ 3 files changed, 121 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index c1d272a156cf..81dcfee8b135 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -280,6 +280,9 @@ M(NPC_SET_PKIND,        0x6010,   npc_set_pkind,                        \
+ 				  npc_set_pkind, msg_rsp)               \
+ M(NPC_MCAM_READ_BASE_RULE, 0x6011, npc_read_base_steer_rule,            \
+ 				   msg_req, npc_mcam_read_base_rule_rsp)  \
++M(NPC_MCAM_GET_STATS, 0x6012, npc_mcam_entry_stats,                     \
++				   npc_mcam_get_stats_req,              \
++				   npc_mcam_get_stats_rsp)              \
+ /* NIX mbox IDs (range 0x8000 - 0xFFFF) */				\
+ M(NIX_LF_ALLOC,		0x8000, nix_lf_alloc,				\
+ 				 nix_lf_alloc_req, nix_lf_alloc_rsp)	\
+@@ -1536,6 +1539,17 @@ struct npc_mcam_read_base_rule_rsp {
+ 	struct mcam_entry entry;
+ };
+ 
++struct npc_mcam_get_stats_req {
++	struct mbox_msghdr hdr;
++	u16 entry; /* mcam entry */
++};
++
++struct npc_mcam_get_stats_rsp {
++	struct mbox_msghdr hdr;
++	u64 stat;  /* counter stats */
++	u8 stat_ena; /* enabled */
++};
++
+ /* TIM mailbox error codes
+  * Range 801 - 900.
+  */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index 4541ee94602d..1d8e7c98fdfb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -3207,3 +3207,42 @@ int rvu_mbox_handler_npc_read_base_steer_rule(struct rvu *rvu,
+ out:
+ 	return rc;
+ }
++
++int rvu_mbox_handler_npc_mcam_entry_stats(struct rvu *rvu,
++					  struct npc_mcam_get_stats_req *req,
++					  struct npc_mcam_get_stats_rsp *rsp)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	u16 index, cntr;
++	int blkaddr;
++	u64 regval;
++	u32 bank;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return NPC_MCAM_INVALID_REQ;
++
++	mutex_lock(&mcam->lock);
++
++	index = req->entry & (mcam->banksize - 1);
++	bank = npc_get_bank(mcam, req->entry);
++
++	/* read MCAM entry STAT_ACT register */
++	regval = rvu_read64(rvu, blkaddr, NPC_AF_MCAMEX_BANKX_STAT_ACT(index, bank));
++
++	if (!(regval & rvu->hw->npc_stat_ena)) {
++		rsp->stat_ena = 0;
++		mutex_unlock(&mcam->lock);
++		return 0;
++	}
++
++	cntr = regval & 0x1FF;
++
++	rsp->stat_ena = 1;
++	rsp->stat = rvu_read64(rvu, blkaddr, NPC_AF_MATCH_STATX(cntr));
++	rsp->stat &= BIT_ULL(48) - 1;
++
++	mutex_unlock(&mcam->lock);
++
++	return 0;
++}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+index a361eec568a2..aaa26b613d9c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+@@ -16,12 +16,20 @@
+ 
+ #include "otx2_common.h"
+ 
++struct otx2_tc_flow_stats {
++	u64 bytes;
++	u64 pkts;
++	u64 used;
++};
++
+ struct otx2_tc_flow {
+ 	struct rhash_head		node;
+ 	unsigned long			cookie;
+ 	u16				entry;
+ 	unsigned int			bitpos;
+ 	struct rcu_head			rcu;
++	struct otx2_tc_flow_stats	stats;
++	spinlock_t			lock; /* lock for stats */
+ };
+ 
+ static int otx2_tc_parse_actions(struct otx2_nic *nic,
+@@ -403,6 +411,65 @@ static int otx2_tc_add_flow(struct otx2_nic *nic,
+ 	return rc;
+ }
+ 
++static int otx2_tc_get_flow_stats(struct otx2_nic *nic,
++				  struct flow_cls_offload *tc_flow_cmd)
++{
++	struct otx2_tc_info *tc_info = &nic->tc_info;
++	struct npc_mcam_get_stats_req *req;
++	struct npc_mcam_get_stats_rsp *rsp;
++	struct otx2_tc_flow_stats *stats;
++	struct otx2_tc_flow *flow_node;
++	int err;
++
++	flow_node = rhashtable_lookup_fast(&tc_info->flow_table,
++					   &tc_flow_cmd->cookie,
++					   tc_info->flow_ht_params);
++	if (!flow_node) {
++		netdev_info(nic->netdev, "tc flow not found for cookie %lx",
++			    tc_flow_cmd->cookie);
++		return -EINVAL;
++	}
++
++	mutex_lock(&nic->mbox.lock);
++
++	req = otx2_mbox_alloc_msg_npc_mcam_entry_stats(&nic->mbox);
++	if (!req) {
++		mutex_unlock(&nic->mbox.lock);
++		return -ENOMEM;
++	}
++
++	req->entry = flow_node->entry;
++
++	err = otx2_sync_mbox_msg(&nic->mbox);
++	if (err) {
++		netdev_err(nic->netdev, "Failed to get stats for MCAM flow entry %d\n",
++			   req->entry);
++		mutex_unlock(&nic->mbox.lock);
++		return -EFAULT;
++	}
++
++	rsp = (struct npc_mcam_get_stats_rsp *)otx2_mbox_get_rsp
++		(&nic->mbox.mbox, 0, &req->hdr);
++	if (IS_ERR(rsp)) {
++		mutex_unlock(&nic->mbox.lock);
++		return PTR_ERR(rsp);
++	}
++
++	mutex_unlock(&nic->mbox.lock);
++
++	if (!rsp->stat_ena)
++		return -EINVAL;
++
++	stats = &flow_node->stats;
++
++	spin_lock(&flow_node->lock);
++	flow_stats_update(&tc_flow_cmd->stats, 0x0, rsp->stat - stats->pkts, 0x0);
++	stats->pkts = rsp->stat;
++	spin_unlock(&flow_node->lock);
++
++	return 0;
++}
++
+ static int otx2_setup_tc_cls_flower(struct otx2_nic *nic,
+ 				    struct flow_cls_offload *cls_flower)
+ {
+@@ -412,7 +479,7 @@ static int otx2_setup_tc_cls_flower(struct otx2_nic *nic,
+ 	case FLOW_CLS_DESTROY:
+ 		return otx2_tc_del_flow(nic, cls_flower);
+ 	case FLOW_CLS_STATS:
+-		return -EOPNOTSUPP;
++		return otx2_tc_get_flow_stats(nic, cls_flower);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+-- 
+2.31.1
+

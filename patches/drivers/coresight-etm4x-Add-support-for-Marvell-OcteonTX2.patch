@@ -1,0 +1,433 @@
+From c3d774ddc56a6e0fb3eaea8f668e72a34271d1f4 Mon Sep 17 00:00:00 2001
+From: Tanmay Jagdale <tanmay@marvell.com>
+Date: Thu, 15 Jul 2021 00:35:59 +0530
+Subject: [PATCH 1885/1921] coresight: etm4x: Add support for Marvell OcteonTX2
+
+Add device ID for Marvell OcteonTX2 CN9xxx device.
+This device has a few quirks and added a new coresight-quirks.c
+file to handle the hardware quirks which are as follows:
+
+- OcteonTX2 reports ETM version as ETMv4.2 but it supports
+  Ignore Packet feature of ETM4.3. Treat the device as compatible
+  with ETM4.3.
+
+- The hardware does not implement periodic trace sync packet
+  insertion. Hence add helper APIs to support sync packet
+  insertion via software.
+
+Change-Id: I5643ed2b8e44b0f5cb3decee8e71be64d8d1b7c6
+Signed-off-by: Tanmay Jagdale <tanmay@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/hwtracing/coresight/Makefile          |   2 +-
+ .../coresight/coresight-etm4x-core.c          |  61 ++++++++-
+ .../coresight/coresight-etm4x-sysfs.c         |  21 ++-
+ drivers/hwtracing/coresight/coresight-etm4x.h |   3 +
+ .../hwtracing/coresight/coresight-quirks.c    | 127 ++++++++++++++++++
+ .../hwtracing/coresight/coresight-quirks.h    |  53 ++++++++
+ 6 files changed, 262 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/hwtracing/coresight/coresight-quirks.c
+ create mode 100644 drivers/hwtracing/coresight/coresight-quirks.h
+
+diff --git a/drivers/hwtracing/coresight/Makefile b/drivers/hwtracing/coresight/Makefile
+index d60816509755..6b31e765b615 100644
+--- a/drivers/hwtracing/coresight/Makefile
++++ b/drivers/hwtracing/coresight/Makefile
+@@ -4,7 +4,7 @@
+ #
+ obj-$(CONFIG_CORESIGHT) += coresight.o
+ coresight-y := coresight-core.o  coresight-etm-perf.o coresight-platform.o \
+-		coresight-sysfs.o
++		coresight-sysfs.o coresight-quirks.o
+ obj-$(CONFIG_CORESIGHT_LINK_AND_SINK_TMC) += coresight-tmc.o
+ coresight-tmc-y := coresight-tmc-core.o coresight-tmc-etf.o \
+ 		      coresight-tmc-etr.o
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x-core.c b/drivers/hwtracing/coresight/coresight-etm4x-core.c
+index db881993c211..015b0d0593a7 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x-core.c
++++ b/drivers/hwtracing/coresight/coresight-etm4x-core.c
+@@ -39,6 +39,7 @@
+ 
+ #include "coresight-etm4x.h"
+ #include "coresight-etm-perf.h"
++#include "coresight-quirks.h"
+ 
+ static int boot_enable;
+ module_param(boot_enable, int, 0444);
+@@ -48,7 +49,7 @@ MODULE_PARM_DESC(boot_enable, "Enable tracing on boot");
+ #define PARAM_PM_SAVE_NEVER	  1 /* never save any state */
+ #define PARAM_PM_SAVE_SELF_HOSTED 2 /* save self-hosted state only */
+ 
+-static int pm_save_enable = PARAM_PM_SAVE_FIRMWARE;
++static int pm_save_enable = PARAM_PM_SAVE_NEVER;
+ module_param(pm_save_enable, int, 0444);
+ MODULE_PARM_DESC(pm_save_enable,
+ 	"Save/restore state on power down: 1 = never, 2 = self-hosted");
+@@ -180,7 +181,10 @@ static void etm_write_os_lock(struct etmv4_drvdata *drvdata,
+ static inline void etm4_os_unlock_csa(struct etmv4_drvdata *drvdata,
+ 				      struct csdev_access *csa)
+ {
++	/* Disable this warning for task isolation mode */
++#ifndef CONFIG_TASK_ISOLATION
+ 	WARN_ON(drvdata->cpu != smp_processor_id());
++#endif
+ 
+ 	/* Writing 0 to OS Lock unlocks the trace unit registers */
+ 	etm_write_os_lock(drvdata, csa, 0x0);
+@@ -462,6 +466,20 @@ static int etm4_enable_hw(struct etmv4_drvdata *drvdata)
+ done:
+ 	etm4_cs_lock(drvdata, csa);
+ 
++	/* For supporting SW sync insertion */
++	if (drvdata->etm_quirks & CORESIGHT_QUIRK_ETM_SW_SYNC) {
++		/* ETM sync insertions are gated in the ETR timer
++		 * handler based on hw state.
++		 */
++		drvdata->hw_state = USR_START;
++
++		/* Global timer handler not being associated with
++		 * a specific ETM core, need to know the current
++		 * list of acitve ETMs.
++		 */
++		coresight_etm_active_enable(drvdata->cpu);
++	}
++
+ 	dev_dbg(etm_dev, "cpu: %d enable smp call done: %d\n",
+ 		drvdata->cpu, rc);
+ 	return rc;
+@@ -674,9 +692,16 @@ static int etm4_enable_sysfs(struct coresight_device *csdev)
+ 	/*
+ 	 * Executing etm4_enable_hw on the cpu whose ETM is being enabled
+ 	 * ensures that register writes occur when cpu is powered.
++	 *
++	 * Note: When task isolation is enabled, the target cpu used
++	 * is always primary core and hence the above assumption of
++	 * cpu associated with the ETM being in powered up state during
++	 * register writes is not valid.
++	 * But on the other hand, using smp call ensures that atomicity is
++	 * not broken as well.
+ 	 */
+ 	arg.drvdata = drvdata;
+-	ret = smp_call_function_single(drvdata->cpu,
++	ret = smp_call_function_single(drvdata->rc_cpu,
+ 				       etm4_enable_hw_smp_call, &arg, 1);
+ 	if (!ret)
+ 		ret = arg.rc;
+@@ -789,6 +814,12 @@ static void etm4_disable_hw(void *info)
+ 	coresight_disclaim_device_unlocked(csdev);
+ 	etm4_cs_lock(drvdata, csa);
+ 
++	/* For supporting SW sync insertion */
++	if (drvdata->etm_quirks & CORESIGHT_QUIRK_ETM_SW_SYNC) {
++		drvdata->hw_state = USR_STOP;
++		coresight_etm_active_disable(drvdata->cpu);
++	}
++
+ 	dev_dbg(&drvdata->csdev->dev,
+ 		"cpu: %d disable smp call done\n", drvdata->cpu);
+ }
+@@ -834,8 +865,15 @@ static void etm4_disable_sysfs(struct coresight_device *csdev)
+ 	/*
+ 	 * Executing etm4_disable_hw on the cpu whose ETM is being disabled
+ 	 * ensures that register writes occur when cpu is powered.
++	 *
++	 * Note: When task isolation is enabled, the target cpu used
++	 * is always primary core and hence the above assumption of
++	 * cpu associated with the ETM being in powered up state during
++	 * register writes is not valid.
++	 * But on the other hand, using smp call ensures that atomicity is
++	 * not broken as well.
+ 	 */
+-	smp_call_function_single(drvdata->cpu, etm4_disable_hw, drvdata, 1);
++	smp_call_function_single(drvdata->rc_cpu, etm4_disable_hw, drvdata, 1);
+ 
+ 	spin_unlock(&drvdata->spinlock);
+ 	cpus_read_unlock();
+@@ -930,6 +968,15 @@ static bool etm4_init_iomem_access(struct etmv4_drvdata *drvdata,
+ 	u32 devarch = readl_relaxed(drvdata->base + TRCDEVARCH);
+ 	u32 idr1 = readl_relaxed(drvdata->base + TRCIDR1);
+ 
++	/* OcteonTX2 hardware reports version as ETMv4.2 but it supports
++	 * Ignore Packet feature of ETMv4.3. Hence, treat this as comaptible
++	 * with ETMv4.3.
++	 */
++	if (drvdata->etm_quirks & CORESIGHT_QUIRK_ETM_TREAT_ETMv43) {
++		idr1 &= ~0xF0;
++		idr1 |= 0x30;
++	}
++
+ 	/*
+ 	 * All ETMs must implement TRCDEVARCH to indicate that
+ 	 * the component is an ETMv4. To support any broken
+@@ -1887,6 +1934,13 @@ static int etm4_probe(struct device *dev, void __iomem *base, u32 etm_pid)
+ 	if (drvdata->cpu < 0)
+ 		return drvdata->cpu;
+ 
++	/* Update the SMP target cpu */
++	drvdata->rc_cpu = coresight_get_etm_sync_mode() == SYNC_MODE_SW_GLOBAL ?
++			  SYNC_GLOBAL_CORE : drvdata->cpu;
++
++	/* Enable fixes for Silicon issues */
++	drvdata->etm_quirks = coresight_get_etm_quirks(etm_pid);
++
+ 	init_arg.drvdata = drvdata;
+ 	init_arg.csa = &desc.access;
+ 	init_arg.pid = etm_pid;
+@@ -2071,6 +2125,7 @@ static const struct amba_id etm4_ids[] = {
+ 	CS_AMBA_UCI_ID(0x000bb805, uci_id_etm4),/* Qualcomm Kryo 4XX Cortex-A55 */
+ 	CS_AMBA_UCI_ID(0x000bb804, uci_id_etm4),/* Qualcomm Kryo 4XX Cortex-A76 */
+ 	CS_AMBA_UCI_ID(0x000cc0af, uci_id_etm4),/* Marvell ThunderX2 */
++	CS_AMBA_UCI_ID(0x000cc210, uci_id_etm4),/* Marvell OcteonTX2 CN9XXX */
+ 	CS_AMBA_UCI_ID(0x000b6d01, uci_id_etm4),/* HiSilicon-Hip08 */
+ 	CS_AMBA_UCI_ID(0x000b6d02, uci_id_etm4),/* HiSilicon-Hip09 */
+ 	{},
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c b/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c
+index 007bad9e7ad8..95bf221095a3 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c
++++ b/drivers/hwtracing/coresight/coresight-etm4x-sysfs.c
+@@ -9,6 +9,7 @@
+ #include <linux/sysfs.h>
+ #include "coresight-etm4x.h"
+ #include "coresight-priv.h"
++#include "coresight-quirks.h"
+ 
+ static int etm4_set_mode_exclude(struct etmv4_drvdata *drvdata, bool exclude)
+ {
+@@ -2341,8 +2342,26 @@ static u32 etmv4_cross_read(const struct etmv4_drvdata *drvdata, u32 offset)
+ 	/*
+ 	 * smp cross call ensures the CPU will be powered up before
+ 	 * accessing the ETMv4 trace core registers
++	 *
++	 * Note: When task isolation is enabled, the target cpu used
++	 * is always primary core and hence the above assumption of
++	 * cpu associated with the ETM being in powered up state during
++	 * register writes is not valid.
++	 * But on the other hand, using smp call ensures that atomicity is
++	 * not broken as well.
+ 	 */
+-	smp_call_function_single(drvdata->cpu, do_smp_cross_read, &reg, 1);
++	smp_call_function_single(drvdata->rc_cpu, do_smp_cross_read, &reg, 1);
++
++	/* OcteonTX2 hardware reports version as ETMv4.2 but it supports
++	 * Ignore Packet feature of ETMv4.3. Hence, treat this as comaptible
++	 * with ETMv4.3.
++	 */
++	if ((offset == TRCIDR1) &&
++	    (drvdata->etm_quirks & CORESIGHT_QUIRK_ETM_TREAT_ETMv43)) {
++		reg.data &= ~0xF0;
++		reg.data |= 0x30;
++	}
++
+ 	return reg.data;
+ }
+ 
+diff --git a/drivers/hwtracing/coresight/coresight-etm4x.h b/drivers/hwtracing/coresight/coresight-etm4x.h
+index e5b79bdb9851..f23955f17cfd 100644
+--- a/drivers/hwtracing/coresight/coresight-etm4x.h
++++ b/drivers/hwtracing/coresight/coresight-etm4x.h
+@@ -932,6 +932,9 @@ struct etmv4_drvdata {
+ 	struct coresight_device		*csdev;
+ 	spinlock_t			spinlock;
+ 	local_t				mode;
++	u32				etm_quirks;
++	int				hw_state;
++	int				rc_cpu;
+ 	int				cpu;
+ 	u8				arch;
+ 	u8				nr_pe;
+diff --git a/drivers/hwtracing/coresight/coresight-quirks.c b/drivers/hwtracing/coresight/coresight-quirks.c
+new file mode 100644
+index 000000000000..27591e0f6a97
+--- /dev/null
++++ b/drivers/hwtracing/coresight/coresight-quirks.c
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++#include <asm/cputype.h>
++#include <linux/coresight.h>
++#include "coresight-priv.h"
++#include "coresight-quirks.h"
++#include "coresight-etm4x.h"
++
++/* Raw enable/disable APIs for ETM sync insertion */
++void etm4_enable_raw(struct coresight_device *csdev)
++{
++	struct etmv4_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
++	struct csdev_access *csa = &csdev->access;
++
++	CS_UNLOCK(drvdata->base);
++
++	/* Writing 0 to TRCOLSAR unlocks the trace registers */
++	writel(0x0, drvdata->base + TRCOSLAR);
++
++	/* Enable the trace unit */
++	writel(1, drvdata->base + TRCPRGCTLR);
++
++	coresight_timeout(csa, TRCSTATR, TRCSTATR_IDLE_BIT, 0);
++
++	dsb(sy);
++	isb();
++
++	CS_LOCK(drvdata->base);
++}
++EXPORT_SYMBOL(etm4_enable_raw);
++
++void etm4_disable_raw(struct coresight_device *csdev)
++{
++	struct etmv4_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
++	struct csdev_access *csa = &csdev->access;
++
++	CS_UNLOCK(drvdata->base);
++	/*
++	 * Make sure everything completes before disabling, as recommended
++	 * by section 7.3.77 ("TRCVICTLR, ViewInst Main Control Register,
++	 * SSTATUS") of ARM IHI 0064D
++	 */
++	dsb(sy);
++	isb();
++
++	writel_relaxed(0x0, drvdata->base + TRCPRGCTLR);
++
++	/* Wait for ETM to become stable */
++	coresight_timeout(csa, TRCSTATR, TRCSTATR_PMSTABLE_BIT, 1);
++
++	CS_LOCK(drvdata->base);
++}
++EXPORT_SYMBOL(etm4_disable_raw);
++
++bool coresight_etm_has_hw_sync(void)
++{
++	/* Check if hardware supports sync insertion */
++	if (midr_is_cpu_model_range(read_cpuid_id(),
++				    MIDR_MRVL_OCTEONTX2_96XX,
++				    MIDR_CPU_VAR_REV(0, 0),
++				    MIDR_CPU_VAR_REV(3, 1)) ||
++	    midr_is_cpu_model_range(read_cpuid_id(),
++				    MIDR_MRVL_OCTEONTX2_95XX,
++				    MIDR_CPU_VAR_REV(0, 0),
++				    MIDR_CPU_VAR_REV(2, 0)))
++		return false;
++	else
++		return true;
++}
++
++/* ETM quirks on OcteonTX */
++u32 coresight_get_etm_quirks(unsigned int id)
++{
++	u32 quirks = 0; /* reset */
++
++	if (id == OCTEONTX_CN9XXX_ETM)
++		quirks |= CORESIGHT_QUIRK_ETM_TREAT_ETMv43;
++
++	if (!coresight_etm_has_hw_sync())
++		quirks |= CORESIGHT_QUIRK_ETM_SW_SYNC;
++
++	return quirks;
++}
++EXPORT_SYMBOL(coresight_get_etm_quirks);
++
++/* APIs for choosing the sync insertion mode */
++int coresight_get_etm_sync_mode(void)
++{
++	/* Check if hardware supports sync insertion */
++	if (coresight_etm_has_hw_sync())
++		return SYNC_MODE_HW;
++
++	/* Find the software based sync insertion mode */
++#ifdef CONFIG_TASK_ISOLATION
++	return SYNC_MODE_SW_GLOBAL;
++#else
++	return SYNC_MODE_SW_PER_CORE;
++#endif
++}
++EXPORT_SYMBOL(coresight_get_etm_sync_mode);
++
++/* Support functions for managing active ETM list used by
++ * global mode sync insertion.
++ *
++ * Note: It is assumed that all accessor functions
++ * on etm_active_list should be called in a atomic context
++ */
++
++static cpumask_t etm_active_list; /* Bitmap of active ETMs cpu wise */
++
++void coresight_etm_active_enable(int cpu)
++{
++	cpumask_set_cpu(cpu, &etm_active_list);
++}
++EXPORT_SYMBOL(coresight_etm_active_enable);
++
++void coresight_etm_active_disable(int cpu)
++{
++	cpumask_clear_cpu(cpu, &etm_active_list);
++}
++EXPORT_SYMBOL(coresight_etm_active_disable);
++
++cpumask_t coresight_etm_active_list(void)
++{
++	return etm_active_list;
++}
++EXPORT_SYMBOL(coresight_etm_active_list);
+diff --git a/drivers/hwtracing/coresight/coresight-quirks.h b/drivers/hwtracing/coresight/coresight-quirks.h
+new file mode 100644
+index 000000000000..1b795aade4d6
+--- /dev/null
++++ b/drivers/hwtracing/coresight/coresight-quirks.h
+@@ -0,0 +1,53 @@
++#ifndef	_CORESIGHT_QUIRKS_H
++#define	_CORESIGHT_QUIRKS_H
++
++/* Marvell OcteonTx CN9xxx ETM device */
++#define OCTEONTX_CN9XXX_ETM			0x000cc210
++
++/* Coresight ETM Hardware quirks */
++#define CORESIGHT_QUIRK_ETM_SW_SYNC		0x1 /* No Hardware sync */
++#define CORESIGHT_QUIRK_ETM_TREAT_ETMv43	0x2 /* ETMv4.2 as ETMv4.3 */
++
++/* ETM sync insertion modes
++ * 1. MODE_HW
++ *    Sync insertion is done by hardware without any software intervention
++ *
++ * 2. MODE_SW_GLOBAL
++ *    sync insertion runs from common timer handler on primary core
++ *
++ * 3. MODE_SW_PER_CORE
++ *    sync insertion runs from per core timer handler
++ *
++ * When hardware doesn't support sync insertion, we fall back to software based
++ * ones. Typically, GLOBAL mode would be preferred when the traced cores are
++ * running performance critical applications and cannot be interrupted,
++ * but at the same time there would be a small loss of trace data during the
++ * insertion sequence as well.
++ *
++ * For the sake of simplicity, in GLOBAL mode, common timer handler is
++ * always expected to run on primary core(core 0).
++ */
++#define SYNC_GLOBAL_CORE			0 /* Core 0 */
++
++enum etm_sync_mode {
++	SYNC_MODE_INVALID,
++	SYNC_MODE_HW,
++	SYNC_MODE_SW_GLOBAL,
++	SYNC_MODE_SW_PER_CORE,
++};
++
++enum hw_state {
++	USR_STOP,
++	SW_STOP,
++	USR_START,
++};
++
++u32 coresight_get_etm_quirks(unsigned int id);
++int coresight_get_etm_sync_mode(void);
++
++void etm4_enable_raw(struct coresight_device *csdev);
++void etm4_disable_raw(struct coresight_device *csdev);
++void coresight_etm_active_enable(int cpu);
++void coresight_etm_active_disable(int cpu);
++cpumask_t coresight_etm_active_list(void);
++#endif
+-- 
+2.31.1
+

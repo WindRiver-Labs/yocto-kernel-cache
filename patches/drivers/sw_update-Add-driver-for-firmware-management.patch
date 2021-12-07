@@ -1,0 +1,415 @@
+From a91289b1464613d9e6aa9d7b36a75df9643e3f98 Mon Sep 17 00:00:00 2001
+From: Witold Sadowski <wsadowski@marvell.com>
+Date: Mon, 24 May 2021 22:26:42 -0700
+Subject: [PATCH 1571/1921] sw_update: Add driver for firmware management
+
+Add driver for managing current FW.
+It is exchanging data with userspace via IOCTL.
+Currently supported:
+ -> get version
+ -> calculate hash
+
+Signed-off-by: Witold Sadowski <wsadowski@marvell.com>
+Change-Id: I077547308a36cb302dc28cfcde570a6d19f8b662
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/52653
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+Tested-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/soc/marvell/Kconfig                 |  10 +
+ drivers/soc/marvell/Makefile                |   1 +
+ drivers/soc/marvell/cn10ka-swup/Makefile    |   7 +
+ drivers/soc/marvell/cn10ka-swup/mrvl_swup.c | 200 ++++++++++++++++++++
+ drivers/soc/marvell/cn10ka-swup/mrvl_swup.h | 126 ++++++++++++
+ 5 files changed, 344 insertions(+)
+ create mode 100644 drivers/soc/marvell/cn10ka-swup/Makefile
+ create mode 100644 drivers/soc/marvell/cn10ka-swup/mrvl_swup.c
+ create mode 100644 drivers/soc/marvell/cn10ka-swup/mrvl_swup.h
+
+diff --git a/drivers/soc/marvell/Kconfig b/drivers/soc/marvell/Kconfig
+index bb857d7910a2..b28919cb6abc 100644
+--- a/drivers/soc/marvell/Kconfig
++++ b/drivers/soc/marvell/Kconfig
+@@ -175,4 +175,14 @@ config MARVELL_CN10K_RPRAM
+ 	  requested by user. Enable this option if you are building for octeontx
+ 	  cn10k platforms and memory preservation feature is used.
+ 
++config MARVELL_CN10K_SWUP
++	tristate "CN10K firmware secure update"
++	depends on ARM64
++	help
++	  Provide debugfs interface for firmware update.
++	  Supported on cn10k family only.
++	  Currently supported operations:
++	    -> TIM Version check
++	    -> TIM Hash verification
++
+ endmenu
+diff --git a/drivers/soc/marvell/Makefile b/drivers/soc/marvell/Makefile
+index 7bfef4ee2252..633f733f5ce4 100644
+--- a/drivers/soc/marvell/Makefile
++++ b/drivers/soc/marvell/Makefile
+@@ -7,6 +7,7 @@ obj-y		+= octeontx2-npa/
+ obj-y		+= octeontx2-llc/
+ obj-y 		+= csr-access/
+ obj-y 		+= octeontx2-serdes/
++obj-y           += cn10ka-swup/
+ obj-$(CONFIG_OCTEONTX_INFO) += octeontx_info.o
+ obj-$(CONFIG_MVMDIO_UIO) += mvmdio_uio.o
+ obj-$(CONFIG_MRVL_PHY_DIAGNOSTICS) += phy_diag.o
+diff --git a/drivers/soc/marvell/cn10ka-swup/Makefile b/drivers/soc/marvell/cn10ka-swup/Makefile
+new file mode 100644
+index 000000000000..d35e2317ae31
+--- /dev/null
++++ b/drivers/soc/marvell/cn10ka-swup/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for Marvell's CN10K firmware secure update driver
++#
++
++obj-$(CONFIG_MARVELL_CN10K_SWUP) += mrvl_swup.o
++
+diff --git a/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c
+new file mode 100644
+index 000000000000..de98f8c3c246
+--- /dev/null
++++ b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.c
+@@ -0,0 +1,200 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2021 Marvell
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/arm-smccc.h>
++#include <linux/uaccess.h>
++#include <linux/ioctl.h>
++#include <linux/slab.h>
++#include <linux/bitops.h>
++#include <linux/debugfs.h>
++
++#include "mrvl_swup.h"
++
++/* Buffer for SMC call */
++struct smc_version_info swup_info;
++struct dentry *mrvl_swup_root;
++
++/* IOCTL mapping to fw name */
++const struct {
++	const char *str;
++	uint8_t bit;
++} name_to_sel_obj[] = {
++	{"tim0", 0},
++	{"rom-script0.fw", 1},
++	{"scp_bl1.bin", 2},
++	{"mcp_bl1.bin", 3},
++	{"ecp_bl1.bin", 4},
++	{"init.bin", 5},
++	{"gserm.fw", 6},
++	{"bl2.bin", 7},
++	{"bl31.bin", 8},
++	{"u-boot-nodtb.bin", 9},
++	{"npc_mkex-cn10xx.fw", 10},
++	{"efi_app1.efi", 11},
++	{"switch_fw_ap.fw", 12},
++	{"switch_fw_super.fw", 13},
++};
++
++const char *obj_bit_to_str(uint32_t bit)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(name_to_sel_obj); i++) {
++		if (name_to_sel_obj[i].bit == bit)
++			return name_to_sel_obj[i].str;
++	}
++	return NULL;
++}
++
++/* Prepare objects for limited read */
++void prepare_names(struct smc_version_info *info, uint32_t objects)
++{
++	int i;
++	int obj_count = 0;
++	const char *tmp = NULL;
++
++	for (i = 0; i < SMC_MAX_VERSION_ENTRIES; i++) {
++		if (objects & (1<<i)) {
++			tmp = obj_bit_to_str((i));
++			if (tmp == NULL) {
++				pr_info("incorrect object selected!\n");
++			} else {
++				memcpy(info->objects[obj_count].name, tmp, VER_MAX_NAME_LENGTH);
++				obj_count++;
++			}
++		}
++	}
++}
++
++enum smc_version_entry_retcode get_version(unsigned long arg, uint8_t calculate_hash)
++{
++	int i, ret = 0;
++	uint64_t x0_addr, x1_size;
++	struct marlin_bootflash_get_versions *user_desc;
++	struct arm_smccc_res res;
++
++	user_desc = kzalloc(sizeof(struct marlin_bootflash_get_versions), GFP_KERNEL);
++	if (!user_desc)
++		return -ENOMEM;
++
++	if (copy_from_user(user_desc,
++			  (struct marlin_bootflash_get_versions *)arg,
++			  sizeof(struct marlin_bootflash_get_versions))) {
++		pr_err("Data Read Error\n");
++		ret = -EFAULT;
++		goto mem_error;
++	}
++
++	/* We have to perform conversion from IOCTL interface to smc */
++	memset(&swup_info, 0x00, sizeof(struct smc_version_info));
++
++	swup_info.magic_number = VERSION_MAGIC;
++	swup_info.version      = VERSION_INFO_VERSION;
++	swup_info.bus          = user_desc->bus;
++	swup_info.cs           = user_desc->cs;
++
++	if (calculate_hash)
++		swup_info.version_flags |= SMC_VERSION_CHECK_VALIDATE_HASH;
++
++	if (user_desc->version_flags & MARLIN_CHECK_PREDEFINED_OBJ) {
++		swup_info.version_flags |= SMC_VERSION_CHECK_SPECIFIC_OBJECTS;
++		prepare_names(&swup_info, user_desc->selected_objects);
++		swup_info.num_objects = hweight_long(user_desc->selected_objects);
++	} else {
++		swup_info.num_objects = SMC_MAX_OBJECTS;
++	}
++
++	//SMC call
++	x0_addr = virt_to_phys(&swup_info);
++	x1_size = sizeof(swup_info);
++	arm_smccc_smc(PLAT_CN10K_VERIFY_FIRMWARE, x0_addr, x1_size, 0, 0, 0, 0, 0, &res);
++
++	if (res.a0) {
++		pr_err("Error during SMC processing\n");
++		ret = res.a0;
++		goto mem_error;
++	}
++
++	user_desc->retcode = swup_info.retcode;
++	for (i = 0; i < SMC_MAX_VERSION_ENTRIES; i++)
++		memcpy(&user_desc->desc[i],
++		       &swup_info.objects[i],
++		       sizeof(struct smc_version_info_entry));
++
++	if (copy_to_user((struct marlin_bootflash_get_versions *)arg,
++			user_desc,
++			sizeof(struct marlin_bootflash_get_versions))) {
++		pr_err("Data Write Error\n");
++		ret = -EFAULT;
++	}
++
++mem_error:
++	kfree(user_desc);
++	return ret;
++}
++
++static long mrvl_swup_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	switch (cmd) {
++	case GET_VERSION:
++		return get_version(arg, 0);
++	case VERIFY_HASH:
++		return get_version(arg, 1);
++	default:
++		pr_err("Not supported IOCTL\n");
++		return -ENXIO;
++	}
++	return 0;
++}
++
++static const struct file_operations mrvl_fops = {
++	.owner			= THIS_MODULE,
++	.unlocked_ioctl		= mrvl_swup_ioctl,
++	.llseek			= no_llseek,
++};
++
++static int mrvl_swup_setup_debugfs(void)
++{
++	struct dentry *pfile;
++
++	mrvl_swup_root = debugfs_create_dir("cn10k_swup", NULL);
++
++	pfile = debugfs_create_file("verification", 0644, mrvl_swup_root, NULL,
++				    &mrvl_fops);
++	if (!pfile)
++		goto create_failed;
++
++	return 0;
++
++create_failed:
++	pr_err("Failed to create debugfs dir/file for firmware update\n");
++	debugfs_remove_recursive(mrvl_swup_root);
++	return 1;
++}
++
++static int __init mrvl_swup_init(void)
++{
++	return mrvl_swup_setup_debugfs();
++}
++
++static void __exit mrvl_swup_exit(void)
++{
++	debugfs_remove_recursive(mrvl_swup_root);
++}
++
++module_init(mrvl_swup_init)
++module_exit(mrvl_swup_exit)
++
++MODULE_DESCRIPTION("Marvell firmware update");
++MODULE_AUTHOR("Witold Sadowski <wsadowski@marvell.com>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h
+new file mode 100644
+index 000000000000..a81b9dc97d15
+--- /dev/null
++++ b/drivers/soc/marvell/cn10ka-swup/mrvl_swup.h
+@@ -0,0 +1,126 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2021 Marvell
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifndef __MRVL_SWUP_H__
++#define __MRVL_SWUP_H__
++
++#define PLAT_CN10K_VERIFY_FIRMWARE		0xc2000b0c
++
++#define VER_MAX_NAME_LENGTH	32
++#define SMC_MAX_OBJECTS		32
++#define SMC_MAX_VERSION_ENTRIES 32
++#define VERSION_STRING_LENGTH   32
++#define HASH_SIZE               64
++#define VERIFY_LOG_SIZE		1024
++
++#define MARLIN_CHECK_PREDEFINED_OBJ (1<<0)
++#define MARLIN_PRINT_CONSOLE_LOGS   (1<<15)
++
++#define VERSION_FLAG_BACKUP	                BIT(0)
++#define VERSION_FLAG_EMMC	                BIT(1)
++#define SMC_VERSION_CHECK_SPECIFIC_OBJECTS	BIT(2)
++#define SMC_VERSION_CHECK_VALIDATE_HASH		BIT(3)
++
++#define VERSION_MAGIC		0x4e535256	/** VRSN */
++#define VERSION_INFO_VERSION	0x0100	/** 1.0.0.0 */
++
++struct tim_opaque_data_version_info {
++	uint8_t     major_version;  /** Major version number */
++	uint8_t     minor_version;  /** Minor version number */
++	uint8_t     revision_number;/** Revision number */
++	uint8_t     revision_type;  /** Revision type (TBD) */
++	uint16_t    year;           /** GIT Year */
++	uint8_t     month;          /** GIT Month */
++	uint8_t     day;            /** GIT Day */
++	uint8_t     hour;           /** GIT Hour */
++	uint8_t     minute;         /** GIT Minute */
++	uint16_t    flags;          /** Flags (TBD) */
++	uint32_t    customer_version;/** Customer defined version number */
++	uint8_t     version_string[VERSION_STRING_LENGTH];
++} __packed4;
++
++/** Return code for version info */
++enum smc_version_ret {
++	VERSION_OK,
++	FIRMWARE_LAYOUT_CHANGED,
++	TOO_MANY_OBJECTS,
++	INVALID_DEVICE_TREE,
++	VERSION_NOT_SUPPORTED,
++};
++
++/** This is used for each object (version entry) */
++enum smc_version_entry_retcode {
++	RET_OK = 0,
++	RET_NOT_FOUND = 1,
++	RET_TIM_INVALID = 2,
++	RET_BAD_HASH = 3,
++	RET_NOT_ENOUGH_MEMORY = 4,
++	RET_NAME_MISMATCH = 5,
++	RET_TIM_NO_VERSION = 6,
++	RET_TIM_NO_HASH = 7,
++	RET_HASH_ENGINE_ERROR = 8,
++	RET_HASH_NO_MATCH = 9,
++	RET_IMAGE_TOO_BIG = 10,
++	RET_DEVICE_TREE_ENTRY_ERROR = 11,
++};
++
++struct smc_version_info_entry {
++	char name[VER_MAX_NAME_LENGTH];
++	struct tim_opaque_data_version_info version;
++	uint8_t tim_hash[HASH_SIZE];	/** Hash value stored in the TIM */
++	uint8_t obj_hash[HASH_SIZE];	/** Calculated hash value */
++	uint64_t tim_address;		/** Address of TIM in flash */
++	uint64_t max_size;		/** Maximum space for object and TIM */
++	uint64_t object_size;		/** Size of flash object in bytes */
++	uint64_t object_address;	/** Address of object in flash */
++	uint16_t hash_size;		/** Size of hash in bytes */
++	uint16_t flags;			/** Flags for this object */
++	enum smc_version_entry_retcode retcode;	/** Return code if error */
++	uint64_t reserved[8];		/** Reserved for future growth */
++	uint8_t log[VERIFY_LOG_SIZE];	/** Log for object */
++};
++
++struct smc_version_info {
++	uint32_t	magic_number;	/** VRSN */
++	uint16_t	version;	/** Version of descriptor */
++	uint16_t	version_flags;	/** Flags passed to version process */
++	uint32_t	bus;		/** SPI BUS number */
++	uint32_t	cs;		/** SPI chip select number */
++	uintptr_t	work_buffer_addr;/** Used to decompress objects */
++	uint64_t	work_buffer_size;/** Size of decompression buffer */
++	enum smc_version_ret	retcode;
++	uint32_t	num_objects;
++	uint32_t	timeout;	/** Timeout in ms */
++	uint32_t	pad32;		/** Pad to 64 bits */
++	uint64_t	reserved[5];	/** Reserved for future growth */
++	struct smc_version_info_entry objects[SMC_MAX_VERSION_ENTRIES];
++};
++
++/* IOCTL interface
++ * Use same data structure for:
++ * get_version
++ * verify_hash
++ */
++
++struct marlin_bootflash_get_versions {
++	uint32_t  bus;              /** SPI BUS number */
++	uint32_t  cs;               /** SPI chip select number */
++	uintptr_t log_addr;         /** Pointer to a buffer where to store log */
++	size_t    log_size;         /** Size of the log buffer */
++	uint16_t  version_flags;    /** Flags to specify options */
++	uint32_t  selected_objects; /** Mask of a selection of TIMs (32 max) */
++	uint64_t  reserved[5];	    /** Reserved for future growth */
++	enum smc_version_ret	retcode;
++	struct smc_version_info_entry desc[SMC_MAX_VERSION_ENTRIES];
++};
++
++#define GET_VERSION _IOWR('a', 'a', struct marlin_bootflash_get_versions*)
++#define VERIFY_HASH _IOWR('a', 'b', struct marlin_bootflash_get_versions*)
++
++#endif	/* __TIM_UPDATE_H__ */
+-- 
+2.31.1
+

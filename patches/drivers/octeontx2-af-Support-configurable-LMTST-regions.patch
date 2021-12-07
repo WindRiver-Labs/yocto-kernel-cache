@@ -1,0 +1,215 @@
+From 32c8af212b89febc94dbaa65d4e230eb98972067 Mon Sep 17 00:00:00 2001
+From: Geetha sowjanya <gakula@marvell.com>
+Date: Wed, 21 Apr 2021 11:32:35 +0530
+Subject: [PATCH 1492/1921] octeontx2-af: Support configurable LMTST regions
+
+This patch extends the lmtst_tbl_setup_req mbox to support run time
+LMTST configuration.
+RVU PF/VF and DPDK/ODP allocates a LMTregion, creates a translation
+entry for a device via VFIO IOCTLs.
+This IOVA is shared with AF through above mbox. AF then uses
+RVU_SMMU transulation Widget and gets PA for the IOVA and updates
+the LMTtable entry for that device.
+
+Change-Id: Ie8ce2be4f82661013e62ec7843a60171d54cd185
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Geetha sowjanya <gakula@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/50478
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |   3 +
+ .../ethernet/marvell/octeontx2/af/rvu_cn10k.c | 123 +++++++++++++-----
+ .../ethernet/marvell/octeontx2/af/rvu_reg.h   |   5 +
+ 3 files changed, 101 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index fcf1d261c5b6..3d1317792ae2 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -1700,6 +1700,9 @@ struct lmtst_tbl_setup_req {
+ 	u64 dis_line_pref	 :1;
+ 	u64 ssow_pf_func	 :13;
+ 	u16 base_pcifunc;
++	u8  use_local_lmt_region;
++	u64 lmt_iova;
++	u64 rsvd[4];
+ };
+ 
+ struct set_vf_perm  {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c
+index 05d70a669484..a965923795f4 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c
+@@ -314,15 +314,104 @@ static u32 rvu_get_lmtst_tbl_index(struct rvu *rvu, u16 pcifunc)
+ 		(pcifunc & RVU_PFVF_FUNC_MASK)) * LMT_MAPTBL_ENTRY_SIZE;
+ }
+ 
++static int rvu_get_lmtaddr(struct rvu *rvu, u16 pcifunc,
++			   u64 iova, u64 *lmt_addr)
++{
++	u64 pa, val, pf;
++	int err;
++
++	if (!iova) {
++		dev_err(rvu->dev, "%s Requested Null address for transulation\n", __func__);
++		return -EINVAL;
++	}
++
++	rvu_write64(rvu, BLKADDR_RVUM, RVU_AF_SMMU_ADDR_REQ, iova);
++	pf = rvu_get_pf(pcifunc) & 0x1F;
++	val = BIT_ULL(63) | BIT_ULL(14) | BIT_ULL(13) | pf << 8 |
++	      ((pcifunc & RVU_PFVF_FUNC_MASK) & 0xFF);
++	rvu_write64(rvu, BLKADDR_RVUM, RVU_AF_SMMU_TXN_REQ, val);
++
++	err = rvu_poll_reg(rvu, BLKADDR_RVUM, RVU_AF_SMMU_ADDR_RSP_STS, BIT_ULL(0), false);
++	if (err) {
++		dev_err(rvu->dev, "%s LMTLINE iova transulation failed\n", __func__);
++		return err;
++	}
++	val = rvu_read64(rvu, BLKADDR_RVUM, RVU_AF_SMMU_ADDR_RSP_STS);
++	if (val & ~0x1ULL) {
++		dev_err(rvu->dev, "%s LMTLINE iova transulation failed err:%llx\n", __func__, val);
++		return -EIO;
++	}
++	/* PA[51:12] = RVU_AF_SMMU_TLN_FLIT1[60:21]
++	 * PA[11:0] = IOVA[11:0]
++	 */
++	pa = rvu_read64(rvu, BLKADDR_RVUM, RVU_AF_SMMU_TLN_FLIT1) >> 21;
++	pa &= GENMASK_ULL(39, 0);
++	*lmt_addr = (pa << 12) | (iova  & 0xFFF);
++
++	return 0;
++}
++
++static int rvu_update_lmtaddr(struct rvu *rvu, u16 pcifunc, u64 lmt_addr)
++{
++	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
++	u32 tbl_idx;
++	int err = 0;
++	u64 val;
++
++	/* Read the current lmt addr of pcifunc */
++	tbl_idx = rvu_get_lmtst_tbl_index(rvu, pcifunc);
++	err = lmtst_map_table_ops(rvu, tbl_idx, &val, LMT_TBL_OP_READ);
++	if (err) {
++		dev_err(rvu->dev,
++			"Failed to read LMT map table: index 0x%x err %d\n",
++			tbl_idx, err);
++		return err;
++	}
++
++	/* Storing the seondary's lmt base address as this needs to be
++	 * reverted in FLR. Also making sure this default value doesn't
++	 * get overwritten on multiple calls to this mailbox.
++	 */
++	if (!pfvf->lmt_base_addr)
++		pfvf->lmt_base_addr = val;
++
++	/* Update the LMT table with new addr */
++	err = lmtst_map_table_ops(rvu, tbl_idx, &lmt_addr, LMT_TBL_OP_WRITE);
++	if (err) {
++		dev_err(rvu->dev,
++			"Failed to update LMT map table: index 0x%x err %d\n",
++			tbl_idx, err);
++		return err;
++	}
++	return 0;
++}
++
+ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
+ 				     struct lmtst_tbl_setup_req *req,
+ 				     struct msg_rsp *rsp)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, req->hdr.pcifunc);
+-	u32 pri_tbl_idx, sec_tbl_idx, tbl_idx;
++	u32 pri_tbl_idx, tbl_idx;
++	u64 lmt_addr;
+ 	int err = 0;
+ 	u64 val;
+ 
++	/* Check if PF_FUNC wants to use it's own local memory as LMTLINE
++	 * region, if so, convert that IOVA to physical address and
++	 * populate LMT table with that address
++	 */
++	if (req->use_local_lmt_region) {
++		err = rvu_get_lmtaddr(rvu, req->hdr.pcifunc,
++				      req->lmt_iova, &lmt_addr);
++		if (err < 0)
++			return err;
++
++		/* Update the lmt addr for this PFFUNC in the LMT table */
++		err = rvu_update_lmtaddr(rvu, req->hdr.pcifunc, lmt_addr);
++		if (err)
++			return err;
++	}
++
+ 	/* Reconfiguring lmtst map table in lmt region shared mode i.e. make
+ 	 * multiple PF_FUNCs to share an LMTLINE region, so primary/base
+ 	 * pcifunc (which is passed as an argument to mailbox) is the one
+@@ -335,27 +424,6 @@ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
+ 		 */
+ 		pri_tbl_idx = rvu_get_lmtst_tbl_index(rvu, req->base_pcifunc);
+ 
+-		/* Truncating secondary pcifunc to calculate the LMT table index
+-		 * equivalent to secondary pcifunc.
+-		 */
+-		sec_tbl_idx = rvu_get_lmtst_tbl_index(rvu, req->hdr.pcifunc);
+-		/* Read the base lmt addr of the secondary pcifunc */
+-		err = lmtst_map_table_ops(rvu, sec_tbl_idx, &val,
+-					  LMT_TBL_OP_READ);
+-		if (err) {
+-			dev_err(rvu->dev,
+-				"Failed to read LMT map table: index 0x%x err %d\n",
+-				sec_tbl_idx, err);
+-			goto error;
+-		}
+-
+-		/* Storing the seondary's lmt base address as this needs to be
+-		 * reverted in FLR. Also making sure this default value doesn't
+-		 * get overwritten on multiple calls to this mailbox.
+-		 */
+-		if (!pfvf->lmt_base_addr)
+-			pfvf->lmt_base_addr = val;
+-
+ 		/* Read the base lmt addr of the primary pcifunc */
+ 		err = lmtst_map_table_ops(rvu, pri_tbl_idx, &val,
+ 					  LMT_TBL_OP_READ);
+@@ -369,14 +437,9 @@ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
+ 		/* Update the base lmt addr of secondary with primary's base
+ 		 * lmt addr.
+ 		 */
+-		err = lmtst_map_table_ops(rvu, sec_tbl_idx, &val,
+-					  LMT_TBL_OP_WRITE);
+-		if (err) {
+-			dev_err(rvu->dev,
+-				"Failed to update LMT map table: index 0x%x err %d\n",
+-				sec_tbl_idx, err);
+-			goto error;
+-		}
++		err = rvu_update_lmtaddr(rvu, req->hdr.pcifunc, val);
++		if (err)
++			return err;
+ 	}
+ 
+ 	/* This mailbox can also be used to update word1 of APR_LMT_MAP_ENTRY_S
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+index 2652bf80d73b..9039352d3d65 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+@@ -49,6 +49,11 @@
+ #define RVU_AF_PFX_VF_BAR4_ADDR             (0x5400 | (a) << 4)
+ #define RVU_AF_PFX_VF_BAR4_CFG              (0x5600 | (a) << 4)
+ #define RVU_AF_PFX_LMTLINE_ADDR             (0x5800 | (a) << 4)
++#define RVU_AF_SMMU_ADDR_REQ		    (0x6000)
++#define RVU_AF_SMMU_TXN_REQ		    (0x6008)
++#define RVU_AF_SMMU_ADDR_RSP_STS	    (0x6010)
++#define RVU_AF_SMMU_ADDR_TLN		    (0x6018)
++#define RVU_AF_SMMU_TLN_FLIT1		    (0x6030)
+ 
+ /* Admin function's privileged PF/VF registers */
+ #define RVU_PRIV_CONST                      (0x8000000)
+-- 
+2.31.1
+

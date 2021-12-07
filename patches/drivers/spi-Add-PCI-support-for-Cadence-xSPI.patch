@@ -1,0 +1,257 @@
+From 49a17ddc10b9c3525acc630a3f1e802c8880d3d1 Mon Sep 17 00:00:00 2001
+From: Witold Sadowski <wsadowski@marvell.com>
+Date: Tue, 16 Mar 2021 04:24:58 -0700
+Subject: [PATCH 1332/1921] spi: Add PCI support for Cadence xSPI
+
+Add polling mode support
+
+Change-Id: Id6b4d22fbc07273d63ed1d58b8ca90cf68daf79e
+Signed-off-by: Witold Sadowski <wsadowski@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/47824
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Reviewed-by: Chandrakala Chavva <cchavva@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/48121
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/spi/Kconfig                |  11 +++
+ drivers/spi/Makefile               |   6 +-
+ drivers/spi/spi-cadence-xspi-pci.c | 108 +++++++++++++++++++++++++++++
+ drivers/spi/spi-cadence-xspi.c     |  48 +++++++++++--
+ 4 files changed, 166 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/spi/spi-cadence-xspi-pci.c
+
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index 5f07cb9b2880..9a9171b54481 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -883,6 +883,17 @@ config SPI_CADENCE_XSPI_PLATFORM
+ 	  device with a Cadence XSPI controller and want to access the
+ 	  Flash as an MTD device. Register as platform device.
+ 
++config SPI_CADENCE_XSPI_PCI
++	tristate "Cadence XSPI controller with PCI support"
++	depends on (OF || COMPILE_TEST) && HAS_IOMEM && PCI && 64BIT && ARM64
++	help
++	  Enable support for the Cadence XSPI Flash controller with PCI support.
++
++	  Cadence XSPI is a specialized controller for connecting an SPI
++	  Flash over upto 8bit wide bus. Enable this option if you have a
++	  device with a Cadence XSPI controller and want to access the
++	  Flash as an MTD device. Register as PCI device.
++
+ #
+ # Add new SPI master controllers in alphabetical order above this line
+ #
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index ca6936a115ed..932bfe146b61 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -122,8 +122,10 @@ obj-$(CONFIG_SPI_XLP)			+= spi-xlp.o
+ obj-$(CONFIG_SPI_XTENSA_XTFPGA)		+= spi-xtensa-xtfpga.o
+ obj-$(CONFIG_SPI_ZYNQ_QSPI)		+= spi-zynq-qspi.o
+ obj-$(CONFIG_SPI_ZYNQMP_GQSPI)		+= spi-zynqmp-gqspi.o
+-spi-cdns-xspi-plat-objs              	:= spi-cadence-xspi.o spi-cadence-xspi-platform.o
+-obj-$(CONFIG_SPI_CADENCE_XSPI_PLATFORM) += spi-cdns-xspi-plat.o
++spi-cdns-xspi-plat-objs			:= spi-cadence-xspi.o spi-cadence-xspi-platform.o
++obj-$(CONFIG_SPI_CADENCE_XSPI_PLATFORM)	+= spi-cdns-xspi-plat.o
++spi-cdns-xspi-pci-objs			:= spi-cadence-xspi.o spi-cadence-xspi-pci.o
++obj-$(CONFIG_SPI_CADENCE_XSPI_PCI)	+= spi-cdns-xspi-pci.o
+ 
+ # SPI slave protocol handlers
+ obj-$(CONFIG_SPI_SLAVE_TIME)		+= spi-slave-time.o
+diff --git a/drivers/spi/spi-cadence-xspi-pci.c b/drivers/spi/spi-cadence-xspi-pci.c
+new file mode 100644
+index 000000000000..3cc46a48c4e4
+--- /dev/null
++++ b/drivers/spi/spi-cadence-xspi-pci.c
+@@ -0,0 +1,108 @@
++// SPDX-License-Identifier: GPL-2.0+
++#include "spi-cadence-xspi.h"
++#include <linux/pci.h>
++
++#define DRV_NAME       "spi-cadence-octeon"
++#define STIG_OFFSET    (0x10000000)
++#define AUX_OFFSET     (0x2000)
++#define MAX_CS_COUNT   (4)
++#define PCI_CDNS_XSPI             0xA09B
++
++
++static int cadence_octeon_spi_probe(struct pci_dev *pdev,
++			       const struct pci_device_id *ent)
++{
++	struct device *dev = &pdev->dev;
++	void __iomem *register_base;
++	int ret;
++
++	struct spi_master *master = NULL;
++	struct cdns_xspi_dev *cdns_xspi = NULL;
++	struct cdns_xspi_platform_data *plat_data = NULL;
++
++	master = cdns_xspi_prepare_master(dev);
++	if (!master) {
++		ret = -ENOMEM;
++		dev_err(dev, "Failed to allocate memory for spi_master\n");
++		goto err_no_mem;
++	}
++
++	ret = pcim_enable_device(pdev);
++	if (ret)
++		return -ENODEV;
++
++	ret = pci_request_regions(pdev, DRV_NAME);
++	if (ret)
++		goto error_disable;
++
++	register_base = pcim_iomap(pdev, 0, pci_resource_len(pdev, 0));
++	if (!register_base) {
++		ret = -EINVAL;
++		goto error_disable;
++	}
++
++	plat_data = devm_kmalloc(dev, sizeof(*plat_data), GFP_KERNEL);
++	if (!plat_data) {
++		ret = -ENOMEM;
++		dev_err(dev, "Failed to allocate memory for platform_data\n");
++		goto error_disable;
++	}
++
++	cdns_xspi = spi_master_get_devdata(master);
++	cdns_xspi->plat_data = plat_data;
++	cdns_xspi->dev = dev;
++
++	cdns_xspi->iobase   = register_base;
++	cdns_xspi->auxbase  = register_base + AUX_OFFSET;
++	cdns_xspi->sdmabase = register_base + STIG_OFFSET;
++	cdns_xspi->irq = 0;
++
++	init_completion(&cdns_xspi->cmd_complete);
++	init_completion(&cdns_xspi->sdma_complete);
++
++	ret = cdns_xspi_configure(cdns_xspi);
++	if (ret) {
++		dev_err(dev, "Failed to prepare xSPI");
++		goto error_disable;
++	}
++
++	master->num_chipselect = 1 << cdns_xspi->hw_num_banks;
++
++	ret = devm_spi_register_master(dev, master);
++	if (ret)
++		dev_err(dev, "Failed to register SPI master\n");
++
++	return 0;
++
++error_disable:
++	spi_master_put(master);
++
++err_no_mem:
++	return ret;
++}
++
++static void cadence_octeon_spi_remove(struct pci_dev *pdev)
++{
++	pci_disable_device(pdev);
++}
++
++static const struct pci_device_id cadence_octeon_spi_pci_id_table[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_CAVIUM,
++		     PCI_CDNS_XSPI) },
++	{ 0, }
++};
++
++MODULE_DEVICE_TABLE(pci, cadence_octeon_spi_pci_id_table);
++
++static struct pci_driver cadence_octeon_spi_driver = {
++	.name		= DRV_NAME,
++	.id_table	= cadence_octeon_spi_pci_id_table,
++	.probe		= cadence_octeon_spi_probe,
++	.remove		= cadence_octeon_spi_remove,
++};
++
++module_pci_driver(cadence_octeon_spi_driver);
++
++MODULE_DESCRIPTION("xSPI PCI bus driver");
++MODULE_AUTHOR("Marvell Inc.");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/spi/spi-cadence-xspi.c b/drivers/spi/spi-cadence-xspi.c
+index 061ba8270638..7b11db5071d9 100644
+--- a/drivers/spi/spi-cadence-xspi.c
++++ b/drivers/spi/spi-cadence-xspi.c
+@@ -211,6 +211,9 @@ static void cdns_xspi_set_interrupts(struct cdns_xspi_dev *cdns_xspi,
+ {
+ 	u32 intr_enable;
+ 
++	if (!cdns_xspi->irq)
++		return;
++
+ 	intr_enable = readl(cdns_xspi->iobase + CDNS_XSPI_INTR_ENABLE_REG);
+ 	if (enabled)
+ 		intr_enable |= CDNS_XSPI_INTR_MASK;
+@@ -268,6 +271,34 @@ static void cdns_xspi_sdma_handle(struct cdns_xspi_dev *cdns_xspi)
+ 	}
+ }
+ 
++bool cdns_xspi_stig_ready(struct cdns_xspi_dev *cdns_xspi)
++{
++	u32 ctrl_stat;
++
++	readl_relaxed_poll_timeout
++		(cdns_xspi->iobase + CDNS_XSPI_CTRL_STATUS_REG,
++		ctrl_stat,
++		((ctrl_stat & BIT(3)) == 0),
++		10,
++		1000);
++
++	return true;
++}
++
++bool cdns_xspi_sdma_ready(struct cdns_xspi_dev *cdns_xspi)
++{
++	u32 ctrl_stat;
++
++	readl_relaxed_poll_timeout
++		(cdns_xspi->iobase + CDNS_XSPI_CTRL_STATUS_REG,
++		ctrl_stat,
++		((ctrl_stat & BIT(0)) == 0),
++		10,
++		1000);
++
++	return true;
++}
++
+ static int cdns_xspi_send_stig_command(struct cdns_xspi_dev *cdns_xspi,
+ 	const struct spi_mem_op *op, bool data_phase)
+ {
+@@ -301,15 +332,22 @@ static int cdns_xspi_send_stig_command(struct cdns_xspi_dev *cdns_xspi,
+ 
+ 		cdns_xspi_trigger_command(cdns_xspi, cmd_regs);
+ 
+-		wait_for_completion(&cdns_xspi->sdma_complete);
+-		if (cdns_xspi->sdma_error) {
+-			cdns_xspi_set_interrupts(cdns_xspi, false);
+-			return -EIO;
++		if (cdns_xspi->irq) {
++			wait_for_completion(&cdns_xspi->sdma_complete);
++			if (cdns_xspi->sdma_error) {
++				cdns_xspi_set_interrupts(cdns_xspi, false);
++				return -EIO;
++			}
++		} else {
++			cdns_xspi_sdma_ready(cdns_xspi);
+ 		}
+ 		cdns_xspi_sdma_handle(cdns_xspi);
+ 	}
+ 
+-	wait_for_completion(&cdns_xspi->cmd_complete);
++	if (cdns_xspi->irq)
++		wait_for_completion(&cdns_xspi->cmd_complete);
++	else
++		cdns_xspi_stig_ready(cdns_xspi);
+ 
+ 	cmd_status = cdns_xspi_check_command_status(cdns_xspi);
+ 	cdns_xspi_set_interrupts(cdns_xspi, false);
+-- 
+2.31.1
+

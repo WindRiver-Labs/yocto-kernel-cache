@@ -1,0 +1,190 @@
+From 2d1068f7fce34eaf30e42d3a7d7d0aa8927f57cb Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 15 Aug 2019 16:42:41 +0530
+Subject: [PATCH 0261/1921] octeontx2-pf: Fix interface init and shutdown
+ sequence
+
+This patch fixes multiple issues
+- netif_carrier_off() should be done before disabling
+  transmit at CGX/NPC level.
+- Fixed SQE free count checking in otx2_xmit()
+- In NAPI, added a check to wakeup a TXQ if incase it was stopped
+  earlier due to queue full.
+- In otx2_open() 'pfvf->intf_down' should be cleared before
+  enabling Rx at CGX/NPC level. Otherwise if in between CQ IRQ
+  is raised then in NAPI CQ interrupt will be disabled forever.
+- In otx2_stop(), RQ and SQ sizes should not be cleared, otherwise
+  upon interface DOWN and UP, RQ size will fallback to 256 which
+  is not supported on 96xx A0. Also if user has changed RQ/SQ size
+  via ethtool intf DOWN and UP will reset the sizes back to default.
+- Fixed time and packet coalescing settings, user given value was
+  getting shifted due to wrong type used while clamping it to within
+  supported ranges.
+
+Change-Id: I152ce646909e64ac6ff858ba0d253f3d59ea3d8d
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/14394
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/nic/otx2_ethtool.c      | 14 +++++++--
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 30 +++++++++++--------
+ .../marvell/octeontx2/nic/otx2_txrx.c         |  5 ++++
+ .../marvell/octeontx2/nic/otx2_txrx.h         |  4 +--
+ 4 files changed, 35 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+index 086ca416ceb1..7e792f2d7178 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_ethtool.c
+@@ -422,9 +422,9 @@ static int otx2_set_coalesce(struct net_device *netdev,
+ 	/* 'cq_time_wait' is 8bit and is in multiple of 100ns,
+ 	 * so clamp the user given value to the range of 1 to 25usec.
+ 	 */
+-	ec->rx_coalesce_usecs = clamp_t(u8, ec->rx_coalesce_usecs,
++	ec->rx_coalesce_usecs = clamp_t(u32, ec->rx_coalesce_usecs,
+ 					1, CQ_TIMER_THRESH_MAX);
+-	ec->tx_coalesce_usecs = clamp_t(u8, ec->tx_coalesce_usecs,
++	ec->tx_coalesce_usecs = clamp_t(u32, ec->tx_coalesce_usecs,
+ 					1, CQ_TIMER_THRESH_MAX);
+ 
+ 	/* Rx and Tx are mapped to same CQ, check which one
+@@ -438,6 +438,14 @@ static int otx2_set_coalesce(struct net_device *netdev,
+ 		pfvf->cq_time_wait = min_t(u8, ec->rx_coalesce_usecs,
+ 					   ec->tx_coalesce_usecs);
+ 
++	/* Max ecount_wait supported is 16bit,
++	 * so clamp the user given value to the range of 1 to 64k.
++	 */
++	ec->rx_max_coalesced_frames = clamp_t(u32, ec->rx_max_coalesced_frames,
++					      1, U16_MAX);
++	ec->tx_max_coalesced_frames = clamp_t(u32, ec->tx_max_coalesced_frames,
++					      1, U16_MAX);
++
+ 	/* Rx and Tx are mapped to same CQ, check which one
+ 	 * is changed, if both then choose the min.
+ 	 */
+@@ -446,7 +454,7 @@ static int otx2_set_coalesce(struct net_device *netdev,
+ 	else if (pfvf->cq_ecount_wait == ec->tx_max_coalesced_frames)
+ 		pfvf->cq_ecount_wait = ec->rx_max_coalesced_frames;
+ 	else
+-		pfvf->cq_ecount_wait = min_t(u8, ec->rx_max_coalesced_frames,
++		pfvf->cq_ecount_wait = min_t(u16, ec->rx_max_coalesced_frames,
+ 					     ec->tx_max_coalesced_frames);
+ 
+ 	for (qidx = 0; qidx < pfvf->hw.cint_cnt; qidx++)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 392d83152d2b..932cafbade79 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1432,17 +1432,19 @@ static netdev_tx_t otx2_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 
+ 	sq = &pf->qset.sq[qidx];
+ 
+-	if (!netif_tx_queue_stopped(txq) &&
+-	    !otx2_sq_append_skb(netdev, sq, skb, qidx)) {
++	if (netif_tx_queue_stopped(txq)) {
++		dev_kfree_skb(skb);
++	} else if (!otx2_sq_append_skb(netdev, sq, skb, qidx)) {
+ 		netif_tx_stop_queue(txq);
+ 
+-		/* Barrier, for stop_queue to be visible on other cpus */
++		/* Check again, incase SQBs got freed up */
+ 		smp_mb();
+-		if ((sq->num_sqbs - *sq->aura_fc_addr) > 1)
+-			netif_tx_start_queue(txq);
++		if (((sq->num_sqbs - *sq->aura_fc_addr) * sq->sqe_per_sqb)
++							> sq->sqe_thresh)
++			netif_tx_wake_queue(txq);
+ 		else
+ 			netdev_warn(netdev,
+-				    "%s: No free SQE/SQB, stopping SQ%d\n",
++				    "%s: Transmit ring full, stopping SQ%d\n",
+ 				     netdev->name, qidx);
+ 
+ 		return NETDEV_TX_BUSY;
+@@ -1574,12 +1576,12 @@ int otx2_open(struct net_device *netdev)
+ 
+ 	otx2_set_cints_affinity(pf);
+ 
++	pf->intf_down = false;
++
+ 	err = otx2_rxtx_enable(pf, true);
+ 	if (err)
+ 		goto err_free_cints;
+ 
+-	pf->intf_down = false;
+-
+ 	/* we have already received link status notification */
+ 	if (pf->linfo.link_up && !(pf->pcifunc & RVU_PFVF_FUNC_MASK))
+ 		otx2_handle_link_event(pf);
+@@ -1621,15 +1623,15 @@ int otx2_stop(struct net_device *netdev)
+ 	struct otx2_qset *qset = &pf->qset;
+ 	int qidx, vec, wrk;
+ 
+-	/* First stop packet Rx/Tx */
+-	otx2_rxtx_enable(pf, false);
++	netif_carrier_off(netdev);
++	netif_tx_stop_all_queues(netdev);
+ 
+ 	pf->intf_down = true;
+ 	/* 'intf_down' may be checked on any cpu */
+ 	smp_wmb();
+ 
+-	netif_carrier_off(netdev);
+-	netif_tx_stop_all_queues(netdev);
++	/* First stop packet Rx/Tx */
++	otx2_rxtx_enable(pf, false);
+ 
+ 	/* Cleanup Queue IRQ */
+ 	vec = pci_irq_vector(pf->pdev,
+@@ -1668,7 +1670,9 @@ int otx2_stop(struct net_device *netdev)
+ 	kfree(qset->cq);
+ 	kfree(qset->rq);
+ 	kfree(qset->napi);
+-	memset(qset, 0, sizeof(*qset));
++	/* Do not clear RQ/SQ ringsize settings */
++	memset(qset + offsetof(struct otx2_qset, sqe_cnt), 0,
++	       sizeof(*qset) - offsetof(struct otx2_qset, sqe_cnt));
+ 	return 0;
+ }
+ EXPORT_SYMBOL(otx2_stop);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index c5cbb2c2a539..fce568f671dd 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -464,6 +464,11 @@ int otx2_napi_handler(struct otx2_cq_queue *cq,
+ 	if (tx_pkts) {
+ 		txq = netdev_get_tx_queue(pfvf->netdev, cq->cint_idx);
+ 		netdev_tx_completed_queue(txq, tx_pkts, tx_bytes);
++		/* Check if queue was stopped earlier due to ring full */
++		smp_mb();
++		if (netif_carrier_ok(pfvf->netdev) &&
++		    netif_tx_queue_stopped(txq))
++			netif_tx_wake_queue(txq);
+ 	}
+ 
+ 	if (!cq->pool_ptrs)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+index 757df4aa42ca..11176a3ed0c9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.h
+@@ -115,11 +115,11 @@ struct otx2_cq_queue {
+ } ____cacheline_aligned_in_smp;
+ 
+ struct otx2_qset {
++	u32			rqe_cnt;
++	u32			sqe_cnt; /* Keep these two at top */
+ #define OTX2_MAX_CQ_CNT		64
+ 	u16			cq_cnt;
+ 	u16			xqe_size;
+-	u32			rqe_cnt;
+-	u32			sqe_cnt;
+ 	struct otx2_pool	*pool;
+ 	struct otx2_cq_poll	*napi;
+ 	struct otx2_cq_queue	*cq;
+-- 
+2.31.1
+

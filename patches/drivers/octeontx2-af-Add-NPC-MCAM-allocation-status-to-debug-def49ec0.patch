@@ -1,0 +1,325 @@
+From d1da9492909743e89891dc8f89598ce91d0ab715 Mon Sep 17 00:00:00 2001
+From: Sunil Goutham <sgoutham@marvell.com>
+Date: Thu, 7 Feb 2019 21:15:25 +0530
+Subject: [PATCH 0083/1921] octeontx2-af: Add NPC MCAM allocation status to
+ debugfs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Added support to display current NPC MCAM entries and counter's allocation
+status ín debugfs.
+
+One NPC MCAM counter (last one) is reserved and mapped to NPC RX_INTF's
+MISS_ACTION to count dropped packets due to no MCAM entry match.
+
+cat /sys/kernel/debug/octeontx2/npc/mcam_info' will dump following info
+- MCAM Rx and Tx keysize
+- Total MCAM entries and counters
+- Current available count
+- Count of number of MCAM entries and counters allocated
+  to a RVU PF/VF device.
+
+Change-Id: I9e3bbf9b5e2647427b85cd102a1fbace99d6d559
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+Signed-off-by: Prakash Brahmajyosyula <bprakash@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |   8 +
+ .../marvell/octeontx2/af/rvu_debugfs.c        | 151 ++++++++++++++++++
+ .../ethernet/marvell/octeontx2/af/rvu_npc.c   |  53 +++++-
+ 3 files changed, 210 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 47c4f632bbbc..e1f873cb374b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -51,6 +51,7 @@ struct rvu_debugfs {
+ 	struct dentry *cgx;
+ 	struct dentry *lmac;
+ 	struct dentry *nix;
++	struct dentry *npc;
+ 	struct dump_ctx npa_aura_ctx;
+ 	struct dump_ctx npa_pool_ctx;
+ 	struct dump_ctx nix_cq_ctx;
+@@ -124,6 +125,7 @@ struct npc_mcam {
+ 	u16	lprio_start;
+ 	u16	hprio_count;
+ 	u16	hprio_end;
++	u16	rx_miss_act_cntr;
+ };
+ 
+ struct sso_rsrc {
+@@ -563,6 +565,12 @@ void rvu_npc_disable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_enable_default_entries(struct rvu *rvu, u16 pcifunc, int nixlf);
+ void rvu_npc_update_flowkey_alg_idx(struct rvu *rvu, u16 pcifunc, int nixlf,
+ 				    int group, int alg_idx, int mcam_index);
++void rvu_npc_get_mcam_entry_alloc_info(struct rvu *rvu, u16 pcifunc,
++				       int blkaddr, int *alloc_cnt,
++				       int *enable_cnt);
++void rvu_npc_get_mcam_counter_alloc_info(struct rvu *rvu, u16 pcifunc,
++					 int blkaddr, int *alloc_cnt,
++					 int *enable_cnt);
+ int rvu_mbox_handler_npc_mcam_alloc_entry(struct rvu *rvu,
+ 					  struct npc_mcam_alloc_entry_req *req,
+ 					  struct npc_mcam_alloc_entry_rsp *rsp);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+index fa7ff2543cf9..b666a2280929 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_debugfs.c
+@@ -1197,6 +1197,156 @@ static int rvu_dbg_nix_cq_ctx_display(struct seq_file *filp, void *unused)
+ 
+ RVU_DEBUG_SEQ_FOPS(nix_cq_ctx, nix_cq_ctx_display, nix_cq_ctx_write);
+ 
++/* NPC debugfs APIs */
++static inline void rvu_print_npc_mcam_info(struct seq_file *s,
++					   u16 pcifunc, int blkaddr)
++{
++	struct rvu *rvu = s->private;
++	int entry_acnt, entry_ecnt;
++	int cntr_acnt, cntr_ecnt;
++
++	/* Skip PF0 */
++	if (!pcifunc)
++		return;
++	rvu_npc_get_mcam_entry_alloc_info(rvu, pcifunc, blkaddr,
++					  &entry_acnt, &entry_ecnt);
++	rvu_npc_get_mcam_counter_alloc_info(rvu, pcifunc, blkaddr,
++					    &cntr_acnt, &cntr_ecnt);
++	if (!entry_acnt && !cntr_acnt)
++		return;
++
++	if (!(pcifunc & RVU_PFVF_FUNC_MASK))
++		seq_printf(s, "\n\t\t Device \t\t: PF%d\n",
++			   rvu_get_pf(pcifunc));
++	else
++		seq_printf(s, "\n\t\t Device \t\t: PF%d VF%d\n",
++			   rvu_get_pf(pcifunc),
++			   (pcifunc & RVU_PFVF_FUNC_MASK) - 1);
++
++	if (entry_acnt) {
++		seq_printf(s, "\t\t Entries allocated \t: %d\n", entry_acnt);
++		seq_printf(s, "\t\t Entries enabled \t: %d\n", entry_ecnt);
++	}
++	if (cntr_acnt) {
++		seq_printf(s, "\t\t Counters allocated \t: %d\n", cntr_acnt);
++		seq_printf(s, "\t\t Counters enabled \t: %d\n", cntr_ecnt);
++	}
++}
++
++static int rvu_dbg_npc_mcam_info_display(struct seq_file *filp, void *unsued)
++{
++	struct rvu *rvu = filp->private;
++	int pf, vf, numvfs, blkaddr;
++	struct npc_mcam *mcam;
++	u16 pcifunc;
++	u64 cfg;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return -ENODEV;
++
++	mcam = &rvu->hw->mcam;
++
++	seq_puts(filp, "\nNPC MCAM info:\n");
++	/* MCAM keywidth on receive and transmit sides */
++	cfg = rvu_read64(rvu, blkaddr, NPC_AF_INTFX_KEX_CFG(NIX_INTF_RX));
++	cfg = (cfg >> 32) & 0x07;
++	seq_printf(filp, "\t\t RX keywidth \t: %s\n", (cfg == NPC_MCAM_KEY_X1) ?
++		   "112bits" : ((cfg == NPC_MCAM_KEY_X2) ?
++		   "224bits" : "448bits"));
++	cfg = rvu_read64(rvu, blkaddr, NPC_AF_INTFX_KEX_CFG(NIX_INTF_TX));
++	cfg = (cfg >> 32) & 0x07;
++	seq_printf(filp, "\t\t TX keywidth \t: %s\n", (cfg == NPC_MCAM_KEY_X1) ?
++		   "112bits" : ((cfg == NPC_MCAM_KEY_X2) ?
++		   "224bits" : "448bits"));
++
++	mutex_lock(&mcam->lock);
++	/* MCAM entries */
++	seq_printf(filp, "\n\t\t MCAM entries \t: %d\n", mcam->total_entries);
++	seq_printf(filp, "\t\t Reserved \t: %d\n",
++		   mcam->total_entries - mcam->bmap_entries);
++	seq_printf(filp, "\t\t Available \t: %d\n", mcam->bmap_fcnt);
++
++	/* MCAM counters */
++	cfg = rvu_read64(rvu, blkaddr, NPC_AF_CONST);
++	cfg = (cfg >> 48) & 0xFFFF;
++	seq_printf(filp, "\n\t\t MCAM counters \t: %lld\n", cfg);
++	seq_printf(filp, "\t\t Reserved \t: %lld\n", cfg - mcam->counters.max);
++	seq_printf(filp, "\t\t Available \t: %d\n",
++		   rvu_rsrc_free_count(&mcam->counters));
++
++	if (mcam->bmap_entries == mcam->bmap_fcnt)
++		return 0;
++
++	seq_puts(filp, "\n\t\t Current allocation\n");
++	seq_puts(filp, "\t\t====================\n");
++	for (pf = 0; pf < rvu->hw->total_pfs; pf++) {
++		pcifunc = (pf << RVU_PFVF_PF_SHIFT);
++		rvu_print_npc_mcam_info(filp, pcifunc, blkaddr);
++
++		cfg = rvu_read64(rvu, BLKADDR_RVUM, RVU_PRIV_PFX_CFG(pf));
++		numvfs = (cfg >> 12) & 0xFF;
++		for (vf = 0; vf < numvfs; vf++) {
++			pcifunc = (pf << RVU_PFVF_PF_SHIFT) | (vf + 1);
++			rvu_print_npc_mcam_info(filp, pcifunc, blkaddr);
++		}
++	}
++
++	mutex_unlock(&mcam->lock);
++	return 0;
++}
++
++RVU_DEBUG_SEQ_FOPS(npc_mcam_info, npc_mcam_info_display, NULL);
++
++static int rvu_dbg_npc_rx_miss_stats_display(struct seq_file *filp,
++					     void *unused)
++{
++	struct rvu *rvu = filp->private;
++	struct npc_mcam *mcam;
++	int blkaddr;
++
++	blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NPC, 0);
++	if (blkaddr < 0)
++		return -ENODEV;
++
++	mcam = &rvu->hw->mcam;
++
++	seq_puts(filp, "\nNPC MCAM RX miss action stats\n");
++	seq_printf(filp, "\t\tStat %d: \t%lld\n", mcam->rx_miss_act_cntr,
++		   rvu_read64(rvu, blkaddr,
++			      NPC_AF_MATCH_STATX(mcam->rx_miss_act_cntr)));
++
++	return 0;
++}
++
++RVU_DEBUG_SEQ_FOPS(npc_rx_miss_act, npc_rx_miss_stats_display, NULL);
++
++static void rvu_dbg_npc_init(struct rvu *rvu)
++{
++	const struct device *dev = &rvu->pdev->dev;
++	struct dentry *pfile;
++
++	rvu->rvu_dbg.npc = debugfs_create_dir("npc", rvu->rvu_dbg.root);
++	if (!rvu->rvu_dbg.npc)
++		return;
++
++	pfile = debugfs_create_file("mcam_info", 0444, rvu->rvu_dbg.npc,
++				    rvu, &rvu_dbg_npc_mcam_info_fops);
++	if (!pfile)
++		goto create_failed;
++
++	pfile = debugfs_create_file("rx_miss_act_stats", 0444, rvu->rvu_dbg.npc,
++				    rvu, &rvu_dbg_npc_rx_miss_act_fops);
++	if (!pfile)
++		goto create_failed;
++
++	return;
++
++create_failed:
++	dev_err(dev, "Failed to create debugfs dir/file for NPC\n");
++	debugfs_remove_recursive(rvu->rvu_dbg.npc);
++}
++
+ static void rvu_dbg_nix_init(struct rvu *rvu)
+ {
+ 	const struct device *dev = &rvu->pdev->dev;
+@@ -1346,6 +1496,7 @@ void rvu_dbg_init(struct rvu *rvu)
+ 	rvu_dbg_npa_init(rvu);
+ 	rvu_dbg_cgx_init(rvu);
+ 	rvu_dbg_nix_init(rvu);
++	rvu_dbg_npc_init(rvu);
+ 
+ 	return;
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+index b706d005f591..77480200a5b9 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_npc.c
+@@ -1123,6 +1123,13 @@ static int npc_mcam_rsrcs_init(struct rvu *rvu, int blkaddr)
+ 	mcam->hprio_count = mcam->lprio_count;
+ 	mcam->hprio_end = mcam->hprio_count;
+ 
++	/* Reserve last counter for MCAM RX miss action which is set to
++	 * drop pkt. This way we will know how many pkts didn't match
++	 * any MCAM entry.
++	 */
++	mcam->counters.max--;
++	mcam->rx_miss_act_cntr = mcam->counters.max;
++
+ 	/* Allocate bitmap for managing MCAM counters and memory
+ 	 * for saving counter to RVU PFFUNC allocation mapping.
+ 	 */
+@@ -1160,6 +1167,7 @@ static int npc_mcam_rsrcs_init(struct rvu *rvu, int blkaddr)
+ int rvu_npc_init(struct rvu *rvu)
+ {
+ 	struct npc_pkind *pkind = &rvu->hw->pkind;
++	struct npc_mcam *mcam = &rvu->hw->mcam;
+ 	u64 keyz = NPC_MCAM_KEY_X2;
+ 	int blkaddr, entry, bank, err;
+ 	u64 cfg, nibble_ena;
+@@ -1242,10 +1250,13 @@ int rvu_npc_init(struct rvu *rvu)
+ 	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_MISS_ACT(NIX_INTF_TX),
+ 		    NIX_TX_ACTIONOP_UCAST_DEFAULT);
+ 
+-	/* If MCAM lookup doesn't result in a match, drop the received packet */
++	/* If MCAM lookup doesn't result in a match, drop the received packet
++	 * And map this action to a counter to count dropped pkts.
++	 */
+ 	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_MISS_ACT(NIX_INTF_RX),
+ 		    NIX_RX_ACTIONOP_DROP);
+-
++	rvu_write64(rvu, blkaddr, NPC_AF_INTFX_MISS_STAT_ACT(NIX_INTF_RX),
++		    BIT_ULL(9) | mcam->rx_miss_act_cntr);
+ 	return 0;
+ }
+ 
+@@ -1259,6 +1270,44 @@ void rvu_npc_freemem(struct rvu *rvu)
+ 	mutex_destroy(&mcam->lock);
+ }
+ 
++void rvu_npc_get_mcam_entry_alloc_info(struct rvu *rvu, u16 pcifunc,
++				       int blkaddr, int *alloc_cnt,
++				       int *enable_cnt)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int entry;
++
++	*alloc_cnt = 0;
++	*enable_cnt = 0;
++
++	for (entry = 0; entry < mcam->bmap_entries; entry++) {
++		if (mcam->entry2pfvf_map[entry] == pcifunc) {
++			(*alloc_cnt)++;
++			if (is_mcam_entry_enabled(rvu, mcam, blkaddr, entry))
++				(*enable_cnt)++;
++		}
++	}
++}
++
++void rvu_npc_get_mcam_counter_alloc_info(struct rvu *rvu, u16 pcifunc,
++					 int blkaddr, int *alloc_cnt,
++					 int *enable_cnt)
++{
++	struct npc_mcam *mcam = &rvu->hw->mcam;
++	int cntr;
++
++	*alloc_cnt = 0;
++	*enable_cnt = 0;
++
++	for (cntr = 0; cntr < mcam->counters.max; cntr++) {
++		if (mcam->cntr2pfvf_map[cntr] == pcifunc) {
++			(*alloc_cnt)++;
++			if (mcam->cntr_refcnt[cntr])
++				(*enable_cnt)++;
++		}
++	}
++}
++
+ static int npc_mcam_verify_entry(struct npc_mcam *mcam,
+ 				 u16 pcifunc, int entry)
+ {
+-- 
+2.31.1
+

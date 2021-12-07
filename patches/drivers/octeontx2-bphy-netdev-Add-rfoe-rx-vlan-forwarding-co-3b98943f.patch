@@ -1,0 +1,177 @@
+From a91d5f81f87eea2372a54f111e27f102c3708d1c Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Mon, 10 May 2021 11:50:13 +0530
+Subject: [PATCH 1554/1921] octeontx2-bphy-netdev: Add rfoe rx vlan forwarding
+ configuration
+
+This patch adds support for VLAN forwarding configuration which
+enables/disables forwarding the incoming VLAN packets matching
+a VID.
+
+The configuration is done using "ip link" command:
+Example (enable forwarding packets with vid 5):
+    # ip link add link rfoe0 name rfoe0.5 type vlan id 5
+
+Change-Id: Ie12e0f2d1c3339686aae9306a5d6ca8f0026f4a4
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/51953
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/bphy/otx2_bphy_hw.h     | 10 +++
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        | 73 +++++++++++++++++++
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        |  2 +
+ 3 files changed, 85 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_hw.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_hw.h
+index bed5a285a62e..1ac0c2483480 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_hw.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_hw.h
+@@ -39,6 +39,9 @@
+ /* RFOE MHAB register offsets */
+ #define RFOEX_RX_CTL(a)				(0x0818ULL | \
+ 						 ((unsigned long)(a) << 36))
++#define RFOEX_RX_VLANX_CFG(a, b)		(0x0870ULL | \
++						 ((unsigned long)(a) << 36) | \
++						 ((b) << 3))
+ #define RFOEX_RX_INDIRECT_INDEX_OFFSET(a)	(0x13F8ULL | \
+ 						 ((unsigned long)(a) << 36))
+ #define RFOEX_RX_IND_FTX_CFG(a, b)	(0x1400ULL | \
+@@ -50,6 +53,9 @@
+ 						 ((unsigned long)(a) << 36))
+ #define RFOEX_RX_IND_MBT_SEG_STATE(a)		(0x1430ULL | \
+ 						 ((unsigned long)(a) << 36))
++#define RFOEX_RX_IND_VLANX_FWD(a, b)		(0x14D0ULL | \
++						 ((unsigned long)(a) << 36) | \
++						 ((b) << 3))
+ #define RFOEX_RX_IND_JDT_CFG0(a)		(0x1440ULL | \
+ 						 ((unsigned long)(a) << 36))
+ #define RFOEX_RX_IND_JDT_CFG1(a)		(0x1448ULL | \
+@@ -344,6 +350,10 @@ struct rfoex_abx_slotx_configuration2 {
+ 	u64 reserved1		: 8;
+ };
+ 
++struct rfoe_rx_ind_vlanx_fwd {
++	u64 fwd			: 64;
++};
++
+ struct mhab_job_desc_cfg {
+ 	struct rfoex_abx_slotx_configuration cfg;
+ 	struct rfoex_abx_slotx_configuration1 cfg1;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index 8af48a01a080..44a933e74c15 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -1082,7 +1082,78 @@ static int otx2_rfoe_eth_stop(struct net_device *netdev)
+ 	return 0;
+ }
+ 
++static int otx2_rfoe_init(struct net_device *netdev)
++{
++	struct otx2_rfoe_ndev_priv *priv = netdev_priv(netdev);
++
++	/* Enable VLAN TPID match */
++	writeq(0x18100, (priv->rfoe_reg_base +
++			 RFOEX_RX_VLANX_CFG(priv->rfoe_num, 0)));
++	netdev->features |= NETIF_F_HW_VLAN_CTAG_FILTER;
++
++	return 0;
++}
++
++static int otx2_rfoe_vlan_rx_configure(struct net_device *netdev, u16 vid,
++				       bool forward)
++{
++	struct rfoe_rx_ind_vlanx_fwd fwd;
++	struct otx2_rfoe_ndev_priv *priv = netdev_priv(netdev);
++	struct otx2_bphy_cdev_priv *cdev_priv = priv->cdev_priv;
++	u64 index = (vid >> 6) & 0x3F;
++	u64 mask = (0x1ll << (vid & 0x3F));
++	unsigned long flags;
++
++	if (vid >= VLAN_N_VID) {
++		netdev_err(netdev, "Invalid VLAN ID %d\n", vid);
++		return -EINVAL;
++	}
++
++	spin_lock_irqsave(&cdev_priv->mbt_lock, flags);
++
++	if (forward && priv->rfoe_common->rx_vlan_fwd_refcnt[vid]++)
++		goto out;
++
++	if (!forward && --priv->rfoe_common->rx_vlan_fwd_refcnt[vid])
++		goto out;
++
++	/* read current fwd mask */
++	writeq(index, (priv->rfoe_reg_base +
++		       RFOEX_RX_INDIRECT_INDEX_OFFSET(priv->rfoe_num)));
++	fwd.fwd = readq(priv->rfoe_reg_base +
++			RFOEX_RX_IND_VLANX_FWD(priv->rfoe_num, 0));
++
++	if (forward)
++		fwd.fwd |= mask;
++	else
++		fwd.fwd &= ~mask;
++
++	/* write the new fwd mask */
++	writeq(index, (priv->rfoe_reg_base +
++		       RFOEX_RX_INDIRECT_INDEX_OFFSET(priv->rfoe_num)));
++	writeq(fwd.fwd, (priv->rfoe_reg_base +
++			 RFOEX_RX_IND_VLANX_FWD(priv->rfoe_num, 0)));
++
++out:
++	spin_unlock_irqrestore(&cdev_priv->mbt_lock, flags);
++
++	return 0;
++}
++
++static int otx2_rfoe_vlan_rx_add(struct net_device *netdev, __be16 proto,
++				 u16 vid)
++{
++	return otx2_rfoe_vlan_rx_configure(netdev, vid, true);
++}
++
++static int otx2_rfoe_vlan_rx_kill(struct net_device *netdev, __be16 proto,
++				  u16 vid)
++{
++	return otx2_rfoe_vlan_rx_configure(netdev, vid, false);
++}
++
+ static const struct net_device_ops otx2_rfoe_netdev_ops = {
++	.ndo_init		= otx2_rfoe_init,
+ 	.ndo_open		= otx2_rfoe_eth_open,
+ 	.ndo_stop		= otx2_rfoe_eth_stop,
+ 	.ndo_start_xmit		= otx2_rfoe_eth_start_xmit,
+@@ -1090,6 +1161,8 @@ static const struct net_device_ops otx2_rfoe_netdev_ops = {
+ 	.ndo_set_mac_address	= eth_mac_addr,
+ 	.ndo_validate_addr	= eth_validate_addr,
+ 	.ndo_get_stats64	= otx2_rfoe_get_stats64,
++	.ndo_vlan_rx_add_vid	= otx2_rfoe_vlan_rx_add,
++	.ndo_vlan_rx_kill_vid	= otx2_rfoe_vlan_rx_kill,
+ };
+ 
+ static void otx2_rfoe_dump_rx_ft_cfg(struct otx2_rfoe_ndev_priv *priv)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index cd739f2094a0..4c8d7e52d5b5 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -20,6 +20,7 @@
+ #include <linux/if_ether.h>
+ #include <linux/net_tstamp.h>
+ #include <linux/ptp_clock_kernel.h>
++#include <linux/if_vlan.h>
+ 
+ #include "otx2_bphy.h"
+ #include "otx2_bphy_hw.h"
+@@ -163,6 +164,7 @@ struct tx_job_queue_cfg {
+ struct rfoe_common_cfg {
+ 	struct tx_job_queue_cfg		tx_oth_job_cfg;
+ 	u8				refcnt;
++	u8				rx_vlan_fwd_refcnt[VLAN_N_VID];
+ };
+ 
+ /* ptp pending skb list */
+-- 
+2.31.1
+

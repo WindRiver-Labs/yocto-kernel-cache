@@ -1,0 +1,113 @@
+From 231688e4223982934a5abc9d8f1ee54437bebefc Mon Sep 17 00:00:00 2001
+From: Radha Mohan Chintakuntla <radhac@marvell.com>
+Date: Thu, 8 Oct 2020 22:43:36 -0700
+Subject: [PATCH 0817/1921] octeontx2-af: Add support for multiple SDP blocks
+
+98xx SoC has 2xSDP blocks each connected to different NIX blocks. So we
+need a way to use the correct SDP+NIX combination during initialization.
+This patch adds support for handling this case.
+
+Signed-off-by: Radha Mohan Chintakuntla <radhac@marvell.com>
+Change-Id: I88ab793b82b66c78af88ad7da0c68e6b2910d9e6
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/37851
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/rvu.c    |  7 ++++++-
+ .../net/ethernet/marvell/octeontx2/af/rvu.h    |  7 ++++++-
+ .../ethernet/marvell/octeontx2/af/rvu_sdp.c    | 18 ++++++++++++++++++
+ 3 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+index 7202a3c44dfe..c7c3d95e7dca 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.c
+@@ -1461,9 +1461,10 @@ static int rvu_get_nix_blkaddr(struct rvu *rvu, u16 pcifunc)
+ 	int blkaddr = BLKADDR_NIX0, vf;
+ 	struct rvu_pfvf *pf;
+ 
++	pf = rvu_get_pfvf(rvu, pcifunc & ~RVU_PFVF_FUNC_MASK);
++
+ 	/* All CGX mapped PFs are set with assigned NIX block during init */
+ 	if (is_pf_cgxmapped(rvu, rvu_get_pf(pcifunc))) {
+-		pf = rvu_get_pfvf(rvu, pcifunc & ~RVU_PFVF_FUNC_MASK);
+ 		blkaddr = pf->nix_blkaddr;
+ 	} else if (is_afvf(pcifunc)) {
+ 		vf = pcifunc - 1;
+@@ -1476,6 +1477,10 @@ static int rvu_get_nix_blkaddr(struct rvu *rvu, u16 pcifunc)
+ 			blkaddr = BLKADDR_NIX0;
+ 	}
+ 
++	/* if SDP1 then the blkaddr is NIX1 */
++	if (pf->is_sdp1)
++		blkaddr = BLKADDR_NIX1;
++
+ 	switch (blkaddr) {
+ 	case BLKADDR_NIX1:
+ 		pfvf->nix_blkaddr = BLKADDR_NIX1;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index 50c4b1280f69..c167cc57faaf 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -317,6 +317,8 @@ struct rvu_pfvf {
+ 	int     intf_mode;
+ 	u8	nix_rx_intf; /* NIX0_RX/NIX1_RX interface to NPC */
+ 	u8	nix_tx_intf; /* NIX0_TX/NIX1_TX interface to NPC */
++	bool	is_sdp0; /* is this PF mapped to SDP0 */
++	bool	is_sdp1; /* is this PF mapped to SDP1 */
+ };
+ 
+ struct nix_txsch {
+@@ -629,7 +631,10 @@ void rvu_aq_free(struct rvu *rvu, struct admin_queue *aq);
+ /* CGX APIs */
+ static inline bool is_pf_cgxmapped(struct rvu *rvu, u8 pf)
+ {
+-	return (pf >= PF_CGXMAP_BASE && pf <= rvu->cgx_mapped_pfs);
++	struct rvu_pfvf *pfvf = &rvu->pf[pf];
++
++	return (pf >= PF_CGXMAP_BASE && pf <= rvu->cgx_mapped_pfs) &&
++		(!pfvf->is_sdp0 && !pfvf->is_sdp1);
+ }
+ 
+ static inline void rvu_get_cgx_lmac_id(u8 map, u8 *cgx_id, u8 *lmac_id)
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
+index f2d318f3641d..2002b197baa3 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
+@@ -43,6 +43,7 @@ bool is_sdp_pf(u16 pcifunc)
+ int rvu_sdp_init(struct rvu *rvu)
+ {
+ 	struct pci_dev *pdev = NULL;
++	struct rvu_pfvf *pfvf;
+ 	u32 i = 0;
+ 
+ 	while ((i < MAX_SDP) && (pdev = pci_get_device(PCI_VENDOR_ID_CAVIUM,
+@@ -50,6 +51,23 @@ int rvu_sdp_init(struct rvu *rvu)
+ 						       pdev)) != NULL) {
+ 		/* The RVU PF number is one less than bus number */
+ 		sdp_pf_num[i] = pdev->bus->number - 1;
++		pfvf = &rvu->pf[sdp_pf_num[i]];
++		/* To differentiate a PF between SDP0 or SDP1 we make use of the
++		 * revision ID field in the config space. The revision is filled
++		 * by the firmware.
++		 * 0 means SDP0
++		 * 1 means SDP1
++		 */
++		if (pdev->revision) {
++			pfvf->is_sdp0 = 0;
++			pfvf->is_sdp1 = 1;
++		} else {
++			pfvf->is_sdp0 = 1;
++			pfvf->is_sdp1 = 0;
++		}
++
++		dev_info(rvu->dev, "SDP PF number:%d\n", sdp_pf_num[i]);
++
+ 		put_device(&pdev->dev);
+ 		i++;
+ 	}
+-- 
+2.31.1
+

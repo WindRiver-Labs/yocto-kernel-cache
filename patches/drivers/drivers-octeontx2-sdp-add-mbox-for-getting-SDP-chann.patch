@@ -1,0 +1,192 @@
+From 9e668d2f577ef5ee3222571be3ed86d4bed72f30 Mon Sep 17 00:00:00 2001
+From: Radha Mohan Chintakuntla <radhac@marvell.com>
+Date: Sun, 20 Jun 2021 22:37:52 -0700
+Subject: [PATCH 1607/1921] drivers: octeontx2-sdp: add mbox for getting SDP
+ channel information
+
+From CN10K onwards the SDP channels are programmable. So implemented a
+mailbox message to get the base channel and number of channels for the
+SDP block. For CN9K the mailbox will give the HW fixed values.
+
+Signed-off-by: Radha Mohan Chintakuntla <radhac@marvell.com>
+Change-Id: I131bc1c12114a6a47d008ca176d044a6bd02eb83
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/54498
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  8 +++
+ .../ethernet/marvell/octeontx2/af/rvu_sdp.c   | 19 +++++++
+ drivers/soc/marvell/octeontx2-sdp/sdp.c       | 51 +++++++++++++++++++
+ drivers/soc/marvell/octeontx2-sdp/sdp.h       |  4 +-
+ 4 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 17083987213b..c673084c21ff 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -245,6 +245,7 @@ M(REE_RULE_DB_GET,	0xE05, ree_rule_db_get,				\
+ 				ree_rule_db_get_rsp_msg)		\
+ /* SDP mbox IDs (range 0x1000 - 0x11FF) */				\
+ M(SET_SDP_CHAN_INFO, 0x1000, set_sdp_chan_info, sdp_chan_info_msg, msg_rsp) \
++M(GET_SDP_CHAN_INFO, 0x1001, get_sdp_chan_info, msg_req, sdp_get_chan_info_msg) \
+ /* NPC mbox IDs (range 0x6000 - 0x7FFF) */				\
+ M(NPC_MCAM_ALLOC_ENTRY,	0x6000, npc_mcam_alloc_entry, npc_mcam_alloc_entry_req,\
+ 				npc_mcam_alloc_entry_rsp)		\
+@@ -1944,4 +1945,11 @@ struct sdp_chan_info_msg {
+ 	struct mbox_msghdr hdr;
+ 	struct sdp_node_info info;
+ };
++
++struct sdp_get_chan_info_msg {
++	struct mbox_msghdr hdr;
++	u16 chan_base;
++	u16 num_chan;
++};
++
+ #endif /* MBOX_H */
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
+index 8b1f1c3ad6a2..a4e714c2207e 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_sdp.c
+@@ -90,3 +90,22 @@ rvu_mbox_handler_set_sdp_chan_info(struct rvu *rvu,
+ 		 req->info.pf_srn);
+ 	return 0;
+ }
++
++int
++rvu_mbox_handler_get_sdp_chan_info(struct rvu *rvu, struct msg_req *req,
++				   struct sdp_get_chan_info_msg *rsp)
++{
++	struct rvu_hwinfo *hw = rvu->hw;
++	int blkaddr;
++
++	if (!hw->cap.programmable_chans) {
++		rsp->chan_base = NIX_CHAN_SDP_CH_START;
++		rsp->num_chan = NIX_CHAN_SDP_NUM_CHANS;
++	} else {
++		blkaddr = rvu_get_blkaddr(rvu, BLKTYPE_NIX, 0);
++		rsp->chan_base = hw->sdp_chan_base;
++		rsp->num_chan = rvu_read64(rvu, blkaddr, NIX_AF_CONST1) & 0xFFFUL;
++	}
++
++	return 0;
++}
+diff --git a/drivers/soc/marvell/octeontx2-sdp/sdp.c b/drivers/soc/marvell/octeontx2-sdp/sdp.c
+index 691f1ddb7854..0f1dec3298e5 100644
+--- a/drivers/soc/marvell/octeontx2-sdp/sdp.c
++++ b/drivers/soc/marvell/octeontx2-sdp/sdp.c
+@@ -298,6 +298,9 @@ static void sdp_afpf_mbox_handler(struct work_struct *work)
+ 			case MBOX_MSG_SET_SDP_CHAN_INFO:
+ 				/* Nothing to do */
+ 				break;
++			case MBOX_MSG_GET_SDP_CHAN_INFO:
++				/* Nothing to do */
++				break;
+ 			default:
+ 				dev_err(&sdp->pdev->dev,
+ 					"Unsupported msg %d received.\n",
+@@ -1085,6 +1088,36 @@ static void sdp_host_handshake_fn(struct work_struct *wrk)
+ 	queue_delayed_work(sdp->sdp_host_handshake, &sdp->sdp_work,  HZ * 1);
+ }
+ 
++static int get_chan_info(struct sdp_dev *sdp)
++{
++	struct sdp_get_chan_info_msg *rsp;
++	struct msg_req *req;
++	int res = 0;
++
++	req = (struct msg_req *) otx2_mbox_alloc_msg(&sdp->afpf_mbox, 0, sizeof(*req));
++	if (req == NULL) {
++		dev_err(&sdp->pdev->dev, "RVU Mbox failed to alloc\n");
++		return -EFAULT;
++	}
++	req->hdr.id = MBOX_MSG_GET_SDP_CHAN_INFO;
++	req->hdr.sig = OTX2_MBOX_REQ_SIG;
++	req->hdr.pcifunc = RVU_PFFUNC(sdp->pf, 0);
++
++	otx2_mbox_msg_send(&sdp->afpf_mbox, 0);
++	res = otx2_mbox_wait_for_rsp(&sdp->afpf_mbox, 0);
++	if (res == -EIO)
++		dev_err(&sdp->pdev->dev, "RVU AF Mbox timeout\n");
++	else if (res) {
++		dev_err(&sdp->pdev->dev, "RVU Mbox error: %d\n", res);
++		res = -EFAULT;
++	}
++	rsp = (struct sdp_get_chan_info_msg *)otx2_mbox_get_rsp(&sdp->afpf_mbox, 0,
++								&req->hdr);
++	sdp->chan_base = rsp->chan_base;
++	sdp->num_chan = rsp->num_chan;
++
++	return res;
++}
+ static int send_chan_info(struct sdp_dev *sdp, struct sdp_node_info *info)
+ {
+ 	struct sdp_chan_info_msg *cinfo;
+@@ -1119,6 +1152,7 @@ static int sdp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	uint64_t inst, sdp_gbl_ctl;
+ 	struct sdp_dev *sdp;
+ 	union ring fw_rinfo;
++	uint64_t regval;
+ 	int err;
+ 
+ 	sdp = devm_kzalloc(dev, sizeof(struct sdp_dev), GFP_KERNEL);
+@@ -1226,6 +1260,22 @@ static int sdp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto get_pcifunc_failed;
+ 	}
+ 
++	err = get_chan_info(sdp);
++	if (err) {
++		dev_err(&pdev->dev, "SDP get channel info failed\n");
++		goto get_chan_info_failed;
++	}
++
++	dev_info(&sdp->pdev->dev, "SDP chan base: 0x%x, num chan: 0x%x\n",
++		 sdp->chan_base, sdp->num_chan);
++
++	/* From cn10k onwards the SDP channel configuration is programmable */
++	if (pdev->subsystem_device >= PCI_SUBSYS_DEVID_CN10K_A) {
++		regval = sdp->chan_base;
++		regval |= sdp->num_chan << 16;
++		writeq(regval, sdp->sdp_base + SDPX_LINK_CFG);
++	}
++
+ 	err = sdp_parse_rinfo(pdev, &info);
+ 	if (err) {
+ 		err = -EINVAL;
+@@ -1285,6 +1335,7 @@ static int sdp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	return 0;
+ 
++get_chan_info_failed:
+ get_rinfo_failed:
+ get_pcifunc_failed:
+ 	disable_af_mbox_int(pdev);
+diff --git a/drivers/soc/marvell/octeontx2-sdp/sdp.h b/drivers/soc/marvell/octeontx2-sdp/sdp.h
+index 7d6e19874a17..19f963bf17fb 100644
+--- a/drivers/soc/marvell/octeontx2-sdp/sdp.h
++++ b/drivers/soc/marvell/octeontx2-sdp/sdp.h
+@@ -36,9 +36,9 @@
+ #define SDPX_RINGX_IN_PKT_CNT(a)	(0x10080ull | a << 17)
+ #define SDPX_OUT_BP_ENX_W1S(a)		(0x80280ull | a << 4)
+ #define SDPX_OUT_WMARK			(0x40060000ull)
++#define SDPX_LINK_CFG			(0x40080180ull)
+ #define SDPX_GBL_CONTROL		(0x40080200ull)
+ 
+-
+ struct sdp_dev;
+ 
+ struct rvu_vf {
+@@ -67,6 +67,8 @@ struct sdp_dev {
+ #define SDP_VF_ENABLED 0x1
+ 	u32			flags;
+ 	u32			num_vfs;
++	u16			chan_base;
++	u16			num_chan;
+ 	bool			*irq_allocated;
+ 	char			*irq_names;
+ 	int			msix_count;
+-- 
+2.31.1
+

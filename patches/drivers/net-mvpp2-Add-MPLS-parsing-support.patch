@@ -1,0 +1,241 @@
+From 4eadf8ed81756d6a78966ae43740605e03643bd7 Mon Sep 17 00:00:00 2001
+From: Ben Peled <bpeled@marvell.com>
+Date: Tue, 22 Jun 2021 16:27:46 +0300
+Subject: [PATCH 1610/1921] net: mvpp2: Add MPLS parsing support
+
+Under ethertype added both UC and MC MPLS TCAM entries.
+Under MPLS added ipv4, ipv6 and multi MPLS entries
+Total of 5 new entries.
+MPLS parsing support added to RSS MPLS flows.
+
+Signed-off-by: Ben Peled <bpeled@marvell.com>
+Change-Id: I300166b58ef928d8f6a7c3a0e23c75765afa00b5
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/54469
+Reviewed-by: Stefan Chulski <stefanc@marvell.com>
+Tested-by: Stefan Chulski <stefanc@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/net/ethernet/marvell/mvpp2/mvpp2.h    |   1 +
+ .../net/ethernet/marvell/mvpp2/mvpp2_prs.c    | 145 ++++++++++++++++++
+ .../net/ethernet/marvell/mvpp2/mvpp2_prs.h    |   1 +
+ 3 files changed, 147 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+index 849b5bb0d8b8..e01dda382102 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2.h
+@@ -567,6 +567,7 @@
+ #define MVPP2_PPPOE_HDR_SIZE		8
+ #define MVPP2_VLAN_TAG_LEN		4
+ #define MVPP2_VLAN_TAG_EDSA_LEN		8
++#define MVPP2_MPLS_HEADER_LEN		4
+ 
+ /* Lbtd 802.3 type */
+ #define MVPP2_IP_LBDT_TYPE		0xfffa
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c
+index 29b8df64cbd2..2b3e8f804b15 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.c
+@@ -11,6 +11,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/platform_device.h>
++#include <linux/mpls.h>
+ #include <uapi/linux/ppp_defs.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+@@ -198,6 +199,19 @@ static void mvpp2_prs_match_etype(struct mvpp2_prs_entry *pe, int offset,
+ 	mvpp2_prs_tcam_data_byte_set(pe, offset + 1, ethertype & 0xff, 0xff);
+ }
+ 
++/* Set u32 in tcam sw entry */
++static void mvpp2_prs_tcam_data_u32_set(struct mvpp2_prs_entry *pe,
++					u32 val, u32 mask)
++{
++	int i;
++
++	for (i = sizeof(u32) - 1; i >= 0; --i) {
++		mvpp2_prs_tcam_data_byte_set(pe, i, val & 0xff, mask & 0xff);
++		mask >>= 8;
++		val >>= 8;
++	}
++}
++
+ /* Set vid in tcam sw entry */
+ static void mvpp2_prs_match_vid(struct mvpp2_prs_entry *pe, int offset,
+ 				unsigned short vid)
+@@ -1331,6 +1345,7 @@ static void mvpp2_prs_vid_init(struct mvpp2 *priv)
+ static int mvpp2_prs_etype_init(struct mvpp2 *priv)
+ {
+ 	struct mvpp2_prs_entry pe;
++	unsigned short ethertype;
+ 	int tid, ihl;
+ 
+ 	/* Ethertype: PPPoE */
+@@ -1492,6 +1507,34 @@ static int mvpp2_prs_etype_init(struct mvpp2 *priv)
+ 				MVPP2_PRS_RI_L3_PROTO_MASK);
+ 	mvpp2_prs_hw_write(priv, &pe);
+ 
++	for (ethertype = ETH_P_MPLS_UC; ethertype <= ETH_P_MPLS_MC; ++ethertype) {
++		tid = mvpp2_prs_tcam_first_free(priv, MVPP2_PE_FIRST_FREE_TID,
++						MVPP2_PE_LAST_FREE_TID);
++		if (tid < 0)
++			return tid;
++
++		memset(&pe, 0, sizeof(pe));
++		mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_L2);
++		pe.index = tid;
++
++		mvpp2_prs_match_etype(&pe, 0, ethertype);
++		mvpp2_prs_sram_next_lu_set(&pe, MVPP2_PRS_LU_MPLS);
++
++		mvpp2_prs_sram_shift_set(&pe, MVPP2_ETH_TYPE_LEN,
++					 MVPP2_PRS_SRAM_OP_SEL_SHIFT_ADD);
++
++		/* Set L3 offset */
++		mvpp2_prs_sram_offset_set(&pe, MVPP2_PRS_SRAM_UDF_TYPE_L3,
++					  MVPP2_ETH_TYPE_LEN,
++					  MVPP2_PRS_SRAM_OP_SEL_UDF_ADD);
++
++		/* Update shadow table and hw entry */
++		mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_L2);
++		priv->prs_shadow[pe.index].udf = MVPP2_PRS_UDF_L2_DEF;
++		priv->prs_shadow[pe.index].finish = false;
++		mvpp2_prs_hw_write(priv, &pe);
++	}
++
+ 	/* Default entry for MVPP2_PRS_LU_L2 - Unknown ethtype */
+ 	memset(&pe, 0, sizeof(struct mvpp2_prs_entry));
+ 	mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_L2);
+@@ -1603,6 +1646,104 @@ static int mvpp2_prs_vlan_init(struct platform_device *pdev, struct mvpp2 *priv)
+ 	return 0;
+ }
+ 
++/* Set entries for MPLS ethertype */
++static int mvpp2_prs_mpls_init(struct mvpp2 *priv)
++{
++	struct mvpp2_prs_entry pe;
++	int tid;
++
++	/* Add multiple MPLS TCAM entry */
++	tid = mvpp2_prs_tcam_first_free(priv, MVPP2_PE_FIRST_FREE_TID,
++					MVPP2_PE_LAST_FREE_TID);
++	if (tid < 0)
++		return tid;
++
++	memset(&pe, 0, sizeof(pe));
++	mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_MPLS);
++	pe.index = tid;
++
++	mvpp2_prs_tcam_data_u32_set(&pe, 0, MPLS_LS_S_MASK);
++
++	mvpp2_prs_sram_shift_set(&pe, MVPP2_MPLS_HEADER_LEN,
++				 MVPP2_PRS_SRAM_OP_SEL_SHIFT_ADD);
++
++	/* Set L3 offset */
++	mvpp2_prs_sram_offset_set(&pe, MVPP2_PRS_SRAM_UDF_TYPE_L3,
++				  MVPP2_MPLS_HEADER_LEN,
++				  MVPP2_PRS_SRAM_OP_SEL_UDF_ADD);
++
++	/* If MPLS isn't last MPLS jump to next MPLS */
++	mvpp2_prs_sram_next_lu_set(&pe, MVPP2_PRS_LU_MPLS);
++
++	/* Update shadow table and hw entry */
++	mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_MPLS);
++	mvpp2_prs_hw_write(priv, &pe);
++
++	/* Add ipv4 MPLS TCAM entry */
++	tid = mvpp2_prs_tcam_first_free(priv, MVPP2_PE_FIRST_FREE_TID,
++					MVPP2_PE_LAST_FREE_TID);
++	if (tid < 0)
++		return tid;
++
++	memset(&pe, 0, sizeof(pe));
++	mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_MPLS);
++	pe.index = tid;
++
++	mvpp2_prs_tcam_data_u32_set(&pe, MPLS_LABEL_IPV4NULL << MPLS_LS_LABEL_SHIFT,
++				    MPLS_LS_LABEL_MASK);
++
++	mvpp2_prs_sram_next_lu_set(&pe, MVPP2_PRS_LU_IP4);
++
++	mvpp2_prs_sram_ri_update(&pe, MVPP2_PRS_RI_L3_IP4,
++				 MVPP2_PRS_RI_L3_PROTO_MASK);
++
++	/* goto ipv4 dest-address (skip eth_type + IP-header-size - 4) */
++	mvpp2_prs_sram_shift_set(&pe, MVPP2_MPLS_HEADER_LEN +
++				 sizeof(struct iphdr) - 4,
++				 MVPP2_PRS_SRAM_OP_SEL_SHIFT_ADD);
++	/* Set L3 offset */
++	mvpp2_prs_sram_offset_set(&pe, MVPP2_PRS_SRAM_UDF_TYPE_L3,
++				  MVPP2_MPLS_HEADER_LEN,
++				  MVPP2_PRS_SRAM_OP_SEL_UDF_ADD);
++
++	/* Update shadow table and hw entry */
++	mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_MPLS);
++	mvpp2_prs_hw_write(priv, &pe);
++
++	/* Add ipv6 MPLS TCAM entry */
++	tid = mvpp2_prs_tcam_first_free(priv, MVPP2_PE_FIRST_FREE_TID,
++					MVPP2_PE_LAST_FREE_TID);
++	if (tid < 0)
++		return tid;
++
++	memset(&pe, 0, sizeof(pe));
++	mvpp2_prs_tcam_lu_set(&pe, MVPP2_PRS_LU_MPLS);
++	pe.index = tid;
++
++	mvpp2_prs_tcam_data_u32_set(&pe, MPLS_LABEL_IPV6NULL << MPLS_LS_LABEL_SHIFT,
++				    MPLS_LS_LABEL_MASK);
++
++	mvpp2_prs_sram_next_lu_set(&pe, MVPP2_PRS_LU_IP6);
++
++	/* Skip DIP of IPV6 header */
++	mvpp2_prs_sram_shift_set(&pe, MVPP2_MPLS_HEADER_LEN + 8 +
++				 MVPP2_MAX_L3_ADDR_SIZE,
++				 MVPP2_PRS_SRAM_OP_SEL_SHIFT_ADD);
++
++	mvpp2_prs_sram_ri_update(&pe, MVPP2_PRS_RI_L3_IP6,
++				 MVPP2_PRS_RI_L3_PROTO_MASK);
++	/* Set L3 offset */
++	mvpp2_prs_sram_offset_set(&pe, MVPP2_PRS_SRAM_UDF_TYPE_L3,
++				  MVPP2_MPLS_HEADER_LEN,
++				  MVPP2_PRS_SRAM_OP_SEL_UDF_ADD);
++
++	/* Update shadow table and hw entry */
++	mvpp2_prs_shadow_set(priv, pe.index, MVPP2_PRS_LU_MPLS);
++	mvpp2_prs_hw_write(priv, &pe);
++
++	return 0;
++}
++
+ /* Set entries for PPPoE ethertype */
+ static int mvpp2_prs_pppoe_init(struct mvpp2 *priv)
+ {
+@@ -2193,6 +2334,10 @@ int mvpp2_prs_default_init(struct platform_device *pdev, struct mvpp2 *priv)
+ 	if (err)
+ 		return err;
+ 
++	err = mvpp2_prs_mpls_init(priv);
++	if (err)
++		return err;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.h b/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.h
+index b3d76cdc28e0..c0da6d645076 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.h
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_prs.h
+@@ -266,6 +266,7 @@ enum mvpp2_prs_lookup {
+ 	MVPP2_PRS_LU_IP4,
+ 	MVPP2_PRS_LU_IP6,
+ 	MVPP2_PRS_LU_FLOWS,
++	MVPP2_PRS_LU_MPLS,
+ 	MVPP2_PRS_LU_LAST,
+ };
+ 
+-- 
+2.31.1
+

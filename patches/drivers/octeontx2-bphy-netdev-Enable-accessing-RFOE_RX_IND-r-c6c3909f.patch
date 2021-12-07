@@ -1,0 +1,197 @@
+From acfd031fa81554a2825969ce5ff85cc2cc76ec9b Mon Sep 17 00:00:00 2001
+From: Naveen Mamindlapalli <naveenm@marvell.com>
+Date: Mon, 3 Aug 2020 14:50:28 +0530
+Subject: [PATCH 0683/1921] octeontx2-bphy-netdev: Enable accessing RFOE_RX_IND
+ regs before odp netdev init
+
+This change addresses the issue of accessing RFOE()_RX_IND_*
+registers using ioctl before ODP<->NETDEV initialization.
+
+Change-Id: Ie8dceabf63e79bdea44df00dc319642ea9eee059
+Signed-off-by: Naveen Mamindlapalli <naveenm@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/33391
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../marvell/octeontx2/bphy/otx2_bphy.h        |  1 +
+ .../marvell/octeontx2/bphy/otx2_bphy_main.c   | 34 ++++---------------
+ .../marvell/octeontx2/bphy/otx2_rfoe.c        | 14 +++++---
+ .../marvell/octeontx2/bphy/otx2_rfoe.h        |  2 --
+ 4 files changed, 17 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
+index 6143e2e3d75c..5a2916ad9894 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy.h
+@@ -63,6 +63,7 @@ struct otx2_bphy_cdev_priv {
+ 	int				irq;
+ 	struct mutex			mutex_lock;	/* mutex */
+ 	spinlock_t			lock;		/* irq lock */
++	spinlock_t			mbt_lock;	/* mbt ind lock */
+ 	u8				mhab_mode[OTX2_BPHY_MHAB_INST];
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+index 17bf19f196ef..2fe1f3f97803 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_bphy_main.c
+@@ -196,45 +196,24 @@ static long otx2_bphy_cdev_ioctl(struct file *filp, unsigned int cmd,
+ 	}
+ 	case OTX2_RFOE_IOCTL_RX_IND_CFG:
+ 	{
+-		struct otx2_rfoe_drv_ctx *drv_ctx = NULL;
+-		struct otx2_rfoe_ndev_priv *priv;
+ 		struct otx2_rfoe_rx_ind_cfg cfg;
+-		struct net_device *netdev;
+ 		unsigned long flags;
+-		int idx;
+ 
+-		if (!cdev->odp_intf_cfg) {
+-			dev_err(cdev->dev, "odp interface cfg is not done\n");
+-			ret = -EBUSY;
+-			goto out;
+-		}
+ 		if (copy_from_user(&cfg, (void __user *)arg,
+ 				   sizeof(struct otx2_rfoe_rx_ind_cfg))) {
+ 			dev_err(cdev->dev, "copy from user fault\n");
+ 			ret = -EFAULT;
+ 			goto out;
+ 		}
+-		for (idx = 0; idx < RFOE_MAX_INTF; idx++) {
+-			drv_ctx = &rfoe_drv_ctx[idx];
+-			if (!(drv_ctx->valid &&
+-			      drv_ctx->rfoe_num == cfg.rfoe_num))
+-				break;
+-		}
+-		if (idx >= RFOE_MAX_INTF) {
+-			dev_err(cdev->dev, "valid drv_ctx not found\n");
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-		netdev = drv_ctx->netdev;
+-		priv = netdev_priv(netdev);
+-		spin_lock_irqsave(&priv->rfoe_common->rx_lock, flags);
+-		writeq(cfg.rx_ind_idx, (priv->rfoe_reg_base +
++
++		spin_lock_irqsave(&cdev->mbt_lock, flags);
++		writeq(cfg.rx_ind_idx, (rfoe_reg_base +
+ 		       RFOEX_RX_INDIRECT_INDEX_OFFSET(cfg.rfoe_num)));
+ 		if (cfg.dir == OTX2_RFOE_RX_IND_READ)
+-			cfg.regval = readq(priv->rfoe_reg_base + cfg.regoff);
++			cfg.regval = readq(rfoe_reg_base + cfg.regoff);
+ 		else
+-			writeq(cfg.regval, priv->rfoe_reg_base + cfg.regoff);
+-		spin_unlock_irqrestore(&priv->rfoe_common->rx_lock, flags);
++			writeq(cfg.regval, rfoe_reg_base + cfg.regoff);
++		spin_unlock_irqrestore(&cdev->mbt_lock, flags);
+ 		if (copy_to_user((void __user *)(unsigned long)arg, &cfg,
+ 				 sizeof(struct otx2_rfoe_rx_ind_cfg))) {
+ 			dev_err(cdev->dev, "copy to user fault\n");
+@@ -571,6 +550,7 @@ static int otx2_bphy_probe(struct platform_device *pdev)
+ 	cdev_priv->devt = devt;
+ 	cdev_priv->is_open = 0;
+ 	spin_lock_init(&cdev_priv->lock);
++	spin_lock_init(&cdev_priv->mbt_lock);
+ 	mutex_init(&cdev_priv->mutex_lock);
+ 
+ 	cdev_init(&cdev_priv->cdev, &otx2_bphy_cdev_fops);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+index 9d4aba4b254c..2cafee783505 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.c
+@@ -412,6 +412,7 @@ static void otx2_rfoe_tx_timer_cb(struct timer_list *t)
+ static void otx2_rfoe_process_rx_pkt(struct otx2_rfoe_ndev_priv *priv,
+ 				     struct rx_ft_cfg *ft_cfg, int mbt_buf_idx)
+ {
++	struct otx2_bphy_cdev_priv *cdev_priv = priv->cdev_priv;
+ 	struct mhbw_jd_dma_cfg_word_0_s *jd_dma_cfg_word_0;
+ 	struct rfoe_ecpri_psw0_s *ecpri_psw0 = NULL;
+ 	struct rfoe_ecpri_psw1_s *ecpri_psw1 = NULL;
+@@ -427,12 +428,12 @@ static void otx2_rfoe_process_rx_pkt(struct otx2_rfoe_ndev_priv *priv,
+ 	u8 lmac_id;
+ 
+ 	/* read mbt state */
+-	spin_lock(&priv->rfoe_common->rx_lock);
++	spin_lock(&cdev_priv->mbt_lock);
+ 	writeq(mbt_buf_idx, (priv->rfoe_reg_base +
+ 			 RFOEX_RX_INDIRECT_INDEX_OFFSET(priv->rfoe_num)));
+ 	mbt_state = readq(priv->rfoe_reg_base +
+ 			  RFOEX_RX_IND_MBT_SEG_STATE(priv->rfoe_num));
+-	spin_unlock(&priv->rfoe_common->rx_lock);
++	spin_unlock(&cdev_priv->mbt_lock);
+ 
+ 	if ((mbt_state >> 16 & 0xf) != 0) {
+ 		pr_err("rx pkt error: mbt_buf_idx=%d, err=%d\n",
+@@ -553,6 +554,7 @@ static void otx2_rfoe_process_rx_pkt(struct otx2_rfoe_ndev_priv *priv,
+ static int otx2_rfoe_process_rx_flow(struct otx2_rfoe_ndev_priv *priv,
+ 				     int pkt_type, int budget)
+ {
++	struct otx2_bphy_cdev_priv *cdev_priv = priv->cdev_priv;
+ 	int count = 0, processed_pkts = 0;
+ 	struct rx_ft_cfg *ft_cfg;
+ 	u64 mbt_cfg;
+@@ -560,14 +562,14 @@ static int otx2_rfoe_process_rx_flow(struct otx2_rfoe_ndev_priv *priv,
+ 
+ 	ft_cfg = &priv->rx_ft_cfg[pkt_type];
+ 
+-	spin_lock(&priv->rfoe_common->rx_lock);
++	spin_lock(&cdev_priv->mbt_lock);
+ 	/* read mbt nxt_buf */
+ 	writeq(ft_cfg->mbt_idx,
+ 	       priv->rfoe_reg_base +
+ 	       RFOEX_RX_INDIRECT_INDEX_OFFSET(priv->rfoe_num));
+ 	mbt_cfg = readq(priv->rfoe_reg_base +
+ 			RFOEX_RX_IND_MBT_CFG(priv->rfoe_num));
+-	spin_unlock(&priv->rfoe_common->rx_lock);
++	spin_unlock(&cdev_priv->mbt_lock);
+ 
+ 	nxt_buf = (mbt_cfg >> 32) & 0xffff;
+ 
+@@ -1089,6 +1091,7 @@ static void otx2_rfoe_dump_rx_ft_cfg(struct otx2_rfoe_ndev_priv *priv)
+ static inline void otx2_rfoe_fill_rx_ft_cfg(struct otx2_rfoe_ndev_priv *priv,
+ 					    struct bphy_netdev_comm_if *if_cfg)
+ {
++	struct otx2_bphy_cdev_priv *cdev_priv = priv->cdev_priv;
+ 	struct bphy_netdev_rbuf_info *rbuf_info;
+ 	struct rx_ft_cfg *ft_cfg;
+ 	u64 jdt_cfg0, iova;
+@@ -1117,11 +1120,13 @@ static inline void otx2_rfoe_fill_rx_ft_cfg(struct otx2_rfoe_ndev_priv *priv,
+ 		iova = ft_cfg->jdt_iova_addr;
+ 		ft_cfg->jdt_virt_addr = otx2_iova_to_virt(priv->iommu_domain,
+ 							  iova);
++		spin_lock(&cdev_priv->mbt_lock);
+ 		writeq(ft_cfg->jdt_idx,
+ 		       (priv->rfoe_reg_base +
+ 			RFOEX_RX_INDIRECT_INDEX_OFFSET(priv->rfoe_num)));
+ 		jdt_cfg0 = readq(priv->rfoe_reg_base +
+ 				 RFOEX_RX_IND_JDT_CFG0(priv->rfoe_num));
++		spin_unlock(&cdev_priv->mbt_lock);
+ 		ft_cfg->jd_rd_offset = ((jdt_cfg0 >> 28) & 0xf) * 8;
+ 		ft_cfg->pkt_offset = (u8)((jdt_cfg0 >> 52) & 0x7);
+ 		ft_cfg->priv = priv;
+@@ -1222,7 +1227,6 @@ int otx2_rfoe_parse_and_init_intf(struct otx2_bphy_cdev_priv *cdev,
+ 					ret = -ENOMEM;
+ 					goto err_exit;
+ 				}
+-				spin_lock_init(&priv->rfoe_common->rx_lock);
+ 			}
+ 			spin_lock_init(&priv->lock);
+ 			priv->netdev = netdev;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+index b2d075452dec..843c77161207 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
++++ b/drivers/net/ethernet/marvell/octeontx2/bphy/otx2_rfoe.h
+@@ -161,8 +161,6 @@ struct tx_job_queue_cfg {
+ /* rfoe common (for all lmac's) */
+ struct rfoe_common_cfg {
+ 	struct tx_job_queue_cfg		tx_oth_job_cfg;
+-	/* lmac protection lock */
+-	spinlock_t			rx_lock;
+ };
+ 
+ /* ptp pending skb list */
+-- 
+2.31.1
+

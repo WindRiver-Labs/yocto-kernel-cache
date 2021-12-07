@@ -1,0 +1,232 @@
+From 978348ec5bf3c5eb958ae671d233a3c39fab291b Mon Sep 17 00:00:00 2001
+From: Srujana Challa <schalla@marvell.com>
+Date: Thu, 26 Nov 2020 19:53:24 +0530
+Subject: [PATCH 0948/1921] crypto: octeontx2: Handle VF function level reset
+
+Add support to handle VF function level reset.
+Upon receiving the FLR, PF sends a message to
+admin function (AF), which then cleans up all
+resources attached to that VF.
+
+Signed-off-by: Srujana Challa <schalla@marvell.com>
+Change-Id: I3c52583321f5df8a3025d42413eea49e519cbab7
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/41113
+Tested-by: sa_ip-sw-jenkins <sa_ip-sw-jenkins@marvell.com>
+Reviewed-by: Suheil Chandran <schandran@marvell.com>
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ drivers/crypto/marvell/octeontx2/otx2_cptpf.h |   8 ++
+ .../marvell/octeontx2/otx2_cptpf_main.c       | 119 ++++++++++++++++--
+ .../marvell/octeontx2/otx2_cptpf_mbox.c       |   3 +
+ 3 files changed, 117 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/crypto/marvell/octeontx2/otx2_cptpf.h b/drivers/crypto/marvell/octeontx2/otx2_cptpf.h
+index ed748d6aa7ef..d52e60be9aab 100644
+--- a/drivers/crypto/marvell/octeontx2/otx2_cptpf.h
++++ b/drivers/crypto/marvell/octeontx2/otx2_cptpf.h
+@@ -46,6 +46,11 @@ union otx2_cpt_eng_caps {
+ 	};
+ };
+ 
++struct cptpf_flr_work {
++	struct work_struct work;
++	struct otx2_cptpf_dev *pf;
++};
++
+ struct otx2_cptpf_dev {
+ 	void __iomem *reg_base;		/* CPT PF registers start address */
+ 	void __iomem *afpf_mbox_base;	/* PF-AF mbox start address */
+@@ -67,6 +72,9 @@ struct otx2_cptpf_dev {
+ 	struct otx2_mbox	vfpf_mbox;
+ 	struct workqueue_struct *vfpf_mbox_wq;
+ 
++	struct workqueue_struct	*flr_wq;
++	struct cptpf_flr_work   *flr_work;
++
+ 	bool irq_registered[OTX2_CPT_PF_MSIX_VECTORS];	/* Is IRQ registered */
+ 	u8 pf_id;		/* RVU PF number */
+ 	u8 max_vfs;		/* Maximum number of VFs supported by CPT */
+diff --git a/drivers/crypto/marvell/octeontx2/otx2_cptpf_main.c b/drivers/crypto/marvell/octeontx2/otx2_cptpf_main.c
+index 823d757ce845..6455f6bdc64b 100644
+--- a/drivers/crypto/marvell/octeontx2/otx2_cptpf_main.c
++++ b/drivers/crypto/marvell/octeontx2/otx2_cptpf_main.c
+@@ -106,22 +106,72 @@ static void cptpf_disable_vfpf_mbox_intrs(struct otx2_cptpf_dev *cptpf)
+ 			 RVU_PF_VFPF_MBOX_INTX(1), ~0x0ULL);
+ }
+ 
+-static irqreturn_t cptpf_vf_flr_intr(int __always_unused irq, void *arg)
++static void cptpf_flr_wq_handler(struct work_struct *work)
+ {
+-	struct otx2_cptpf_dev *cptpf = arg;
++	struct cptpf_flr_work *flr_work;
++	struct otx2_cptpf_dev *pf;
++	struct mbox_msghdr *req;
++	struct otx2_mbox *mbox;
++	int vf, reg = 0;
+ 
+-	/* Clear transaction pending register */
+-	otx2_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0, RVU_PF_VFTRPENDX(0),
+-			 ~0x0ULL);
+-	otx2_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0, RVU_PF_VFTRPENDX(1),
+-			 ~0x0ULL);
++	flr_work = container_of(work, struct cptpf_flr_work, work);
++	pf = flr_work->pf;
++	mbox = &pf->afpf_mbox;
+ 
+-	/* Clear interrupt if any */
+-	otx2_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0, RVU_PF_VFFLR_INTX(0),
+-			 ~0x0ULL);
+-	otx2_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0, RVU_PF_VFFLR_INTX(1),
+-			 ~0x0ULL);
++	vf = flr_work - pf->flr_work;
+ 
++	req = otx2_mbox_alloc_msg_rsp(mbox, 0, sizeof(*req),
++				      sizeof(struct msg_rsp));
++	if (!req)
++		return;
++
++	req->sig = OTX2_MBOX_REQ_SIG;
++	req->id = MBOX_MSG_VF_FLR;
++	req->pcifunc &= RVU_PFVF_FUNC_MASK;
++	req->pcifunc |= (vf + 1) & RVU_PFVF_FUNC_MASK;
++
++	otx2_cpt_send_mbox_msg(pf->pdev);
++
++	if (vf >= 64) {
++		reg = 1;
++		vf = vf - 64;
++	}
++	/* Clear transaction pending register */
++	otx2_cpt_write64(pf->reg_base, BLKADDR_RVUM, 0,
++			 RVU_PF_VFTRPENDX(reg), BIT_ULL(vf));
++	otx2_cpt_write64(pf->reg_base, BLKADDR_RVUM, 0,
++			 RVU_PF_VFFLR_INT_ENA_W1SX(reg), BIT_ULL(vf));
++}
++
++static irqreturn_t cptpf_vf_flr_intr(int __always_unused irq, void *arg)
++{
++	int reg, dev, vf, start_vf, num_reg = 1;
++	struct otx2_cptpf_dev *cptpf = arg;
++	u64 intr;
++
++	if (cptpf->max_vfs > 64)
++		num_reg = 2;
++
++	for (reg = 0; reg < num_reg; reg++) {
++		intr = otx2_cpt_read64(cptpf->reg_base, BLKADDR_RVUM, 0,
++				       RVU_PF_VFFLR_INTX(reg));
++		if (!intr)
++			continue;
++		start_vf = 64 * reg;
++		for (vf = 0; vf < 64; vf++) {
++			if (!(intr & BIT_ULL(vf)))
++				continue;
++			dev = vf + start_vf;
++			queue_work(cptpf->flr_wq, &cptpf->flr_work[dev].work);
++			/* Clear interrupt */
++			otx2_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0,
++					 RVU_PF_VFFLR_INTX(reg), BIT_ULL(vf));
++			/* Disable the interrupt */
++			otx2_cpt_write64(cptpf->reg_base, BLKADDR_RVUM, 0,
++					 RVU_PF_VFFLR_INT_ENA_W1CX(reg),
++					 BIT_ULL(vf));
++		}
++	}
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -199,6 +249,41 @@ static int cptpf_register_interrupts(struct otx2_cptpf_dev *cptpf)
+ 	return ret;
+ }
+ 
++static void cptpf_flr_wq_destroy(struct otx2_cptpf_dev *pf)
++{
++	if (!pf->flr_wq)
++		return;
++	destroy_workqueue(pf->flr_wq);
++	pf->flr_wq = NULL;
++	kfree(pf->flr_work);
++}
++
++static int cptpf_flr_wq_init(struct otx2_cptpf_dev *cptpf)
++{
++	int num_vfs = cptpf->max_vfs;
++	int vf;
++
++	cptpf->flr_wq = alloc_ordered_workqueue("cptpf_flr_wq", 0);
++	if (!cptpf->flr_wq)
++		return -ENOMEM;
++
++	cptpf->flr_work = kcalloc(num_vfs, sizeof(struct cptpf_flr_work),
++				  GFP_KERNEL);
++	if (!cptpf->flr_work)
++		goto destroy_wq;
++
++	for (vf = 0; vf < num_vfs; vf++) {
++		cptpf->flr_work[vf].pf = cptpf;
++		INIT_WORK(&cptpf->flr_work[vf].work, cptpf_flr_wq_handler);
++	}
++
++	return 0;
++
++destroy_wq:
++	destroy_workqueue(cptpf->flr_wq);
++	return -ENOMEM;
++}
++
+ static int cptpf_afpf_mbox_init(struct otx2_cptpf_dev *cptpf)
+ {
+ 	int err;
+@@ -565,10 +650,14 @@ static int otx2_cptpf_probe(struct pci_dev *pdev,
+ 	if (err)
+ 		goto destroy_afpf_mbox;
+ 
++	err = cptpf_flr_wq_init(cptpf);
++	if (err)
++		goto destroy_vfpf_mbox;
++
+ 	/* Register interrupts */
+ 	err = cptpf_register_interrupts(cptpf);
+ 	if (err)
+-		goto destroy_vfpf_mbox;
++		goto destroy_flr;
+ 
+ 	/* Enable VF FLR interrupts */
+ 	cptpf_enable_vf_flr_intrs(cptpf);
+@@ -605,6 +694,8 @@ static int otx2_cptpf_probe(struct pci_dev *pdev,
+ 	cptpf_disable_afpf_mbox_intrs(cptpf);
+ 	cptpf_disable_vf_flr_intrs(cptpf);
+ 	cptpf_unregister_interrupts(cptpf);
++destroy_flr:
++	cptpf_flr_wq_destroy(cptpf);
+ destroy_vfpf_mbox:
+ 	cptpf_vfpf_mbox_destroy(cptpf);
+ destroy_afpf_mbox:
+@@ -650,6 +741,8 @@ static void otx2_cptpf_remove(struct pci_dev *pdev)
+ 	cptpf_disable_vf_flr_intrs(cptpf);
+ 	/* Unregister CPT interrupts */
+ 	cptpf_unregister_interrupts(cptpf);
++	/* Destroy FLR work queue */
++	cptpf_flr_wq_destroy(cptpf);
+ 	/* Destroy AF-PF mbox */
+ 	cptpf_afpf_mbox_destroy(cptpf);
+ 	/* Destroy VF-PF mbox */
+diff --git a/drivers/crypto/marvell/octeontx2/otx2_cptpf_mbox.c b/drivers/crypto/marvell/octeontx2/otx2_cptpf_mbox.c
+index dcd635ebfec3..d4cdf35653da 100644
+--- a/drivers/crypto/marvell/octeontx2/otx2_cptpf_mbox.c
++++ b/drivers/crypto/marvell/octeontx2/otx2_cptpf_mbox.c
+@@ -587,6 +587,9 @@ void otx2_cptpf_afpf_mbox_handler(struct work_struct *work)
+ 					vf_id, cptpf->enabled_vfs);
+ 				goto error;
+ 			}
++			if (msg->id == MBOX_MSG_VF_FLR)
++				goto error;
++
+ 			fwd = otx2_mbox_alloc_msg(vfpf_mbox, vf_id, size);
+ 			if (!fwd) {
+ 				dev_err(&cptpf->pdev->dev,
+-- 
+2.31.1
+

@@ -1,0 +1,193 @@
+From 8e85b2c178258e44beb0ca4a0880a762d5993337 Mon Sep 17 00:00:00 2001
+From: Harman Kalra <hkalra@marvell.com>
+Date: Fri, 23 Oct 2020 17:54:47 +0530
+Subject: [PATCH 0905/1921] octeontx2-af: cn10K: support for sched lmtst and
+ other features
+
+Enhancing the mailbox scope to support important configurations
+like enabling scheduled LMTST, disable LMTLINE prefetch, disable
+early completion for ordered LMTST, as per request from the
+applicaiton.
+On FLR these configurations will be resetted to default.
+
+Change-Id: If206612875e47f2072521a69c0703810eee706f7
+Signed-off-by: Harman Kalra <hkalra@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/c/IP/SW/kernel/linux/+/35724
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Signed-off-by: Sunil Goutham <sgoutham@marvell.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../net/ethernet/marvell/octeontx2/af/mbox.h  |  4 +
+ .../net/ethernet/marvell/octeontx2/af/rvu.h   |  1 +
+ .../ethernet/marvell/octeontx2/af/rvu_cn10k.c | 83 ++++++++++++++++---
+ .../ethernet/marvell/octeontx2/af/rvu_reg.h   |  4 +
+ 4 files changed, 82 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+index 18c8727a7959..cb49315e71eb 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/mbox.h
+@@ -1617,6 +1617,10 @@ struct ndc_sync_op {
+ 
+ struct lmtst_tbl_setup_req {
+ 	struct mbox_msghdr hdr;
++	u64 dis_sched_early_comp :1;
++	u64 sch_ena		 :1;
++	u64 dis_line_pref	 :1;
++	u64 ssow_pf_func	 :13;
+ 	u16 base_pcifunc;
+ };
+ 
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+index bad42d9d7078..8f343efba36c 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu.h
+@@ -326,6 +326,7 @@ struct rvu_pfvf {
+ 	bool	is_sdp0; /* is this PF mapped to SDP0 */
+ 	bool	is_sdp1; /* is this PF mapped to SDP1 */
+ 	u64     lmt_base_addr; /* Preseving the pcifunc's lmtst base addr*/
++	u64     lmt_map_ent_w1; /*Preseving the word1 of lmtst map table entry*/
+ };
+ 
+ struct nix_txsch {
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c
+index d1320d78bf82..5aa6359883de 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_cn10k.c
+@@ -292,6 +292,7 @@ int lmtst_map_table_ops(struct rvu *rvu, u32 index, u64 *val,
+ 	return 0;
+ }
+ 
++#define LMT_MAP_TBL_W1_OFF  8
+ static u32 rvu_get_lmtst_tbl_index(struct rvu *rvu, u16 pcifunc)
+ {
+ 	return ((rvu_get_pf(pcifunc) * rvu->hw->total_vfs) +
+@@ -303,7 +304,7 @@ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
+ 				     struct msg_rsp *rsp)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, req->hdr.pcifunc);
+-	u32 pri_tbl_idx, sec_tbl_idx;
++	u32 pri_tbl_idx, sec_tbl_idx, tbl_idx;
+ 	int err = 0;
+ 	u64 val;
+ 
+@@ -363,11 +364,56 @@ int rvu_mbox_handler_lmtst_tbl_setup(struct rvu *rvu,
+ 		}
+ 	}
+ 
++	/* This mailbox can also be used to update word1 of APR_LMT_MAP_ENTRY_S
++	 * like enabling scheduled LMTST, disable LMTLINE prefetch, disable
++	 * early completion for ordered LMTST.
++	 */
++	if (req->sch_ena || req->dis_sched_early_comp || req->dis_line_pref) {
++		tbl_idx = rvu_get_lmtst_tbl_index(rvu, req->hdr.pcifunc);
++		err = lmtst_map_table_ops(rvu, tbl_idx + LMT_MAP_TBL_W1_OFF,
++					  &val, LMT_TBL_OP_READ);
++		if (err) {
++			dev_err(rvu->dev,
++				"Failed to read LMT map table: index 0x%x err %d\n",
++				tbl_idx + LMT_MAP_TBL_W1_OFF, err);
++			goto error;
++		}
++
++		/* Storing lmt map table entry word1 default value as this needs
++		 * to be reverted in FLR. Also making sure this default value
++		 * doesn't get overwritten on multiple calls to this mailbox.
++		 */
++		if (!pfvf->lmt_map_ent_w1)
++			pfvf->lmt_map_ent_w1 = val;
++
++		/* Disable early completion for Ordered LMTSTs. */
++		if (req->dis_sched_early_comp)
++			val |= (req->dis_sched_early_comp <<
++				APR_LMT_MAP_ENT_DIS_SCH_CMP_SHIFT);
++		/* Enable scheduled LMTST */
++		if (req->sch_ena)
++			val |= (req->sch_ena << APR_LMT_MAP_ENT_SCH_ENA_SHIFT) |
++				req->ssow_pf_func;
++		/* Disables LMTLINE prefetch before receiving store data. */
++		if (req->dis_line_pref)
++			val |= (req->dis_line_pref <<
++				APR_LMT_MAP_ENT_DIS_LINE_PREF_SHIFT);
++
++		err = lmtst_map_table_ops(rvu, tbl_idx + LMT_MAP_TBL_W1_OFF,
++					  &val, LMT_TBL_OP_WRITE);
++		if (err) {
++			dev_err(rvu->dev,
++				"Failed to update LMT map table: index 0x%x err %d\n",
++				tbl_idx + LMT_MAP_TBL_W1_OFF, err);
++			goto error;
++		}
++	}
++
+ error:
+ 	return err;
+ }
+ 
+-/* Resetting the lmtst map table to original base addresses */
++/* Resetting the lmtst map table to original default values */
+ void rvu_reset_lmt_map_tbl(struct rvu *rvu, u16 pcifunc)
+ {
+ 	struct rvu_pfvf *pfvf = rvu_get_pfvf(rvu, pcifunc);
+@@ -377,18 +423,35 @@ void rvu_reset_lmt_map_tbl(struct rvu *rvu, u16 pcifunc)
+ 	if (is_rvu_otx2(rvu))
+ 		return;
+ 
+-	if (pfvf->lmt_base_addr) {
++	if (pfvf->lmt_base_addr || pfvf->lmt_map_ent_w1) {
+ 		/* This corresponds to lmt map table index */
+ 		tbl_idx = rvu_get_lmtst_tbl_index(rvu, pcifunc);
+ 		/* Reverting back original lmt base addr for respective
+ 		 * pcifunc.
+ 		 */
+-		err = lmtst_map_table_ops(rvu, tbl_idx, &pfvf->lmt_base_addr,
+-					  LMT_TBL_OP_WRITE);
+-		if (err)
+-			dev_err(rvu->dev,
+-				"Failed to update LMT map table: index 0x%x err %d\n",
+-				tbl_idx, err);
+-		pfvf->lmt_base_addr = 0;
++		if (pfvf->lmt_base_addr) {
++			err = lmtst_map_table_ops(rvu, tbl_idx,
++						  &pfvf->lmt_base_addr,
++						  LMT_TBL_OP_WRITE);
++			if (err)
++				dev_err(rvu->dev,
++					"Failed to update LMT map table: index 0x%x err %d\n",
++					tbl_idx, err);
++			pfvf->lmt_base_addr = 0;
++		}
++		/* Reverting back to orginal word1 val of lmtst map table entry
++		 * which underwent changes.
++		 */
++		if (pfvf->lmt_map_ent_w1) {
++			err = lmtst_map_table_ops(rvu,
++						  tbl_idx + LMT_MAP_TBL_W1_OFF,
++						  &pfvf->lmt_map_ent_w1,
++						  LMT_TBL_OP_WRITE);
++			if (err)
++				dev_err(rvu->dev,
++					"Failed to update LMT map table: index 0x%x err %d\n",
++					tbl_idx + LMT_MAP_TBL_W1_OFF, err);
++			pfvf->lmt_map_ent_w1 = 0;
++		}
+ 	}
+ }
+diff --git a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+index 8a0920aa7d42..948104fb41b0 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
++++ b/drivers/net/ethernet/marvell/octeontx2/af/rvu_reg.h
+@@ -928,4 +928,8 @@
+ #define	APR_AF_LMT_MAP_BASE		(0x008ull)
+ #define APR_AF_LMT_CTL			(0x010ull)
+ 
++#define APR_LMT_MAP_ENT_DIS_SCH_CMP_SHIFT	23
++#define APR_LMT_MAP_ENT_SCH_ENA_SHIFT		22
++#define APR_LMT_MAP_ENT_DIS_LINE_PREF_SHIFT	21
++
+ #endif /* RVU_REG_H */
+-- 
+2.31.1
+

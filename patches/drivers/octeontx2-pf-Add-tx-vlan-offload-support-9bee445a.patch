@@ -1,0 +1,143 @@
+From 3dcfe2e6feed738971f401f66c0de4c279b1ab5c Mon Sep 17 00:00:00 2001
+From: hariprasad <hkelam@marvell.com>
+Date: Wed, 7 Aug 2019 16:11:24 +0530
+Subject: [PATCH 0253/1921] octeontx2-pf: Add tx vlan offload support
+
+This patch adds below features on vlan tx side
+        * vlan tag insertion by NIX
+        * Make use of hardware tso feature for tagged packets.
+
+Change-Id: Ic5806bdc52e6d1b24833cfef2efa0fc32cea6fe5
+Signed-off-by: hariprasad <hkelam@marvell.com>
+Reviewed-on: https://sj1git1.cavium.com/13974
+Reviewed-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+Tested-by: Sunil Kovvuri Goutham <Sunil.Goutham@cavium.com>
+[WK: The original patch got from Marvell sdk11.21.09]
+Signed-off-by: Wenlin Kang <wenlin.kang@windriver.com>
+---
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  | 12 ++++++++++++
+ .../marvell/octeontx2/nic/otx2_txrx.c         | 19 +++++++++++++++++++
+ .../ethernet/marvell/octeontx2/nic/otx2_vf.c  | 12 ++++++++++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 7f354f8716a9..33d8904f1f02 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -1996,6 +1996,13 @@ static int otx2_get_vf_config(struct net_device *netdev, int vf,
+ 	return 0;
+ }
+ 
++static netdev_features_t
++otx2_features_check(struct sk_buff *skb, struct net_device *dev,
++		    netdev_features_t features)
++{
++	return features;
++}
++
+ static const struct net_device_ops otx2_netdev_ops = {
+ 	.ndo_open		= otx2_open,
+ 	.ndo_stop		= otx2_stop,
+@@ -2011,6 +2018,7 @@ static const struct net_device_ops otx2_netdev_ops = {
+ 	.ndo_set_vf_mac		= otx2_set_vf_mac,
+ 	.ndo_set_vf_vlan	= otx2_set_vf_vlan,
+ 	.ndo_get_vf_config	= otx2_get_vf_config,
++	.ndo_features_check     = otx2_features_check,
+ };
+ 
+ static int otx2_check_pf_usable(struct otx2_nic *nic)
+@@ -2166,6 +2174,10 @@ static int otx2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			       NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+ 			       NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6);
+ 	netdev->features |= netdev->hw_features;
++	/* Support TSO on tag interface */
++	netdev->vlan_features |= netdev->features;
++	netdev->features  |= NETIF_F_HW_VLAN_CTAG_TX |
++			     NETIF_F_HW_VLAN_STAG_TX;
+ 
+ 	netdev->hw_features |= NETIF_F_LOOPBACK | NETIF_F_NTUPLE |
+ 			       NETIF_F_RXALL;
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+index 893d3d1d00b0..c5cbb2c2a539 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_txrx.c
+@@ -636,6 +636,19 @@ static void otx2_sqe_add_ext(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+ 		ext->tstmp = 1;
+ 	}
+ 
++#define OTX2_VLAN_PTR_OFFSET     (ETH_HLEN - ETH_TLEN)
++	if (skb_vlan_tag_present(skb)) {
++		if (skb->vlan_proto == htons(ETH_P_8021Q)) {
++			ext->vlan1_ins_ena = 1;
++			ext->vlan1_ins_ptr = OTX2_VLAN_PTR_OFFSET;
++			ext->vlan1_ins_tci = skb_vlan_tag_get(skb);
++		} else if (skb->vlan_proto == htons(ETH_P_8021AD)) {
++			ext->vlan0_ins_ena = 1;
++			ext->vlan0_ins_ptr = OTX2_VLAN_PTR_OFFSET;
++			ext->vlan0_ins_tci = skb_vlan_tag_get(skb);
++		}
++	}
++
+ 	*offset += sizeof(*ext);
+ }
+ 
+@@ -674,6 +687,9 @@ static void otx2_sqe_add_hdr(struct otx2_nic *pfvf, struct otx2_snd_queue *sq,
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ 		sqe_hdr->ol3ptr = skb_network_offset(skb);
+ 		sqe_hdr->ol4ptr = skb_transport_offset(skb);
++		/* get vlan protocol Ethertype */
++		if (eth_type_vlan(skb->protocol))
++			skb->protocol = vlan_get_protocol(skb);
+ 
+ 		if (skb->protocol == htons(ETH_P_IP)) {
+ 			proto = ip_hdr(skb)->protocol;
+@@ -939,6 +955,9 @@ bool otx2_sq_append_skb(struct net_device *netdev, struct otx2_snd_queue *sq,
+ 	}
+ 
+ 	if (skb_shinfo(skb)->gso_size && !is_hw_tso_supported(pfvf, skb)) {
++		/* Insert vlan tag before giving pkt to tso */
++		if (skb_vlan_tag_present(skb))
++			skb = __vlan_hwaccel_push_inside(skb);
+ 		otx2_sq_append_tso(pfvf, sq, skb, qidx);
+ 		return true;
+ 	}
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+index f20f65569792..17374ced8e2b 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_vf.c
+@@ -431,6 +431,13 @@ static void otx2vf_reset_task(struct work_struct *work)
+ 	netif_trans_update(vf->netdev);
+ }
+ 
++static netdev_features_t
++otx2_features_check(struct sk_buff *skb, struct net_device *dev,
++		    netdev_features_t features)
++{
++	return features;
++}
++
+ static const struct net_device_ops otx2vf_netdev_ops = {
+ 	.ndo_open = otx2vf_open,
+ 	.ndo_stop = otx2vf_stop,
+@@ -439,6 +446,7 @@ static const struct net_device_ops otx2vf_netdev_ops = {
+ 	.ndo_change_mtu = otx2_change_mtu,
+ 	.ndo_get_stats64 = otx2_get_stats64,
+ 	.ndo_tx_timeout = otx2_tx_timeout,
++	.ndo_features_check = otx2_features_check,
+ };
+ 
+ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+@@ -546,6 +554,10 @@ static int otx2vf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 			      NETIF_F_IPV6_CSUM | NETIF_F_RXHASH |
+ 			      NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6;
+ 	netdev->features = netdev->hw_features;
++	/* Support TSO on tag interface */
++	netdev->vlan_features |= netdev->features;
++	netdev->features  |= NETIF_F_HW_VLAN_CTAG_TX |
++			     NETIF_F_HW_VLAN_STAG_TX;
+ 	netdev->watchdog_timeo = OTX2_TX_TIMEOUT;
+ 
+ 	netdev->netdev_ops = &otx2vf_netdev_ops;
+-- 
+2.31.1
+
