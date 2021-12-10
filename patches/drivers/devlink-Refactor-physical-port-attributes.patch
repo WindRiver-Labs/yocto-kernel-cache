@@ -1,0 +1,152 @@
+From 524e2eeabb93308da5f1493182e16463700fa35b Mon Sep 17 00:00:00 2001
+From: Parav Pandit <parav@mellanox.com>
+Date: Mon, 8 Jul 2019 23:17:35 -0500
+Subject: [PATCH 150/214] devlink: Refactor physical port attributes
+
+commit 378ef01b5f75e6c485b8f16b4f6a7842a312aa07 upstream.
+
+To support additional devlink port flavours and to support few common
+and few different port attributes, move physical port attributes to a
+different structure.
+
+Acked-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: Parav Pandit <parav@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ include/net/devlink.h | 13 ++++++++--
+ net/core/devlink.c    | 58 ++++++++++++++++++++++++++++---------------
+ 2 files changed, 49 insertions(+), 22 deletions(-)
+
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 48e8aecd1ce7..2436e70751ef 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -37,14 +37,23 @@ struct devlink {
+ 	char priv[0] __aligned(NETDEV_ALIGN);
+ };
+ 
++struct devlink_port_phys_attrs {
++	u32 port_number; /* Same value as "split group".
++			  * A physical port which is visible to the user
++			  * for a given port flavour.
++			  */
++	u32 split_subport_number;
++};
++
+ struct devlink_port_attrs {
+ 	u8 set:1,
+ 	   split:1,
+ 	   switch_port:1;
+ 	enum devlink_port_flavour flavour;
+-	u32 port_number; /* same value as "split group" */
+-	u32 split_subport_number;
+ 	struct netdev_phys_item_id switch_id;
++	union {
++		struct devlink_port_phys_attrs phys;
++	};
+ };
+ 
+ struct devlink_port {
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index 119d203b0723..979070c1518a 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -514,14 +514,16 @@ static int devlink_nl_port_attrs_put(struct sk_buff *msg,
+ 		return 0;
+ 	if (nla_put_u16(msg, DEVLINK_ATTR_PORT_FLAVOUR, attrs->flavour))
+ 		return -EMSGSIZE;
+-	if (nla_put_u32(msg, DEVLINK_ATTR_PORT_NUMBER, attrs->port_number))
++	if (nla_put_u32(msg, DEVLINK_ATTR_PORT_NUMBER,
++			attrs->phys.port_number))
+ 		return -EMSGSIZE;
+ 	if (!attrs->split)
+ 		return 0;
+-	if (nla_put_u32(msg, DEVLINK_ATTR_PORT_SPLIT_GROUP, attrs->port_number))
++	if (nla_put_u32(msg, DEVLINK_ATTR_PORT_SPLIT_GROUP,
++			attrs->phys.port_number))
+ 		return -EMSGSIZE;
+ 	if (nla_put_u32(msg, DEVLINK_ATTR_PORT_SPLIT_SUBPORT_NUMBER,
+-			attrs->split_subport_number))
++			attrs->phys.split_subport_number))
+ 		return -EMSGSIZE;
+ 	return 0;
+ }
+@@ -5538,6 +5540,29 @@ void devlink_port_type_clear(struct devlink_port *devlink_port)
+ }
+ EXPORT_SYMBOL_GPL(devlink_port_type_clear);
+ 
++static int __devlink_port_attrs_set(struct devlink_port *devlink_port,
++				    enum devlink_port_flavour flavour,
++				    const unsigned char *switch_id,
++				    unsigned char switch_id_len)
++{
++	struct devlink_port_attrs *attrs = &devlink_port->attrs;
++
++	if (WARN_ON(devlink_port->registered))
++		return -EEXIST;
++	attrs->set = true;
++	attrs->flavour = flavour;
++	if (switch_id) {
++		attrs->switch_port = true;
++		if (WARN_ON(switch_id_len > MAX_PHYS_ITEM_ID_LEN))
++			switch_id_len = MAX_PHYS_ITEM_ID_LEN;
++		memcpy(attrs->switch_id.id, switch_id, switch_id_len);
++		attrs->switch_id.id_len = switch_id_len;
++	} else {
++		attrs->switch_port = false;
++	}
++	return 0;
++}
++
+ /**
+  *	devlink_port_attrs_set - Set port attributes
+  *
+@@ -5560,23 +5585,15 @@ void devlink_port_attrs_set(struct devlink_port *devlink_port,
+ 			    unsigned char switch_id_len)
+ {
+ 	struct devlink_port_attrs *attrs = &devlink_port->attrs;
++	int ret;
+ 
+-	if (WARN_ON(devlink_port->registered))
++	ret = __devlink_port_attrs_set(devlink_port, flavour,
++				       switch_id, switch_id_len);
++	if (ret)
+ 		return;
+-	attrs->set = true;
+-	attrs->flavour = flavour;
+-	attrs->port_number = port_number;
+ 	attrs->split = split;
+-	attrs->split_subport_number = split_subport_number;
+-	if (switch_id) {
+-		attrs->switch_port = true;
+-		if (WARN_ON(switch_id_len > MAX_PHYS_ITEM_ID_LEN))
+-			switch_id_len = MAX_PHYS_ITEM_ID_LEN;
+-		memcpy(attrs->switch_id.id, switch_id, switch_id_len);
+-		attrs->switch_id.id_len = switch_id_len;
+-	} else {
+-		attrs->switch_port = false;
+-	}
++	attrs->phys.port_number = port_number;
++	attrs->phys.split_subport_number = split_subport_number;
+ }
+ EXPORT_SYMBOL_GPL(devlink_port_attrs_set);
+ 
+@@ -5592,10 +5609,11 @@ static int __devlink_port_phys_port_name_get(struct devlink_port *devlink_port,
+ 	switch (attrs->flavour) {
+ 	case DEVLINK_PORT_FLAVOUR_PHYSICAL:
+ 		if (!attrs->split)
+-			n = snprintf(name, len, "p%u", attrs->port_number);
++			n = snprintf(name, len, "p%u", attrs->phys.port_number);
+ 		else
+-			n = snprintf(name, len, "p%us%u", attrs->port_number,
+-				     attrs->split_subport_number);
++			n = snprintf(name, len, "p%us%u",
++				     attrs->phys.port_number,
++				     attrs->phys.split_subport_number);
+ 		break;
+ 	case DEVLINK_PORT_FLAVOUR_CPU:
+ 	case DEVLINK_PORT_FLAVOUR_DSA:
+-- 
+2.31.1
+

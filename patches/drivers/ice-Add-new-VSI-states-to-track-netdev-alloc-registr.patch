@@ -1,0 +1,121 @@
+From 41f7bfa4dfb8d097c19b2b008250bb3ec2074ff9 Mon Sep 17 00:00:00 2001
+From: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Date: Tue, 2 Mar 2021 10:15:41 -0800
+Subject: [PATCH 064/214] ice: Add new VSI states to track netdev
+ alloc/registration
+
+commit a476d72abe6cdd2cccc3dbf5a844286cfe9684ed upstream.
+
+Add two new VSI states, one to track if a netdev for the VSI has been
+allocated and the other to track if the netdev has been registered.
+Call unregister_netdev/free_netdev only when the corresponding state
+bits are set.
+
+Signed-off-by: Anirudh Venkataramanan <anirudh.venkataramanan@intel.com>
+Tested-by: Tony Brelinski <tonyx.brelinski@intel.com>
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/net/ethernet/intel/ice/ice.h      |  2 ++
+ drivers/net/ethernet/intel/ice/ice_lib.c  | 21 +++++++++++++++------
+ drivers/net/ethernet/intel/ice/ice_main.c |  5 +++++
+ 3 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 81fa1ceec90e..00d1c393ce69 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -240,6 +240,8 @@ enum ice_pf_state {
+ enum ice_vsi_state {
+ 	ICE_VSI_DOWN,
+ 	ICE_VSI_NEEDS_RESTART,
++	ICE_VSI_NETDEV_ALLOCD,
++	ICE_VSI_NETDEV_REGISTERED,
+ 	ICE_VSI_UMAC_FLTR_CHANGED,
+ 	ICE_VSI_MMAC_FLTR_CHANGED,
+ 	ICE_VSI_VLAN_FLTR_CHANGED,
+diff --git a/drivers/net/ethernet/intel/ice/ice_lib.c b/drivers/net/ethernet/intel/ice/ice_lib.c
+index 83f0dfdacd78..4341d17aee07 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_lib.c
+@@ -2752,11 +2752,14 @@ int ice_vsi_release(struct ice_vsi *vsi)
+ 	 * PF that is running the work queue items currently. This is done to
+ 	 * avoid check_flush_dependency() warning on this wq
+ 	 */
+-	if (vsi->netdev && !ice_is_reset_in_progress(pf->state)) {
++	if (vsi->netdev && !ice_is_reset_in_progress(pf->state) &&
++	    (test_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state))) {
+ 		unregister_netdev(vsi->netdev);
+-		ice_devlink_destroy_port(vsi);
++		clear_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
+ 	}
+ 
++	ice_devlink_destroy_port(vsi);
++
+ 	if (test_bit(ICE_FLAG_RSS_ENA, pf->flags))
+ 		ice_rss_clean(vsi);
+ 
+@@ -2811,10 +2814,16 @@ int ice_vsi_release(struct ice_vsi *vsi)
+ 	ice_vsi_delete(vsi);
+ 	ice_vsi_free_q_vectors(vsi);
+ 
+-	/* make sure unregister_netdev() was called by checking ICE_DOWN */
+-	if (vsi->netdev && test_bit(ICE_VSI_DOWN, vsi->state)) {
+-		free_netdev(vsi->netdev);
+-		vsi->netdev = NULL;
++	if (vsi->netdev) {
++		if (test_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state)) {
++			unregister_netdev(vsi->netdev);
++			clear_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
++		}
++		if (test_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state)) {
++			free_netdev(vsi->netdev);
++			vsi->netdev = NULL;
++			clear_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
++		}
+ 	}
+ 
+ 	if (vsi->type == ICE_VSI_VF &&
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 27ee48f9861a..858b78e01d75 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -2824,6 +2824,7 @@ static int ice_cfg_netdev(struct ice_vsi *vsi)
+ 	if (!netdev)
+ 		return -ENOMEM;
+ 
++	set_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
+ 	vsi->netdev = netdev;
+ 	np = netdev_priv(netdev);
+ 	np->vsi = vsi;
+@@ -3036,6 +3037,7 @@ static int ice_setup_pf_sw(struct ice_pf *pf)
+ 	if (vsi) {
+ 		ice_napi_del(vsi);
+ 		if (vsi->netdev) {
++			clear_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
+ 			free_netdev(vsi->netdev);
+ 			vsi->netdev = NULL;
+ 		}
+@@ -3801,6 +3803,7 @@ static int ice_register_netdev(struct ice_pf *pf)
+ 	if (err)
+ 		goto err_register_netdev;
+ 
++	set_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
+ 	netif_carrier_off(vsi->netdev);
+ 	netif_tx_stop_all_queues(vsi->netdev);
+ 	err = ice_devlink_create_port(vsi);
+@@ -3812,9 +3815,11 @@ static int ice_register_netdev(struct ice_pf *pf)
+ 	return 0;
+ err_devlink_create:
+ 	unregister_netdev(vsi->netdev);
++	clear_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
+ err_register_netdev:
+ 	free_netdev(vsi->netdev);
+ 	vsi->netdev = NULL;
++	clear_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
+ 	return err;
+ }
+ 
+-- 
+2.31.1
+
