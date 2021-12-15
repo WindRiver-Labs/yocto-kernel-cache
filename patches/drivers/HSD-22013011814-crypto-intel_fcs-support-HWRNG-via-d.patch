@@ -1,0 +1,152 @@
+From 984cde795dd6e7d5505873bc195c00960e57c130 Mon Sep 17 00:00:00 2001
+From: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+Date: Mon, 6 Sep 2021 11:10:37 +0800
+Subject: [PATCH 06/20] HSD #22013011814: crypto: intel_fcs: support HWRNG via
+ /dev/hwrng
+
+commit 20cf8927f26543578df97439e53ec6e266d547c7 from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+Add random number generation (RNG) support via /dev/hwrng for N5X device.
+
+Signed-off-by: Richard Gong <richard.gong@intel.com>
+Signed-off-by: Siew Chin Lim <elly.siew.chin.lim@intel.com>
+
+[Abhishek: Dropped the defconfig related part]
+
+Signed-off-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/crypto/Kconfig     |  2 +-
+ drivers/crypto/intel_fcs.c | 68 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+index f6e838af80ec..93414fb97198 100644
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -299,7 +299,7 @@ config CRYPTO_DEV_TALITOS2
+ 
+ config CRYPTO_DEV_INTEL_FCS
+ 	tristate "Intel FPGA Crypto Service support"
+-	depends on INTEL_STRATIX10_SERVICE
++	depends on INTEL_STRATIX10_SERVICE && HW_RANDOM
+ 	help
+ 	 Support crypto services on Intel SoCFPGA platforms. The crypto
+ 	 services include security certificate, image boot validation,
+diff --git a/drivers/crypto/intel_fcs.c b/drivers/crypto/intel_fcs.c
+index d8c55d7c59f5..ac936dc6e822 100644
+--- a/drivers/crypto/intel_fcs.c
++++ b/drivers/crypto/intel_fcs.c
+@@ -9,6 +9,7 @@
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include <linux/fs.h>
++#include <linux/hw_random.h>
+ #include <linux/kobject.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+@@ -74,6 +75,7 @@ struct intel_fcs_priv {
+ 	unsigned int cid_low;
+ 	unsigned int cid_high;
+ 	unsigned int sid;
++	struct hwrng rng;
+ };
+ 
+ static void fcs_data_callback(struct stratix10_svc_client *client,
+@@ -2339,6 +2341,56 @@ static int fcs_close(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++static int fcs_rng_read(struct hwrng *rng, void *buf, size_t max, bool wait)
++{
++	struct stratix10_svc_client_msg *msg;
++	struct intel_fcs_priv *priv;
++	struct device *dev;
++	void *s_buf;
++	int ret = 0;
++	size_t size;
++
++	priv = (struct intel_fcs_priv *)rng->priv;
++	dev = priv->client.dev;
++
++	msg = devm_kzalloc(dev, sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	s_buf = stratix10_svc_allocate_memory(priv->chan,
++					      RANDOM_NUMBER_SIZE);
++	if (!s_buf) {
++		dev_err(dev, "failed to allocate RNG buffer\n");
++		return -ENOMEM;
++	}
++
++	msg->command = COMMAND_FCS_RANDOM_NUMBER_GEN;
++	msg->payload = s_buf;
++	msg->payload_length = RANDOM_NUMBER_SIZE;
++	priv->client.receive_cb = fcs_data_callback;
++
++	ret = fcs_request_service(priv, (void *)msg,
++				  FCS_REQUEST_TIMEOUT);
++	if (!ret && !priv->status) {
++		if (!priv->kbuf) {
++			dev_err(dev, "failure on kbuf\n");
++			fcs_close_services(priv, s_buf, NULL);
++			return -EFAULT;
++		}
++
++		if (max > priv->size)
++			size = priv->size;
++		else
++			size = max;
++
++		memcpy((uint8_t *)buf, (uint8_t *)priv->kbuf, size);
++	}
++
++	fcs_close_services(priv, s_buf, NULL);
++
++	return size;
++}
++
+ static const struct file_operations fcs_fops = {
+ 	.owner = THIS_MODULE,
+ 	.unlocked_ioctl = fcs_ioctl,
+@@ -2381,8 +2433,6 @@ static int fcs_driver_probe(struct platform_device *pdev)
+ 
+ 	init_completion(&priv->completion);
+ 
+-	platform_set_drvdata(pdev, priv);
+-
+ 	ret = misc_register(&priv->miscdev);
+ 	if (ret) {
+ 		dev_err(dev, "can't register on minor=%d\n",
+@@ -2390,6 +2440,19 @@ static int fcs_driver_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	/* register hwrng device */
++	priv->rng.name = "intel-rng";
++	priv->rng.read = fcs_rng_read;
++	priv->rng.priv = (unsigned long)priv;
++
++	ret = hwrng_register(&priv->rng);
++	if (ret) {
++		dev_err(dev, "can't register RNG device (%d)\n", ret);
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, priv);
++
+ 	return 0;
+ }
+ 
+@@ -2397,6 +2460,7 @@ static int fcs_driver_remove(struct platform_device *pdev)
+ {
+ 	struct intel_fcs_priv *priv = platform_get_drvdata(pdev);
+ 
++	hwrng_unregister(&priv->rng);
+ 	misc_deregister(&priv->miscdev);
+ 	stratix10_svc_free_channel(priv->chan);
+ 
+-- 
+2.31.1
+

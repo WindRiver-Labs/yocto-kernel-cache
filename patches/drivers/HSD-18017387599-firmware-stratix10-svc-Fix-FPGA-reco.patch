@@ -1,0 +1,167 @@
+From 330865457b2d86a00a92728e320763e371bcfe4f Mon Sep 17 00:00:00 2001
+From: Ang Tien Sung <tien.sung.ang@intel.com>
+Date: Mon, 22 Nov 2021 09:15:15 +0800
+Subject: [PATCH 14/20] HSD #18017387599: firmware: stratix10-svc: Fix FPGA
+ reconfiguration SVC timeout
+
+commit 3614078c4cd972889de13d973104b31318d02a04 from
+https://github.com/altera-opensource/linux-socfpga/commits/socfpga-5.4.124-lts
+
+Modifying the driver to return a single callback for every SMC call.
+As the SVC driver sends a callback for every block of memory reclaimed at the end of
+every FPGA data transfer, it triggers multiple callbacks.
+The additional callbacks triggers the FPGA driver to start a new block of 512kBytes
+transfer without waiting for the previous 512kBytes of data to be done.
+As a result, it starts waiting earlier and eventually time-outs.
+The change also  increases the time-out of the FPGA reconfiguration
+as it is too close to the threshold.
+
+Reported-by: Russell Zhang <russel.zhang@nokia-sbell.com>
+Signed-off-by: Ang Tien Sung <tien.sung.ang@intel.com>
+Integrated-by: Abhishek Paliwal <paliwal.abhishek@windriver.com>
+---
+ drivers/firmware/stratix10-svc.c              | 39 +++++++++++++------
+ drivers/fpga/stratix10-soc.c                  | 15 ++++---
+ .../firmware/intel/stratix10-svc-client.h     |  6 ++-
+ 3 files changed, 39 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/firmware/stratix10-svc.c b/drivers/firmware/stratix10-svc.c
+index 35926a774434..88efcb33644d 100644
+--- a/drivers/firmware/stratix10-svc.c
++++ b/drivers/firmware/stratix10-svc.c
+@@ -206,6 +206,8 @@ static void svc_thread_cmd_data_claim(struct stratix10_svc_controller *ctrl,
+ {
+ 	struct arm_smccc_res res;
+ 	unsigned long timeout;
++	void *buf_claim_addr[4] = {NULL};
++	int buf_claim_count = 0;
+ 
+ 	reinit_completion(&ctrl->complete_status);
+ 	timeout = msecs_to_jiffies(FPGA_CONFIG_DATA_CLAIM_TIMEOUT_MS);
+@@ -217,20 +219,35 @@ static void svc_thread_cmd_data_claim(struct stratix10_svc_controller *ctrl,
+ 
+ 		if (res.a0 == INTEL_SIP_SMC_STATUS_OK) {
+ 			if (!res.a1) {
++				/* Transaction of 4 blocks are now done */
+ 				complete(&ctrl->complete_status);
++				cb_data->status = BIT(SVC_STATUS_BUFFER_DONE);
++				cb_data->kaddr1 = buf_claim_addr[0];
++				cb_data->kaddr2 = buf_claim_addr[1];
++				cb_data->kaddr3 = buf_claim_addr[2];
++				cb_data->kaddr4 = buf_claim_addr[3];
++				p_data->chan->scl->receive_cb(p_data->chan->scl,
++				cb_data);
+ 				break;
+ 			}
+-			cb_data->status = BIT(SVC_STATUS_BUFFER_DONE);
+-			cb_data->kaddr1 = svc_pa_to_va(res.a1);
+-			cb_data->kaddr2 = (res.a2) ?
+-					  svc_pa_to_va(res.a2) : NULL;
+-			cb_data->kaddr3 = (res.a3) ?
+-					  svc_pa_to_va(res.a3) : NULL;
+-			p_data->chan->scl->receive_cb(p_data->chan->scl,
+-						      cb_data);
+-		} else {
+-			pr_debug("%s: secure world busy, polling again\n",
+-				 __func__);
++
++			if (buf_claim_count >= 4) {
++				/* Maximum buffer to reclaim */
++				pr_err("%s Buffer re-claim error", __func__);
++				break;
++			}
++
++			buf_claim_addr[buf_claim_count++]
++			= svc_pa_to_va(res.a1);
++			if (res.a2) {
++				buf_claim_addr[buf_claim_count++]
++				= svc_pa_to_va(res.a2);
++			}
++			if (res.a3) {
++				buf_claim_addr[buf_claim_count++]
++				= svc_pa_to_va(res.a3);
++			}
++
+ 		}
+ 	} while (res.a0 == INTEL_SIP_SMC_STATUS_OK ||
+ 		 res.a0 == INTEL_SIP_SMC_STATUS_BUSY ||
+diff --git a/drivers/fpga/stratix10-soc.c b/drivers/fpga/stratix10-soc.c
+index 9ab7afd28a64..ce58fd30bf17 100644
+--- a/drivers/fpga/stratix10-soc.c
++++ b/drivers/fpga/stratix10-soc.c
+@@ -176,6 +176,7 @@ static void s10_receive_callback(struct stratix10_svc_client *client,
+ 	u32 status;
+ 	int i;
+ 
++	pr_debug("%s data %x\n", __func__, data->status);
+ 	WARN_ONCE(!data, "%s: stratix10_svc_rc_data = NULL", __func__);
+ 
+ 	status = data->status;
+@@ -192,6 +193,7 @@ static void s10_receive_callback(struct stratix10_svc_client *client,
+ 		s10_unlock_bufs(priv, data->kaddr1);
+ 		s10_unlock_bufs(priv, data->kaddr2);
+ 		s10_unlock_bufs(priv, data->kaddr3);
++		s10_unlock_bufs(priv, data->kaddr4);
+ 	}
+ 
+ 	complete(&priv->status_return_completion);
+@@ -347,13 +349,7 @@ static int s10_ops_write(struct fpga_manager *mgr, const char *buf,
+ 				break;
+ 		}
+ 
+-		/*
+-		 * If callback hasn't already happened, wait for buffers to be
+-		 * returned from service layer
+-		 */
+-		wait_status = 1; /* not timed out */
+-		if (!priv->status)
+-			wait_status = wait_for_completion_timeout(
++		wait_status = wait_for_completion_timeout(
+ 				&priv->status_return_completion,
+ 				S10_BUFFER_TIMEOUT);
+ 
+@@ -391,7 +387,10 @@ static int s10_ops_write_complete(struct fpga_manager *mgr,
+ 	unsigned long timeout;
+ 	int ret;
+ 
+-	timeout = usecs_to_jiffies(info->config_complete_timeout_us);
++	/* The time taken to process this is close to 600ms
++	 * This MUST be increased over 1 second
++	 */
++	timeout = S10_RECONFIG_TIMEOUT;
+ 
+ 	do {
+ 		reinit_completion(&priv->status_return_completion);
+diff --git a/include/linux/firmware/intel/stratix10-svc-client.h b/include/linux/firmware/intel/stratix10-svc-client.h
+index 99cd38639922..38640945afaa 100644
+--- a/include/linux/firmware/intel/stratix10-svc-client.h
++++ b/include/linux/firmware/intel/stratix10-svc-client.h
+@@ -72,8 +72,8 @@
+  * timeout value used in Stratix10 FPGA manager driver.
+  * timeout value used in RSU driver
+  */
+-#define SVC_RECONFIG_REQUEST_TIMEOUT_MS         300
+-#define SVC_RECONFIG_BUFFER_TIMEOUT_MS          720
++#define SVC_RECONFIG_REQUEST_TIMEOUT_MS         5000
++#define SVC_RECONFIG_BUFFER_TIMEOUT_MS          5000
+ #define SVC_RSU_REQUEST_TIMEOUT_MS              300
+ #define SVC_FCS_REQUEST_TIMEOUT_MS		2000
+ #define SVC_COMPLETED_TIMEOUT_MS		30000
+@@ -333,12 +333,14 @@ struct stratix10_svc_command_config_type {
+  * @kaddr1: address of 1st completed data block
+  * @kaddr2: address of 2nd completed data block
+  * @kaddr3: address of 3rd completed data block
++ * @kaddr4: address of 4th completed data block
+  */
+ struct stratix10_svc_cb_data {
+ 	u32 status;
+ 	void *kaddr1;
+ 	void *kaddr2;
+ 	void *kaddr3;
++	void *kaddr4;
+ };
+ 
+ /**
+-- 
+2.31.1
+
