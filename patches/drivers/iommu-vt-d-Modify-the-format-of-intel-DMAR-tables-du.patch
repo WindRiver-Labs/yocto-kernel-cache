@@ -1,0 +1,164 @@
+From b0e622f728a7d369958425b48b3c8fb20a134933 Mon Sep 17 00:00:00 2001
+From: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+Date: Fri, 24 May 2019 16:40:15 -0700
+Subject: [PATCH 03/20] iommu/vt-d: Modify the format of intel DMAR tables dump
+
+commit ea09506c363e90ef0b7532fdcf187bb67281a5e6 upstream.
+
+Presently, "/sys/kernel/debug/iommu/intel/dmar_translation_struct" file
+dumps DMAR tables in the below format
+
+IOMMU dmar2: Root Table Address:4362cc000
+Root Table Entries:
+ Bus: 0 H: 0 L: 4362f0001
+ Context Table Entries for Bus: 0
+  Entry	B:D.F	High	Low
+  160   00:14.0	102     4362ef001
+  184   00:17.0	302     435ec4001
+  248   00:1f.0	202     436300001
+
+This format has few short comings like
+1. When extended for dumping scalable mode DMAR table it will quickly be
+   very clumsy, making it unreadable.
+2. It has information like the Bus number and Entry which are basically
+   part of B:D.F, hence are a repetition and are not so useful.
+
+So, change it to a new format which could be easily extended to dump
+scalable mode DMAR table. The new format looks as below:
+
+IOMMU dmar2: Root Table Address: 0x436f7d000
+B.D.F	Root_entry				Context_entry
+00:14.0	0x0000000000000000:0x0000000436fbd001	0x0000000000000102:0x0000000436fbc001
+00:17.0	0x0000000000000000:0x0000000436fbd001	0x0000000000000302:0x0000000436af4001
+00:1f.0	0x0000000000000000:0x0000000436fbd001	0x0000000000000202:0x0000000436fcd001
+
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Ashok Raj <ashok.raj@intel.com>
+Cc: Lu Baolu <baolu.lu@linux.intel.com>
+Cc: Sohil Mehta <sohil.mehta@intel.com>
+Cc: David Woodhouse <dwmw2@infradead.org>
+Cc: Jacob Pan <jacob.jun.pan@linux.intel.com>
+Cc: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+Signed-off-by: Liwei Song <liwei.song@windriver.com>
+---
+ drivers/iommu/intel-iommu-debugfs.c | 65 ++++++++++++++++++-----------
+ 1 file changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/iommu/intel-iommu-debugfs.c b/drivers/iommu/intel-iommu-debugfs.c
+index e077ceb0aae0..f596ff0a525b 100644
+--- a/drivers/iommu/intel-iommu-debugfs.c
++++ b/drivers/iommu/intel-iommu-debugfs.c
+@@ -14,6 +14,13 @@
+ 
+ #include <asm/irq_remapping.h>
+ 
++struct tbl_walk {
++	u16 bus;
++	u16 devfn;
++	struct root_entry *rt_entry;
++	struct context_entry *ctx_entry;
++};
++
+ struct iommu_regset {
+ 	int offset;
+ 	const char *regs;
+@@ -141,16 +148,25 @@ static int iommu_regset_show(struct seq_file *m, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(iommu_regset);
+ 
+-static void ctx_tbl_entry_show(struct seq_file *m, struct intel_iommu *iommu,
+-			       int bus)
++static inline void print_tbl_walk(struct seq_file *m)
+ {
+-	struct context_entry *context;
+-	int devfn;
++	struct tbl_walk *tbl_wlk = m->private;
+ 
+-	seq_printf(m, " Context Table Entries for Bus: %d\n", bus);
+-	seq_puts(m, "  Entry\tB:D.F\tHigh\tLow\n");
++	seq_printf(m, "%02x:%02x.%x\t0x%016llx:0x%016llx\t0x%016llx:0x%016llx\n",
++		   tbl_wlk->bus, PCI_SLOT(tbl_wlk->devfn),
++		   PCI_FUNC(tbl_wlk->devfn), tbl_wlk->rt_entry->hi,
++		   tbl_wlk->rt_entry->lo, tbl_wlk->ctx_entry->hi,
++		   tbl_wlk->ctx_entry->lo);
++}
++
++static void ctx_tbl_walk(struct seq_file *m, struct intel_iommu *iommu, u16 bus)
++{
++	struct context_entry *context;
++	u16 devfn;
+ 
+ 	for (devfn = 0; devfn < 256; devfn++) {
++		struct tbl_walk tbl_wlk = {0};
++
+ 		context = iommu_context_addr(iommu, bus, devfn, 0);
+ 		if (!context)
+ 			return;
+@@ -158,33 +174,34 @@ static void ctx_tbl_entry_show(struct seq_file *m, struct intel_iommu *iommu,
+ 		if (!context_present(context))
+ 			continue;
+ 
+-		seq_printf(m, "  %-5d\t%02x:%02x.%x\t%-6llx\t%llx\n", devfn,
+-			   bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+-			   context[0].hi, context[0].lo);
++		tbl_wlk.bus = bus;
++		tbl_wlk.devfn = devfn;
++		tbl_wlk.rt_entry = &iommu->root_entry[bus];
++		tbl_wlk.ctx_entry = context;
++		m->private = &tbl_wlk;
++
++		print_tbl_walk(m);
+ 	}
+ }
+ 
+-static void root_tbl_entry_show(struct seq_file *m, struct intel_iommu *iommu)
++static void root_tbl_walk(struct seq_file *m, struct intel_iommu *iommu)
+ {
+ 	unsigned long flags;
+-	int bus;
++	u16 bus;
+ 
+ 	spin_lock_irqsave(&iommu->lock, flags);
+-	seq_printf(m, "IOMMU %s: Root Table Address:%llx\n", iommu->name,
++	seq_printf(m, "IOMMU %s: Root Table Address: 0x%llx\n", iommu->name,
+ 		   (u64)virt_to_phys(iommu->root_entry));
+-	seq_puts(m, "Root Table Entries:\n");
+-
+-	for (bus = 0; bus < 256; bus++) {
+-		if (!(iommu->root_entry[bus].lo & 1))
+-			continue;
++	seq_puts(m, "B.D.F\tRoot_entry\t\t\t\tContext_entry\n");
+ 
+-		seq_printf(m, " Bus: %d H: %llx L: %llx\n", bus,
+-			   iommu->root_entry[bus].hi,
+-			   iommu->root_entry[bus].lo);
++	/*
++	 * No need to check if the root entry is present or not because
++	 * iommu_context_addr() performs the same check before returning
++	 * context entry.
++	 */
++	for (bus = 0; bus < 256; bus++)
++		ctx_tbl_walk(m, iommu, bus);
+ 
+-		ctx_tbl_entry_show(m, iommu, bus);
+-		seq_putc(m, '\n');
+-	}
+ 	spin_unlock_irqrestore(&iommu->lock, flags);
+ }
+ 
+@@ -202,7 +219,7 @@ static int dmar_translation_struct_show(struct seq_file *m, void *unused)
+ 				   iommu->name);
+ 			continue;
+ 		}
+-		root_tbl_entry_show(m, iommu);
++		root_tbl_walk(m, iommu);
+ 		seq_putc(m, '\n');
+ 	}
+ 	rcu_read_unlock();
+-- 
+2.31.1
+
