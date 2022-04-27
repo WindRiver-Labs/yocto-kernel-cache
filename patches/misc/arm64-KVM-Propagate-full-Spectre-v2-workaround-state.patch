@@ -1,0 +1,173 @@
+From 01b1013970e54c82352f4f4bb9a0153275e4d033 Mon Sep 17 00:00:00 2001
+From: Andre Przywara <andre.przywara@arm.com>
+Date: Fri, 3 May 2019 15:27:48 +0100
+Subject: [PATCH 10/13] arm64: KVM: Propagate full Spectre v2 workaround state
+ to KVM guests
+
+Recent commits added the explicit notion of "workaround not required" to
+the state of the Spectre v2 (aka. BP_HARDENING) workaround, where we
+just had "needed" and "unknown" before.
+
+Export this knowledge to the rest of the kernel and enhance the existing
+kvm_arm_harden_branch_predictor() to report this new state as well.
+Export this new state to guests when they use KVM's firmware interface
+emulation.
+
+Signed-off-by: Andre Przywara <andre.przywara@arm.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+[AZ: backport of c118bbb52743 from 5.4.y branch of linux-stable]
+Signed-off-by: Adrian Zaharia <Adrian.Zaharia@windriver.com>
+---
+ arch/arm/include/asm/kvm_host.h     | 12 +++++++++---
+ arch/arm64/include/asm/cpufeature.h |  6 ++++++
+ arch/arm64/include/asm/kvm_host.h   | 16 ++++++++++++++--
+ arch/arm64/kernel/cpu_errata.c      | 23 ++++++++++++++++++-----
+ virt/kvm/arm/psci.c                 | 10 +++++++++-
+ 5 files changed, 56 insertions(+), 11 deletions(-)
+
+diff --git a/arch/arm/include/asm/kvm_host.h b/arch/arm/include/asm/kvm_host.h
+index f80418ddeb60..e74e8f408987 100644
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -362,7 +362,11 @@ static inline void kvm_vcpu_pmu_restore_host(struct kvm_vcpu *vcpu) {}
+ static inline void kvm_arm_vhe_guest_enter(void) {}
+ static inline void kvm_arm_vhe_guest_exit(void) {}
+ 
+-static inline bool kvm_arm_harden_branch_predictor(void)
++#define KVM_BP_HARDEN_UNKNOWN		-1
++#define KVM_BP_HARDEN_WA_NEEDED		0
++#define KVM_BP_HARDEN_NOT_REQUIRED	1
++
++static inline int kvm_arm_harden_branch_predictor(void)
+ {
+ 	switch(read_cpuid_part()) {
+ #ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
+@@ -370,10 +374,12 @@ static inline bool kvm_arm_harden_branch_predictor(void)
+ 	case ARM_CPU_PART_CORTEX_A12:
+ 	case ARM_CPU_PART_CORTEX_A15:
+ 	case ARM_CPU_PART_CORTEX_A17:
+-		return true;
++		return KVM_BP_HARDEN_WA_NEEDED;
+ #endif
++	case ARM_CPU_PART_CORTEX_A7:
++		return KVM_BP_HARDEN_NOT_REQUIRED;
+ 	default:
+-		return false;
++		return KVM_BP_HARDEN_UNKNOWN;
+ 	}
+ }
+ 
+diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
+index 731f2c4161b9..f80763a2b40f 100644
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -615,6 +615,12 @@ static __always_inline bool system_uses_irq_prio_masking(void)
+ 	       cpus_have_const_cap(ARM64_HAS_IRQ_PRIO_MASKING);
+ }
+ 
++#define ARM64_BP_HARDEN_UNKNOWN		-1
++#define ARM64_BP_HARDEN_WA_NEEDED	0
++#define ARM64_BP_HARDEN_NOT_REQUIRED	1
++
++int get_spectre_v2_workaround_state(void);
++
+ #define ARM64_SSBD_UNKNOWN		-1
+ #define ARM64_SSBD_FORCE_DISABLE	0
+ #define ARM64_SSBD_KERNEL		1
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 5ecf3ea2ede4..a6f9cb0ef9f3 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -623,9 +623,21 @@ static inline void kvm_arm_vhe_guest_exit(void)
+ 	isb();
+ }
+ 
+-static inline bool kvm_arm_harden_branch_predictor(void)
++#define KVM_BP_HARDEN_UNKNOWN		-1
++#define KVM_BP_HARDEN_WA_NEEDED		0
++#define KVM_BP_HARDEN_NOT_REQUIRED	1
++
++static inline int kvm_arm_harden_branch_predictor(void)
+ {
+-	return cpus_have_const_cap(ARM64_HARDEN_BRANCH_PREDICTOR);
++	switch (get_spectre_v2_workaround_state()) {
++	case ARM64_BP_HARDEN_WA_NEEDED:
++		return KVM_BP_HARDEN_WA_NEEDED;
++	case ARM64_BP_HARDEN_NOT_REQUIRED:
++		return KVM_BP_HARDEN_NOT_REQUIRED;
++	case ARM64_BP_HARDEN_UNKNOWN:
++	default:
++		return KVM_BP_HARDEN_UNKNOWN;
++	}
+ }
+ 
+ #define KVM_SSBD_UNKNOWN		-1
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 97ea23091a41..cbbf937ee238 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -563,6 +563,17 @@ cpu_enable_cache_maint_trap(const struct arm64_cpu_capabilities *__unused)
+ static bool __hardenbp_enab = true;
+ static bool __spectrev2_safe = true;
+ 
++int get_spectre_v2_workaround_state(void)
++{
++	if (__spectrev2_safe)
++		return ARM64_BP_HARDEN_NOT_REQUIRED;
++
++	if (!__hardenbp_enab)
++		return ARM64_BP_HARDEN_UNKNOWN;
++
++	return ARM64_BP_HARDEN_WA_NEEDED;
++}
++
+ /*
+  * List of CPUs that do not need any Spectre-v2 mitigation at all.
+  */
+@@ -922,13 +933,15 @@ ssize_t cpu_show_spectre_v1(struct device *dev, struct device_attribute *attr,
+ ssize_t cpu_show_spectre_v2(struct device *dev, struct device_attribute *attr,
+ 		char *buf)
+ {
+-	if (__spectrev2_safe)
++	switch (get_spectre_v2_workaround_state()) {
++	case ARM64_BP_HARDEN_NOT_REQUIRED:
+ 		return sprintf(buf, "Not affected\n");
+-
+-	if (__hardenbp_enab)
++        case ARM64_BP_HARDEN_WA_NEEDED:
+ 		return sprintf(buf, "Mitigation: Branch predictor hardening\n");
+-
+-	return sprintf(buf, "Vulnerable\n");
++        case ARM64_BP_HARDEN_UNKNOWN:
++	default:
++		return sprintf(buf, "Vulnerable\n");
++	}
+ }
+ 
+ ssize_t cpu_show_spec_store_bypass(struct device *dev,
+diff --git a/virt/kvm/arm/psci.c b/virt/kvm/arm/psci.c
+index be3c9cdca9f3..355b9e38a42d 100644
+--- a/virt/kvm/arm/psci.c
++++ b/virt/kvm/arm/psci.c
+@@ -401,8 +401,16 @@ int kvm_hvc_call_handler(struct kvm_vcpu *vcpu)
+ 		feature = smccc_get_arg1(vcpu);
+ 		switch(feature) {
+ 		case ARM_SMCCC_ARCH_WORKAROUND_1:
+-			if (kvm_arm_harden_branch_predictor())
++			switch (kvm_arm_harden_branch_predictor()) {
++			case KVM_BP_HARDEN_UNKNOWN:
++				break;
++			case KVM_BP_HARDEN_WA_NEEDED:
+ 				val = SMCCC_RET_SUCCESS;
++				break;
++			case KVM_BP_HARDEN_NOT_REQUIRED:
++				val = SMCCC_RET_NOT_REQUIRED;
++				break;
++			}
+ 			break;
+ 		case ARM_SMCCC_ARCH_WORKAROUND_2:
+ 			switch (kvm_arm_have_ssbd()) {
+-- 
+2.34.1
+
