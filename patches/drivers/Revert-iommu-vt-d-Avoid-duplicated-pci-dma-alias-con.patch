@@ -1,0 +1,135 @@
+From 8c5c8afb68c7cf02a04712105b36ba0a4c78dc80 Mon Sep 17 00:00:00 2001
+From: Lu Baolu <baolu.lu@linux.intel.com>
+Date: Mon, 26 Aug 2019 16:50:56 +0800
+Subject: [PATCH 27/36] Revert "iommu/vt-d: Avoid duplicated pci dma alias
+ consideration"
+
+commit 0ce4a85f4f015d13a6a6b4954f4e8e63cd83f7b1 upstream.
+
+This reverts commit 557529494d79f3f1fadd486dd18d2de0b19be4da.
+
+Commit 557529494d79f ("iommu/vt-d: Avoid duplicated pci dma alias
+consideration") aimed to address a NULL pointer deference issue
+happened when a thunderbolt device driver returned unexpectedly.
+
+Unfortunately, this change breaks a previous pci quirk added by
+commit cc346a4714a59 ("PCI: Add function 1 DMA alias quirk for
+Marvell devices"), as the result, devices like Marvell 88SE9128
+SATA controller doesn't work anymore.
+
+We will continue to try to find the real culprit mentioned in
+557529494d79f, but for now we should revert it to fix current
+breakage.
+
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=204627
+Cc: Stijn Tintel <stijn@linux-ipv6.be>
+Cc: Petr Vandrovec <petr@vandrovec.name>
+Reported-by: Stijn Tintel <stijn@linux-ipv6.be>
+Reported-by: Petr Vandrovec <petr@vandrovec.name>
+Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+---
+ drivers/iommu/intel-iommu.c | 55 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 99aedf76b09a..c263fd4ea2c5 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -339,6 +339,8 @@ static void domain_exit(struct dmar_domain *domain);
+ static void domain_remove_dev_info(struct dmar_domain *domain);
+ static void dmar_remove_one_dev_info(struct device *dev);
+ static void __dmar_remove_one_dev_info(struct device_domain_info *info);
++static void domain_context_clear(struct intel_iommu *iommu,
++				 struct device *dev);
+ static int domain_detach_iommu(struct dmar_domain *domain,
+ 			       struct intel_iommu *iommu);
+ static bool device_is_rmrr_locked(struct device *dev);
+@@ -2120,9 +2122,26 @@ static int domain_context_mapping_one(struct dmar_domain *domain,
+ 	return ret;
+ }
+ 
++struct domain_context_mapping_data {
++	struct dmar_domain *domain;
++	struct intel_iommu *iommu;
++	struct pasid_table *table;
++};
++
++static int domain_context_mapping_cb(struct pci_dev *pdev,
++				     u16 alias, void *opaque)
++{
++	struct domain_context_mapping_data *data = opaque;
++
++	return domain_context_mapping_one(data->domain, data->iommu,
++					  data->table, PCI_BUS_NUM(alias),
++					  alias & 0xff);
++}
++
+ static int
+ domain_context_mapping(struct dmar_domain *domain, struct device *dev)
+ {
++	struct domain_context_mapping_data data;
+ 	struct pasid_table *table;
+ 	struct intel_iommu *iommu;
+ 	u8 bus, devfn;
+@@ -2132,7 +2151,17 @@ domain_context_mapping(struct dmar_domain *domain, struct device *dev)
+ 		return -ENODEV;
+ 
+ 	table = intel_pasid_get_table(dev);
+-	return domain_context_mapping_one(domain, iommu, table, bus, devfn);
++
++	if (!dev_is_pci(dev))
++		return domain_context_mapping_one(domain, iommu, table,
++						  bus, devfn);
++
++	data.domain = domain;
++	data.iommu = iommu;
++	data.table = table;
++
++	return pci_for_each_dma_alias(to_pci_dev(dev),
++				      &domain_context_mapping_cb, &data);
+ }
+ 
+ static int domain_context_mapped_cb(struct pci_dev *pdev,
+@@ -4837,6 +4866,28 @@ int __init intel_iommu_init(void)
+ 	return ret;
+ }
+ 
++static int domain_context_clear_one_cb(struct pci_dev *pdev, u16 alias, void *opaque)
++{
++	struct intel_iommu *iommu = opaque;
++
++	domain_context_clear_one(iommu, PCI_BUS_NUM(alias), alias & 0xff);
++	return 0;
++}
++
++/*
++ * NB - intel-iommu lacks any sort of reference counting for the users of
++ * dependent devices.  If multiple endpoints have intersecting dependent
++ * devices, unbinding the driver from any one of them will possibly leave
++ * the others unable to operate.
++ */
++static void domain_context_clear(struct intel_iommu *iommu, struct device *dev)
++{
++	if (!iommu || !dev || !dev_is_pci(dev))
++		return;
++
++	pci_for_each_dma_alias(to_pci_dev(dev), &domain_context_clear_one_cb, iommu);
++}
++
+ static void __dmar_remove_one_dev_info(struct device_domain_info *info)
+ {
+ 	struct dmar_domain *domain;
+@@ -4857,7 +4908,7 @@ static void __dmar_remove_one_dev_info(struct device_domain_info *info)
+ 					PASID_RID2PASID);
+ 
+ 		iommu_disable_dev_iotlb(info);
+-		domain_context_clear_one(iommu, info->bus, info->devfn);
++		domain_context_clear(iommu, info->dev);
+ 		intel_pasid_free_table(info->dev);
+ 	}
+ 
+-- 
+2.34.1
+
