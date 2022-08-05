@@ -1,0 +1,422 @@
+From e20e61f72c852cfacfdae708b0c634420e94a066 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Tue, 1 Aug 2017 17:32:07 +0200
+Subject: [PATCH 1/4] fbcon: Make fbcon a built-time depency for fbdev
+
+commit 6104c37094e729f3d4ce65797002112735d49cd1 upstream
+
+There's a bunch of folks who're trying to make printk less
+contended and faster, but there's a problem: printk uses the
+console_lock, and the console lock has become the BKL for all things
+fbdev/fbcon, which in turn pulled in half the drm subsystem under that
+lock. That's awkward.
+
+There reasons for that is probably just a historical accident:
+
+- fbcon is a runtime option of fbdev, i.e. at runtime you can pick
+  whether your fbdev driver instances are used as kernel consoles.
+  Unfortunately this wasn't implemented with some module option, but
+  through some module loading magic: As long as you don't load
+  fbcon.ko, there's no fbdev console support, but loading it (in any
+  order wrt fbdev drivers) will create console instances for all fbdev
+  drivers.
+
+- This was implemented through a notifier chain. fbcon.ko enumerates
+  all fbdev instances at load time and also registers itself as
+  listener in the fbdev notifier. The fbdev core tries to register new
+  fbdev instances with fbcon using the notifier.
+
+- On top of that the modifier chain is also used at runtime by the
+  fbdev subsystem to e.g. control backlights for panels.
+
+- The problem is that the notifier puts a mutex locking context
+  between fbdev and fbcon, which mixes up the locking contexts for
+  both the runtime usage and the register time usage to notify fbcon.
+  And at runtime fbcon (through the fbdev core) might call into the
+  notifier from a printk critical section while console_lock is held.
+
+- This means console_lock must be an outer lock for the entire fbdev
+  subsystem, which also means it must be acquired when registering a
+  new framebuffer driver as the outermost lock since we might call
+  into fbcon (through the notifier) which would result in a locking
+  inversion if fbcon would acquire the console_lock from its notifier
+  callback (which it needs to register the console).
+
+- console_lock can be held anywhere, since printk can be called
+  anywhere, and through the above story, plus drm/kms being an fbdev
+  driver, we pull in a shocking amount of locking hiercharchy
+  underneath the console_lock. Which makes cleaning up printk really
+  hard (not even splitting console_lock into an rwsem is all that
+  useful due to this).
+
+There's various ways to address this, but the cleanest would be to
+make fbcon a compile-time option, where fbdev directly calls the fbcon
+register functions from register_framebuffer, or dummy static inline
+versions if fbcon is disabled. Maybe augmented with a runtime knob to
+disable fbcon, if that's needed (for debugging perhaps).
+
+But this could break some users who rely on the magic "loading
+fbcon.ko enables/disables fbdev framebuffers at runtime" thing, even
+if that's unlikely. Hence we must be careful:
+
+1. Create a compile-time dependency between fbcon and fbdev in the
+least minimal way. This is what this patch does.
+
+2. Wait at least 1 year to give possible users time to scream about
+how we broke their setup. Unlikely, since all distros make fbcon
+compile-in, and embedded platforms only compile stuff they know they
+need anyway. But still.
+
+3. Convert the notifier to direct functions calls, with dummy static
+inlines if fbcon is disabled. We'll still need the fb notifier for the
+other uses (like backlights), but we can probably move it into the fb
+core (atm it must be built-into vmlinux).
+
+4. Push console_lock down the call-chain, until it is down in
+console_register again.
+
+5. Finally start to clean up and rework the printk/console locking.
+
+For context of this saga see
+
+commit 50e244cc793d511b86adea24972f3a7264cae114
+Author: Alan Cox <alan@linux.intel.com>
+Date:   Fri Jan 25 10:28:15 2013 +1000
+
+    fb: rework locking to fix lock ordering on takeover
+
+plus the pile of commits on top that tried to make this all work
+without terminally upsetting lockdep. We've uncovered all this when
+console_lock lockdep annotations where added in
+
+commit daee779718a319ff9f83e1ba3339334ac650bb22
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Sat Sep 22 19:52:11 2012 +0200
+
+    console: implement lockdep support for console_lock
+
+On the patch itself:
+- Switch CONFIG_FRAMEBUFFER_CONSOLE to be a boolean, using the overall
+  CONFIG_FB tristate to decided whether it should be a module or
+  built-in.
+
+- At first I thought I could force the build depency with just a dummy
+  symbol that fbcon.ko exports and fb.ko uses. But that leads to a
+  module depency cycle (it works fine when built-in).
+
+  Since this tight binding is the entire goal the simplest solution is
+  to move all the fbcon modules (and there's a bunch of optinal
+  source-files which are each modules of their own, for no good
+  reason) into the overall fb.ko core module. That's a bit more than
+  what I would have liked to do in this patch, but oh well.
+
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
+Cc: Sergey Senozhatsky <sergey.senozhatsky.work@gmail.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+Signed-off-by: Stefan Ghinea <stefan.ghinea@windriver.com>
+---
+ drivers/video/console/Kconfig                       |  2 +-
+ drivers/video/console/Makefile                      |  8 --------
+ drivers/video/fbdev/core/Makefile                   | 11 +++++++++++
+ drivers/video/{console => fbdev/core}/bitblit.c     |  4 ----
+ drivers/video/{console => fbdev/core}/fbcon.c       | 13 +++----------
+ drivers/video/{console => fbdev/core}/fbcon.h       |  0
+ drivers/video/{console => fbdev/core}/fbcon_ccw.c   |  4 ----
+ drivers/video/{console => fbdev/core}/fbcon_cw.c    |  4 ----
+ .../video/{console => fbdev/core}/fbcon_rotate.c    |  4 ----
+ .../video/{console => fbdev/core}/fbcon_rotate.h    |  0
+ drivers/video/{console => fbdev/core}/fbcon_ud.c    |  4 ----
+ drivers/video/fbdev/core/fbmem.c                    |  6 ++++++
+ drivers/video/{console => fbdev/core}/softcursor.c  |  4 ----
+ drivers/video/{console => fbdev/core}/tileblit.c    |  5 -----
+ include/linux/fbcon.h                               | 12 ++++++++++++
+ 15 files changed, 33 insertions(+), 48 deletions(-)
+ rename drivers/video/{console => fbdev/core}/bitblit.c (98%)
+ rename drivers/video/{console => fbdev/core}/fbcon.c (99%)
+ rename drivers/video/{console => fbdev/core}/fbcon.h (100%)
+ rename drivers/video/{console => fbdev/core}/fbcon_ccw.c (98%)
+ rename drivers/video/{console => fbdev/core}/fbcon_cw.c (98%)
+ rename drivers/video/{console => fbdev/core}/fbcon_rotate.c (95%)
+ rename drivers/video/{console => fbdev/core}/fbcon_rotate.h (100%)
+ rename drivers/video/{console => fbdev/core}/fbcon_ud.c (98%)
+ rename drivers/video/{console => fbdev/core}/softcursor.c (93%)
+ rename drivers/video/{console => fbdev/core}/tileblit.c (96%)
+ create mode 100644 include/linux/fbcon.h
+
+diff --git a/drivers/video/console/Kconfig b/drivers/video/console/Kconfig
+index 8d6b4bd9954d..7434320168e0 100644
+--- a/drivers/video/console/Kconfig
++++ b/drivers/video/console/Kconfig
+@@ -71,7 +71,7 @@ config DUMMY_CONSOLE_ROWS
+           Select 25 if you use a 640x480 resolution by default.
+ 
+ config FRAMEBUFFER_CONSOLE
+-	tristate "Framebuffer Console support"
++	bool "Framebuffer Console support"
+ 	depends on FB && !UML
+ 	select VT_HW_CONSOLE_BINDING
+ 	select CRC32
+diff --git a/drivers/video/console/Makefile b/drivers/video/console/Makefile
+index 43bfa485db96..eb2cbec52643 100644
+--- a/drivers/video/console/Makefile
++++ b/drivers/video/console/Makefile
+@@ -7,13 +7,5 @@ obj-$(CONFIG_SGI_NEWPORT_CONSOLE) += newport_con.o
+ obj-$(CONFIG_STI_CONSOLE)         += sticon.o sticore.o
+ obj-$(CONFIG_VGA_CONSOLE)         += vgacon.o
+ obj-$(CONFIG_MDA_CONSOLE)         += mdacon.o
+-obj-$(CONFIG_FRAMEBUFFER_CONSOLE) += fbcon.o bitblit.o softcursor.o
+-ifeq ($(CONFIG_FB_TILEBLITTING),y)
+-obj-$(CONFIG_FRAMEBUFFER_CONSOLE)     += tileblit.o
+-endif
+-ifeq ($(CONFIG_FRAMEBUFFER_CONSOLE_ROTATION),y)
+-obj-$(CONFIG_FRAMEBUFFER_CONSOLE)     += fbcon_rotate.o fbcon_cw.o fbcon_ud.o \
+-                                         fbcon_ccw.o
+-endif
+ 
+ obj-$(CONFIG_FB_STI)              += sticore.o
+diff --git a/drivers/video/fbdev/core/Makefile b/drivers/video/fbdev/core/Makefile
+index 9e3ddf225393..0214b863ac3f 100644
+--- a/drivers/video/fbdev/core/Makefile
++++ b/drivers/video/fbdev/core/Makefile
+@@ -4,6 +4,17 @@ obj-$(CONFIG_FB)                  += fb.o
+ fb-y                              := fbmem.o fbmon.o fbcmap.o fbsysfs.o \
+                                      modedb.o fbcvt.o
+ fb-$(CONFIG_FB_DEFERRED_IO)       += fb_defio.o
++
++ifeq ($(CONFIG_FRAMEBUFFER_CONSOLE),y)
++fb-y				  += fbcon.o bitblit.o softcursor.o
++ifeq ($(CONFIG_FB_TILEBLITTING),y)
++fb-y				  += tileblit.o
++endif
++ifeq ($(CONFIG_FRAMEBUFFER_CONSOLE_ROTATION),y)
++fb-y				  += fbcon_rotate.o fbcon_cw.o fbcon_ud.o \
++				     fbcon_ccw.o
++endif
++endif
+ fb-objs                           := $(fb-y)
+ 
+ obj-$(CONFIG_FB_CFB_FILLRECT)  += cfbfillrect.o
+diff --git a/drivers/video/console/bitblit.c b/drivers/video/fbdev/core/bitblit.c
+similarity index 98%
+rename from drivers/video/console/bitblit.c
+rename to drivers/video/fbdev/core/bitblit.c
+index dbfe4eecf12e..99f3a1c3d093 100644
+--- a/drivers/video/console/bitblit.c
++++ b/drivers/video/fbdev/core/bitblit.c
+@@ -416,7 +416,3 @@ void fbcon_set_bitops(struct fbcon_ops *ops)
+ 
+ EXPORT_SYMBOL(fbcon_set_bitops);
+ 
+-MODULE_AUTHOR("Antonino Daplas <adaplas@pol.net>");
+-MODULE_DESCRIPTION("Bit Blitting Operation");
+-MODULE_LICENSE("GPL");
+-
+diff --git a/drivers/video/console/fbcon.c b/drivers/video/fbdev/core/fbcon.c
+similarity index 99%
+rename from drivers/video/console/fbcon.c
+rename to drivers/video/fbdev/core/fbcon.c
+index 4ab69f07cf31..71fb75ec44b1 100644
+--- a/drivers/video/console/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@ -68,6 +68,7 @@
+ #include <linux/kd.h>
+ #include <linux/slab.h>
+ #include <linux/fb.h>
++#include <linux/fbcon.h>
+ #include <linux/vt_kern.h>
+ #include <linux/selection.h>
+ #include <linux/font.h>
+@@ -3292,7 +3293,7 @@ static void fbcon_exit(void)
+ 	fbcon_has_exited = 1;
+ }
+ 
+-static int __init fb_console_init(void)
++void __init fb_console_init(void)
+ {
+ 	int i;
+ 
+@@ -3314,11 +3315,8 @@ static int __init fb_console_init(void)
+ 
+ 	console_unlock();
+ 	fbcon_start();
+-	return 0;
+ }
+ 
+-fs_initcall(fb_console_init);
+-
+ #ifdef MODULE
+ 
+ static void __exit fbcon_deinit_device(void)
+@@ -3333,7 +3331,7 @@ static void __exit fbcon_deinit_device(void)
+ 	}
+ }
+ 
+-static void __exit fb_console_exit(void)
++void __exit fb_console_exit(void)
+ {
+ 	console_lock();
+ 	fb_unregister_client(&fbcon_event_notifier);
+@@ -3343,9 +3341,4 @@ static void __exit fb_console_exit(void)
+ 	do_unregister_con_driver(&fb_con);
+ 	console_unlock();
+ }	
+-
+-module_exit(fb_console_exit);
+-
+ #endif
+-
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/video/console/fbcon.h b/drivers/video/fbdev/core/fbcon.h
+similarity index 100%
+rename from drivers/video/console/fbcon.h
+rename to drivers/video/fbdev/core/fbcon.h
+diff --git a/drivers/video/console/fbcon_ccw.c b/drivers/video/fbdev/core/fbcon_ccw.c
+similarity index 98%
+rename from drivers/video/console/fbcon_ccw.c
+rename to drivers/video/fbdev/core/fbcon_ccw.c
+index 5a3cbf6dff4d..2eeefa97bd4a 100644
+--- a/drivers/video/console/fbcon_ccw.c
++++ b/drivers/video/fbdev/core/fbcon_ccw.c
+@@ -418,7 +418,3 @@ void fbcon_rotate_ccw(struct fbcon_ops *ops)
+ 	ops->update_start = ccw_update_start;
+ }
+ EXPORT_SYMBOL(fbcon_rotate_ccw);
+-
+-MODULE_AUTHOR("Antonino Daplas <adaplas@pol.net>");
+-MODULE_DESCRIPTION("Console Rotation (270 degrees) Support");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/video/console/fbcon_cw.c b/drivers/video/fbdev/core/fbcon_cw.c
+similarity index 98%
+rename from drivers/video/console/fbcon_cw.c
+rename to drivers/video/fbdev/core/fbcon_cw.c
+index e7ee44db4e98..c321f7c59e5c 100644
+--- a/drivers/video/console/fbcon_cw.c
++++ b/drivers/video/fbdev/core/fbcon_cw.c
+@@ -401,7 +401,3 @@ void fbcon_rotate_cw(struct fbcon_ops *ops)
+ 	ops->update_start = cw_update_start;
+ }
+ EXPORT_SYMBOL(fbcon_rotate_cw);
+-
+-MODULE_AUTHOR("Antonino Daplas <adaplas@pol.net>");
+-MODULE_DESCRIPTION("Console Rotation (90 degrees) Support");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/video/console/fbcon_rotate.c b/drivers/video/fbdev/core/fbcon_rotate.c
+similarity index 95%
+rename from drivers/video/console/fbcon_rotate.c
+rename to drivers/video/fbdev/core/fbcon_rotate.c
+index 0e3321081945..e9a5c6a4b562 100644
+--- a/drivers/video/console/fbcon_rotate.c
++++ b/drivers/video/fbdev/core/fbcon_rotate.c
+@@ -111,7 +111,3 @@ void fbcon_set_rotate(struct fbcon_ops *ops)
+ 	}
+ }
+ EXPORT_SYMBOL(fbcon_set_rotate);
+-
+-MODULE_AUTHOR("Antonino Daplas <adaplas@pol.net>");
+-MODULE_DESCRIPTION("Console Rotation Support");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/video/console/fbcon_rotate.h b/drivers/video/fbdev/core/fbcon_rotate.h
+similarity index 100%
+rename from drivers/video/console/fbcon_rotate.h
+rename to drivers/video/fbdev/core/fbcon_rotate.h
+diff --git a/drivers/video/console/fbcon_ud.c b/drivers/video/fbdev/core/fbcon_ud.c
+similarity index 98%
+rename from drivers/video/console/fbcon_ud.c
+rename to drivers/video/fbdev/core/fbcon_ud.c
+index 19e3714abfe8..c0b605d49cb3 100644
+--- a/drivers/video/console/fbcon_ud.c
++++ b/drivers/video/fbdev/core/fbcon_ud.c
+@@ -446,7 +446,3 @@ void fbcon_rotate_ud(struct fbcon_ops *ops)
+ 	ops->update_start = ud_update_start;
+ }
+ EXPORT_SYMBOL(fbcon_rotate_ud);
+-
+-MODULE_AUTHOR("Antonino Daplas <adaplas@pol.net>");
+-MODULE_DESCRIPTION("Console Rotation (180 degrees) Support");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/video/fbdev/core/fbmem.c b/drivers/video/fbdev/core/fbmem.c
+index 069fe7960df1..283d57cf8526 100644
+--- a/drivers/video/fbdev/core/fbmem.c
++++ b/drivers/video/fbdev/core/fbmem.c
+@@ -32,6 +32,7 @@
+ #include <linux/device.h>
+ #include <linux/efi.h>
+ #include <linux/fb.h>
++#include <linux/fbcon.h>
+ 
+ #include <asm/fb.h>
+ 
+@@ -1888,6 +1889,9 @@ fbmem_init(void)
+ 		fb_class = NULL;
+ 		goto err_class;
+ 	}
++
++	fb_console_init();
++
+ 	return 0;
+ 
+ err_class:
+@@ -1902,6 +1906,8 @@ module_init(fbmem_init);
+ static void __exit
+ fbmem_exit(void)
+ {
++	fb_console_exit();
++
+ 	remove_proc_entry("fb", NULL);
+ 	class_destroy(fb_class);
+ 	unregister_chrdev(FB_MAJOR, "fb");
+diff --git a/drivers/video/console/softcursor.c b/drivers/video/fbdev/core/softcursor.c
+similarity index 93%
+rename from drivers/video/console/softcursor.c
+rename to drivers/video/fbdev/core/softcursor.c
+index 46dd8f5d2e9e..fc93f254498e 100644
+--- a/drivers/video/console/softcursor.c
++++ b/drivers/video/fbdev/core/softcursor.c
+@@ -76,7 +76,3 @@ int soft_cursor(struct fb_info *info, struct fb_cursor *cursor)
+ }
+ 
+ EXPORT_SYMBOL(soft_cursor);
+-
+-MODULE_AUTHOR("James Simmons <jsimmons@users.sf.net>");
+-MODULE_DESCRIPTION("Generic software cursor");
+-MODULE_LICENSE("GPL");
+diff --git a/drivers/video/console/tileblit.c b/drivers/video/fbdev/core/tileblit.c
+similarity index 96%
+rename from drivers/video/console/tileblit.c
+rename to drivers/video/fbdev/core/tileblit.c
+index 1c5393257357..e325ff980b7a 100644
+--- a/drivers/video/console/tileblit.c
++++ b/drivers/video/fbdev/core/tileblit.c
+@@ -153,8 +153,3 @@ void fbcon_set_tileops(struct vc_data *vc, struct fb_info *info)
+ }
+ 
+ EXPORT_SYMBOL(fbcon_set_tileops);
+-
+-MODULE_AUTHOR("Antonino Daplas <adaplas@pol.net>");
+-MODULE_DESCRIPTION("Tile Blitting Operation");
+-MODULE_LICENSE("GPL");
+-
+diff --git a/include/linux/fbcon.h b/include/linux/fbcon.h
+new file mode 100644
+index 000000000000..0fac6305d51c
+--- /dev/null
++++ b/include/linux/fbcon.h
+@@ -0,0 +1,12 @@
++#ifndef _LINUX_FBCON_H
++#define _LINUX_FBCON_H
++
++#ifdef CONFIG_FRAMEBUFFER_CONSOLE
++void __init fb_console_init(void);
++void __exit fb_console_exit(void);
++#else
++static void fb_console_init(void) {}
++static void fb_console_exit(void) {}
++#endif
++
++#endif /* _LINUX_FBCON_H */
+-- 
+2.31.1
+
